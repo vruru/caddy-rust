@@ -80,6 +80,18 @@ Unimplemented modules must remain explicit gaps, never silently ignored or
 advertised as supported. No Go runtime is permitted in the replacement's normal
 request or certificate path.
 
+The library now includes isolated HTTP and Admin runtimes. HTTP request and
+response bodies stream with backpressure, including long transfers and upgrades;
+configuration snapshots keep accepted requests independent of later publication.
+The Admin runtime bounds connections, requests and queued configuration writes,
+retains accepted writes after client disconnection, and separates parallel reads
+from serialized publication. Its backend contract requires real candidate
+provisioning, identity acquisition and rollback. Those product-level connections
+are still incomplete: the CLI remains the read-only inspector described above.
+Unsupported modules and transport options fail validation instead of being
+silently ignored. The vendored HTTP crates contain opt-in compatibility changes;
+see vendor/VENDOR.md and THIRD-PARTY-NOTICES.
+
 Build with the current official stable Rust, pinned to 1.99.1 for this phase.
 Keep all QA, fixtures, private configuration, keys, logs, and build output in the
 current LocalOps task. Do not create GitHub Actions. The authorized source
