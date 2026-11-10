@@ -638,13 +638,13 @@ fn parse_handler(value: &Value, depth: usize) -> Result<Handler> {
             deny_unknown(m, &["handler", "request", "response"], path)?;
             let request = m
                 .get("request")
-                .map(|v| parse_header_ops(v, path))
+                .map(|v| parse_header_ops(v, path, false))
                 .transpose()?
                 .unwrap_or_default();
             let (response, deferred) = if let Some(v) = m.get("response") {
                 (
-                    parse_header_ops(v, path)?,
-                    boolean(object(v, path)?.get("defer"), false, path)?,
+                    parse_header_ops(v, path, true)?,
+                    boolean(object(v, path)?.get("deferred"), false, path)?,
                 )
             } else {
                 (HeaderOps::default(), false)
@@ -903,9 +903,17 @@ fn parse_header_values(value: &Value, path: &str) -> Result<Vec<(String, Vec<Str
     }
     Ok(values)
 }
-fn parse_header_ops(value: &Value, path: &str) -> Result<HeaderOps> {
+fn parse_header_ops(value: &Value, path: &str, response: bool) -> Result<HeaderOps> {
     let m = object(value, path)?;
-    deny_unknown(m, &["set", "add", "delete", "defer"], path)?;
+    deny_unknown(
+        m,
+        if response {
+            &["set", "add", "delete", "deferred"]
+        } else {
+            &["set", "add", "delete"]
+        },
+        path,
+    )?;
     let delete = m
         .get("delete")
         .map(|v| strings(v, path))
@@ -1090,10 +1098,10 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
         let h = object(v, path)?;
         deny_unknown(h, &["request", "response"], path)?;
         if let Some(v) = h.get("request") {
-            request_headers = parse_header_ops(v, path)?;
+            request_headers = parse_header_ops(v, path, false)?;
         }
         if let Some(v) = h.get("response") {
-            response_headers = parse_header_ops(v, path)?;
+            response_headers = parse_header_ops(v, path, false)?;
         }
     }
     Ok(ProxyConfig {

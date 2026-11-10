@@ -281,6 +281,9 @@ pub(super) async fn handle(
         Ok(Flow::Continue | Flow::Stop) => simple(StatusCode::OK, Bytes::new()),
         Err(error) => {
             let status = populate_error(&mut ctx, &error);
+            // The failed handler stack has unwound. Its deferred writers did
+            // not commit headers and must not wrap the server error routes.
+            ctx.deferred.clear();
             ctx.groups.clear();
             match routes(&server.plan.errors, &mut ctx, &inner, &server).await {
                 Ok(Flow::Response(response)) => response,
@@ -569,11 +572,15 @@ fn handlers<'a>(
                     errors,
                     errors_configured,
                 } => {
+                    let pending_headers = ctx.deferred.len();
                     let result = routes(list, ctx, inner, server).await;
                     match result {
                         Ok(Flow::Continue) => {}
                         Ok(flow) => return Ok(flow),
                         Err(error) if *errors_configured => {
+                            // Keep wrappers outside this subroute, while
+                            // dropping the failed inner route's deferred work.
+                            ctx.deferred.truncate(pending_headers);
                             populate_error(ctx, &error);
                             match routes(errors, ctx, inner, server).await? {
                                 Flow::Continue => {}
@@ -881,21 +888,24 @@ fn matches<'a>(
                 let mut all = true;
                 for (name, patterns) in headers {
                     let values = if name.eq_ignore_ascii_case("host") {
-                        vec![ctx.authority.as_str()]
+                        vec![ctx.authority.as_bytes()]
                     } else {
                         ctx.req()
                             .headers()
                             .get_all(name)
                             .iter()
-                            .filter_map(|v| v.to_str().ok())
+                            .map(HeaderValue::as_bytes)
                             .collect::<Vec<_>>()
                     };
                     let matched = match patterns {
                         None => values.is_empty(),
                         Some(patterns) if patterns.is_empty() => !values.is_empty(),
                         Some(patterns) => patterns.iter().any(|p| {
-                            ctx.expand(p)
-                                .is_ok_and(|p| values.iter().any(|v| wildcard(&p, v, false)))
+                            ctx.expand(p).is_ok_and(|p| {
+                                values
+                                    .iter()
+                                    .any(|v| header_value_bytes_pattern(p.as_bytes(), v))
+                            })
                         }),
                     };
                     if !matched {
@@ -1087,19 +1097,25 @@ fn path_match(pattern: &str, path: &str) -> bool {
     }
     go_path_glob(pattern, &path)
 }
-pub(super) fn wildcard(pattern: &str, value: &str, insensitive: bool) -> bool {
-    let mut regex = String::from(if insensitive { "(?i)^" } else { "^" });
-    for c in pattern.chars() {
-        if c == '*' {
-            regex.push_str(".*");
-        } else if c == '?' {
-            regex.push('.');
-        } else {
-            regex.push_str(&regex::escape(&c.to_string()));
-        }
+pub(super) fn header_value_pattern(pattern: &str, value: &str) -> bool {
+    header_value_bytes_pattern(pattern.as_bytes(), value.as_bytes())
+}
+// Behavioral reference: Caddy v2.11.7 modules/caddyhttp/matchers.go::matchHeaders.
+pub(super) fn header_value_bytes_pattern(pattern: &[u8], value: &[u8]) -> bool {
+    // Go matches raw header bytes, including obs-text, with stars only at the
+    // ends. Middle stars and '?' remain literal; this is not a regular glob.
+    if pattern == b"*" {
+        true
+    } else if pattern.starts_with(b"*") && pattern.ends_with(b"*") {
+        let needle = &pattern[1..pattern.len() - 1];
+        needle.is_empty() || value.windows(needle.len()).any(|window| window == needle)
+    } else if let Some(suffix) = pattern.strip_prefix(b"*") {
+        value.ends_with(suffix)
+    } else if let Some(prefix) = pattern.strip_suffix(b"*") {
+        value.starts_with(prefix)
+    } else {
+        pattern == value
     }
-    regex.push('$');
-    regex::Regex::new(&regex).is_ok_and(|r| r.is_match(value))
 }
 fn client_ip(headers: &HeaderMap, peer: IpAddr, trusted: bool, server: &ServerConfig) -> IpAddr {
     if !trusted {
@@ -1212,15 +1228,5 @@ where
 }
 
 fn header_pattern(pattern: &str, value: &str) -> bool {
-    let pattern = pattern.to_ascii_lowercase();
-    let value = value.to_ascii_lowercase();
-    if pattern.starts_with('*') && pattern.ends_with('*') && pattern.len() > 1 {
-        value.contains(&pattern[1..pattern.len() - 1])
-    } else if let Some(suffix) = pattern.strip_prefix('*') {
-        value.ends_with(suffix)
-    } else if let Some(prefix) = pattern.strip_suffix('*') {
-        value.starts_with(prefix)
-    } else {
-        pattern == value
-    }
+    header_value_pattern(&pattern.to_ascii_lowercase(), &value.to_ascii_lowercase())
 }
