@@ -1,0 +1,682 @@
+{
+  "reference": "Caddy v2.11.7",
+  "meaning": "baseline capabilities, not implemented or advertised by this inspection build",
+  "moduleCount": 135,
+  "modules": [
+    {
+      "id": "admin.api.load",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "admin.api.metrics",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "admin.api.pki",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "admin.api.reverse_proxy",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.adapters.caddyfile",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.config_loaders.http",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.filesystems",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.listeners.http_redirect",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.listeners.proxy_protocol",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.listeners.tls",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.cores.mock",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.encoders.append",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.encoders.console",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.encoders.filter",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.encoders.filter.cookie",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.encoders.filter.delete",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.encoders.filter.hash",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.encoders.filter.ip_mask",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.encoders.filter.multi_regexp",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.encoders.filter.query",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.encoders.filter.regexp",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.encoders.filter.rename",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.encoders.filter.replace",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.encoders.filter.set_cookie",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.encoders.journald",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.encoders.json",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.writers.discard",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.writers.file",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.writers.net",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.writers.stderr",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.logging.writers.stdout",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.network_proxy.none",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.network_proxy.url",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "caddy.storage.file_system",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "events",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.authentication.hashes.argon2id",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.authentication.hashes.bcrypt",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.authentication.providers.http_basic",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.encoders.gzip",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.encoders.zstd",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.acme_server",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.authentication",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.copy_response",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.copy_response_headers",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.encode",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.error",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.file_server",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.headers",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.intercept",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.invoke",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.log_append",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.map",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.metrics",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.push",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.request_body",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.reverse_proxy",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.rewrite",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.static_response",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.subroute",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.templates",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.timeouts",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.tracing",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.handlers.vars",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.ip_sources.static",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.matchers.client_ip",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.matchers.expression",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.matchers.file",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.matchers.header",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.matchers.header_regexp",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.matchers.host",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.matchers.method",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.matchers.not",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.matchers.path",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.matchers.path_regexp",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.matchers.protocol",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.matchers.query",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.matchers.remote_ip",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.matchers.tls",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.matchers.url_pattern",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.matchers.vars",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.matchers.vars_regexp",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.precompressed.br",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.precompressed.gzip",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.precompressed.zstd",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.reverse_proxy.selection_policies.client_ip_hash",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.reverse_proxy.selection_policies.cookie",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.reverse_proxy.selection_policies.first",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.reverse_proxy.selection_policies.header",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.reverse_proxy.selection_policies.ip_hash",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.reverse_proxy.selection_policies.least_conn",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.reverse_proxy.selection_policies.query",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.reverse_proxy.selection_policies.random",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.reverse_proxy.selection_policies.random_choose",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.reverse_proxy.selection_policies.round_robin",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.reverse_proxy.selection_policies.uri_hash",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.reverse_proxy.selection_policies.weighted_round_robin",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.reverse_proxy.transport.fastcgi",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.reverse_proxy.transport.http",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.reverse_proxy.upstreams.a",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.reverse_proxy.upstreams.multi",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "http.reverse_proxy.upstreams.srv",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "pki",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.ca_pool.source.combined",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.ca_pool.source.file",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.ca_pool.source.http",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.ca_pool.source.inline",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.ca_pool.source.pki_intermediate",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.ca_pool.source.pki_root",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.ca_pool.source.storage",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.ca_pool.source.system",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.certificates.automate",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.certificates.load_files",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.certificates.load_folders",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.certificates.load_pem",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.certificates.load_storage",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.client_auth.verifier.leaf",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.ech.publishers.dns",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.get_certificate.http",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.get_certificate.tailscale",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.handshake_match.local_ip",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.handshake_match.remote_ip",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.handshake_match.sni",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.handshake_match.sni_regexp",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.issuance.acme",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.issuance.internal",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.issuance.zerossl",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.leaf_cert_loader.file",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.leaf_cert_loader.folder",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.leaf_cert_loader.pem",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.leaf_cert_loader.storage",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.permission.http",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.stek.distributed",
+      "implementation": "pending",
+      "verification": "pending"
+    },
+    {
+      "id": "tls.stek.standard",
+      "implementation": "pending",
+      "verification": "pending"
+    }
+  ]
+}

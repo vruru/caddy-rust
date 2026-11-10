@@ -1,0 +1,5 @@
+Independent Rust compatibility implementation in progress.
+Behavioral reference: Caddy v2.11.7 (https://github.com/caddyserver/caddy),
+Copyright 2015 Matthew Holt and The Caddy Authors, Apache License 2.0;
+CertMagic v0.25.6 (https://github.com/caddyserver/certmagic), Apache License 2.0.
+This project is not an official Caddy distribution. No endorsement is implied.

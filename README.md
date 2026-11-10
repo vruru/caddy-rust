@@ -1,0 +1,48 @@
+# Native compatibility implementation
+
+Standalone Rust implementation in progress for the existing Caddy deployment.
+This is a separate project from GoEdge. The current build is a **read-only
+migration inspector**, not a traffic-serving replacement. Existing production
+Caddy remains unchanged until the replacement passes the applicable contracts.
+
+The user requires original functionality and module behavior to remain available,
+especially automatic certificate issuance and renewal. See COMPATIBILITY.md for
+the full baseline and the current incomplete status. Compilation and parsing
+success are not evidence that a proxy, plugin, or certificate issuer is complete.
+
+Current commands:
+
+- `inspect-config FILE`: extract a privacy-safe configuration feature inventory.
+- `inspect-storage ROOT`: inspect CertMagic certificate/account layout and validate
+  supported certificate/key pairs without writing or registering an ACME account.
+
+Neither command serves traffic, renews a certificate, reloads a running process,
+or replaces existing state. Reports must not contain private keys, account email,
+account URLs, domain names, or credential values. Schema pointers use documented
+redaction for dynamic map keys; they are not Admin API mutation paths.
+
+The library also contains bounded HTTP-01/TLS-ALPN-01 challenge ownership and a
+validated TLS certificate snapshot resolver. These are integration primitives,
+not an automatic-certificate service. Challenge leases are scoped by registration
+generation, and challenge certificates must never serve ordinary TLS handshakes.
+Failed certificate candidates retain the previously published snapshot. The
+caller still needs to provide listeners, ACME account/order handling, persistence,
+renewal scheduling, issuer selection, OCSP and transactional configuration reload.
+Certificate `upsert` uses bounded optimistic publication. A competing full reload
+or another publisher can exhaust its eight attempts and return `retry required`.
+The future certificate manager must retain the validated candidate and retry with
+bounded backoff outside handshake and publication locks; it must not treat that
+result as a successful renewal or re-register an ACME account because of it.
+
+The official Caddy v2.11.7 and CertMagic v0.25.6 implementation provide the pinned
+behavioral reference. The original Go plugins have no native cross-language ABI:
+module configuration and behavior require individual Rust implementations.
+Unimplemented modules must remain explicit gaps, never silently ignored or
+advertised as supported. No Go runtime is permitted in the replacement's normal
+request or certificate path.
+
+Build with the current official stable Rust, pinned to 1.99.1 for this phase.
+Keep all QA, fixtures, private configuration, keys, logs, and build output in the
+current LocalOps task. Do not create GitHub Actions. The authorized source
+repository is the private `vruru/caddy-rust` repository; do not publish this
+standalone project into another repository.

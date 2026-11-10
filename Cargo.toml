@@ -1,0 +1,20 @@
+[package]
+name = "caddy-compat-native"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+publish = false
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+x509-parser = "0.18"
+zeroize = "1"
+pem = "3"
+rustix = { version = "1", features = ["fs"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto"] }
