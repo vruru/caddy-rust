@@ -1,4 +1,5 @@
 pub mod caddyfile_lexer;
+pub mod caddyfile_parser;
 pub mod certmagic;
 pub mod challenge;
 pub mod surface;
@@ -13,3 +14,5 @@ pub mod acme_wire;
 pub mod cert_automation;
 pub mod cert_status;
 pub mod leaf_guard;
+
+pub mod duration;

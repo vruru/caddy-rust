@@ -8,6 +8,11 @@ src/http_runtime/mime.rs follows Go mime/type.go (Copyright 2010 The Go Authors)
 src/http_runtime/sniff.rs follows Go net/http/sniff.go (Copyright 2011 The Go Authors).
 The optional trailer continuation normalizer in vendor/hyper-1.12.0 follows
 Go 1.27.3 src/net/textproto/reader.go (Copyright 2010 The Go Authors).
+src/caddyfile_parser/io.rs follows Go 1.27.3 path/filepath/match.go
+(Copyright 2010 The Go Authors).
+src/caddyfile_parser/scalar.rs follows Go internal/strconv/atof.go and atoi.go
+(Copyright 2009 The Go Authors).
+src/duration.rs follows Go time/format.go (Copyright 2010 The Go Authors).
 These portions retain their source notices and the following BSD license:
 
 Copyright 2009 The Go Authors.

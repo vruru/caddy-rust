@@ -565,6 +565,13 @@ fn is_valid_heredoc_marker(marker: &str) -> bool {
 
 /// Tokenize takes bytes as input and lexes it into a list of tokens.
 pub fn tokenize(input: &[u8], file: &str) -> Result<Vec<Token>> {
+    tokenize_bounded(input, file, usize::MAX)
+}
+
+/// The parser's bounded entry point checks before retaining another token.
+/// `tokenize` keeps its original unbounded lexical contract for callers which
+/// impose their own input limit.
+pub fn tokenize_bounded(input: &[u8], file: &str, max_tokens: usize) -> Result<Vec<Token>> {
     let mut lexer = Lexer::new(input)?;
     let mut tokens: Vec<Token> = Vec::new();
 
@@ -573,6 +580,9 @@ pub fn tokenize(input: &[u8], file: &str) -> Result<Vec<Token>> {
             Ok(found) => {
                 if !found {
                     break;
+                }
+                if tokens.len() >= max_tokens {
+                    return Err(anyhow!("Caddyfile token count limit exceeded"));
                 }
                 lexer.token.file = file.to_string();
                 tokens.push(lexer.token.clone());

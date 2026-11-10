@@ -23,7 +23,10 @@ redaction for dynamic map keys; they are not Admin API mutation paths.
 
 The library also includes the Caddy v2.11.7 lexical tokenizer and token helpers,
 including quoted strings, heredocs, source line tracking and import-chain line
-boundaries. This is not yet a Caddyfile parser or configuration adapter.
+boundaries. A source-preserving parser now handles server blocks, imports,
+snippets, arguments, environment expansion and the compatible scalar helpers.
+Its synchronous parsing and filesystem work require a bounded blocking worker.
+The HTTP configuration adapter and its product integration remain incomplete.
 
 The library also contains bounded HTTP-01/TLS-ALPN-01 challenge ownership and a
 validated TLS certificate snapshot resolver. These are integration primitives,
@@ -130,3 +133,8 @@ client identities, derives supported dynamic server names per request, and bound
 connect/handshake/read/write waits. HTTP-only ALPN follows the original absence
 of an ALPN extension. Static and managed leaves share revocation policy. This
 is isolated transport support; transactional listener integration remains work.
+
+The shared duration parser preserves the original day-unit float conversion and
+rounding while rejecting integer overflow instead of wrapping. JSON integer
+durations retain nanosecond semantics. Callers keep their own negative-value
+policy and error context; this helper does not provision a runtime.
