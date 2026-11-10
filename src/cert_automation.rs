@@ -157,7 +157,26 @@ enum LoadMode {
     Online,
     CacheOnly,
     Probe,
+    Refresh,
 }
+
+pub(crate) enum RefreshOutcome {
+    Usable {
+        certificate: ManagedCertificate,
+        ari_after: i64,
+    },
+    Unusable,
+    Missing,
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingPromotion;
+impl std::fmt::Display for PendingPromotion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ACME certificate cache has an unpromoted issuance attempt")
+    }
+}
+impl std::error::Error for PendingPromotion {}
 
 /// Strict read-only candidate inspection. Busy never waits for a same-manager
 /// name gate; material is one stable grouped storage snapshot, not an issuance
@@ -165,7 +184,10 @@ enum LoadMode {
 pub enum CachedProbe {
     Busy,
     Missing,
-    Material { usable: Option<ManagedCertificate>, bundle: CertificateBundle },
+    Material {
+        usable: Option<ManagedCertificate>,
+        bundle: CertificateBundle,
+    },
 }
 
 #[derive(Clone)]
@@ -176,6 +198,7 @@ struct ManagerInner {
     store: FsStore,
     registry: ChallengeRegistry,
     resolver: Arc<HotCertificateResolver>,
+    publish_to_resolver: bool,
     options: AutomationOptions,
     global: Arc<Semaphore>,
     local: Arc<Semaphore>,
@@ -189,7 +212,15 @@ struct ManagerInner {
 /// Prepare a real listener only for the selected pending authorization. The
 /// owner must retain its listener lease through ensure and release it on every
 /// completion/cancellation path. No callback is made for cached/ARI-only work.
-pub type SolverPreparation = Arc<dyn Fn(String, ChallengeType, CancellationToken) -> futures_util::future::BoxFuture<'static, Result<()>> + Send + Sync>;
+pub type SolverPreparation = Arc<
+    dyn Fn(
+            String,
+            ChallengeType,
+            CancellationToken,
+        ) -> futures_util::future::BoxFuture<'static, Result<()>>
+        + Send
+        + Sync,
+>;
 struct CaState {
     limiter: Arc<Semaphore>,
     next_allowed_unix: Arc<AtomicI64>,
@@ -198,6 +229,7 @@ struct CaState {
 /// automation policies must reuse this object instead of multiplying budgets.
 pub struct AutomationResources {
     global: Arc<Semaphore>,
+    permission_global: Arc<Semaphore>,
     local: Arc<Semaphore>,
     cas: std::sync::Mutex<HashMap<String, Weak<Semaphore>>>,
     cooldowns: std::sync::Mutex<HashMap<[u8; 32], Arc<AtomicI64>>>,
@@ -205,22 +237,60 @@ pub struct AutomationResources {
     max_per_ca: usize,
 }
 impl AutomationResources {
-    pub(crate) fn cpu_slots(&self) -> Arc<Semaphore> { self.local.clone() }
-    pub fn limits(&self) -> (usize, usize) { (self.max_concurrent, self.max_per_ca) }
+    pub(crate) fn cpu_slots(&self) -> Arc<Semaphore> {
+        self.local.clone()
+    }
+    pub fn limits(&self) -> (usize, usize) {
+        (self.max_concurrent, self.max_per_ca)
+    }
     pub fn new(max_concurrent: usize, max_per_ca: usize) -> Result<Self> {
-        ensure!((1..=128).contains(&max_concurrent) && (1..=32).contains(&max_per_ca), "ACME concurrency outside bounds");
+        ensure!(
+            (1..=128).contains(&max_concurrent) && (1..=32).contains(&max_per_ca),
+            "ACME concurrency outside bounds"
+        );
         Ok(Self {
             global: Arc::new(Semaphore::new(max_concurrent)),
-            local: Arc::new(Semaphore::new(std::thread::available_parallelism().map_or(1, usize::from).min(4))),
+            permission_global: Arc::new(Semaphore::new(max_concurrent)),
+            local: Arc::new(Semaphore::new(
+                std::thread::available_parallelism()
+                    .map_or(1, usize::from)
+                    .min(4),
+            )),
             cas: std::sync::Mutex::new(HashMap::new()),
             cooldowns: std::sync::Mutex::new(HashMap::new()),
             max_concurrent,
             max_per_ca,
         })
     }
+    /// Permission is an independent network operation. Slow CA orders cannot
+    /// consume its budget, and permission always releases before acquisition.
+    pub(crate) async fn admit_permission(
+        &self,
+        origin: String,
+        cancel: &CancellationToken,
+    ) -> Result<OriginPermit> {
+        ensure!(origin.len() <= 4096, "certificate origin limit exceeded");
+        let issuer = tokio::select! { biased;
+            _ = cancel.cancelled() => bail!("certificate operation cancelled"),
+            permit = self.ca(format!("permission\0{origin}"))?.acquire_owned() => permit.map_err(|_| anyhow!("certificate origin closed"))?,
+        };
+        let global = tokio::select! { biased;
+            _ = cancel.cancelled() => bail!("certificate operation cancelled"),
+            permit = self.permission_global.clone().acquire_owned() => permit.map_err(|_| anyhow!("certificate networking closed"))?,
+        };
+        Ok(OriginPermit {
+            _global: global,
+            _issuer: issuer,
+        })
+    }
     fn ca(&self, origin: String) -> Result<Arc<Semaphore>> {
-        let mut states = self.cas.lock().map_err(|_| anyhow!("ACME resource state unavailable"))?;
-        if let Some(state) = states.get(&origin).and_then(Weak::upgrade) { return Ok(state); }
+        let mut states = self
+            .cas
+            .lock()
+            .map_err(|_| anyhow!("ACME resource state unavailable"))?;
+        if let Some(state) = states.get(&origin).and_then(Weak::upgrade) {
+            return Ok(state);
+        }
         states.retain(|_, state| state.strong_count() > 0);
         ensure!(states.len() < 1024, "ACME origin resource limit exceeded");
         let state = Arc::new(Semaphore::new(self.max_per_ca));
@@ -230,32 +300,67 @@ impl AutomationResources {
     fn cooldown(&self, store: &FsStore, config: &AcmeIssuerConfig) -> Result<Arc<AtomicI64>> {
         let mut hash = Sha256::new();
         hash.update(b"acme-equivalent-issuer-retry-v1");
-        let frame = |hash: &mut Sha256, bytes: &[u8]| { hash.update((bytes.len() as u64).to_be_bytes()); hash.update(bytes); };
-        let (dev,ino) = store.root_identity();
-        hash.update(dev.to_be_bytes()); hash.update(ino.to_be_bytes());
+        let frame = |hash: &mut Sha256, bytes: &[u8]| {
+            hash.update((bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
+        };
+        let (dev, ino) = store.root_identity();
+        hash.update(dev.to_be_bytes());
+        hash.update(ino.to_be_bytes());
         frame(&mut hash, config.wire.directory.as_bytes());
         frame(&mut hash, config.email.as_bytes());
-        frame(&mut hash, &serde_json::to_vec(&(config.account_key_type,config.leaf_key_type,&config.challenge_types))?);
-        hash.update([u8::from(config.terms_of_service_agreed), u8::from(config.wire.allow_insecure_loopback)]);
+        frame(
+            &mut hash,
+            &serde_json::to_vec(&(
+                config.account_key_type,
+                config.leaf_key_type,
+                &config.challenge_types,
+            ))?,
+        );
+        hash.update([
+            u8::from(config.terms_of_service_agreed),
+            u8::from(config.wire.allow_insecure_loopback),
+        ]);
         hash.update(config.wire.request_timeout.as_nanos().to_be_bytes());
         hash.update((config.wire.extra_ca_pem.len() as u64).to_be_bytes());
-        for root in &config.wire.extra_ca_pem { frame(&mut hash, root); }
+        for root in &config.wire.extra_ca_pem {
+            frame(&mut hash, root);
+        }
         hash.update((config.wire.trusted_ca_origins.len() as u64).to_be_bytes());
-        for origin in &config.wire.trusted_ca_origins { frame(&mut hash, origin.as_bytes()); }
+        for origin in &config.wire.trusted_ca_origins {
+            frame(&mut hash, origin.as_bytes());
+        }
         match &config.eab {
-            Some(eab) => { hash.update([1]); frame(&mut hash,eab.kid.as_bytes()); frame(&mut hash,eab.hmac_key.as_bytes()); },
+            Some(eab) => {
+                hash.update([1]);
+                frame(&mut hash, eab.kid.as_bytes());
+                frame(&mut hash, eab.hmac_key.as_bytes());
+            }
             None => hash.update([0]),
         }
-        let key: [u8;32] = hash.finalize().into();
-        let mut cooldowns = self.cooldowns.lock().map_err(|_| anyhow!("ACME retry state unavailable"))?;
-        if let Some(state) = cooldowns.get(&key) { return Ok(state.clone()); }
+        let key: [u8; 32] = hash.finalize().into();
+        let mut cooldowns = self
+            .cooldowns
+            .lock()
+            .map_err(|_| anyhow!("ACME retry state unavailable"))?;
+        if let Some(state) = cooldowns.get(&key) {
+            return Ok(state.clone());
+        }
         let at = now();
-        cooldowns.retain(|_, state| Arc::strong_count(state) > 1 || state.load(Ordering::Acquire) > at);
-        ensure!(cooldowns.len() < 16_384, "ACME retry scope capacity exceeded");
+        cooldowns
+            .retain(|_, state| Arc::strong_count(state) > 1 || state.load(Ordering::Acquire) > at);
+        ensure!(
+            cooldowns.len() < 16_384,
+            "ACME retry scope capacity exceeded"
+        );
         let state = Arc::new(AtomicI64::new(0));
-        cooldowns.insert(key,state.clone());
+        cooldowns.insert(key, state.clone());
         Ok(state)
     }
+}
+pub(crate) struct OriginPermit {
+    _global: tokio::sync::OwnedSemaphorePermit,
+    _issuer: tokio::sync::OwnedSemaphorePermit,
 }
 struct IssuerState {
     config: AcmeIssuerConfig,
@@ -369,7 +474,11 @@ struct Replacement {
 }
 
 impl CertificateManager {
-    async fn net_permit<'a>(&'a self, issuer: &'a IssuerState, cancel: &CancellationToken) -> Result<NetworkPermit<'a>> {
+    async fn net_permit<'a>(
+        &'a self,
+        issuer: &'a IssuerState,
+        cancel: &CancellationToken,
+    ) -> Result<NetworkPermit<'a>> {
         let issuer = tokio::select! { biased;
             _ = cancel.cancelled() => bail!("ACME operation cancelled"),
             permit = issuer.ca.limiter.acquire() => permit.map_err(|_| anyhow!("ACME issuer closed"))?,
@@ -378,23 +487,49 @@ impl CertificateManager {
             _ = cancel.cancelled() => bail!("ACME operation cancelled"),
             permit = self.inner.global.acquire() => permit.map_err(|_| anyhow!("ACME manager closed"))?,
         };
-        Ok(NetworkPermit { _global: global, _issuer: issuer })
+        Ok(NetworkPermit {
+            _global: global,
+            _issuer: issuer,
+        })
     }
-    async fn cpu<T: Send + 'static>(&self, cancel: &CancellationToken, operation: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    async fn cpu<T: Send + 'static>(
+        &self,
+        cancel: &CancellationToken,
+        operation: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<T> {
         crate::cert_cpu::run(self.inner.local.clone(), cancel.clone(), operation).await
     }
-    async fn inspect_material(&self, bundle: &CertificateBundle, names: &[String], cancel: &CancellationToken) -> Result<MaterialInfo> {
-        let bundle = CertificateBundle { chain_pem:bundle.chain_pem.clone(), private_key_pem:bundle.private_key_pem.clone(), metadata:Value::Null };
+    async fn inspect_material(
+        &self,
+        bundle: &CertificateBundle,
+        names: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<MaterialInfo> {
+        let bundle = CertificateBundle {
+            chain_pem: bundle.chain_pem.clone(),
+            private_key_pem: bundle.private_key_pem.clone(),
+            metadata: Value::Null,
+        };
         let names = names.to_vec();
-        self.cpu(cancel, move || material_info(&bundle, &names)).await
+        self.cpu(cancel, move || material_info(&bundle, &names))
+            .await
     }
-    async fn certificate_id(&self, pem: &[u8], cancel: &CancellationToken) -> Result<Option<String>> {
+    async fn certificate_id(
+        &self,
+        pem: &[u8],
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>> {
         let pem = pem.to_vec();
         self.cpu(cancel, move || ari_certificate_id(&pem)).await
     }
-    async fn account_signer(&self, pem: &[u8], cancel: &CancellationToken) -> Result<Arc<AccountSigner>> {
+    async fn account_signer(
+        &self,
+        pem: &[u8],
+        cancel: &CancellationToken,
+    ) -> Result<Arc<AccountSigner>> {
         let pem = Zeroizing::new(pem.to_vec());
-        self.cpu(cancel, move || Ok(Arc::new(AccountSigner::from_pem(&pem)?))).await
+        self.cpu(cancel, move || Ok(Arc::new(AccountSigner::from_pem(&pem)?)))
+            .await
     }
     pub fn new(
         store: FsStore,
@@ -402,7 +537,10 @@ impl CertificateManager {
         resolver: Arc<HotCertificateResolver>,
         options: AutomationOptions,
     ) -> Result<Self> {
-        let resources = Arc::new(AutomationResources::new(options.max_concurrent, options.max_concurrent_per_ca)?);
+        let resources = Arc::new(AutomationResources::new(
+            options.max_concurrent,
+            options.max_concurrent_per_ca,
+        )?);
         Self::with_resources(store, registry, resolver, options, resources)
     }
     pub fn with_resources(
@@ -451,7 +589,11 @@ impl CertificateManager {
             );
             issuer_key(&issuer.wire.directory)?;
         }
-        ensure!(options.max_concurrent == resources.max_concurrent && options.max_concurrent_per_ca == resources.max_per_ca, "ACME resource budgets differ from manager options");
+        ensure!(
+            options.max_concurrent == resources.max_concurrent
+                && options.max_concurrent_per_ca == resources.max_per_ca,
+            "ACME resource budgets differ from manager options"
+        );
         let mut issuers = Vec::new();
         for mut config in options.issuers.iter().cloned() {
             let directory = url::Url::parse(&config.wire.directory)
@@ -463,7 +605,7 @@ impl CertificateManager {
             // or issuer configuration never inherit an unrelated cooldown.
             let state = Arc::new(CaState {
                 limiter: resources.ca(ca)?,
-                next_allowed_unix: resources.cooldown(&store,&config)?,
+                next_allowed_unix: resources.cooldown(&store, &config)?,
             });
             issuers.push(IssuerState {
                 config,
@@ -477,6 +619,7 @@ impl CertificateManager {
                 store,
                 registry,
                 resolver,
+                publish_to_resolver: true,
                 global: resources.global.clone(),
                 local: resources.local.clone(),
                 solver,
@@ -491,6 +634,14 @@ impl CertificateManager {
     }
     pub fn recovery_report(&self) -> Option<RecoveryReport> {
         self.inner.recovered.get().cloned()
+    }
+    /// The calling generation owns certificate purpose checks and scoped
+    /// publication. Keep using its LeafGuard, but never insert an unowned key.
+    pub(crate) fn storage_only(mut self) -> Result<Self> {
+        Arc::get_mut(&mut self.inner)
+            .ok_or_else(|| anyhow!("certificate manager already shared"))?
+            .publish_to_resolver = false;
+        Ok(self)
     }
     async fn startup_recovery(&self, cancel: CancellationToken) -> Result<&RecoveryReport> {
         let report = self
@@ -596,10 +747,17 @@ impl CertificateManager {
                     );
                     let wire = issuer
                         .wire
-                        .get_or_try_init(|| AcmeWire::connect_with_cpu(issuer.config.wire.clone(), self.inner.local.clone(), &cancel))
+                        .get_or_try_init(|| {
+                            AcmeWire::connect_with_cpu(
+                                issuer.config.wire.clone(),
+                                self.inner.local.clone(),
+                                &cancel,
+                            )
+                        })
                         .await?;
                     let session = wire.restore(
-                        self.account_signer(&account.private_key_pem, &cancel).await?,
+                        self.account_signer(&account.private_key_pem, &cancel)
+                            .await?,
                         &job.account_location,
                     )?;
                     let resource = session.order(&order_url, &cancel).await?;
@@ -672,15 +830,68 @@ impl CertificateManager {
         Ok(cached)
     }
 
+    /// Inspect the existing certificate's renewal deadline with an optional
+    /// authenticated ARI refresh. This never promotes a candidate, reconciles an
+    /// order, registers an account, creates an order or changes resolver state.
+    /// Pending/incomplete storage is an error, not permission to issue. Callers
+    /// must obtain on-demand permission before a subsequently due ensure().
+    pub(crate) async fn refresh_cached(
+        &self,
+        names: &[String],
+        cancel: CancellationToken,
+    ) -> Result<RefreshOutcome> {
+        let names = normalize_names(names)?;
+        let gate = self.name_gate(&names).await?;
+        let _gate = tokio::select! { biased;
+            _ = cancel.cancelled() => bail!("ACME renewal inspection cancelled"),
+            guard = gate.lock() => guard,
+        };
+        let lease = self
+            .inner
+            .store
+            .lock(&format!("issue_cert_{}", names[0]), cancel.clone())
+            .await?;
+        let work = cancel.child_token();
+        let lost = lease.lost();
+        let result = {
+            let operation = self.load_existing(&names, Some(&lease), &work, LoadMode::Refresh);
+            tokio::pin!(operation);
+            tokio::select! { biased;
+                _ = cancel.cancelled() => { work.cancel(); let _ = operation.await; Err(anyhow!("ACME renewal inspection cancelled")) },
+                _ = lost.cancelled() => { work.cancel(); let _ = operation.await; Err(anyhow!("certificate storage lease lost")) },
+                _ = tokio::time::sleep(self.inner.options.job_timeout.min(Duration::from_secs(480))) => { work.cancel(); let _ = operation.await; Err(anyhow!("ACME renewal inspection deadline exceeded")) },
+                result = &mut operation => result.map(|(ready,selected,bundle)|match (ready,selected) {
+                    (Some(certificate),_) => RefreshOutcome::Usable {
+                        certificate,
+                        ari_after: bundle.as_ref().and_then(|bundle| ari_refresh_time(&bundle.metadata)).unwrap_or(i64::MAX),
+                    },
+                    (None,Some(_)) => RefreshOutcome::Unusable,
+                    (None,None) => RefreshOutcome::Missing,
+                }),
+            }
+        };
+        work.cancel();
+        let released = lease.release().await;
+        result.and_then(|ready| released.map(|_| ready))
+    }
+
     /// No recovery, storage lease, ACME, ARI or checkpoint write. FsStore's
     /// grouped reader rejects pending transactions and changing generations.
     /// Local integrity/I/O errors remain errors rather than guessed misses.
-    pub async fn probe_cached(&self, names: &[String], cancel: CancellationToken) -> Result<CachedProbe> {
+    pub async fn probe_cached(
+        &self,
+        names: &[String],
+        cancel: CancellationToken,
+    ) -> Result<CachedProbe> {
         let names = normalize_names(names)?;
         ensure!(!cancel.is_cancelled(), "ACME cache probe cancelled");
         let gate = self.name_gate(&names).await?;
-        let Ok(_guard) = gate.try_lock() else { return Ok(CachedProbe::Busy); };
-        let (usable, _, bundle) = self.load_existing(&names, None, &cancel, LoadMode::Probe).await?;
+        let Ok(_guard) = gate.try_lock() else {
+            return Ok(CachedProbe::Busy);
+        };
+        let (usable, _, bundle) = self
+            .load_existing(&names, None, &cancel, LoadMode::Probe)
+            .await?;
         Ok(match bundle {
             Some(bundle) => CachedProbe::Material { usable, bundle },
             None => CachedProbe::Missing,
@@ -787,7 +998,13 @@ impl CertificateManager {
             }
             let wire = match issuer
                 .wire
-                .get_or_try_init(|| AcmeWire::connect_with_cpu(issuer.config.wire.clone(), self.inner.local.clone(), &cancel))
+                .get_or_try_init(|| {
+                    AcmeWire::connect_with_cpu(
+                        issuer.config.wire.clone(),
+                        self.inner.local.clone(),
+                        &cancel,
+                    )
+                })
                 .await
             {
                 Ok(wire) => wire,
@@ -860,7 +1077,9 @@ impl CertificateManager {
                     }
                     let _network = self.net_permit(issuer, &leg_cancel).await?;
                     let allowed = issuer.ca.next_allowed_unix.load(Ordering::Acquire);
-                    if allowed > now() { return Err(RetryAfterError(allowed).into()); }
+                    if allowed > now() {
+                        return Err(RetryAfterError(allowed).into());
+                    }
                     self.issue(
                         &names,
                         issuer,
@@ -938,7 +1157,8 @@ impl CertificateManager {
             });
         }
         self.load_existing(names, Some(lease), cancel, LoadMode::Online)
-            .await.map(|(ready, previous, _)| (ready, previous))
+            .await
+            .map(|(ready, previous, _)| (ready, previous))
     }
     async fn read_reservation(
         &self,
@@ -1115,86 +1335,97 @@ impl CertificateManager {
         lease: Option<&StorageLease>,
         cancel: &CancellationToken,
         mode: LoadMode,
-    ) -> Result<(Option<ManagedCertificate>, Option<Replacement>, Option<CertificateBundle>)> {
+    ) -> Result<(
+        Option<ManagedCertificate>,
+        Option<Replacement>,
+        Option<CertificateBundle>,
+    )> {
         let key = names_key(names)?;
         let selection = {
-        let active_attempt = self.load_attempt(names).await?;
-        let selected = active_attempt.as_ref().and_then(|a| {
-            a.winner
-                .as_ref()
-                .map(|w| w.leaf_sha256.as_str())
-                .or(a.base_leaf.as_deref())
-        });
-        let restricted = active_attempt.is_some();
-        let winner = active_attempt.as_ref().and_then(|a| a.winner.as_ref());
-        let mut best = None;
-        let mut fallback = None;
-        for (index, issuer) in self.inner.issuers.iter().enumerate() {
-            ensure!(!cancel.is_cancelled(), "ACME cache inspection cancelled");
-            if let Some(lease) = lease { lease.check().await?; }
-            let issuer_name = issuer_key(&issuer.config.wire.directory)?;
-            let material = async {
-                if let Some(lease) = lease { self.inner
-                    .store
-                    .recover_certificate_with_lease(&issuer_name, &key, lease)
-                    .await?; }
-                let Some(bundle) = self
-                    .inner
-                    .store
-                    .load_certificate(&issuer_name, &key)
-                    .await?
-                else {
-                    return Ok(None);
-                };
-                let info = self.inspect_material(&bundle, names, cancel).await?;
-                Ok::<_, anyhow::Error>(Some((bundle, info)))
-            }
-            .await;
-            let Some((bundle, info)) = (match material {
-                Ok(value) => value,
-                Err(error) if mode != LoadMode::Online => return Err(error),
-                Err(_) => {
-                    let _ = self.inner.events.send(AutomationEvent {
-                        names: names.to_vec(),
-                        kind: "issuer_certificate_material_error",
-                        recovery_issue: None,
-                    });
-                    continue;
+            let active_attempt = self.load_attempt(names).await?;
+            let selected = active_attempt.as_ref().and_then(|a| {
+                a.winner
+                    .as_ref()
+                    .map(|w| w.leaf_sha256.as_str())
+                    .or(a.base_leaf.as_deref())
+            });
+            let restricted = active_attempt.is_some();
+            let winner = active_attempt.as_ref().and_then(|a| a.winner.as_ref());
+            let mut best = None;
+            let mut fallback = None;
+            for (index, issuer) in self.inner.issuers.iter().enumerate() {
+                ensure!(!cancel.is_cancelled(), "ACME cache inspection cancelled");
+                if let Some(lease) = lease {
+                    lease.check().await?;
                 }
-            }) else {
-                continue;
-            };
-            {
-                let preferred = !restricted
-                    || (selected == Some(info.leaf_sha256.as_str())
-                        && winner.is_none_or(|w| w.issuer_key == issuer_name));
-                if !preferred {
-                    // A crash can replace the base generation before its
-                    // winner CAS. Serve complete valid material while there is
-                    // no winner, rather than hiding every on-disk certificate.
-                    if winner.is_none()
-                        && info.not_before <= now()
-                        && info.not_after > now()
-                        && fallback.as_ref().is_none_or(
-                            |(_, _, old): &(usize, CertificateBundle, MaterialInfo)| {
-                                info.not_before > old.not_before
-                            },
-                        )
-                    {
-                        fallback = Some((index, bundle, info));
+                let issuer_name = issuer_key(&issuer.config.wire.directory)?;
+                let material = async {
+                    if let Some(lease) = lease.filter(|_| mode != LoadMode::Refresh) {
+                        self.inner
+                            .store
+                            .recover_certificate_with_lease(&issuer_name, &key, lease)
+                            .await?;
                     }
-                    continue;
+                    let Some(bundle) = self
+                        .inner
+                        .store
+                        .load_certificate(&issuer_name, &key)
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    let info = self.inspect_material(&bundle, names, cancel).await?;
+                    Ok::<_, anyhow::Error>(Some((bundle, info)))
                 }
-                if best.as_ref().is_none_or(
-                    |(_, _, old): &(usize, CertificateBundle, MaterialInfo)| {
-                        info.not_before > old.not_before
-                    },
-                ) {
-                    best = Some((index, bundle, info));
+                .await;
+                let Some((bundle, info)) = (match material {
+                    Ok(value) => value,
+                    Err(error) if mode != LoadMode::Online => return Err(error),
+                    Err(_) => {
+                        let _ = self.inner.events.send(AutomationEvent {
+                            names: names.to_vec(),
+                            kind: "issuer_certificate_material_error",
+                            recovery_issue: None,
+                        });
+                        continue;
+                    }
+                }) else {
+                    continue;
+                };
+                {
+                    let preferred = !restricted
+                        || (selected == Some(info.leaf_sha256.as_str())
+                            && winner.is_none_or(|w| w.issuer_key == issuer_name));
+                    if !preferred {
+                        // A crash can replace the base generation before its
+                        // winner CAS. Serve complete valid material while there is
+                        // no winner, rather than hiding every on-disk certificate.
+                        if winner.is_none()
+                            && info.not_before <= now()
+                            && info.not_after > now()
+                            && fallback.as_ref().is_none_or(
+                                |(_, _, old): &(usize, CertificateBundle, MaterialInfo)| {
+                                    info.not_before > old.not_before
+                                },
+                            )
+                        {
+                            fallback = Some((index, bundle, info));
+                        }
+                        continue;
+                    }
+                    if best.as_ref().is_none_or(
+                        |(_, _, old): &(usize, CertificateBundle, MaterialInfo)| {
+                            info.not_before > old.not_before
+                        },
+                    ) {
+                        best = Some((index, bundle, info));
+                    }
                 }
             }
-        }
-        best.or(fallback)
+            if mode == LoadMode::Refresh && best.is_none() && restricted {
+                return Err(PendingPromotion.into());
+            }
+            best.or(fallback)
         };
         let mut previous_id = None;
         if let Some((index, mut bundle, info)) = selection {
@@ -1203,20 +1434,18 @@ impl CertificateManager {
             // Preserve the attempt/winner selection above. A revocation vetoes
             // cached readiness; it must not select an older issuer's leaf.
             let revoked = info.not_after > now && self.material_revocation(&info)?.is_some();
-            if mode == LoadMode::Online && info.not_before > now {
+            if matches!(mode, LoadMode::Online | LoadMode::Refresh) && info.not_before > now {
                 // A stored future leaf can mean local clock skew. Preserve the
                 // selected winner/base and wait rather than creating another
                 // order (possibly another future leaf) at each scheduler pass.
                 return Err(FutureCertificate(info.not_before).into());
             }
             if mode == LoadMode::Online && info.not_before <= now && info.not_after > now {
-                        self.publish(names, &bundle, cancel).await?;
+                self.publish(names, &bundle, cancel).await?;
             }
-            let certificate_id = {
-                        self.certificate_id(&bundle.chain_pem,cancel).await?
-            };
+            let certificate_id = { self.certificate_id(&bundle.chain_pem, cancel).await? };
             let mut ari = parse_ari(&bundle.metadata);
-            if mode == LoadMode::Online
+            if matches!(mode, LoadMode::Online | LoadMode::Refresh)
                 && certificate_id.is_some()
                 && !revoked
                 && issuer.ca.next_allowed_unix.load(Ordering::Acquire) <= now
@@ -1225,10 +1454,18 @@ impl CertificateManager {
             {
                 let update = async {
                     let _network = self.net_permit(issuer, cancel).await?;
-                    if issuer.ca.next_allowed_unix.load(Ordering::Acquire) > now { return Ok(None); }
+                    if issuer.ca.next_allowed_unix.load(Ordering::Acquire) > now {
+                        return Ok(None);
+                    }
                     let wire = issuer
                         .wire
-                        .get_or_try_init(|| AcmeWire::connect_with_cpu(issuer.config.wire.clone(), self.inner.local.clone(), cancel))
+                        .get_or_try_init(|| {
+                            AcmeWire::connect_with_cpu(
+                                issuer.config.wire.clone(),
+                                self.inner.local.clone(),
+                                cancel,
+                            )
+                        })
                         .await?;
                     if let Some(cert_id) = certificate_id.as_deref() {
                         return wire.renewal_info(cert_id, cancel).await;
@@ -1239,7 +1476,7 @@ impl CertificateManager {
                 ensure!(!cancel.is_cancelled(), "ACME operation cancelled");
                 match update {
                     Ok(Some(updated)) => {
-                                        // Caddy may have persisted an equivalent SAN set in a
+                        // Caddy may have persisted an equivalent SAN set in a
                         // different order. Native leases use normalized first SAN.
                         bundle.metadata["sans"] = json!(names);
                         write_ari(
@@ -1248,7 +1485,8 @@ impl CertificateManager {
                             &info,
                             self.inner.options.renewal_window_ratio,
                         )?;
-                        let lease = lease.ok_or_else(||anyhow!("online cache update requires storage lease"))?;
+                        let lease = lease
+                            .ok_or_else(|| anyhow!("online cache update requires storage lease"))?;
                         lease.check().await?;
                         self.inner
                             .store
@@ -1261,7 +1499,12 @@ impl CertificateManager {
                             .await?;
                         ari = Some(updated);
                     }
-                    Err(error) => record_issuer_error(issuer, &error),
+                    Err(error) => {
+                        record_issuer_error(issuer, &error);
+                        if mode == LoadMode::Refresh {
+                            return Err(error);
+                        }
+                    }
                     Ok(None) => {}
                 }
             }
@@ -1300,10 +1543,14 @@ impl CertificateManager {
                         obtained: false,
                     }),
                     previous_id,
-                    (mode == LoadMode::Probe).then_some(bundle),
+                    matches!(mode, LoadMode::Probe | LoadMode::Refresh).then_some(bundle),
                 ));
             }
-            return Ok((None, previous_id, (mode == LoadMode::Probe).then_some(bundle)));
+            return Ok((
+                None,
+                previous_id,
+                (mode == LoadMode::Probe).then_some(bundle),
+            ));
         }
         Ok((None, previous_id, None))
     }
@@ -1393,7 +1640,8 @@ impl CertificateManager {
                     );
                     return wire
                         .restore(
-                            self.account_signer(&account.private_key_pem, cancel).await?,
+                            self.account_signer(&account.private_key_pem, cancel)
+                                .await?,
                             location,
                         )
                         .map(Some);
@@ -1419,75 +1667,203 @@ impl CertificateManager {
         // caller/deadline cancellation must also stop an uncertain request.
         // Join the operation before releasing its fenced registration lease.
         let result = {
-        let registration_cancel = cancel.child_token();
-        let lost = lease.lost();
-        let operation=async {
-            self.inner.store.recover_account_with_lease(&issuer_name,&email,&lease).await?;
-            if let Some(value)=self.inner.store.journal_load(&pending_id).await?&&value["phase"]=="account_received"{
-                let pending:PendingAccount=serde_json::from_value(value).map_err(|_|anyhow!("invalid account publication checkpoint"))?;
-                return Ok((None,Some(pending)));
-            }
-            let existing=self.inner.store.load_account(&issuer_name,&email).await?;
-            if let Some(account)=existing {
-                ensure!(account_lock_name(&account.metadata)?==registration,"account contact changed while acquiring registration lock");
-                let signer=self.account_signer(&account.private_key_pem, cancel).await?;
-                if let Some(location)=account.metadata["location"].as_str().filter(|v|!v.is_empty()){
-                    ensure!(account.metadata["status"]=="valid"&&expected_location.is_none_or(|v|v==location),"stored ACME account identity changed");
-                    return Ok::<_,anyhow::Error>((Some(wire.restore(signer,location)?),None));
+            let registration_cancel = cancel.child_token();
+            let lost = lease.lost();
+            let operation = async {
+                self.inner
+                    .store
+                    .recover_account_with_lease(&issuer_name, &email, &lease)
+                    .await?;
+                if let Some(value) = self.inner.store.journal_load(&pending_id).await?
+                    && value["phase"] == "account_received"
+                {
+                    let pending: PendingAccount = serde_json::from_value(value)
+                        .map_err(|_| anyhow!("invalid account publication checkpoint"))?;
+                    return Ok((None, Some(pending)));
                 }
-                let(session,response)=wire.account(signer,&email,issuer.config.terms_of_service_agreed,true,None,&registration_cancel).await?;
-                ensure!(expected_location.is_none_or(|v|v==session.location()),"recovered account identity changed");
-                let mut metadata=account.metadata.clone();merge_account(&mut metadata,&response.metadata)?;
-                let pending=PendingAccount{version:1,directory:wire.directory_url().to_owned(),phase:"account_received".to_owned(),private_key_pem:std::str::from_utf8(&account.private_key_pem)?.to_owned(),eab:None,storage_email:Some(account_primary(&metadata)?.to_owned()),metadata:Some(metadata)};
-                self.store_checkpoint(&pending_id,serde_json::to_value(&pending)?,&lease).await?;
-                return Ok((None,Some(pending)));
-            }
-            let old=self.inner.store.journal_load(&pending_id).await?;
-            // A different publisher may have completed an alias after our
-            // optimistic read but before we acquired this registration lease.
-            if old.as_ref().is_some_and(|v|v["phase"]=="stored"&&v["storage_email"].is_string()){
-                return Err(anyhow::Error::new(RetryAccountAlias));
-            }
-            ensure!(expected_location.is_none(),"active order account material missing; restore it instead of registering another account");
-            let mut pending=if let Some(value)=old.filter(|v|v["phase"]!="stored") {
-                let pending:PendingAccount=serde_json::from_value(value).map_err(|_|anyhow!("invalid account checkpoint"))?;
-                ensure!(pending.version==1&&pending.directory==wire.directory_url(),"account checkpoint identity changed");pending
-            }else{
-                let kind=issuer.config.account_key_type;
-                let(_,key)=self.cpu(cancel, move||AccountSigner::generate(kind)).await?;
-                let pending=PendingAccount{version:1,directory:wire.directory_url().to_owned(),phase:"key_prepared".to_owned(),private_key_pem:std::str::from_utf8(&key)?.to_owned(),eab:None,storage_email:None,metadata:Some(if email.is_empty(){json!({"contact":[]})}else{json!({"contact":[format!("mailto:{email}")]})})};
-                self.store_checkpoint(&pending_id,serde_json::to_value(&pending)?,&lease).await?;pending
+                let existing = self.inner.store.load_account(&issuer_name, &email).await?;
+                if let Some(account) = existing {
+                    ensure!(
+                        account_lock_name(&account.metadata)? == registration,
+                        "account contact changed while acquiring registration lock"
+                    );
+                    let signer = self
+                        .account_signer(&account.private_key_pem, cancel)
+                        .await?;
+                    if let Some(location) = account.metadata["location"]
+                        .as_str()
+                        .filter(|v| !v.is_empty())
+                    {
+                        ensure!(
+                            account.metadata["status"] == "valid"
+                                && expected_location.is_none_or(|v| v == location),
+                            "stored ACME account identity changed"
+                        );
+                        return Ok::<_, anyhow::Error>((
+                            Some(wire.restore(signer, location)?),
+                            None,
+                        ));
+                    }
+                    let (session, response) = wire
+                        .account(
+                            signer,
+                            &email,
+                            issuer.config.terms_of_service_agreed,
+                            true,
+                            None,
+                            &registration_cancel,
+                        )
+                        .await?;
+                    ensure!(
+                        expected_location.is_none_or(|v| v == session.location()),
+                        "recovered account identity changed"
+                    );
+                    let mut metadata = account.metadata.clone();
+                    merge_account(&mut metadata, &response.metadata)?;
+                    let pending = PendingAccount {
+                        version: 1,
+                        directory: wire.directory_url().to_owned(),
+                        phase: "account_received".to_owned(),
+                        private_key_pem: std::str::from_utf8(&account.private_key_pem)?.to_owned(),
+                        eab: None,
+                        storage_email: Some(account_primary(&metadata)?.to_owned()),
+                        metadata: Some(metadata),
+                    };
+                    self.store_checkpoint(&pending_id, serde_json::to_value(&pending)?, &lease)
+                        .await?;
+                    return Ok((None, Some(pending)));
+                }
+                let old = self.inner.store.journal_load(&pending_id).await?;
+                // A different publisher may have completed an alias after our
+                // optimistic read but before we acquired this registration lease.
+                if old
+                    .as_ref()
+                    .is_some_and(|v| v["phase"] == "stored" && v["storage_email"].is_string())
+                {
+                    return Err(anyhow::Error::new(RetryAccountAlias));
+                }
+                ensure!(
+                    expected_location.is_none(),
+                    "active order account material missing; restore it instead of registering another account"
+                );
+                let mut pending = if let Some(value) = old.filter(|v| v["phase"] != "stored") {
+                    let pending: PendingAccount = serde_json::from_value(value)
+                        .map_err(|_| anyhow!("invalid account checkpoint"))?;
+                    ensure!(
+                        pending.version == 1 && pending.directory == wire.directory_url(),
+                        "account checkpoint identity changed"
+                    );
+                    pending
+                } else {
+                    let kind = issuer.config.account_key_type;
+                    let (_, key) = self
+                        .cpu(cancel, move || AccountSigner::generate(kind))
+                        .await?;
+                    let pending = PendingAccount {
+                        version: 1,
+                        directory: wire.directory_url().to_owned(),
+                        phase: "key_prepared".to_owned(),
+                        private_key_pem: std::str::from_utf8(&key)?.to_owned(),
+                        eab: None,
+                        storage_email: None,
+                        metadata: Some(if email.is_empty() {
+                            json!({"contact":[]})
+                        } else {
+                            json!({"contact":[format!("mailto:{email}")]})
+                        }),
+                    };
+                    self.store_checkpoint(&pending_id, serde_json::to_value(&pending)?, &lease)
+                        .await?;
+                    pending
+                };
+                if pending.phase == "account_received" {
+                    return Ok((None, Some(pending)));
+                }
+                let signer = self
+                    .account_signer(pending.private_key_pem.as_bytes(), cancel)
+                    .await?;
+                let recovered = if pending.phase != "key_prepared" {
+                    match wire
+                        .account(
+                            signer.clone(),
+                            &email,
+                            issuer.config.terms_of_service_agreed,
+                            true,
+                            None,
+                            &registration_cancel,
+                        )
+                        .await
+                    {
+                        Ok(result) => Some(result),
+                        Err(error) => {
+                            if !error.downcast_ref::<ProtocolError>().is_some_and(|p| {
+                                p.status() == 400 && p.kind() == "accountDoesNotExist"
+                            }) {
+                                return Err(error.context("account registration remains uncertain"));
+                            }
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let (_, response) = if let Some(result) = recovered {
+                    result
+                } else {
+                    if issuer.config.eab.is_none()
+                        && pending.eab.is_none()
+                        && wire
+                            .directory_url()
+                            .starts_with("https://acme.zerossl.com/")
+                    {
+                        let (kid, hmac_key) =
+                            wire.zero_ssl_eab(&email, &registration_cancel).await?;
+                        pending.eab = Some(ExternalAccountBinding { kid, hmac_key });
+                        self.store_checkpoint(&pending_id, serde_json::to_value(&pending)?, &lease)
+                            .await?;
+                    }
+                    pending.phase = "registration_intent".to_owned();
+                    self.store_checkpoint(&pending_id, serde_json::to_value(&pending)?, &lease)
+                        .await?;
+                    wire.account(
+                        signer,
+                        &email,
+                        issuer.config.terms_of_service_agreed,
+                        false,
+                        issuer
+                            .config
+                            .eab
+                            .as_ref()
+                            .or(pending.eab.as_ref())
+                            .map(|e| (e.kid.as_str(), e.hmac_key.as_str())),
+                        &registration_cancel,
+                    )
+                    .await?
+                };
+                let mut metadata = pending.metadata.take().unwrap_or_else(|| {
+                    if email.is_empty() {
+                        json!({"contact":[]})
+                    } else {
+                        json!({"contact":[format!("mailto:{email}")]})
+                    }
+                });
+                merge_account(&mut metadata, &response.metadata)?;
+                pending.phase = "account_received".to_owned();
+                pending.storage_email = Some(account_primary(&metadata)?.to_owned());
+                pending.metadata = Some(metadata);
+                self.store_checkpoint(&pending_id, serde_json::to_value(&pending)?, &lease)
+                    .await?;
+                Ok((None, Some(pending)))
             };
-            if pending.phase=="account_received"{return Ok((None,Some(pending)))}
-            let signer=self.account_signer(pending.private_key_pem.as_bytes(), cancel).await?;
-            let recovered=if pending.phase!="key_prepared" {
-                match wire.account(signer.clone(),&email,issuer.config.terms_of_service_agreed,true,None,&registration_cancel).await {
-                    Ok(result)=>Some(result),
-                    Err(error)=>{if !error.downcast_ref::<ProtocolError>().is_some_and(|p|p.status()==400&&p.kind()=="accountDoesNotExist"){return Err(error.context("account registration remains uncertain"))}None}
+            tokio::pin!(operation);
+            tokio::select! {
+                result = &mut operation => result,
+                _ = lost.cancelled() => {
+                    registration_cancel.cancel();
+                    let _ = operation.await;
+                    Err(anyhow!("account storage lease lost"))
                 }
-            }else{None};
-            let(_,response)=if let Some(result)=recovered {result}else{
-                if issuer.config.eab.is_none()&&pending.eab.is_none()&&wire.directory_url().starts_with("https://acme.zerossl.com/"){
-                    let(kid,hmac_key)=wire.zero_ssl_eab(&email,&registration_cancel).await?;pending.eab=Some(ExternalAccountBinding{kid,hmac_key});
-                    self.store_checkpoint(&pending_id,serde_json::to_value(&pending)?,&lease).await?;
-                }
-                pending.phase="registration_intent".to_owned();self.store_checkpoint(&pending_id,serde_json::to_value(&pending)?,&lease).await?;
-                wire.account(signer,&email,issuer.config.terms_of_service_agreed,false,issuer.config.eab.as_ref().or(pending.eab.as_ref()).map(|e|(e.kid.as_str(),e.hmac_key.as_str())),&registration_cancel).await?
-            };
-            let mut metadata=pending.metadata.take().unwrap_or_else(||if email.is_empty(){json!({"contact":[]})}else{json!({"contact":[format!("mailto:{email}")]})});
-            merge_account(&mut metadata,&response.metadata)?;
-            pending.phase="account_received".to_owned();pending.storage_email=Some(account_primary(&metadata)?.to_owned());pending.metadata=Some(metadata);
-            self.store_checkpoint(&pending_id,serde_json::to_value(&pending)?,&lease).await?;Ok((None,Some(pending)))
-        };
-        tokio::pin!(operation);
-        tokio::select! {
-            result = &mut operation => result,
-            _ = lost.cancelled() => {
-                registration_cancel.cancel();
-                let _ = operation.await;
-                Err(anyhow!("account storage lease lost"))
             }
-        }
         };
         let released = lease.release().await;
         let (ready, pending) = result?;
@@ -1543,7 +1919,9 @@ impl CertificateManager {
             metadata["status"] == "valid" && expected_location.is_none_or(|v| v == location),
             "account publication identity changed"
         );
-        let signer = self.account_signer(pending.private_key_pem.as_bytes(), cancel).await?;
+        let signer = self
+            .account_signer(pending.private_key_pem.as_bytes(), cancel)
+            .await?;
         let session = wire.restore(signer.clone(), &location)?;
         let destination_lock = account_lock_name(metadata)?;
         let lease = self
@@ -1559,7 +1937,9 @@ impl CertificateManager {
             let mut stored = metadata.clone();
             if let Some(existing) = self.inner.store.load_account(issuer_name, &actual).await? {
                 ensure!(
-                    self.account_signer(&existing.private_key_pem, cancel).await?.public_spki()?
+                    self.account_signer(&existing.private_key_pem, cancel)
+                        .await?
+                        .public_spki()?
                         == signer.public_spki()?
                         && existing.metadata["location"]
                             .as_str()
@@ -1632,7 +2012,13 @@ impl CertificateManager {
         let (replacement, reservation, attempt_id) = cycle;
         let wire = issuer
             .wire
-            .get_or_try_init(|| AcmeWire::connect_with_cpu(issuer.config.wire.clone(), self.inner.local.clone(), cancel))
+            .get_or_try_init(|| {
+                AcmeWire::connect_with_cpu(
+                    issuer.config.wire.clone(),
+                    self.inner.local.clone(),
+                    cancel,
+                )
+            })
             .await?;
         let issuer_name = issuer_key(wire.directory_url())?;
         let replaces = replacement
@@ -1672,7 +2058,9 @@ impl CertificateManager {
         } else {
             let csr_names = names.to_vec();
             let kind = issuer.config.leaf_key_type;
-            let (csr, key) = self.cpu(cancel, move || generate_csr(&csr_names, kind)).await?;
+            let (csr, key) = self
+                .cpu(cancel, move || generate_csr(&csr_names, kind))
+                .await?;
             let job = Job {
                 version: 1,
                 names: names.to_vec(),
@@ -1741,7 +2129,9 @@ impl CertificateManager {
             // externally replaced or now-due certificate starts a fresh cycle.
             let csr_names = names.to_vec();
             let kind = issuer.config.leaf_key_type;
-            let (csr, key) = self.cpu(cancel, move || generate_csr(&csr_names, kind)).await?;
+            let (csr, key) = self
+                .cpu(cancel, move || generate_csr(&csr_names, kind))
+                .await?;
             job.csr_der = csr;
             job.private_key_pem = std::str::from_utf8(&key)
                 .map_err(|_| anyhow!("invalid generated certificate key"))?
@@ -2093,14 +2483,25 @@ impl CertificateManager {
         bundle: &CertificateBundle,
         cancel: &CancellationToken,
     ) -> Result<()> {
+        if !self.inner.publish_to_resolver {
+            ensure!(!cancel.is_cancelled(), "ACME operation cancelled");
+            return Ok(());
+        }
         for attempt in 0..8 {
             let names_owned = names.to_vec();
             let chain = bundle.chain_pem.clone();
             let key = bundle.private_key_pem.clone();
             let resolver = self.inner.resolver.clone();
-            match self.cpu(cancel, move || Ok(resolver.upsert(&CertificateInput {
-                names: &names_owned, certificate_pem: &chain, private_key_pem: &key,
-            }))).await? {
+            match self
+                .cpu(cancel, move || {
+                    Ok(resolver.upsert(&CertificateInput {
+                        names: &names_owned,
+                        certificate_pem: &chain,
+                        private_key_pem: &key,
+                    }))
+                })
+                .await?
+            {
                 Ok(()) => {
                     // Cached material is also a new resolver instance. Observers
                     // must discover it even when no ACME order was necessary.
@@ -2423,7 +2824,10 @@ impl rcgen::SigningKey for CsrSigner {
         }
     }
 }
-pub(crate) fn generate_csr(names: &[String], kind: KeyType) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
+pub(crate) fn generate_csr(
+    names: &[String],
+    kind: KeyType,
+) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
     let (signer, pem) = AccountSigner::generate(kind)?;
     let pair = CsrSigner::new(signer)?;
     let mut params = rcgen::CertificateParams::new(names.to_vec())
@@ -2517,6 +2921,9 @@ pub fn renewal_time(
         }
     }
     Ok(fallback)
+}
+pub(crate) fn ari_refresh_time(meta: &Value) -> Option<i64> {
+    parse_ari(meta).map(|ari| ari.refresh_after_unix)
 }
 fn parse_ari(meta: &Value) -> Option<AriWindow> {
     let ari = &meta["issuer_data"]["renewal_info"];

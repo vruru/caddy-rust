@@ -15,8 +15,12 @@ mod material;
 mod model;
 #[path = "tls_app_config/parse.rs"]
 mod parse;
+#[path = "tls_app_config/permission.rs"]
+mod permission;
 #[path = "tls_app_config/pki_parse.rs"]
 mod pki_parse;
+#[path = "tls_app_config/resident_cache.rs"]
+mod resident_cache;
 #[path = "tls_app_config/schema.rs"]
 mod schema;
 #[path = "tls_app_config/services.rs"]

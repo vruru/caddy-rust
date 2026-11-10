@@ -28,6 +28,12 @@ pub(super) struct AcmeSettings {
 }
 
 #[derive(Clone)]
+pub(super) struct PermissionSetting {
+    pub endpoint: String,
+    pub legacy: bool,
+}
+
+#[derive(Clone)]
 pub(super) struct Policy {
     pub subjects: Vec<String>,
     pub issuers: Vec<Issuer>,
@@ -101,6 +107,7 @@ pub struct CertificatePlan {
     pub(super) ocsp_interval: Duration,
     pub(super) clean_interval: Duration,
     pub(super) cache_capacity: usize,
+    pub(super) permission: Option<PermissionSetting>,
 }
 
 impl Default for CertificatePlan {
@@ -119,6 +126,7 @@ impl Default for CertificatePlan {
             ocsp_interval: Duration::from_secs(3600),
             clean_interval: Duration::from_secs(86400),
             cache_capacity: 10000,
+            permission: None,
         }
     }
 }

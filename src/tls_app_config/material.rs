@@ -8,6 +8,13 @@ use std::sync::Arc;
 use x509_parser::extensions::GeneralName;
 use zeroize::Zeroizing;
 
+#[derive(Clone, Copy)]
+pub(super) enum Validity {
+    Current,
+    Future(i64),
+    Expired,
+}
+
 #[derive(Clone)]
 pub(super) struct Material {
     pub names: Vec<String>,
@@ -127,6 +134,23 @@ impl Material {
         };
         ensure!(allowed, "configured certificate purpose mismatch");
         Ok(())
+    }
+
+    /// Classify already-verified managed material without treating an expired
+    /// leaf as ready. This is used only for post-commit maintenance planning.
+    pub(super) fn classify_at(&self, now: i64) -> Result<Validity> {
+        ensure!(self.server_auth, "configured certificate purpose mismatch");
+        ensure!(
+            self.not_before < self.not_after,
+            "invalid certificate lifetime"
+        );
+        Ok(if now < self.not_before {
+            Validity::Future(self.not_before)
+        } else if now >= self.not_after {
+            Validity::Expired
+        } else {
+            Validity::Current
+        })
     }
 
     pub(super) fn certified_key(&self) -> Result<Arc<CertifiedKey>> {

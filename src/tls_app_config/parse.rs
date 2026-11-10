@@ -3,7 +3,9 @@ use super::{
     decode::{Object, Result, discriminator},
     error::{ConfigError, pointer},
     issuer_parse,
-    model::{Authority, CertificatePlan, Identity, ManualSource, Policy},
+    model::{
+        Authority, CertificatePlan, Identity, Issuer, ManualSource, PermissionSetting, Policy,
+    },
     pki_parse,
     schema::ObjectKind,
 };
@@ -60,11 +62,14 @@ pub(super) fn parse(views: CertificateViews<'_>) -> Result<CertificatePlan> {
         ));
     }
     let cache = Object::new(tls.value("cache"), ObjectKind::Cache, &tls.at("cache"))?;
-    if let Some(value) = cache.integer("capacity")?
-        && value > 0
-    {
-        plan.cache_capacity =
-            usize::try_from(value).map_err(|_| ConfigError::invalid(cache.at("capacity")))?;
+    if let Some(value) = cache.integer("capacity")? {
+        if value < 0 {
+            return Err(ConfigError::invalid(cache.at("capacity")));
+        }
+        if value > 0 {
+            plan.cache_capacity =
+                usize::try_from(value).map_err(|_| ConfigError::invalid(cache.at("capacity")))?;
+        }
     }
     let certificates = Object::new(
         tls.value("certificates"),
@@ -164,21 +169,32 @@ pub(super) fn parse(views: CertificateViews<'_>) -> Result<CertificatePlan> {
             ObjectKind::OnDemand,
             &automation.at("on_demand"),
         )?;
-        on_demand.string("ask")?;
-        if let Some(permission) = on_demand.value("permission")
-            && discriminator(permission, "module", &on_demand.at("permission"))? == "http"
-        {
+        let ask = on_demand.string("ask")?;
+        if let Some(permission) = on_demand.value("permission") {
+            if !ask.is_empty() {
+                return Err(ConfigError::invalid(on_demand.at("permission")));
+            }
+            if discriminator(permission, "module", &on_demand.at("permission"))? != "http" {
+                return Err(ConfigError::unsupported(
+                    on_demand.at("permission"),
+                    "on_demand_permission_module",
+                ));
+            }
             let permission = Object::new(
                 Some(permission),
                 ObjectKind::PermissionHttp,
                 &on_demand.at("permission"),
             )?;
-            permission.string("endpoint")?;
+            plan.permission = Some(PermissionSetting {
+                endpoint: permission.string("endpoint")?.into(),
+                legacy: false,
+            });
+        } else if !ask.is_empty() {
+            plan.permission = Some(PermissionSetting {
+                endpoint: ask.into(),
+                legacy: true,
+            });
         }
-        return Err(ConfigError::unsupported(
-            automation.at("on_demand"),
-            "on_demand_permission",
-        ));
     }
     for (index, value) in automation.array("policies")?.iter().enumerate() {
         let path = pointer(&automation.at("policies"), &index.to_string());
@@ -234,6 +250,21 @@ pub(super) fn parse(views: CertificateViews<'_>) -> Result<CertificatePlan> {
         || plan.automate.len() > 65536
     {
         return Err(ConfigError::invalid("/apps/tls".into()));
+    }
+    for policy in &plan.policies {
+        if policy.on_demand
+            && plan.permission.is_none()
+            && (policy.subjects.is_empty() || policy.subjects.iter().any(|name| name.contains('*')))
+            && !(!policy.issuers.is_empty()
+                && policy
+                    .issuers
+                    .iter()
+                    .all(|issuer| matches!(issuer, Issuer::Internal { .. })))
+        {
+            return Err(ConfigError::invalid(
+                "/apps/tls/automation/on_demand".into(),
+            ));
+        }
     }
     Ok(plan)
 }

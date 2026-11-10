@@ -411,3 +411,11 @@ it can cancel an older incomplete connection and wait for its actual
 release. Expired or unrelated requests do not evict other connections.
 These limits protect runtime capacity; they do not establish complete
 automatic HTTPS or on-demand TLS compatibility.
+
+On-demand TLS is connected to the native serving generation. A certificate
+miss uses that generation's permission policy. Concurrent requests for the
+same name share an acquisition, and an already verified compatible certificate
+can remain usable across a reload without another permission lookup. Storage
+imports, renewal and eviction remain fenced to their owning generation.
+Original cache capacity, unusual permission request targets, and full
+production automatic-HTTPS acceptance remain separate gates.

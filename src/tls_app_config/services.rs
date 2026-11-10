@@ -1,7 +1,7 @@
 use super::{
     CertificatePlan,
     material::Material,
-    model::{Issuer, Policy},
+    model::{Issuer, PermissionSetting, Policy},
     storage::{CertificatePaths, CertificateResources, Store},
 };
 use crate::{
@@ -13,7 +13,8 @@ use crate::{
     leaf_guard::LeafGuard,
     local_pki::{InternalIssuerOptions, LocalPki, TrustInstaller},
     tls_resolver::{
-        CertificateInput, HotCertificateResolver, ManualCertificateInfo, ManualCertificates,
+        CertificateInput, CertificateResidency, CertificateScope, HotCertificateResolver,
+        ManualCertificateInfo, ManualCertificates, ScopedCertificate,
     },
 };
 use anyhow::{Result, anyhow, ensure};
@@ -22,6 +23,7 @@ use serde_json::json;
 use std::{
     collections::HashMap,
     future::Future,
+    sync::atomic::{AtomicBool, AtomicI64, Ordering},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -33,6 +35,11 @@ mod group;
 mod identity;
 #[path = "services/maintenance.rs"]
 mod maintenance;
+#[path = "services/ocsp_scope.rs"]
+mod ocsp_scope;
+use ocsp_scope::OcspScope;
+#[path = "services/on_demand.rs"]
+mod on_demand;
 #[path = "services/solver.rs"]
 mod solver;
 
@@ -54,12 +61,17 @@ pub struct PrepareContext {
 pub struct RetainedCertificates {
     digest: [u8; 32],
     material: Vec<RetainedMaterial>,
+    permission: Option<PermissionSetting>,
+    business_names: Vec<Vec<String>>,
+    on_demand_names: Vec<Vec<String>>,
 }
 #[derive(Clone)]
 struct RetainedMaterial {
     material: Arc<Material>,
     identity: bool,
     managed_names: Option<Vec<String>>,
+    renew_at: i64,
+    ari_after: i64,
 }
 pub enum PrepareMode {
     Normal,
@@ -89,12 +101,28 @@ struct Group {
     gate: AsyncMutex<()>,
     solver: Option<Arc<solver::SolverBroker>>,
     leaf_state: Mutex<Option<Arc<crate::leaf_guard::LeafState>>>,
+    scope: CertificateScope,
+    residency: Mutex<Option<ResidencyBinding>>,
+    publication: Arc<Mutex<Option<ScopedCertificate>>>,
+    renew_at: AtomicI64,
+    ari_after: AtomicI64,
+    background: AtomicBool,
+    restoring: AtomicBool,
+    cancel: CancellationToken,
+    tasks: TaskTracker,
+    started: Mutex<bool>,
+    _admission: tokio::sync::OwnedSemaphorePermit,
+}
+#[derive(Clone)]
+struct ResidencyBinding {
+    slot: Arc<CertificateResidency>,
+    shared: bool,
 }
 struct State {
     material: Vec<RetainedMaterial>,
     groups: HashMap<String, Arc<Group>>,
     pki: HashMap<String, LocalPki>,
-    ocsp: HashMap<String, OcspManager>,
+    ocsp: HashMap<String, OcspScope>,
     bound: Option<Vec<StagedAddress>>,
     planned: Option<Vec<Vec<String>>>,
     ensured: Option<Vec<Vec<String>>>,
@@ -117,6 +145,11 @@ pub struct CertificateServices {
     activate: Mutex<Option<oneshot::Sender<()>>>,
     events: broadcast::Sender<CertificateEvent>,
     maintenance_changed: tokio::sync::Notify,
+    on_demand: Arc<on_demand::OnDemand>,
+    permission: OnceCell<Option<Arc<super::permission::HttpPermission>>>,
+    group_slots: Arc<tokio::sync::Semaphore>,
+    cache_epoch: OnceCell<Arc<super::resident_cache::Epoch>>,
+    effective_tls: AtomicBool,
 }
 
 impl CertificateServices {
@@ -163,6 +196,7 @@ impl CertificateServices {
         let (activate, committed) = oneshot::channel();
         let tasks = TaskTracker::new();
         let cancel = context.cancel.clone();
+        let cache_receiver = context.resources.resident_cache.subscribe();
         let this = Arc::new(Self {
             plan,
             context,
@@ -188,6 +222,11 @@ impl CertificateServices {
             activate: Mutex::new(Some(activate)),
             events,
             maintenance_changed: tokio::sync::Notify::new(),
+            on_demand: Arc::new(on_demand::OnDemand::new(cache_receiver)),
+            permission: OnceCell::new(),
+            group_slots: Arc::new(tokio::sync::Semaphore::new(4096)),
+            cache_epoch: OnceCell::new(),
+            effective_tls: AtomicBool::new(true),
         });
         let weak = Arc::downgrade(&this);
         tasks.spawn(async move {
@@ -235,6 +274,22 @@ impl CertificateServices {
             .unwrap_or_else(|e| e.into_inner())
             .take()
         {
+            if let Some(epoch) = self.cache_epoch.get() {
+                let cache = self.context.resources.resident_cache.clone();
+                let epoch = epoch.clone();
+                let old = cache.activate(epoch.clone());
+                let cpu = self.context.resources.cpu.clone();
+                let cancel = self.context.cancel.clone();
+                self.tasks.spawn(async move {
+                    let _ = super::loaders::blocking(cpu, cancel, move || {
+                        cache.prune(&epoch)?;
+                        drop(old);
+                        Ok(())
+                    })
+                    .await;
+                });
+            }
+            self.on_demand.active.store(true, Ordering::Release);
             let _ = signal.send(());
         }
     }
@@ -279,7 +334,36 @@ impl CertificateServices {
         let state = self.state.lock().await;
         Ok(RetainedCertificates {
             digest: self.context.configuration_digest,
-            material: state.material.clone(),
+            material: state
+                .material
+                .iter()
+                .filter(|item| {
+                    item.identity
+                        || item.managed_names.as_ref().is_none_or(|names| {
+                            self.on_demand
+                                .bound_material(names, item.material.identity)
+                                .is_some_and(|current| Arc::ptr_eq(&current, &item.material))
+                        })
+                })
+                .cloned()
+                .collect(),
+            permission: self
+                .permission
+                .get()
+                .and_then(|permission| permission.as_ref())
+                .map(|permission| PermissionSetting {
+                    endpoint: permission.endpoint().to_owned(),
+                    legacy: false,
+                }),
+            business_names: state.planned.clone().unwrap_or_default(),
+            on_demand_names: state
+                .planned
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .filter(|names| self.policy(&names[0]).on_demand)
+                .cloned()
+                .collect(),
         })
     }
 
@@ -333,6 +417,7 @@ impl CertificateServices {
         .await
     }
     async fn prepare_inner(&self, cancel: CancellationToken) -> Result<()> {
+        self.prepare_permission(cancel.clone()).await?;
         if let Some(retained) = &self.restore {
             let mut manual = Vec::new();
             for item in &retained.material {
@@ -342,15 +427,20 @@ impl CertificateServices {
                 if !item.identity && item.managed_names.is_none() {
                     manual.push(item.material.clone());
                 } else {
-                    let resolver = if item.identity {
-                        &self.identity_resolver
+                    if item.identity {
+                        self.publish_material(
+                            item.material.clone(),
+                            self.identity_resolver.clone(),
+                            cancel.clone(),
+                        )
+                        .await?;
                     } else {
-                        &self.context.resolver
-                    };
-                    self.publish_material(item.material.clone(), resolver.clone(), cancel.clone()).await?;
+                        self.publish_restored_resident(item.clone(), cancel.clone())
+                            .await?;
+                    }
                 }
             }
-            self.install_manual(&manual,cancel.clone()).await?;
+            self.install_manual(&manual, cancel.clone()).await?;
             self.state.lock().await.material = retained.material.clone();
             if let Some(identity) = &self.plan.identity {
                 let names = identity
@@ -373,48 +463,86 @@ impl CertificateServices {
             super::loaders::load_manual(&self.plan.manual, storage, &self.context, cancel.clone())
                 .await?;
         let materials = materials.into_iter().map(Arc::new).collect::<Vec<_>>();
-        self.install_manual(&materials,cancel.clone()).await?;
+        self.install_manual(&materials, cancel.clone()).await?;
         self.state.lock().await.material = materials
             .into_iter()
             .map(|material| RetainedMaterial {
                 material,
                 identity: false,
                 managed_names: None,
+                renew_at: 0,
+                ari_after: i64::MAX,
             })
             .collect();
         self.manual_ocsp(cancel).await?;
         Ok(())
     }
-    async fn parse_material(&self, certificate: Vec<u8>, key: zeroize::Zeroizing<Vec<u8>>, cancel: CancellationToken) -> Result<Material> {
-        super::loaders::blocking(self.context.resources.cpu.clone(),cancel,move || Material::from_pem(certificate,key)).await
+    async fn parse_material(
+        &self,
+        certificate: Vec<u8>,
+        key: zeroize::Zeroizing<Vec<u8>>,
+        cancel: CancellationToken,
+    ) -> Result<Material> {
+        super::loaders::blocking(self.context.resources.cpu.clone(), cancel, move || {
+            Material::from_pem(certificate, key)
+        })
+        .await
     }
-    async fn publish_material(&self, material: Arc<Material>, resolver: Arc<HotCertificateResolver>, cancel: CancellationToken) -> Result<()> {
-        super::loaders::blocking(self.context.resources.cpu.clone(),cancel,move || material.publish(&resolver)).await
+    async fn publish_material(
+        &self,
+        material: Arc<Material>,
+        resolver: Arc<HotCertificateResolver>,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        super::loaders::blocking(self.context.resources.cpu.clone(), cancel, move || {
+            material.publish(&resolver)
+        })
+        .await
     }
-    async fn install_manual(&self, material: &[Arc<Material>], cancel: CancellationToken) -> Result<()> {
+    async fn install_manual(
+        &self,
+        material: &[Arc<Material>],
+        cancel: CancellationToken,
+    ) -> Result<()> {
         let material = material.to_vec();
+        let materials_for_index = material.clone();
         let resolver = self.manual_resolver.clone();
-        let certificates = super::loaders::blocking(self.context.resources.cpu.clone(),cancel,move || {
-
-        let inputs = material
-            .iter()
-            .map(|material| CertificateInput {
-                names: &material.names,
-                certificate_pem: &material.certificate,
-                private_key_pem: &material.key,
-            })
-            .collect::<Vec<_>>();
-        resolver.replace(&inputs)?;
-        let certificates = material
-            .iter()
-            .map(|material| ManualCertificateInfo {
-                identity: material.identity,
-                names: material.names.clone(),
-                tags: material.tags.clone(),
-            })
-            .collect();
-        Ok(certificates)
-        }).await?;
+        let certificates = super::loaders::blocking(
+            self.context.resources.cpu.clone(),
+            cancel.clone(),
+            move || {
+                let inputs = material
+                    .iter()
+                    .map(|material| CertificateInput {
+                        names: &material.names,
+                        certificate_pem: &material.certificate,
+                        private_key_pem: &material.key,
+                    })
+                    .collect::<Vec<_>>();
+                resolver.replace(&inputs)?;
+                let certificates = material
+                    .iter()
+                    .map(|material| ManualCertificateInfo {
+                        identity: material.identity,
+                        names: material.names.clone(),
+                        tags: material.tags.clone(),
+                    })
+                    .collect();
+                Ok(certificates)
+            },
+        )
+        .await?;
+        let state = self.on_demand.clone();
+        let materials = materials_for_index;
+        super::loaders::blocking(
+            self.context.resources.cpu.clone(),
+            cancel.clone(),
+            move || {
+                state.install_manual(&materials);
+                Ok(())
+            },
+        )
+        .await?;
         self.manual_inventory.store(Arc::new(ManualCertificates {
             resolver: self.manual_resolver.clone(),
             certificates: Arc::new(certificates),
@@ -451,6 +579,12 @@ impl CertificateServices {
             "certificate services are not prepared"
         );
         let names = self.preflight(names)?;
+        if let Some(retained) = &self.restore {
+            ensure!(
+                retained.business_names == names,
+                "retained registered certificate names changed"
+            );
+        }
         {
             let mut state = self.state.lock().await;
             if let Some(planned) = &state.planned {
@@ -472,16 +606,29 @@ impl CertificateServices {
                 return Ok(());
             }
         }
+        self.prepare_resident_cache(&names, cancel.clone()).await?;
         if self.restore.is_some() {
             self.validate_retained_groups(&names, false).await?;
         } else {
             self.provision_authorities(cancel.clone()).await?;
             let groups = stream::iter(names.iter().cloned())
-                .map(|names| async { self.group(names, false, &bound, cancel.clone()).await })
+                .map(|names| async {
+                    if self.policy(&names[0]).on_demand {
+                        return Ok(None);
+                    }
+                    self.group(names, false, &bound, cancel.clone())
+                        .await
+                        .map(Some)
+                })
                 .buffer_unordered(8)
                 .collect::<Vec<_>>()
                 .await;
-            let groups = groups.into_iter().collect::<Result<Vec<_>>>()?;
+            let groups = groups
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
             let results = stream::iter(groups)
                 .map(|group| self.probe_group(group, cancel.clone()))
                 .buffer_unordered(10)
@@ -538,14 +685,25 @@ impl CertificateServices {
     async fn validate_retained_groups(&self, names: &[Vec<String>], identity: bool) -> Result<()> {
         let material = self.state.lock().await.material.clone();
         for names in names {
-            let retained = material
-                .iter()
-                .find(|item| {
-                    item.identity == identity && item.managed_names.as_ref() == Some(names)
-                })
-                .ok_or_else(|| {
-                    anyhow!("retained managed certificate missing for required group")
-                })?;
+            let retained = material.iter().find(|item| {
+                item.identity == identity && item.managed_names.as_ref() == Some(names)
+            });
+            let Some(retained) = retained else {
+                // The opaque, digest-bound snapshot records which subjects
+                // really were registered under its old on-demand policy.
+                if !identity
+                    && self.policy(&names[0]).on_demand
+                    && self
+                        .restore
+                        .as_ref()
+                        .is_some_and(|retained| retained.on_demand_names.contains(names))
+                {
+                    continue;
+                }
+                return Err(anyhow!(
+                    "retained managed certificate missing for required group"
+                ));
+            };
             retained.material.validate_at(now()?, false)?;
             if identity {
                 retained.material.validate_at(now()?, true)?;

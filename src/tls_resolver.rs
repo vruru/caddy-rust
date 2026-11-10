@@ -34,6 +34,15 @@ const MAX_OCSP_BYTES: usize = 1024 * 1024;
 const MAX_STAPLE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug)]
+pub(crate) struct CertificatePublicationConflict;
+impl std::fmt::Display for CertificatePublicationConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("certificate update conflicted with concurrent publication; retry required")
+    }
+}
+impl std::error::Error for CertificatePublicationConflict {}
+
+#[derive(Debug)]
 pub struct OcspPublishConflict;
 impl std::fmt::Display for OcspPublishConflict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -112,6 +121,24 @@ impl CertificateScope {
     }
 }
 
+/// The lifetime of one admitted managed cache slot, independent of the
+/// configuration generations and certificate revisions that use it.
+#[derive(Clone, Default)]
+pub(crate) struct CertificateResidency(tokio_util::sync::CancellationToken);
+impl CertificateResidency {
+    pub(crate) fn live(&self) -> bool {
+        !self.0.is_cancelled()
+    }
+
+    pub(crate) fn retire(&self) {
+        self.0.cancel();
+    }
+
+    pub(crate) async fn retired(&self) {
+        self.0.cancelled().await;
+    }
+}
+
 /// Compare-and-remove receipt for one actual publication. No private material
 /// is retained. A reload, renewal, owner change or alias change invalidates it.
 #[derive(Clone)]
@@ -121,6 +148,15 @@ pub struct ScopedCertificate {
     identity: [u8; 32],
     instance_generation: u64,
     names: Vec<String>,
+}
+impl ScopedCertificate {
+    pub(crate) fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.resolver, &other.resolver)
+            && Arc::ptr_eq(&self.owner.0, &other.owner.0)
+            && self.instance_generation == other.instance_generation
+            && self.identity == other.identity
+            && self.names == other.names
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -183,6 +219,7 @@ struct LoadedCertificate {
     identity: [u8; 32],
     instance_generation: u64,
     owner: Option<CertificateScope>,
+    residency: Option<Arc<CertificateResidency>>,
     staple: Option<Staple>,
     not_before: i64,
     not_after: i64,
@@ -200,8 +237,12 @@ struct InventoryEntry {
     identity: [u8; 32],
     generation: u64,
     names: Vec<String>,
+    residency: Option<Arc<CertificateResidency>>,
 }
 impl InventoryEntry {
+    fn live(&self) -> bool {
+        self.residency.as_ref().is_none_or(|slot| slot.live())
+    }
     fn certificate(&self) -> OcspCertificate {
         OcspCertificate {
             identity: self.identity,
@@ -233,6 +274,7 @@ fn certificate_inventory(
                     identity: certificate.identity,
                     generation: certificate.instance_generation,
                     names: Vec::new(),
+                    residency: certificate.residency.clone(),
                 });
             entry.names.push(name.clone());
         }
@@ -361,7 +403,8 @@ impl HotCertificateResolver {
     /// candidate cannot replace the current key. This does not remove aliases
     /// omitted by the caller: full configuration reload must use replace().
     pub fn upsert(&self, input: &CertificateInput<'_>) -> Result<()> {
-        self.upsert_owned(input, None).map(|_| ())
+        self.upsert_owned(input, None, None, None, || Ok(()))
+            .map(|_| ())
     }
 
     /// Same validation and publication as upsert, with a scope-bound receipt.
@@ -372,18 +415,55 @@ impl HotCertificateResolver {
         input: &CertificateInput<'_>,
         owner: &CertificateScope,
     ) -> Result<ScopedCertificate> {
-        let receipt = self.upsert_owned(input, Some(owner.clone()))?;
+        let receipt = self.upsert_owned(input, Some(owner.clone()), None, None, || Ok(()))?;
         receipt.ok_or_else(|| anyhow!("certificate scope unavailable"))
+    }
+
+    pub(crate) fn upsert_resident(
+        &self,
+        input: &CertificateInput<'_>,
+        owner: &CertificateScope,
+        slot: &Arc<CertificateResidency>,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit: impl FnOnce() -> Result<()>,
+    ) -> Result<ScopedCertificate> {
+        self.upsert_owned(
+            input,
+            Some(owner.clone()),
+            Some(slot.clone()),
+            Some(cancel),
+            commit,
+        )?
+        .ok_or_else(|| anyhow!("certificate scope unavailable"))
+    }
+
+    pub(crate) fn upsert_checked(
+        &self,
+        input: &CertificateInput<'_>,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        self.upsert_owned(input, None, None, Some(cancel), commit)
+            .map(|_| ())
     }
 
     fn upsert_owned(
         &self,
         input: &CertificateInput<'_>,
         owner: Option<CertificateScope>,
+        residency: Option<Arc<CertificateResidency>>,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+        commit: impl FnOnce() -> Result<()>,
     ) -> Result<Option<ScopedCertificate>> {
+        let active = || {
+            residency.as_ref().is_none_or(|slot| slot.live())
+                && cancel.is_none_or(|token| !token.is_cancelled())
+        };
+        ensure!(active(), "certificate cache slot retired");
         let (names, mut cert) = load_certificate(input, &self.leaf_guard)?;
         cert.instance_generation = self.instance_generation()?;
         cert.owner = owner.clone();
+        cert.residency = residency.clone();
         let receipt = owner.map(|owner| {
             let mut names = names.clone();
             names.sort();
@@ -409,6 +489,10 @@ impl HotCertificateResolver {
             // Cloning, merging, capacity checks and destruction of discarded
             // candidates do not block certificate lookups or other publishers.
             let mut next = base.names.clone();
+            next.retain(|_, candidates| {
+                candidates.retain(|old| old.residency.as_ref().is_none_or(|slot| slot.live()));
+                !candidates.is_empty()
+            });
             for name in &names {
                 ensure!(
                     next.contains_key(name) || next.len() < MAX_NAMES,
@@ -417,7 +501,20 @@ impl HotCertificateResolver {
                 let candidates = next.entry(name.clone()).or_default();
                 // Renew one signing profile without discarding e.g. the RSA
                 // certificate when an ECDSA certificate for the same name renews.
-                candidates.retain(|old| old.signature_profile != cert.signature_profile);
+                candidates.retain(|old| match (&old.residency, &cert.residency) {
+                    // One SAN slot has one revision. Do not evict a different
+                    // live slot whose SAN list happens to overlap this alias.
+                    (Some(old), Some(new)) => !Arc::ptr_eq(old, new),
+                    (None, None) => {
+                        let same_scope = match (&old.owner, &cert.owner) {
+                            (Some(old), Some(new)) => Arc::ptr_eq(&old.0, &new.0),
+                            (None, None) => true,
+                            _ => false,
+                        };
+                        !same_scope || old.signature_profile != cert.signature_profile
+                    }
+                    _ => true,
+                });
                 ensure!(
                     candidates.len() < 8,
                     "certificate candidates per alias limit exceeded"
@@ -443,14 +540,17 @@ impl HotCertificateResolver {
                 drop(guard);
                 continue;
             }
+            ensure!(active(), "certificate cache slot retired");
+            // The cache admission hook only commits short in-memory state;
+            // all key validation and snapshot construction already succeeded.
+            // Nothing fallible follows the hook in this publication.
+            commit()?;
             let previous = std::mem::replace(&mut *guard, candidate);
             drop(guard);
             drop(previous);
             return Ok(receipt);
         }
-        Err(anyhow!(
-            "certificate update conflicted with concurrent publication; retry required"
-        ))
+        Err(CertificatePublicationConflict.into())
     }
 
     /// Evict only this resolver's exact loaded instance under the same owner.
@@ -527,6 +627,70 @@ impl HotCertificateResolver {
         ))
     }
 
+    /// Dispose of unreachable aliases after the owning work has joined. A
+    /// replacement may already exist at the same alias; only a dead slot is
+    /// eligible, irrespective of which certificate revision was published.
+    pub(crate) fn sweep_retired(
+        &self,
+        owner: &CertificateScope,
+        slot: &Arc<CertificateResidency>,
+        aliases: &[String],
+    ) -> Result<()> {
+        ensure!(!slot.live(), "cannot sweep a live certificate cache slot");
+        for _ in 0..MAX_UPSERT_ATTEMPTS {
+            let base = self
+                .certificates
+                .read()
+                .map_err(|_| anyhow!("certificate state unavailable"))?
+                .clone();
+            let mut names = base.names.clone();
+            let mut changed = false;
+            for alias in aliases {
+                if let Some(entries) = names.get_mut(alias) {
+                    let before = entries.len();
+                    entries.retain(|cert| {
+                        !(cert
+                            .owner
+                            .as_ref()
+                            .is_some_and(|scope| Arc::ptr_eq(&scope.0, &owner.0))
+                            && cert
+                                .residency
+                                .as_ref()
+                                .is_some_and(|actual| Arc::ptr_eq(actual, slot)))
+                    });
+                    changed |= before != entries.len();
+                    if entries.is_empty() {
+                        names.remove(alias);
+                    }
+                }
+            }
+            if !changed {
+                return Ok(());
+            }
+            let next = Arc::new(Snapshot {
+                generation: base
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("certificate generation exhausted"))?,
+                inventory: certificate_inventory(&names),
+                names,
+            });
+            let mut guard = self
+                .certificates
+                .write()
+                .map_err(|_| anyhow!("certificate state unavailable"))?;
+            if Arc::ptr_eq(&base, &guard) {
+                let previous = std::mem::replace(&mut *guard, next);
+                drop(guard);
+                drop(previous);
+                return Ok(());
+            }
+        }
+        Err(anyhow!(
+            "retired certificate sweep conflicted with concurrent publication"
+        ))
+    }
+
     pub fn generation(&self) -> Option<u64> {
         Some(self.certificates.read().ok()?.generation)
     }
@@ -542,6 +706,7 @@ impl HotCertificateResolver {
         let mut result = snapshot
             .inventory
             .values()
+            .filter(|entry| entry.live())
             .map(InventoryEntry::certificate)
             .collect::<Vec<_>>();
         result.sort_by_key(|certificate| certificate.generation);
@@ -567,6 +732,7 @@ impl HotCertificateResolver {
         let mut result = ids
             .into_iter()
             .filter_map(|id| snapshot.inventory.get(&id))
+            .filter(|entry| entry.live())
             .map(InventoryEntry::certificate)
             .collect::<Vec<_>>();
         result.sort_by_key(|certificate| certificate.generation);
@@ -584,7 +750,7 @@ impl HotCertificateResolver {
         let mut result = snapshot
             .inventory
             .values()
-            .filter(|entry| entry.identity == *identity)
+            .filter(|entry| entry.identity == *identity && entry.live())
             .map(InventoryEntry::certificate)
             .collect::<Vec<_>>();
         result.sort_by_key(|certificate| certificate.generation);
@@ -599,6 +765,7 @@ impl HotCertificateResolver {
         Ok(snapshot
             .inventory
             .values()
+            .filter(|entry| entry.live())
             .map(|entry| entry.identity)
             .collect())
     }
@@ -786,6 +953,9 @@ impl HotCertificateResolver {
         let select = |candidates: &Vec<Arc<LoadedCertificate>>| {
             candidates.iter().find_map(|entry| {
                 if allowed_identities.is_some_and(|allowed| !allowed.contains(&entry.identity)) {
+                    return None;
+                }
+                if entry.residency.as_ref().is_some_and(|slot| !slot.live()) {
                     return None;
                 }
                 let admission = entry.leaf_state.admission();
@@ -1034,6 +1204,7 @@ fn load_certificate(
             identity,
             instance_generation: 0,
             owner: None,
+            residency: None,
             staple: None,
             signature_profile,
             size,

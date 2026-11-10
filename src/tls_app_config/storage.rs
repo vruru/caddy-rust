@@ -29,6 +29,7 @@ pub(super) struct Store {
 /// Storage and issuance pools are bounded independently of the runtime CPU count.
 pub struct CertificateResources {
     stores: Mutex<HashMap<PathBuf, Arc<Store>>>,
+    pub(super) resident_cache: Arc<super::resident_cache::ResidentCache>,
     pub(super) issuance: Arc<AutomationResources>,
     pub(super) ocsp: Arc<OcspResources>,
     pub(super) pki: Arc<crate::local_pki::LocalPkiResources>,
@@ -48,6 +49,7 @@ impl CertificateResources {
     ) -> Result<Self> {
         Ok(Self {
             stores: Mutex::new(HashMap::new()),
+            resident_cache: Arc::new(super::resident_cache::ResidentCache::new()),
             cpu: issuance.cpu_slots(),
             issuance,
             ocsp,

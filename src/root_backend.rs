@@ -78,6 +78,7 @@ struct Prepared {
     certificates: CertificatePlan,
     http: http_config::PreparedConfig,
     needs_client: bool,
+    effective_tls_app: bool,
 }
 fn failed(category: &'static str) -> AdminError {
     AdminError::new(400, category)
@@ -166,6 +167,8 @@ impl NativeBackend {
             publication_started: false,
         };
         let result = async {
+            services.set_effective_tls_app(prepared.effective_tls_app)
+                .map_err(|_| failed("certificate_scope_preparation_failed"))?;
             services
                 .prepare(root.candidates.child_token())
                 .await
@@ -307,6 +310,8 @@ impl Root {
             publication_started: false,
         };
         let result = async {
+            services.set_effective_tls_app(prepared.effective_tls_app)
+                .map_err(|_| failed("certificate_scope_preparation_failed"))?;
             services
                 .prepare(self.candidates.child_token())
                 .await
@@ -316,7 +321,12 @@ impl Root {
                 .map_err(|_| failed("manual_certificate_inventory_failed"))?;
             let stage = self
                 .http
-                .stage_with_certificates(prepared.http, services.business_resolver(), manual)
+                .stage_with_certificates_and_provider(
+                    prepared.http,
+                    services.business_resolver(),
+                    manual,
+                    services.certificate_provider(),
+                )
                 .await
                 .map_err(|_| failed("http_candidate_staging_failed"))?;
             services
@@ -700,6 +710,9 @@ fn prepare(raw: Value) -> Result<Prepared, AdminError> {
     }) {
         return Err(failed("unsupported_application_module"));
     }
+    let effective_tls_app = apps.is_some_and(|apps| {
+        ["tls","http"].into_iter().any(|name| apps.get(name).is_some_and(|v| !v.is_null()))
+    });
     let certificates = CertificatePlan::parse(CertificateViews {
         storage: root.get("storage"),
         tls: apps.and_then(|a| a.get("tls")),
@@ -730,5 +743,6 @@ fn prepare(raw: Value) -> Result<Prepared, AdminError> {
         certificates,
         http,
         needs_client: admin::client_identity_required(root)?,
+        effective_tls_app,
     })
 }

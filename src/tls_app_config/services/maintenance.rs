@@ -3,6 +3,10 @@ use futures_util::FutureExt;
 
 impl CertificateServices {
     pub(super) async fn maintenance(self: Arc<Self>) {
+        let eviction = self.clone();
+        self.tasks.spawn(async move {
+            eviction.run_cache_evictions().await;
+        });
         if self.restore.is_some() {
             // Restore-only preparation is deliberately memory-only. Rebuild the
             // maintenance handles only after commit, without tying activation
@@ -12,9 +16,17 @@ impl CertificateServices {
                 this.restore_maintenance().await;
             });
         }
-        let mut groups_started = std::collections::HashSet::new();
+        if self.restore.is_none() {
+            let this = self.clone();
+            self.tasks.spawn(async move {
+                this.attach_shared_maintenance().await;
+            });
+            let this = self.clone();
+            self.tasks.spawn(async move {
+                this.restore_pending_cache().await;
+            });
+        }
         let mut pki_started = std::collections::HashSet::new();
-        let mut ocsp_started = std::collections::HashSet::new();
         loop {
             if self.context.cancel.is_cancelled() {
                 break;
@@ -42,14 +54,19 @@ impl CertificateServices {
                         .collect::<Vec<_>>(),
                 )
             };
-            for (key, group) in groups {
-                if !groups_started.insert(key) {
+            for (_, group) in groups {
+                if group.policy.on_demand
+                    || !group.background.load(Ordering::Acquire)
+                    || group.restoring.load(Ordering::Acquire)
+                {
                     continue;
                 }
-                let this = self.clone();
-                self.tasks.spawn(async move {
-                    this.run_group(group).await;
-                });
+                if self.start_group(group).is_err() {
+                    let _ = self.events.send(CertificateEvent {
+                        kind: "certificate_maintenance_failed",
+                        names: Vec::new(),
+                    });
+                }
             }
             for (key, pki) in pki {
                 if !pki_started.insert(key) {
@@ -67,34 +84,15 @@ impl CertificateServices {
                     }
                 });
             }
-            for (key, manager) in ocsp {
-                if !ocsp_started.insert(key) {
-                    continue;
+            for (_, manager) in ocsp {
+                if manager.start(&self).is_err() {
+                    let _ = self.events.send(CertificateEvent {
+                        kind: "ocsp_maintenance_failed",
+                        names: Vec::new(),
+                    });
                 }
-                let cancel = self.context.cancel.child_token();
-                let this = self.clone();
-                let mut events = manager.subscribe();
-                let event_cancel = cancel.clone();
-                self.tasks.spawn(async move {
-                    loop { tokio::select! { biased;
-                        _ = event_cancel.cancelled() => break,
-                        event = events.recv() => match event {
-                            Ok(event) => if event.status.is_some_and(|status| status.state == OcspState::Revoked) { this.context.resources.revoked.notify_waiters(); },
-                            Err(broadcast::error::RecvError::Lagged(_)) => this.context.resources.revoked.notify_waiters(),
-                            Err(broadcast::error::RecvError::Closed) => break,
-                        }
-                    }}
-                });
-                let events = self.events.clone();
-                self.tasks.spawn(async move {
-                    if manager.run(cancel).await.is_err() {
-                        let _ = events.send(CertificateEvent {
-                            kind: "ocsp_maintenance_failed",
-                            names: Vec::new(),
-                        });
-                    }
-                });
             }
+
             tokio::select! { biased;
                 _ = self.context.cancel.cancelled() => break,
                 _ = &mut changed => {},
@@ -196,8 +194,50 @@ impl CertificateServices {
         }
     }
 
+    fn start_group(self: &Arc<Self>, group: Arc<Group>) -> Result<()> {
+        let _admission = self
+            .admission
+            .lock()
+            .map_err(|_| anyhow!("certificate service admission unavailable"))?;
+        let mut started = group
+            .started
+            .lock()
+            .map_err(|_| anyhow!("certificate scope admission unavailable"))?;
+        if self.context.cancel.is_cancelled() || group.cancel.is_cancelled() || *started {
+            return Ok(());
+        }
+        *started = true;
+        let this = self.clone();
+        let worker = group.clone();
+        group.tasks.spawn(async move {
+            this.run_group(worker).await;
+        });
+        group.tasks.close();
+        let tasks = group.tasks.clone();
+        self.tasks.spawn(async move {
+            tasks.wait().await;
+        });
+        Ok(())
+    }
+    pub(super) async fn stop_group(&self, group: Arc<Group>) -> Result<()> {
+        {
+            let _admission = group
+                .started
+                .lock()
+                .map_err(|_| anyhow!("certificate scope admission unavailable"))?;
+            group.cancel.cancel();
+            group.tasks.close();
+        }
+        // The gate is released only after actual acquisition, native lease and
+        // solver cleanup are joined. A stopped waiter cannot start new work.
+        {
+            let _gate = group.gate.lock().await;
+        }
+        group.tasks.wait().await;
+        Ok(())
+    }
     async fn run_group(self: Arc<Self>, group: Arc<Group>) {
-        let cancel = self.context.cancel.child_token();
+        let cancel = group.cancel.clone();
         let mut failures = 0u32;
         loop {
             if cancel.is_cancelled() {
@@ -206,14 +246,41 @@ impl CertificateServices {
             let changed = self.context.resources.revoked.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let result = std::panic::AssertUnwindSafe(self.ensure_group(
-                group.clone(),
-                false,
-                cancel.clone(),
-            ))
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|_| Err(anyhow!("certificate maintenance worker panicked")));
+            let refreshed = if group.renew_at.load(Ordering::Acquire) > 0
+                && group.ari_after.load(Ordering::Acquire) <= now().unwrap_or(i64::MAX)
+            {
+                match self.refresh_cached_schedule(&group, cancel.clone()).await {
+                    Err(error) if error.is::<cert_automation::PendingPromotion>() => {
+                        // Explicit non-on-demand groups can resume their
+                        // interrupted attempt through the normal lease path.
+                        group.renew_at.store(0, Ordering::Release);
+                        Ok(())
+                    }
+                    result => result.map(|_| ()),
+                }
+            } else {
+                Ok(())
+            };
+            let cached_deadline = group.renew_at.load(Ordering::Acquire);
+            let pending = group
+                .leaf_state
+                .lock()
+                .map(|leaf| leaf.as_ref().is_some_and(|leaf| leaf.needs_renewal()))
+                .unwrap_or(true);
+            let result = if let Err(error) = refreshed {
+                Err(error)
+            } else if cached_deadline > now().unwrap_or(i64::MAX) && !pending {
+                Ok(cached_deadline)
+            } else {
+                std::panic::AssertUnwindSafe(self.ensure_group(
+                    group.clone(),
+                    false,
+                    cancel.clone(),
+                ))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err(anyhow!("certificate maintenance worker panicked")))
+            };
             let delay = match result {
                 Ok(renew_at) => {
                     failures = 0;
