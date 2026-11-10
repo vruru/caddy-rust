@@ -127,9 +127,11 @@ gates remain incomplete.
 
 Build with the current official stable Rust, pinned to 1.99.1 for this phase.
 Keep all QA, fixtures, private configuration, keys, logs, and build output in the
-current LocalOps task. Do not create GitHub Actions. The authorized source
-repository is the private `vruru/caddy-rust` repository; do not publish this
-standalone project into another repository.
+current LocalOps task. Do not create GitHub Actions. The public source repository
+is [vruru/caddy-rust](https://github.com/vruru/caddy-rust). Publication covers this
+project's reusable source, necessary documentation, and licenses only. Private
+deployment data and other projects are outside its scope. This standalone project
+must not be published into another repository.
 
 HTTP upstream TLS now loads explicit trust material during preparation, validates
 client identities, derives supported dynamic server names per request, and bounds
