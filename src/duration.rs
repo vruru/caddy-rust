@@ -330,8 +330,9 @@ pub fn parse_str(raw: &str) -> anyhow::Result<i64> {
 
 pub fn parse_value(value: &serde_json::Value) -> anyhow::Result<i64> {
     match value {
+        serde_json::Value::Null => Ok(0),
         serde_json::Value::Number(n) => n
-            .as_i64()
+            .as_go_i64()
             .ok_or_else(|| anyhow::anyhow!("parsing duration: number overflow")),
         serde_json::Value::String(s) => parse_str(s),
         _ => Err(anyhow::anyhow!("parsing duration: invalid value type")),

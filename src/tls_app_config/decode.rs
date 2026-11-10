@@ -93,7 +93,11 @@ impl<'a> Object<'a> {
     }
     pub(super) fn integer(&self, key: &'static str) -> Result<Option<i64>> {
         self.value(key)
-            .map(|v| v.as_i64().ok_or_else(|| ConfigError::invalid(self.at(key))))
+            .map(|v| {
+                v.as_number()
+                    .and_then(|n| n.as_go_i64())
+                    .ok_or_else(|| ConfigError::invalid(self.at(key)))
+            })
             .transpose()
     }
     pub(super) fn number(&self, key: &'static str) -> Result<Option<f64>> {

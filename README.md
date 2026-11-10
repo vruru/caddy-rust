@@ -368,3 +368,16 @@ copying DER chains. Complete aliases and distinct loaded generations remain
 authoritative, including multiple instances of one chain. Already authenticated
 negative status still reaches every matching instance. Normal cancellation joins
 owned work before returning without reporting a spurious maintenance failure.
+
+Direct typed JSON and inline module decoding retain their separate number
+semantics. A signed integer field accepts a literal negative-zero integer,
+while arbitrary values retain floating negative zero and unsigned fields keep
+their original rejection behavior. Inline modules apply the same float64
+roundtrip as the reference before strict decoding; a nested route reuses its
+already normalized subtree. This includes issuer and HTTP configuration
+loaders. Configuration acceptance does not establish support for provisional
+HTTP responses; runtime handling of 100 and 103 remains a separate gate.
+
+The configuration DOM has explicit depth and byte limits. Compact arrays can
+still expand considerably in memory; aggregate concurrent configuration work
+requires separate memory admission and load acceptance before rollout.

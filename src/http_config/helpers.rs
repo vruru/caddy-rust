@@ -44,18 +44,7 @@ pub(crate) fn duration(value: &Value, path: &str) -> Result<Duration> {
     Ok(Duration::from_nanos(ns as u64))
 }
 pub(crate) fn signed_duration(value: &Value, path: &str) -> Result<i64> {
-    if value.is_number() {
-        return crate::duration::parse_value(value)
-            .map_err(|_| anyhow::anyhow!("integer nanoseconds required at {path}"));
-    }
-    let raw = value
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("duration required at {path}"))?;
-    ensure!(
-        !raw.is_empty() && raw.len() <= 1024,
-        "invalid duration at {path}"
-    );
-    crate::duration::parse_str(raw).map_err(|_| anyhow::anyhow!("invalid duration at {path}"))
+    crate::duration::parse_value(value).map_err(|_| anyhow::anyhow!("invalid duration at {path}"))
 }
 
 /// Caddy ReplaceAll (unknown -> empty) and ReplaceKnown (unknown preserved).

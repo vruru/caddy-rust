@@ -57,3 +57,18 @@ header-name and header-value parser checks; it cannot manufacture a folded name
 or turn CR/LF into an injected value. These dependency changes do not establish
 full Caddy or module compatibility. Remaining capability and validation gates
 continue to apply; no production replacement is authorized by vendoring alone.
+
+## Typed JSON parser
+
+The functional serde_json source is version 1.0.154. Its registry package
+SHA-256 is `e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6`.
+The original MIT and Apache-2.0 license texts are retained in
+`serde_json-1.0.154`. Development-only dependency and target declarations and
+their files are omitted.
+
+An explicit opt-in DOM parser marks a literal integer negative zero. Only
+signed-integer consumers of that DOM use the mark. Normal JSON parsing,
+float values, equality, hashing, serialization and unsigned decoding retain
+their existing behavior. The application selects this parser only after its
+own Unicode and depth checks. The alternate arbitrary-precision Number
+representation is not enabled or supported in this patched copy.

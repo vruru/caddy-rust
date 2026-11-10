@@ -12,6 +12,9 @@ use serde_json::Value;
 use std::time::Duration;
 
 pub(super) fn parse(value: &Value, path: &str) -> Result<Issuer> {
+    let normalized = crate::module_json::inline(value, "module", false)
+        .map_err(|_| ConfigError::invalid(path.to_owned()))?;
+    let value = normalized.as_ref();
     match discriminator(value, "module", path)? {
         "acme" => acme(value, path),
         "internal" => {

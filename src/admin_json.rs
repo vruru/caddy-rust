@@ -25,10 +25,15 @@ pub fn decoded(input: &[u8]) -> Result<Value, ConfigError> {
     let bytes = encoded(&value)?;
     let mut decoder = serde_json::Deserializer::from_slice(&bytes);
     decoder.disable_recursion_limit();
-    serde::Deserialize::deserialize(&mut decoder).map_err(|_| ConfigError {
+    let normalized = decoder.deserialize_go_value().map_err(|_| ConfigError {
         status: 400,
         category: "invalid_json_configuration",
-    })
+    })?;
+    decoder.end().map_err(|_| ConfigError {
+        status: 400,
+        category: "invalid_json_configuration",
+    })?;
+    Ok(normalized)
 }
 
 /// Decode a direct typed configuration without passing its integer fields
@@ -38,7 +43,7 @@ pub fn decoded_typed(input: &[u8]) -> Result<Value, ConfigError> {
     let sanitized = codec::sanitize(input, MAX_CONFIG_DEPTH)?;
     let mut decoder = serde_json::Deserializer::from_slice(&sanitized);
     decoder.disable_recursion_limit();
-    let value = serde::Deserialize::deserialize(&mut decoder).map_err(|_| ConfigError {
+    let value = decoder.deserialize_go_value().map_err(|_| ConfigError {
         status: 400,
         category: "invalid_json_configuration",
     })?;

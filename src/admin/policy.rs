@@ -29,8 +29,6 @@ struct Raw {
 #[serde(default, deny_unknown_fields)]
 struct Settings {
     persist: Option<bool>,
-    load: Option<Value>,
-    load_delay: Option<Value>,
 }
 
 impl LocalPolicy {
@@ -38,13 +36,22 @@ impl LocalPolicy {
         if !config.is_object() && !config.is_null() {
             return Err(AdminError::new(400, "configuration_must_be_object_or_null"));
         }
-        let raw: Raw = match config.get("admin") {
-            None | Some(Value::Null) => Raw::default(),
+        let (raw, load, load_delay): (Raw, _, _) = match config.get("admin") {
+            None | Some(Value::Null) => (Raw::default(), None, None),
             Some(v) => {
                 let mut typed = v.clone();
                 super::ids::strip_meta(&mut typed);
-                serde_json::from_value(typed)
-                    .map_err(|_| AdminError::new(400, "invalid_or_unknown_admin_field"))?
+                // Keep the DOM tokens until the typed duration and inline
+                // module boundaries; a generic Value deserializer loses them.
+                let (load, delay) = typed
+                    .get_mut("config")
+                    .and_then(Value::as_object_mut)
+                    .map_or((None, None), |settings| {
+                        (settings.remove("load"), settings.remove("load_delay"))
+                    });
+                let parsed = serde_json::from_value(typed)
+                    .map_err(|_| AdminError::new(400, "invalid_or_unknown_admin_field"))?;
+                (parsed, load, delay)
             }
         };
         if raw.remote.is_some()
@@ -63,10 +70,7 @@ impl LocalPolicy {
         }) {
             return Err(AdminError::new(400, "invalid_admin_identity"));
         }
-        let loader = super::loader_schema::LoaderPlan::parse(
-            raw.config.as_ref().and_then(|s| s.load.as_ref()),
-            raw.config.as_ref().and_then(|s| s.load_delay.as_ref()),
-        )?;
+        let loader = super::loader_schema::LoaderPlan::parse(load.as_ref(), load_delay.as_ref())?;
         let listen = if raw.listen.is_empty() {
             std::env::var("CADDY_ADMIN").unwrap_or_else(|_| "localhost:2019".to_owned())
         } else {

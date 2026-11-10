@@ -712,7 +712,13 @@ fn prepare(raw: Value) -> Result<Prepared, AdminError> {
         .filter(|v| !v.is_null())
         .cloned()
         .unwrap_or_else(|| json!({"servers":{}}));
-    let http = http_config::validate_json(&json!({"apps":{"http":http}}))
+    // Insert the existing DOM directly: json!'s to_value roundtrip would erase
+    // the original integer-negative-zero provenance needed by typed fields.
+    let mut applications = serde_json::Map::new();
+    applications.insert("http".to_owned(), http);
+    let mut document = serde_json::Map::new();
+    document.insert("apps".to_owned(), Value::Object(applications));
+    let http = http_config::validate_json(&Value::Object(document))
         .map_err(|_| failed("invalid_http_application"))?;
     let digest = Sha256::digest(
         crate::admin_json::encoded_typed(&raw)

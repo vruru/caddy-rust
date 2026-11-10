@@ -17,7 +17,6 @@ pub(super) struct HttpLoader {
     pub method: String,
     pub url: String,
     pub header: BTreeMap<String, Vec<String>>,
-    pub timeout: Option<Value>,
     pub adapter: String,
     pub tls: Option<LoaderTls>,
     #[serde(skip)]
@@ -28,7 +27,11 @@ fn invalid() -> AdminError {
 }
 impl HttpLoader {
     pub fn parse(raw: &Value) -> Result<Self, AdminError> {
-        let mut object = raw.as_object().ok_or_else(invalid)?.clone();
+        let normalized = crate::module_json::inline(raw, "module", false).map_err(|_| invalid())?;
+        let mut object = match normalized {
+            std::borrow::Cow::Owned(Value::Object(object)) => object,
+            _ => return Err(invalid()),
+        };
         if object.remove("module") != Some(Value::String("http".to_owned())) {
             return Err(AdminError::new(400, "unsupported_config_loader_module"));
         }
@@ -67,6 +70,13 @@ impl HttpLoader {
                 }
             }
         }
+        let timeout = object
+            .remove("timeout")
+            .as_ref()
+            .map(|v| crate::http_config::helpers::signed_duration(v, "admin.config.load.timeout"))
+            .transpose()
+            .map_err(|_| invalid())?
+            .unwrap_or(0);
         let mut loader: Self =
             serde_json::from_value(Value::Object(object)).map_err(|_| invalid())?;
         if loader.method.len() > 128
@@ -84,13 +94,6 @@ impl HttpLoader {
         }) {
             return Err(invalid());
         }
-        let timeout = loader
-            .timeout
-            .as_ref()
-            .map(|v| crate::http_config::helpers::signed_duration(v, "admin.config.load.timeout"))
-            .transpose()
-            .map_err(|_| invalid())?
-            .unwrap_or(0);
         loader.parsed_timeout = if timeout > 0 {
             std::time::Duration::from_nanos(timeout as u64)
         } else {

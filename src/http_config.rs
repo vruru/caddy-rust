@@ -369,7 +369,7 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
             ));
         }
     }
-    let routes = parse_routes(m.get("routes"), 0)?;
+    let routes = parse_routes(m.get("routes"), 0, false)?;
     let inferred = !disabled
         && listen.iter().any(|a| a.port() != 80)
         && route_names(&routes)
@@ -418,8 +418,10 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
     };
     let trusted_strict = m
         .get("trusted_proxies_strict")
+        .filter(|v| !v.is_null())
         .map(|v| {
-            v.as_i64()
+            v.as_number()
+                .and_then(|n| n.as_go_i64())
                 .map(|n| n > 0)
                 .ok_or_else(|| anyhow::anyhow!("integer trusted proxy strict flag required"))
         })
@@ -431,7 +433,7 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
         errors: if let Some(v) = m.get("errors") {
             let e = object(v, path)?;
             deny_unknown(e, &["routes"], path)?;
-            parse_routes(e.get("routes"), 0)?
+            parse_routes(e.get("routes"), 0, false)?
         } else {
             vec![]
         },
@@ -474,7 +476,7 @@ fn parse_ranges(value: &Value, path: &str) -> Result<Vec<ipnet::IpNet>> {
         })
         .collect()
 }
-fn parse_routes(value: Option<&Value>, depth: usize) -> Result<Vec<Route>> {
+fn parse_routes(value: Option<&Value>, depth: usize, normalized: bool) -> Result<Vec<Route>> {
     ensure!(depth < 64, "route nesting limit exceeded");
     let Some(value) = value else {
         return Ok(vec![]);
@@ -494,7 +496,7 @@ fn parse_routes(value: Option<&Value>, depth: usize) -> Result<Vec<Route>> {
                 .as_array()
                 .ok_or_else(|| anyhow::anyhow!("handler array required"))?
             {
-                handlers.push(parse_handler(v, depth + 1)?);
+                handlers.push(parse_handler(v, depth + 1, normalized)?);
             }
         }
         routes.push(Route {
@@ -628,7 +630,9 @@ fn parse_matcher_sets(value: Option<&Value>, depth: usize) -> Result<Vec<Matcher
     }
     Ok(sets)
 }
-fn parse_handler(value: &Value, depth: usize) -> Result<Handler> {
+fn parse_handler(value: &Value, depth: usize, normalized: bool) -> Result<Handler> {
+    let normalized_value = crate::module_json::inline(value, "handler", normalized)?;
+    let value = normalized_value.as_ref();
     let path = "/apps/http/servers/*/routes/*/handle/*";
     let m = object(value, path)?;
     let handler = required(m, "handler")?
@@ -643,17 +647,7 @@ fn parse_handler(value: &Value, depth: usize) -> Result<Handler> {
             )?;
             let status = m
                 .get("status_code")
-                .map(|v| {
-                    if let Some(n) = v.as_u64() {
-                        ensure!(
-                            (200..=999).contains(&n),
-                            "interim static response status is not yet supported"
-                        );
-                        Ok(n.to_string())
-                    } else {
-                        string(v, path)
-                    }
-                })
+                .map(crate::module_json::weak_string)
                 .transpose()?
                 .unwrap_or_default();
             Handler::StaticResponse {
@@ -699,11 +693,11 @@ fn parse_handler(value: &Value, depth: usize) -> Result<Handler> {
             deny_unknown(m, &["handler", "routes", "errors"], path)?;
             Handler::Subroute {
                 errors_configured: m.contains_key("errors"),
-                routes: parse_routes(m.get("routes"), depth + 1)?,
+                routes: parse_routes(m.get("routes"), depth + 1, true)?,
                 errors: if let Some(v) = m.get("errors") {
                     let e = object(v, path)?;
                     deny_unknown(e, &["routes"], path)?;
-                    parse_routes(e.get("routes"), depth + 1)?
+                    parse_routes(e.get("routes"), depth + 1, true)?
                 } else {
                     vec![]
                 },

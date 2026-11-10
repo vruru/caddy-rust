@@ -26,6 +26,7 @@ pub mod caddyfile_adapter;
 pub mod tls_app_config;
 
 pub(crate) mod cert_cpu;
+pub(crate) mod module_json;
 
 #[cfg(feature = "native-run")]
 pub mod root_backend;
