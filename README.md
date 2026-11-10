@@ -264,3 +264,11 @@ current time and shared revocation policy still apply at use. This removes those
 CPU operations from async request workers without starting business issuance
 before activation. TLS handshake CPU isolation and remaining lifecycle/module
 compatibility are separate integration gates; the CLI remains an inspector.
+
+The Caddyfile adapter now assembles the reverse_proxy, forward_auth, php_fastcgi,
+intercept and response-copy directive families, including HTTP/FastCGI transport
+options, response matchers, dynamic upstream sources and selection policies.
+Range expansion and recursive source/fallback trees share the adapter's prepaid
+resource ledger. `formatting_difference` exposes the original formatter comparison
+for command-line use. These are adaptation contracts; executing every emitted
+transport, policy and handler remains a separate production gate.

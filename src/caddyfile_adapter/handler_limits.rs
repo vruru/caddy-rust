@@ -75,7 +75,7 @@ pub(super) fn parse(name: &str, tokens: &[Token]) -> Result<Option<Value>> {
 }
 /// Follows go-humanize v1.1.0 ParseBytes: commas, decimal fractions, SI/IEC
 /// aliases, whole integer checked multiplication before float fallback.
-fn parse_size(input: &str) -> Result<u64> {
+pub(super) fn parse_size(input: &str) -> Result<u64> {
     let end = input
         .bytes()
         .take_while(|b| b.is_ascii_digit() || *b == b'.' || *b == b',')

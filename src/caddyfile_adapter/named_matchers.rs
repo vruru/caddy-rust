@@ -199,3 +199,13 @@ fn parse_not(tokens: &[Token], budget: &mut Budget) -> Result<Value> {
     budget.finish_value(reservation, &value)?;
     Ok(value)
 }
+
+pub(super) fn nested_set(tokens: &[Token], budget: &mut Budget) -> Result<Value> {
+    let Value::Array(mut sets) = parse_not(tokens, budget)? else {
+        return Err(anyhow!("invalid nested matcher set"));
+    };
+    if sets.len() != 1 {
+        return Err(anyhow!("invalid nested matcher count"));
+    }
+    Ok(sets.pop().unwrap())
+}

@@ -17,10 +17,10 @@ mod file_finalize;
 mod format;
 #[path = "caddyfile_adapter/global_admin.rs"]
 mod global_admin;
-#[path = "caddyfile_adapter/global_auxiliary.rs"]
-mod global_auxiliary;
 #[path = "caddyfile_adapter/global_atoms.rs"]
 mod global_atoms;
+#[path = "caddyfile_adapter/global_auxiliary.rs"]
+mod global_auxiliary;
 #[path = "caddyfile_adapter/global_metrics.rs"]
 mod global_metrics;
 #[path = "caddyfile_adapter/global_pki.rs"]
@@ -29,10 +29,10 @@ mod global_pki;
 mod global_tls;
 #[path = "caddyfile_adapter/globals.rs"]
 mod globals;
-#[path = "caddyfile_adapter/handler_auth_trace.rs"]
-mod handler_auth_trace;
 #[path = "caddyfile_adapter/handler_atoms.rs"]
 mod handler_atoms;
+#[path = "caddyfile_adapter/handler_auth_trace.rs"]
+mod handler_auth_trace;
 #[path = "caddyfile_adapter/handler_encode.rs"]
 mod handler_encode;
 #[path = "caddyfile_adapter/handler_errors_status.rs"]
@@ -71,10 +71,10 @@ mod matcher_regexp;
 mod matcher_urlpattern;
 #[path = "caddyfile_adapter/module_value.rs"]
 mod module_value;
-#[path = "caddyfile_adapter/named_routes.rs"]
-mod named_routes;
 #[path = "caddyfile_adapter/named_matchers.rs"]
 mod named_matchers;
+#[path = "caddyfile_adapter/named_routes.rs"]
+mod named_routes;
 #[path = "caddyfile_adapter/order.rs"]
 mod order;
 #[path = "caddyfile_adapter/response_matcher.rs"]
@@ -141,6 +141,11 @@ pub struct Adapted {
 pub fn format_caddyfile(input: &[u8], max_output_bytes: usize) -> Result<Vec<u8>> {
     format::format(input, max_output_bytes)
 }
+/// Compare original formatting with CRLF normalization and return the first
+/// differing source line. This synchronous operation has an explicit input cap.
+pub fn formatting_difference(input: &[u8], max_input_bytes: usize) -> Result<Option<usize>> {
+    format::formatting_difference(input, max_input_bytes)
+}
 /// Return a candidate only; runtime module provisioning and atomic publication
 /// are separate operations. Known but unfinished directives are hard errors.
 pub fn adapt(options: &ParseOptions, input: &[u8], filename: &str) -> Result<Adapted> {
@@ -176,3 +181,18 @@ pub fn adapt(options: &ParseOptions, input: &[u8], filename: &str) -> Result<Ada
     budget.check_json(&config)?;
     Ok(Adapted { config, warnings })
 }
+
+#[path = "caddyfile_adapter/handler_proxy.rs"]
+mod handler_proxy;
+
+#[path = "caddyfile_adapter/proxy_addresses.rs"]
+mod proxy_addresses;
+
+#[path = "caddyfile_adapter/proxy_transport.rs"]
+mod proxy_transport;
+
+#[path = "caddyfile_adapter/proxy_sources.rs"]
+mod proxy_sources;
+
+#[path = "caddyfile_adapter/proxy_shortcuts.rs"]
+mod proxy_shortcuts;

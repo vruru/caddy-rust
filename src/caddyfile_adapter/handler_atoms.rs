@@ -29,7 +29,7 @@ pub(super) fn parse(name: &str, tokens: &[Token]) -> Result<Option<Value>> {
     }
 }
 
-fn weak_string_to_value(ws: &str) -> Value {
+pub(super) fn weak_string_to_value(ws: &str) -> Value {
     if ws == "true" {
         Value::Bool(true)
     } else if ws == "false" {

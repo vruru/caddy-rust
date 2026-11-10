@@ -146,6 +146,7 @@ pub(super) fn parse(
         .iter()
         .map(|v| match &v.value {
             RouteKind::Route(_) => 1,
+            RouteKind::Subroute(routes) => routes.len(),
             RouteKind::ErrorRoute(_) | RouteKind::Binding { .. } | RouteKind::Tls { .. } => 0,
         })
         .sum::<usize>();
@@ -158,6 +159,7 @@ pub(super) fn parse(
         .iter()
         .flat_map(|v| match &v.value {
             RouteKind::Route(r) => std::slice::from_ref(r),
+            RouteKind::Subroute(routes) => routes.as_slice(),
             RouteKind::ErrorRoute(_) | RouteKind::Binding { .. } | RouteKind::Tls { .. } => &[],
         })
         .collect::<Vec<_>>();
@@ -422,6 +424,39 @@ fn parse_segments(
             }
             continue;
         }
+        if name == "php_fastcgi" {
+            scope.pre_extract(seg, budget)?;
+            let r = reserve_helper(seg, budget)?;
+            let (matcher, tokens) = named_matchers::extract(seg, &scope.defs)?;
+            let routes = super::proxy_shortcuts::php_fastcgi(&tokens, budget, options, |t, b| {
+                let nested = block_routes(t, Block::Ordered, scope, options, b, counter, invokes)?;
+                subroute_handler(nested, b)
+            })?;
+            budget.finish_value(r, &Value::Null)?;
+            if let Some(matcher) = matcher {
+                let handler = subroute_handler(routes, budget)?;
+                record_route(
+                    &mut result,
+                    name,
+                    Route {
+                        matchers: vec![matcher],
+                        handlers: vec![handler],
+                        ..Default::default()
+                    },
+                    budget,
+                )?;
+            } else {
+                for route in &routes {
+                    charge_route(route, budget)?;
+                }
+                budget.materialize(64)?;
+                result.push(RouteValue {
+                    directive: name.into(),
+                    value: RouteKind::Subroute(routes),
+                });
+            }
+            continue;
+        }
         scope.pre_extract(seg, budget)?;
         let mut reservation = Some(reserve_helper(seg, budget)?);
         let route = if name == "rewrite" {
@@ -482,6 +517,20 @@ fn parse_segments(
                     options.warn(&first.file, first.line, name, message, budget)?;
                 }
                 value
+            } else if name == "reverse_proxy" || name == "intercept" {
+                super::handler_proxy::parse(name, &tokens, budget, options, |t, b| {
+                    let routes =
+                        block_routes(t, Block::Ordered, scope, options, b, counter, invokes)?;
+                    subroute_handler(routes, b)
+                })?
+            } else if name == "forward_auth" {
+                super::proxy_shortcuts::forward_auth(&tokens, budget, options, |t, b| {
+                    let routes =
+                        block_routes(t, Block::Ordered, scope, options, b, counter, invokes)?;
+                    subroute_handler(routes, b)
+                })?
+            } else if name == "copy_response" || name == "copy_response_headers" {
+                super::handler_proxy::copy(name, &tokens)?
             } else if name == "map" {
                 super::handler_map::parse(&tokens, budget, reservation.take().unwrap(), options)?
             } else if name == "encode" {
@@ -496,7 +545,18 @@ fn parse_segments(
             } else {
                 bail!("Caddyfile directive {name} is registered but not implemented");
             };
-            if !["route", "handle", "handle_path", "file_server", "map"].contains(&name) {
+            if ![
+                "route",
+                "handle",
+                "handle_path",
+                "file_server",
+                "map",
+                "reverse_proxy",
+                "intercept",
+                "forward_auth",
+            ]
+            .contains(&name)
+            {
                 budget.finish_value(reservation.take().unwrap(), &handler)?;
             }
             Route {
@@ -543,7 +603,7 @@ fn block_routes(
                     }
                     RouteKind::Binding { file, line } => Some((file, *line, "bind")),
                     RouteKind::Tls { file, line } => Some((file, *line, "tls")),
-                    RouteKind::Route(_) => None,
+                    RouteKind::Route(_) | RouteKind::Subroute(_) => None,
                 };
                 if let Some((file, line, class)) = invalid {
                     bail!(

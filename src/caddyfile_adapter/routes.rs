@@ -77,6 +77,7 @@ impl ErrorRoute {
 #[derive(Clone)]
 pub(super) enum RouteKind {
     Route(Route),
+    Subroute(Vec<Route>),
     ErrorRoute(ErrorRoute),
     Binding { file: String, line: usize },
     Tls { file: String, line: usize },
@@ -85,7 +86,10 @@ impl RouteValue {
     pub(super) fn route(&self) -> Option<&Route> {
         match &self.value {
             RouteKind::Route(r) => Some(r),
-            RouteKind::ErrorRoute(_) | RouteKind::Binding { .. } | RouteKind::Tls { .. } => None,
+            RouteKind::Subroute(_)
+            | RouteKind::ErrorRoute(_)
+            | RouteKind::Binding { .. }
+            | RouteKind::Tls { .. } => None,
         }
     }
 }
