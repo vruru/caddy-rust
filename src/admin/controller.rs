@@ -1,14 +1,27 @@
 use super::{
-    AdminBackend, AdminError, AdminOptions, files,
+    AdminBackend, AdminError, AdminOptions, AdminTransaction, StopMode,
+    activation::transact_admin,
+    files,
     ids::Indexed,
     policy::LocalPolicy,
-    server::{AdminServerHandle, Prepared, Running},
+    server::{AdminServerHandle, PermissionPublication, Prepared, Running},
 };
 use arc_swap::ArcSwap;
 use futures_util::FutureExt;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{mpsc, oneshot};
+tokio::task_local! { static ADMIN_TRANSACTION: (); }
+pub(super) async fn transaction_scope<F: std::future::Future>(work: F) -> F::Output {
+    ADMIN_TRANSACTION.scope((), work).await
+}
+fn reject_reentrant() -> Result<(), AdminError> {
+    if ADMIN_TRANSACTION.try_with(|_| ()).is_ok() {
+        Err(AdminError::new(409, "admin_txn_reentrant"))
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 pub struct AdminController {
@@ -62,6 +75,7 @@ pub(super) struct Inner {
     admission: Mutex<Admission>,
     sequence: std::sync::atomic::AtomicU64,
     draining: std::sync::atomic::AtomicBool,
+    pub(super) halted: std::sync::atomic::AtomicBool,
     pub listener: tokio::sync::Mutex<Option<Running>>,
     pub remote_listener: tokio::sync::Mutex<Option<Running>>,
     pub requests: Arc<tokio::sync::Semaphore>,
@@ -82,13 +96,17 @@ struct Change {
     if_match: Option<String>,
     force: bool,
     grant: Option<super::remote::Grant>,
-    local_http: bool,
+    local: Option<super::local_access::LocalAdmission>,
     expected_generation: Option<u64>,
     loader_budget: u8,
 }
+pub(super) struct Authorization {
+    pub grant: Option<super::remote::Grant>,
+    pub local: Option<super::local_access::LocalAdmission>,
+}
 enum Work {
     Change(Change),
-    Stop(Option<super::remote::Grant>),
+    Stop(Authorization),
     Drain,
 }
 struct Job {
@@ -136,6 +154,7 @@ impl AdminController {
             admission: Mutex::new(Admission::Open),
             sequence: std::sync::atomic::AtomicU64::new(1),
             draining: std::sync::atomic::AtomicBool::new(false),
+            halted: std::sync::atomic::AtomicBool::new(false),
             listener: tokio::sync::Mutex::new(None),
             remote_listener: tokio::sync::Mutex::new(None),
             requests,
@@ -167,10 +186,23 @@ impl AdminController {
             .as_ref()
             .map(|r| r.address.clone())
     }
-    pub fn snapshot(&self) -> Arc<Value> {
-        self.inner.state.load().raw.clone()
+    pub fn snapshot(&self) -> Result<Arc<Value>, AdminError> {
+        self.inner.check_readable()?;
+        let value = self.inner.state.load().raw.clone();
+        self.inner.check_readable()?;
+        Ok(value)
     }
-    pub async fn start(&self) -> Result<AdminServerHandle, AdminError> {
+    pub async fn start(&self) -> Result<Option<AdminServerHandle>, AdminError> {
+        reject_reentrant()?;
+        // Startup owns its critical section just like an accepted queue write.
+        // Dropping a caller's wait cannot discard a Root commit observation.
+        let owned = Self::borrowed(self.inner.clone());
+        tokio::spawn(async move { owned.start_owned().await })
+            .await
+            .map_err(|_| AdminError::new(500, "admin_start_task_failed"))?
+    }
+    async fn start_owned(&self) -> Result<Option<AdminServerHandle>, AdminError> {
+        self.inner.check_readable()?;
         if self
             .inner
             .draining
@@ -179,70 +211,73 @@ impl AdminController {
         {
             return Err(AdminError::new(503, "admin_controller_shut_down"));
         }
-        let mut current = self.inner.listener.lock().await;
-        if let Some(running) = current.as_ref() {
-            return Ok(AdminServerHandle::new(
-                Arc::downgrade(&self.inner),
-                running.address.clone(),
-            ));
+        let mut local = self.inner.listener.lock().await;
+        let mut remote = self.inner.remote_listener.lock().await;
+        self.inner.check_readable()?;
+        let previous = self.inner.state.load_full();
+        if previous.generation > 0 {
+            return Ok(local
+                .as_ref()
+                .or(remote.as_ref())
+                .map(|r| AdminServerHandle::new(Arc::downgrade(&self.inner), r.address.clone())));
         }
-        let raw = self.inner.state.load().raw.as_ref().clone();
-        let policy = LocalPolicy::parse(&raw)?;
-        let mut remote_current = self.inner.remote_listener.lock().await;
-        if let Some(running) = remote_current.as_ref() {
-            return Ok(AdminServerHandle::new(
-                Arc::downgrade(&self.inner),
-                running.address.clone(),
-            ));
-        }
-        if self.inner.cancel.is_cancelled() {
-            return Err(AdminError::new(503, "admin_controller_shut_down"));
-        }
-        let resolver = if policy.identity.is_some() {
-            Some(self.inner.backend.identity(raw).await?)
-        } else {
-            None
-        };
-        let remote_access = if let Some(remote) = &policy.remote {
-            Some(super::remote::RemoteAccess::new(
-                remote,
-                resolver
-                    .clone()
-                    .ok_or_else(|| AdminError::new(400, "remote_admin_requires_identity"))?,
-            )?)
-        } else {
-            None
-        };
-        let remote_ready = if let (Some(remote), Some(access)) = (&policy.remote, &remote_access) {
-            Some(Prepared::prepare_remote(remote, access.clone(), &self.inner.options).await?)
-        } else {
-            None
-        };
-        let local_ready = if policy.disabled {
+        let raw = previous.raw.clone();
+        let policy = self.inner.offload(move || LocalPolicy::parse(&raw)).await?;
+        let prepared = if policy.disabled {
             None
         } else {
             Some(Prepared::prepare(&policy, &self.inner.options).await?)
         };
-        let address = local_ready
-            .as_ref()
-            .or(remote_ready.as_ref())
-            .map(|p| p.address.clone())
-            .ok_or_else(|| AdminError::new(400, "admin_disabled"))?;
-        let initial = self.inner.state.load().raw.clone();
-        let initial_loaded = finish_load(&self.inner, &policy, initial.clone(), false).await?;
+        let previous_copy = previous.clone();
+        let runtime = self
+            .inner
+            .offload(move || Ok(previous_copy.runtime()))
+            .await?;
+        let (committed, mut guard) = transact_admin(
+            &self.inner,
+            AdminTransaction {
+                config: runtime,
+                force: false,
+                expected_generation: Some(0),
+                restore_only: false,
+            },
+            policy.clone(),
+            prepared,
+            false,
+            Vec::new(),
+        )
+        .await?;
+        if committed.generation == 0 {
+            return Err(AdminError::new(500, "admin_backend_generation_invalid"));
+        }
         self.inner.state.store(Arc::new(Published {
-            indexed: self.inner.state.load().indexed.clone(),
-            generation: 0,
-            access: remote_access,
+            indexed: previous.indexed.clone(),
+            generation: committed.generation,
+            access: guard.stage.access.clone(),
         }));
-        if let Some(ready) = local_ready {
-            *current = Some(ready.start(Arc::downgrade(&self.inner)));
+        let accepting = !self.inner.cancel.is_cancelled() && !committed.stop_pending;
+        if accepting {
+            if let Some(ready) = guard.stage.local.take() {
+                *local = Some(ready.start(Arc::downgrade(&self.inner)));
+            }
+            if let Some(ready) = guard.stage.remote.take() {
+                *remote = Some(ready.start(Arc::downgrade(&self.inner)));
+            }
         }
-        if let Some(ready) = remote_ready {
-            *remote_current = Some(ready.start(Arc::downgrade(&self.inner)));
+        let stage = guard.complete(PermissionPublication::Candidate);
+        if accepting {
+            super::loader::restart(
+                &self.inner,
+                policy.loader,
+                stage.loaded,
+                committed.generation,
+                16,
+            );
         }
-        super::loader::restart(&self.inner, policy.loader, initial_loaded, 0, 16);
-        Ok(AdminServerHandle::new(Arc::downgrade(&self.inner), address))
+        Ok(local
+            .as_ref()
+            .or(remote.as_ref())
+            .map(|r| AdminServerHandle::new(Arc::downgrade(&self.inner), r.address.clone())))
     }
     pub async fn submit(
         &self,
@@ -260,7 +295,7 @@ impl AdminController {
                 if_match: if_match.map(str::to_owned),
                 force,
                 grant: None,
-                local_http: false,
+                local: None,
                 expected_generation: None,
                 loader_budget: 16,
             }))
@@ -273,8 +308,12 @@ impl AdminController {
         body: Option<Value>,
         if_match: Option<&str>,
         force: bool,
-        grant: Option<super::remote::Grant>,
+        authorization: Authorization,
     ) -> Result<(), AdminError> {
+        let Authorization { grant, local } = authorization;
+        if let Some(local) = &local {
+            local.check()?;
+        }
         self.inner
             .enqueue(Work::Change(Change {
                 method: method.to_owned(),
@@ -282,25 +321,40 @@ impl AdminController {
                 body: body.map(super::loader::Loaded::Adapted),
                 if_match: if_match.map(str::to_owned),
                 force,
-                local_http: grant.is_none(),
+                local,
                 expected_generation: None,
                 loader_budget: 16,
                 grant,
             }))
             .await
     }
-    pub(super) async fn stop(&self, grant: Option<super::remote::Grant>) -> Result<(), AdminError> {
-        self.inner.enqueue(Work::Stop(grant)).await
+    pub(super) async fn stop(
+        &self,
+        grant: Option<super::remote::Grant>,
+        local: Option<super::local_access::LocalAdmission>,
+    ) -> Result<(), AdminError> {
+        if let Some(local) = &local {
+            local.check()?;
+        }
+        self.inner
+            .enqueue(Work::Stop(Authorization { grant, local }))
+            .await
     }
     pub(super) async fn read_authorized(
         &self,
         path: &str,
         grant: Option<super::remote::Grant>,
+        local: Option<super::local_access::LocalAdmission>,
     ) -> Result<(Vec<u8>, String), AdminError> {
+        self.inner.check_readable()?;
         let inner = self.inner.clone();
         let path = path.to_owned();
         self.inner
             .offload(move || {
+                inner.check_readable()?;
+                if let Some(local) = &local {
+                    local.check()?;
+                }
                 let current = inner.state.load_full();
                 let path = current.rewrite(&path)?;
                 if let Some(grant) = grant {
@@ -314,12 +368,53 @@ impl AdminController {
                     .map_err(dom)?
                     .unwrap_or_default();
                 let etag = crate::admin_json::etag_encoded(&path, &body);
+                inner.check_readable()?;
+                if let Some(local) = &local {
+                    local.check()?;
+                }
                 Ok((body, etag))
             })
             .await
     }
 }
 impl Inner {
+    pub(super) fn check_readable(&self) -> Result<(), AdminError> {
+        self.backend.check_available()?;
+        if self.halted.load(std::sync::atomic::Ordering::Acquire) {
+            Err(AdminError::new(503, "admin_runtime_halted"))
+        } else {
+            Ok(())
+        }
+    }
+    pub(super) fn halt(self: &Arc<Self>) {
+        if self.halted.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        *self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Admission::Closed;
+        self.cancel.cancel();
+        let stop = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.backend.stop(StopMode::Force)
+        }));
+        self.stop_events
+            .send_replace(Some(super::AdminStopOutcome::TransactionFailed));
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let inner = self.clone();
+            runtime.spawn(async move {
+                if let Some(running) = inner.remote_listener.lock().await.take() {
+                    running.force_shutdown().await;
+                }
+                if let Some(running) = inner.listener.lock().await.take() {
+                    running.force_shutdown().await;
+                }
+                if let Ok(stop) = stop {
+                    let _ = std::panic::AssertUnwindSafe(stop).catch_unwind().await;
+                }
+            });
+        }
+    }
     pub(super) async fn offload<
         T: Send + 'static,
         F: FnOnce() -> Result<T, AdminError> + Send + 'static,
@@ -341,6 +436,8 @@ impl Inner {
         .map_err(|_| AdminError::new(500, "admin_cpu_task_failed"))?
     }
     async fn enqueue(&self, work: Work) -> Result<(), AdminError> {
+        reject_reentrant()?;
+        self.check_readable()?;
         let (reply, wait) = oneshot::channel();
         {
             let mut admission = self.admission.lock().map_err(|_| unavailable())?;
@@ -367,6 +464,7 @@ impl Inner {
         budget: u8,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<bool, AdminError> {
+        self.check_readable()?;
         let permit = tokio::select! {_ = cancel.cancelled()=>return Err(unavailable()), p=self.sender.reserve()=>p.map_err(|_|unavailable())?};
         let (reply, wait) = oneshot::channel();
         {
@@ -386,7 +484,7 @@ impl Inner {
                     if_match: None,
                     force: false,
                     grant: None,
-                    local_http: false,
+                    local: None,
                     expected_generation: Some(generation),
                     loader_budget: budget,
                 }),
@@ -396,6 +494,7 @@ impl Inner {
         wait.await.map_err(|_| unavailable())?
     }
     pub(super) async fn shutdown(&self) -> Result<(), AdminError> {
+        reject_reentrant()?;
         {
             let mut admission = self.admission.lock().map_err(|_| unavailable())?;
             *admission = Admission::Closed;
@@ -444,19 +543,31 @@ async fn worker(weak: Weak<Inner>, mut receiver: mpsc::Receiver<Job>) {
         let Some(inner) = weak.upgrade() else {
             break;
         };
+        if inner.check_readable().is_err() {
+            let result = if matches!(job.work, Work::Stop(_) | Work::Drain) {
+                Ok(false)
+            } else {
+                Err(AdminError::new(503, "admin_runtime_halted"))
+            };
+            let _ = job.reply.send(result);
+            continue;
+        }
         match job.work {
             Work::Drain => {
                 let _ = job.reply.send(Ok(false));
             }
-            Work::Stop(grant) => {
+            Work::Stop(Authorization { grant, local }) => {
                 let current = inner.state.load_full();
-                let authorization = if let Some(g) = &grant {
-                    current.authorize(g, None)
-                } else if LocalPolicy::parse(&current.raw).is_ok_and(|p| p.disabled) {
-                    Err(AdminError::new(403, "local_admin_authorization_revoked"))
-                } else {
-                    Ok(())
-                };
+                let authorization =
+                    if let Some(error) = local.as_ref().and_then(|l| l.check().err()) {
+                        Err(error)
+                    } else if let Some(g) = &grant {
+                        current.authorize(g, None)
+                    } else if LocalPolicy::parse(&current.raw).is_ok_and(|p| p.disabled) {
+                        Err(AdminError::new(403, "local_admin_authorization_revoked"))
+                    } else {
+                        Ok(())
+                    };
                 if let Err(error) = authorization {
                     if let Ok(mut admission) = inner.admission.lock()
                         && matches!(*admission,Admission::StopPending(id)if id==job.id)
@@ -479,9 +590,11 @@ async fn worker(weak: Weak<Inner>, mut receiver: mpsc::Receiver<Job>) {
                         eprintln!("admin event=stop_failed category=admin_shutdown_incomplete");
                         return;
                     }
-                    let result = std::panic::AssertUnwindSafe(backend.stop())
-                        .catch_unwind()
-                        .await;
+                    let result = std::panic::AssertUnwindSafe(
+                        backend.stop(StopMode::Graceful(std::time::Duration::from_secs(35))),
+                    )
+                    .catch_unwind()
+                    .await;
                     match result {
                         Ok(Ok(())) => {
                             inner
@@ -507,7 +620,11 @@ async fn worker(weak: Weak<Inner>, mut receiver: mpsc::Receiver<Job>) {
         }
     }
 }
-fn match_etag(current: &Indexed, condition: &str) -> Result<(), AdminError> {
+fn match_etag(
+    current: &Published,
+    condition: &str,
+    grant: Option<&super::remote::Grant>,
+) -> Result<(), AdminError> {
     if condition.len() < 2 || !condition.starts_with('"') || !condition.ends_with('"') {
         return Err(AdminError::new(400, "malformed_if_match"));
     }
@@ -518,6 +635,14 @@ fn match_etag(current: &Indexed, condition: &str) -> Result<(), AdminError> {
         return Err(AdminError::new(400, "malformed_if_match"));
     }
     let path = current.rewrite(fields[0])?;
+    if let Some(grant) = grant {
+        let read = super::remote::Grant {
+            chain: grant.chain.clone(),
+            method: "GET".into(),
+            path: fields[0].into(),
+        };
+        current.authorize(&read, Some(&path))?;
+    }
     let value = crate::admin_json::read_config(&current.raw, &path).map_err(dom)?;
     let bytes = value
         .map(crate::admin_json::encoded)
@@ -551,14 +676,17 @@ fn prepare_change(
     if let Some(grant) = &change.grant {
         previous.authorize(grant, None)?;
     }
-    if let Some(tag) = change.if_match.as_deref() {
-        match_etag(&previous, tag)?;
+    if let Some(local) = &change.local {
+        local.check()?;
     }
     let path = previous.rewrite(&change.path)?;
     if let Some(grant) = &change.grant {
         previous.authorize(grant, Some(&path))?;
-    } else if change.local_http && LocalPolicy::parse(&previous.raw)?.disabled {
+    } else if change.local.is_some() && LocalPolicy::parse(&previous.raw)?.disabled {
         return Err(AdminError::new(403, "local_admin_authorization_revoked"));
+    }
+    if let Some(tag) = change.if_match.as_deref() {
+        match_etag(&previous, tag, change.grant.as_ref())?;
     }
     if path != "/config" && !path.starts_with("/config/") {
         return Err(AdminError::new(404, "admin_route_not_found"));
@@ -597,6 +725,7 @@ fn prepare_change(
     }))
 }
 async fn apply(inner: &Arc<Inner>, change: Change) -> Result<bool, AdminError> {
+    inner.check_readable()?;
     let previous = inner.state.load_full();
     let Some(Candidate {
         previous,
@@ -611,206 +740,188 @@ async fn apply(inner: &Arc<Inner>, change: Change) -> Result<bool, AdminError> {
     else {
         return Ok(false);
     };
-    let mut listener = inner.listener.lock().await;
-    let mut remote_listener = inner.remote_listener.lock().await;
-    let resolver = if policy.identity.is_some() {
-        let raw = candidate.raw.clone();
-        let copy = inner.offload(move || Ok(raw.as_ref().clone())).await?;
-        Some(inner.backend.identity(copy).await?)
-    } else {
-        None
-    };
-    let remote_access = if policy.remote.is_some() {
-        let raw = candidate.raw.clone();
-        let resolver =
-            resolver.ok_or_else(|| AdminError::new(400, "remote_admin_requires_identity"))?;
-        Some(
-            inner
-                .offload(move || {
-                    let remote = LocalPolicy::parse(&raw)?
-                        .remote
-                        .ok_or_else(|| AdminError::new(400, "remote_admin_requires_identity"))?;
-                    super::remote::RemoteAccess::new(&remote, resolver)
-                })
-                .await?,
-        )
-    } else {
-        None
-    };
+    let mut local = inner.listener.lock().await;
+    let mut remote = inner.remote_listener.lock().await;
+    inner.check_readable()?;
+    if inner.cancel.is_cancelled() {
+        return Err(unavailable());
+    }
+    if inner.state.load().generation != previous.generation {
+        return Err(AdminError::new(409, "admin_configuration_stale_generation"));
+    }
+    if let Some(grant) = &change.grant {
+        previous.authorize(grant, Some(&path))?;
+    }
+    if let Some(local) = &change.local {
+        local.check()?;
+    }
+    let same = local
+        .as_ref()
+        .is_some_and(|r| r.same_local_endpoint(&policy));
     let remote_same = policy.remote.as_ref().is_some_and(|p| {
-        remote_listener
+        remote
             .as_ref()
             .is_some_and(|r| r.same_remote_endpoint(&p.listen))
     });
-    let remote_prepared = if let (Some(config), Some(access)) = (&policy.remote, &remote_access) {
-        if !remote_same {
-            Some(Prepared::prepare_remote(config, access.clone(), &inner.options).await?)
-        } else {
-            None
-        }
+    let local_policy = if same && !policy.disabled {
+        local
+            .as_ref()
+            .map(|r| r.prepare_policy(&policy))
+            .transpose()?
     } else {
         None
     };
-
-    let same = listener
-        .as_ref()
-        .is_some_and(|r| r.same_local_endpoint(&policy));
+    let mut modes = Vec::new();
+    if same
+        && !policy.disabled
+        && let Some(running) = local.as_ref()
+        && let Some(mode) = running.mode_change(&policy)?
+    {
+        modes.push(mode);
+    }
+    if remote_same && let (Some(running), Some(config)) = (remote.as_ref(), policy.remote.as_ref())
+    {
+        let p = LocalPolicy::parse(&json!({"admin":{"listen":config.listen}}))?;
+        if let Some(mode) = running.mode_change(&p)? {
+            modes.push(mode);
+        }
+    }
     let prepared = if !policy.disabled && !same {
         Some(Prepared::prepare(&policy, &inner.options).await?)
     } else {
         None
     };
-    if !policy.disabled
-        && same
-        && let Some(running) = listener.as_ref()
-    {
-        running.validate_policy(&policy)?;
+    let (committed, mut guard) = transact_admin(
+        inner,
+        AdminTransaction {
+            config: runtime,
+            force: change.force,
+            expected_generation: Some(previous.generation),
+            restore_only: false,
+        },
+        policy.clone(),
+        prepared,
+        remote_same,
+        modes,
+    )
+    .await?;
+    if committed.generation <= previous.generation {
+        return Err(AdminError::new(500, "admin_backend_generation_invalid"));
     }
-    let mut mode_changes = Vec::new();
-    if same
-        && !policy.disabled
-        && let Some(running) = listener.as_ref()
-        && let Some(mode) = running.mode_change(&policy)?
-    {
-        mode_changes.push(mode);
-    }
-    if remote_same
-        && let (Some(running), Some(remote)) = (remote_listener.as_ref(), policy.remote.as_ref())
-    {
-        let local = LocalPolicy::parse(&json!({"admin":{"listen":remote.listen}}))?;
-        if let Some(mode) = running.mode_change(&local)? {
-            mode_changes.push(mode);
+    let mode_error = guard
+        .stage
+        .modes
+        .iter_mut()
+        .filter(|m| !m.restrictive())
+        .find_map(|m| m.commit().err());
+    if let Some(error) = mode_error {
+        for mode in &mut guard.stage.modes {
+            mode.retighten()?;
         }
-    }
-    for mode in &mut mode_changes {
-        if mode.restrictive() {
-            mode.commit()?;
+        // The old Admin listeners/access are still bound and unchanged. Root
+        // restages the predecessor once using its retained verified material;
+        // no identity acquisition, fetch, or Admin bind occurs in this finisher.
+        if let Some(running) = local.as_ref() {
+            running.validate_retained()?;
         }
-    }
-    if let Some(grant) = &change.grant {
-        previous.authorize(grant, Some(&path))?;
-    }
-    let loaded = if policy.loader.as_ref().is_some_and(|p| p.delay.is_zero()) {
-        finish_load_with_runtime(inner, &policy, candidate.raw.clone(), runtime, change.force)
-            .await?
-    } else {
-        inner.backend.apply(runtime, change.force).await?;
-        None
-    };
-    for mode in &mut mode_changes {
-        if !mode.restrictive()
-            && let Err(error) = mode.commit()
-        {
-            let saved = previous.clone();
-            let runtime = inner.offload(move || Ok(saved.runtime())).await?;
-            if inner.backend.apply(runtime, true).await.is_err() {
-                return Err(AdminError::new(500, "admin_runtime_rollback_failed"));
-            }
-            return Err(error);
+        if let Some(running) = remote.as_ref() {
+            running.validate_retained()?;
         }
+        let old = previous.clone();
+        let runtime = inner.offload(move || Ok(old.runtime())).await?;
+        let old_policy = LocalPolicy::parse(&previous.raw)?;
+        let restored = transaction_scope(inner.backend.transact(
+            AdminTransaction {
+                config: runtime,
+                force: true,
+                expected_generation: Some(committed.generation),
+                restore_only: true,
+            },
+            Box::new(|_| Box::pin(async { Ok(()) })),
+        ))
+        .await
+        .map_err(|_| AdminError::new(500, "admin_runtime_rollback_failed"))?;
+        if restored.generation <= committed.generation {
+            return Err(AdminError::new(500, "admin_backend_generation_invalid"));
+        }
+        for mode in &mut guard.stage.modes {
+            mode.restore()?;
+        }
+        if let Some(running) = local.as_ref() {
+            running.validate_retained()?;
+        }
+        if let Some(running) = remote.as_ref() {
+            running.validate_retained()?;
+        }
+        inner.state.store(Arc::new(Published {
+            indexed: previous.indexed.clone(),
+            generation: restored.generation,
+            access: previous.access.clone(),
+        }));
+        let _discarded = guard.complete(PermissionPublication::Predecessor);
+        if !restored.stop_pending && !inner.cancel.is_cancelled() {
+            super::loader::restart(
+                inner,
+                old_policy.loader,
+                None,
+                restored.generation,
+                change.loader_budget,
+            );
+        }
+        return Err(error);
     }
-
     let raw = candidate.raw.clone();
     inner.state.store(Arc::new(Published {
         indexed: candidate,
-        generation: previous.generation.wrapping_add(1),
-        access: remote_access.clone(),
+        generation: committed.generation,
+        access: guard.stage.access.clone(),
     }));
+    let mut retired = Vec::new();
+    let accepting = !committed.stop_pending && !inner.cancel.is_cancelled();
     if policy.disabled {
-        if let Some(old) = listener.take() {
-            old.retire().await;
+        if let Some(old) = local.take() {
+            retired.push(old);
         }
-    } else if let Some(ready) = prepared {
-        let new = ready.start(Arc::downgrade(inner));
-        if let Some(old) = listener.replace(new) {
-            old.retire().await;
+    } else if let Some(ready) = guard.stage.local.take() {
+        if accepting && let Some(old) = local.replace(ready.start(Arc::downgrade(inner))) {
+            retired.push(old);
         }
-    } else if same && let Some(running) = listener.as_ref() {
-        running.update_policy(&policy)?;
+    } else if let (Some(running), Some(prepared_policy)) = (local.as_ref(), local_policy) {
+        running.install_policy(prepared_policy);
     }
-    if let Some(ready) = remote_prepared {
-        if let Some(old) = remote_listener.replace(ready.start(Arc::downgrade(inner))) {
-            old.retire().await;
+    if let Some(ready) = guard.stage.remote.take() {
+        if accepting && let Some(old) = remote.replace(ready.start(Arc::downgrade(inner))) {
+            retired.push(old);
         }
-    } else if let Some(access) = remote_access {
-        if let Some(running) = remote_listener.as_ref() {
+    } else if let Some(access) = guard.stage.access.take() {
+        if let Some(running) = remote.as_ref() {
             running.update_remote(access);
         }
-    } else if let Some(old) = remote_listener.take() {
+    } else if let Some(old) = remote.take() {
+        retired.push(old);
+    }
+    let stage = guard.complete(PermissionPublication::Candidate);
+    drop(remote);
+    drop(local);
+    for old in retired {
         old.retire().await;
     }
-    for mode in mode_changes {
-        mode.finish();
+    if accepting {
+        super::loader::restart(
+            inner,
+            policy.loader,
+            stage.loaded,
+            committed.generation,
+            change.loader_budget,
+        );
     }
-    drop(remote_listener);
-    drop(listener);
-    super::loader::restart(
-        inner,
-        policy.loader.clone(),
-        loaded,
-        previous.generation.wrapping_add(1),
-        change.loader_budget,
-    );
     if policy.persist
         && let Some(path) = inner.options.autosave.clone()
     {
-        let result = tokio::task::spawn_blocking(move || files::save(&path, &raw)).await;
-        if !matches!(result, Ok(Ok(()))) {
+        let result = inner.offload(move || files::save(&path, &raw)).await;
+        if result.is_err() {
             eprintln!("admin event=autosave_failed category=admin_file_operation_failed");
         }
     }
     Ok(true)
-}
-
-async fn finish_load(
-    inner: &Arc<Inner>,
-    policy: &LocalPolicy,
-    candidate: Arc<Value>,
-    force: bool,
-) -> Result<Option<super::loader::Loaded>, AdminError> {
-    if !policy.loader.as_ref().is_some_and(|p| p.delay.is_zero()) {
-        return Ok(None);
-    }
-    let raw = candidate.clone();
-    let runtime = inner
-        .offload(move || Ok(Indexed::new((*raw).clone())?.runtime()))
-        .await?;
-    finish_load_with_runtime(inner, policy, candidate, runtime, force).await
-}
-async fn finish_load_with_runtime(
-    inner: &Arc<Inner>,
-    policy: &LocalPolicy,
-    candidate: Arc<Value>,
-    runtime: Value,
-    force: bool,
-) -> Result<Option<super::loader::Loaded>, AdminError> {
-    let Some(plan) = policy.loader.clone().filter(|p| p.delay.is_zero()) else {
-        return Ok(None);
-    };
-    let slot = Arc::new(Mutex::new(None));
-    let output = slot.clone();
-    let owned = inner.clone();
-    let cancel = inner.cancel.child_token();
-    let finish: super::AdminFinisher = Box::new(move || {
-        Box::pin(async move {
-            let value = super::loader::load(&owned, plan, candidate, cancel).await?;
-            *output
-                .lock()
-                .map_err(|_| AdminError::new(500, "config_loader_checkpoint_failed"))? =
-                Some(value);
-            Ok(())
-        })
-    });
-    inner
-        .backend
-        .apply_with_finisher(runtime, force, finish)
-        .await?;
-    let loaded = slot
-        .lock()
-        .map_err(|_| AdminError::new(500, "config_loader_checkpoint_failed"))?
-        .take();
-    if loaded.is_none() {
-        return Err(AdminError::new(500, "config_loader_finisher_not_run"));
-    }
-    Ok(loaded)
 }

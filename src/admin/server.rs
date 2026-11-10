@@ -1,7 +1,8 @@
 use super::{
     AdminController, AdminError, AdminOptions,
-    controller::Inner,
+    controller::{Authorization, Inner},
     files, ids,
+    local_access::{AdmissionState, LocalAdmission},
     policy::{LocalPolicy, OriginPolicy},
     remote::{Grant, Remote, RemoteAccess},
 };
@@ -38,13 +39,97 @@ fn io_failure() -> AdminError {
 }
 struct SocketOwner {
     cap: files::Parent,
+    admission: Arc<AdmissionState>,
     dev: u64,
     ino: u64,
+    gid: u32,
     gate: std::sync::Mutex<Option<File>>,
     released: std::sync::atomic::AtomicBool,
 }
 impl SocketOwner {
+    fn same_inode(&self, st: &fs::Stat) -> bool {
+        st.st_dev as u64 == self.dev
+            && st.st_ino == self.ino
+            && st.st_uid == self.cap.uid
+            && st.st_gid == self.gid
+            && FileType::from_raw_mode(st.st_mode) == FileType::Socket
+    }
+    fn set_mode(&self, mode: Mode) -> Result<(), AdminError> {
+        if !self.matches() {
+            return Err(failure("admin_socket_replaced"));
+        }
+        let before = fs::statat(&self.cap.fd, &self.cap.name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| io_failure())?;
+        if !self.same_inode(&before) {
+            return Err(failure("admin_socket_replaced"));
+        }
+        self.admission
+            .restrict(u32::from(mode.bits()), self.gid);
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = fs::openat(
+                &self.cap.fd,
+                &self.cap.name,
+                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|_| io_failure())?;
+            if !self.same_inode(&fs::fstat(&fd).map_err(|_| io_failure())?) {
+                return Err(failure("admin_socket_replaced"));
+            }
+            // The O_PATH descriptor fixes the inode throughout chmod. Never
+            // fall back to changing the original pathname after a failed call.
+            let result = unsafe {
+                libc::syscall(
+                    linux_raw_sys::general::__NR_fchmodat2 as libc::c_long,
+                    fd.as_raw_fd(),
+                    c"".as_ptr(),
+                    mode.bits() as libc::mode_t,
+                    libc::AT_EMPTY_PATH,
+                )
+            };
+            if result != 0 {
+                match std::io::Error::last_os_error().raw_os_error() {
+                    Some(libc::ENOSYS) | Some(libc::EINVAL) => {
+                        fs::chmodat(
+                            fs::CWD,
+                            format!("/proc/self/fd/{}", fd.as_raw_fd()),
+                            mode,
+                            AtFlags::empty(),
+                        )
+                        .map_err(|_| io_failure())?;
+                    }
+                    _ => return Err(io_failure()),
+                }
+            }
+            let st = fs::fstat(&fd).map_err(|_| io_failure())?;
+            if !self.same_inode(&st) || st.st_mode & 0o7777 != mode.bits() {
+                return Err(failure("admin_socket_replaced"));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // All ancestors are no-follow directory capabilities; the final
+            // directory is owned by this uid and is never group/world writable.
+            fs::chmodat(
+                &self.cap.fd,
+                &self.cap.name,
+                mode,
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(|_| io_failure())?;
+        }
+        let st = fs::statat(&self.cap.fd, &self.cap.name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| io_failure())?;
+        if !self.same_inode(&st) || st.st_mode & 0o7777 != mode.bits() {
+            return Err(failure("admin_socket_replaced"));
+        }
+        self.admission.restrict(u32::from(mode.bits()), st.st_gid);
+        Ok(())
+    }
     fn release(&self) {
+        self.admission.revoke();
         if self
             .released
             .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -62,11 +147,8 @@ impl SocketOwner {
         drop(gate.take());
     }
     fn matches(&self) -> bool {
-        fs::statat(&self.cap.fd, &self.cap.name, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|s| {
-            s.st_dev as u64 == self.dev
-                && s.st_ino == self.ino
-                && FileType::from_raw_mode(s.st_mode) == FileType::Socket
-        })
+        fs::statat(&self.cap.fd, &self.cap.name, AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|s| self.same_inode(&s))
     }
 }
 impl Drop for SocketOwner {
@@ -81,7 +163,7 @@ enum Security {
 }
 #[derive(Clone)]
 enum Peer {
-    Local,
+    Local(LocalAdmission),
     Tls(Vec<rustls::pki_types::CertificateDer<'static>>),
 }
 enum Listener {
@@ -128,11 +210,17 @@ impl AdminServerHandle {
         Ok(())
     }
 }
+#[derive(Clone, Copy)]
+pub(super) enum PermissionPublication {
+    Candidate,
+    Predecessor,
+}
 pub(super) struct ModeChange {
     owner: Arc<SocketOwner>,
     old: Mode,
     new: Mode,
     changed: bool,
+    started: bool,
     finished: bool,
 }
 impl ModeChange {
@@ -143,43 +231,99 @@ impl ModeChange {
         if !self.owner.matches() {
             return Err(failure("admin_socket_replaced"));
         }
-        fs::chmodat(
-            &self.owner.cap.fd,
-            &self.owner.cap.name,
-            self.new,
-            AtFlags::empty(),
-        )
-        .map_err(|_| io_failure())?;
+        // A post-chmod identity check can fail after the mode already changed.
+        // Retain restoration ownership even when the syscall outcome is partial.
+        self.started = true;
         self.changed = true;
+        self.owner.set_mode(self.new)?;
         if !self.owner.matches() {
             return Err(failure("admin_socket_replaced"));
         }
         Ok(())
     }
-    pub fn finish(mut self) {
+    pub fn commit_restrictions(&mut self) -> Result<(), AdminError> {
+        self.started = true;
+        self.owner.admission.enforce();
+        let restricted = Mode::from_raw_mode(self.old.bits() & self.new.bits());
+        if restricted != self.old {
+            self.changed = true;
+            self.owner.set_mode(restricted)?;
+        }
+        Ok(())
+    }
+    pub fn disarm(&mut self, publication: PermissionPublication) {
+        let mode = match publication {
+            PermissionPublication::Candidate => self.new,
+            PermissionPublication::Predecessor => self.old,
+        };
+        if self.started {
+            self.owner.admission.publish_mode(u32::from(mode.bits()));
+        }
         self.finished = true;
+    }
+    /// Fail closed for both predecessor and candidate policies, then disable
+    /// automatic restoration. No chmod follows a replaced socket name.
+    pub fn fence(&mut self) {
+        self.finished = true;
+        if !self.started {
+            return;
+        }
+        self.owner.admission.fence();
+        if !self.changed {
+            return;
+        }
+        if self
+            .owner
+            .set_mode(Mode::from_raw_mode(self.old.bits() & self.new.bits()))
+            .is_err()
+        {
+            eprintln!("admin event=socket_mode_fence_failed category=admin_file_operation_failed");
+        }
+    }
+    /// Restore only the socket inode whose original permissions this guard owns.
+    /// Rollback calls this explicitly after the predecessor apps are published.
+    pub fn restore(&mut self) -> Result<(), AdminError> {
+        if !self.owner.matches() {
+            return Err(failure("admin_socket_replaced"));
+        }
+        if !self.started {
+            return Ok(());
+        }
+        self.owner.set_mode(self.old)?;
+        self.changed = false;
+        if !self.owner.matches() {
+            return Err(failure("admin_socket_replaced"));
+        }
+        Ok(())
+    }
+    /// Compensation must close the candidate's broader admission before Root
+    /// republishes the predecessor, including a partially successful chmod.
+    pub fn retighten(&mut self) -> Result<(), AdminError> {
+        if self.changed {
+            self.owner
+                .set_mode(Mode::from_raw_mode(self.old.bits() & self.new.bits()))?;
+        }
+        Ok(())
     }
 }
 impl Drop for ModeChange {
     fn drop(&mut self) {
-        if self.changed
-            && !self.finished
-            && self.owner.matches()
-            && fs::chmodat(
-                &self.owner.cap.fd,
-                &self.owner.cap.name,
-                self.old,
-                AtFlags::empty(),
-            )
-            .is_err()
-        {
-            eprintln!(
-                "admin event=socket_mode_restore_failed category=admin_file_operation_failed"
-            );
+        if !self.finished {
+            self.fence();
         }
     }
 }
+
 impl Running {
+    pub fn validate_retained(&self) -> Result<(), AdminError> {
+        if self.cancel.is_cancelled()
+            || self.task.as_ref().is_none_or(|task| task.is_finished())
+            || self.owner.as_ref().is_some_and(|owner| !owner.matches())
+        {
+            return Err(failure("admin_retained_listener_unavailable"));
+        }
+        Ok(())
+    }
     pub fn same_remote_endpoint(&self, raw: &str) -> bool {
         let raw = if raw.is_empty() { ":2021" } else { raw };
         if self.requested.starts_with("fd/") && raw.starts_with("fd/") {
@@ -258,18 +402,17 @@ impl Running {
                 old: Mode::from_raw_mode(old),
                 new: Mode::from_raw_mode(new),
                 changed: false,
+                started: false,
                 finished: false,
             }))
         }
     }
 
-    pub fn validate_policy(&self, p: &LocalPolicy) -> Result<(), AdminError> {
-        OriginPolicy::new(p, self.unix, self.port).map(|_| ())
+    pub fn prepare_policy(&self, p: &LocalPolicy) -> Result<OriginPolicy, AdminError> {
+        OriginPolicy::new(p, self.unix, self.port)
     }
-    pub fn update_policy(&self, p: &LocalPolicy) -> Result<(), AdminError> {
-        self.policy
-            .send_replace(Security::Local(OriginPolicy::new(p, self.unix, self.port)?));
-        Ok(())
+    pub fn install_policy(&self, policy: OriginPolicy) {
+        self.policy.send_replace(Security::Local(policy));
     }
     pub fn update_remote(&self, access: Arc<RemoteAccess>) {
         self.policy.send_replace(Security::Remote(access));
@@ -298,6 +441,16 @@ impl Running {
                 .await
                 .is_err()
         {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+    pub async fn force_shutdown(mut self) {
+        self.cancel.cancel();
+        if let Some(owner) = &self.owner {
+            owner.release();
+        }
+        if let Some(task) = self.task.take() {
             task.abort();
             let _ = task.await;
         }
@@ -393,19 +546,15 @@ impl Prepared {
             let st = fs::statat(&cap.fd, &cap.name, AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|_| io_failure())?;
             let owner = SocketOwner {
+                admission: Arc::new(AdmissionState::new(st.st_uid, st.st_gid, u32::from(mode))),
                 cap,
                 dev: st.st_dev as u64,
                 ino: st.st_ino,
+                gid: st.st_gid,
                 gate: std::sync::Mutex::new(Some(File::from(gate))),
                 released: std::sync::atomic::AtomicBool::new(false),
             };
-            fs::chmodat(
-                &owner.cap.fd,
-                &owner.cap.name,
-                Mode::from_raw_mode(mode),
-                AtFlags::empty(),
-            )
-            .map_err(|_| io_failure())?;
+            owner.set_mode(Mode::from_raw_mode(mode))?;
             if !owner.matches() {
                 return Err(failure("admin_socket_replaced"));
             }
@@ -646,7 +795,14 @@ impl Prepared {
             loop {
                 tokio::select! {biased;_=stop.cancelled()=>break,Some(_)=connections.join_next(),if !connections.is_empty()=>{},accepted=accept(&listener)=>{
                  let stream=match accepted{Ok(stream)=>stream,Err(error)=>{if matches!(error.kind(),std::io::ErrorKind::Interrupted|std::io::ErrorKind::ConnectionAborted|std::io::ErrorKind::ConnectionReset)||error.raw_os_error()==Some(libc::EPROTO){continue;}eprintln!("admin event=accept_failed category=admin_accept_failed");tokio::select!{_=stop.cancelled()=>break,_=tokio::time::sleep(Duration::from_millis(100))=>{}}continue;}};if peer_uid && let Stream::Unix(ref s)=stream && !s.peer_cred().is_ok_and(|p|p.uid()==rustix::process::geteuid().as_raw()){continue;}let Ok(permit)=permits.clone().try_acquire_owned()else{if let Ok(reject)=rejects.clone().try_acquire_owned(){connections.spawn(async move{let _reject=reject;reject_connection(stream).await;});}continue;};
-                 let inner=inner.clone();let policy=rx.clone();let cancel=stop.clone();let options=self.options.clone();connections.spawn(async move{let _permit=permit;match stream{Stream::Tcp(s)=>serve_accepted(s,inner,policy,cancel,options).await,Stream::Unix(s)=>serve_accepted(s,inner,policy,cancel,options).await}});
+                 let local = match &stream {
+                    Stream::Tcp(_) => LocalAdmission::tcp(),
+                    Stream::Unix(stream) => match LocalAdmission::for_unix(stream, owner.as_ref().map(|o| o.admission.clone())) {
+                        Ok(local) => local,
+                        Err(_) => continue,
+                    },
+                 };
+                 let inner=inner.clone();let policy=rx.clone();let cancel=stop.clone();let options=self.options.clone();connections.spawn(async move{let _permit=permit;match stream{Stream::Tcp(s)=>serve_accepted(s,inner,policy,cancel,options,local).await,Stream::Unix(s)=>serve_accepted(s,inner,policy,cancel,options,local).await}});
                 }}
             }
             drop(listener);
@@ -702,12 +858,15 @@ async fn serve_accepted<S>(
     policy: watch::Receiver<Security>,
     cancel: CancellationToken,
     options: AdminOptions,
+    local: LocalAdmission,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let security = policy.borrow().clone();
     match security {
-        Security::Local(_) => serve(stream, inner, policy, cancel, options, Peer::Local).await,
+        Security::Local(_) => {
+            serve(stream, inner, policy, cancel, options, Peer::Local(local)).await
+        }
         Security::Remote(access) => {
             let acceptor = tokio_rustls::TlsAcceptor::from(access.tls.clone());
             let accepted = tokio::select! {_=cancel.cancelled()=>return,r=tokio::time::timeout(options.header_timeout,acceptor.accept(stream))=>r};
@@ -899,6 +1058,7 @@ async fn dispatch(
     let inner = inner
         .upgrade()
         .ok_or_else(|| AdminError::new(503, "admin_unavailable"))?;
+    inner.check_readable()?;
     let _permit = inner
         .requests
         .clone()
@@ -914,8 +1074,15 @@ async fn dispatch(
             return Err(failure("absolute_uri_host_mismatch"));
         }
     }
+    let local = match &peer {
+        Peer::Local(local) => {
+            local.check()?;
+            Some(local.clone())
+        }
+        Peer::Tls(_) => None,
+    };
     let (origin, mut grant) = match (&policy, &peer) {
-        (Security::Local(policy), Peer::Local) => (policy.check(request.headers())?, None),
+        (Security::Local(policy), Peer::Local(_)) => (policy.check(request.headers())?, None),
         (Security::Remote(access), Peer::Tls(chain)) => {
             super::policy::remote_browser_check(request.headers())?;
             let _ = access;
@@ -994,7 +1161,9 @@ async fn dispatch(
         .is_some_and(|v| v == "must-revalidate");
     let mut response = match (method.as_str(), path.as_str()) {
         ("GET", p) if p == "/config" || p.starts_with("/config/") || p.starts_with("/id/") => {
-            let (value, tag) = controller.read_authorized(p, grant.clone()).await?;
+            let (value, tag) = controller
+                .read_authorized(p, grant.clone(), local.clone())
+                .await?;
             let mut response = reply(200, value);
             response.headers_mut().insert(
                 header::ETAG,
@@ -1003,7 +1172,7 @@ async fn dispatch(
             response
         }
         ("POST", "/stop") => {
-            controller.stop(grant.clone()).await?;
+            controller.stop(grant.clone(), local.clone()).await?;
             reply(200, Vec::new())
         }
         ("POST", "/adapt") | ("POST", "/load") => {
@@ -1018,6 +1187,18 @@ async fn dispatch(
                 inner.options.body_timeout,
             )
             .await?;
+            if path == "/adapt" && adapter.is_none() {
+                let encoded = inner
+                    .offload(move || {
+                        crate::admin_json::encoded_adapt_raw(&bytes, 64 * 1024 * 1024)
+                            .map_err(|e| AdminError::new(e.status, e.category))
+                    })
+                    .await?;
+                if let Some(local) = &local {
+                    local.check()?;
+                }
+                return Ok(reply(200, encoded));
+            }
             let adapted = if adapter.is_none() {
                 super::AdaptedConfig {
                     result: inner
@@ -1039,7 +1220,7 @@ async fn dispatch(
                         Some(adapted.result),
                         tag.as_deref(),
                         force,
-                        grant.clone(),
+                        Authorization { grant: grant.clone(), local: local.clone() },
                     )
                     .await?;
                 if adapted.warnings.is_empty() {
@@ -1052,6 +1233,9 @@ async fn dispatch(
                     )
                 }
             } else {
+                if let Some(local) = &local {
+                    local.check()?;
+                }
                 reply(
                     200,
                     serde_json::to_vec(
@@ -1095,7 +1279,14 @@ async fn dispatch(
                 )
             };
             controller
-                .submit_authorized(&method, &path, value, tag.as_deref(), force, grant.clone())
+                .submit_authorized(
+                    &method,
+                    &path,
+                    value,
+                    tag.as_deref(),
+                    force,
+                    Authorization { grant: grant.clone(), local: local.clone() },
+                )
                 .await?;
             reply(200, Vec::new())
         }

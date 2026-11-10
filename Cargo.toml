@@ -74,3 +74,6 @@ hyper-util = {path="vendor/hyper-util-0.1.21"}
 
 rustls = { path = "vendor/rustls-0.23.46" }
 openssl-sys = { path = "vendor/openssl-sys-0.9.118" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-raw-sys = { version = "0.12", default-features = false, features = ["std", "general"] }

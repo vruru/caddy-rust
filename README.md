@@ -205,3 +205,15 @@ updates. The caller must authorize names, own leaf keys and integrate generation
 lifecycle and rollback recovery. Native CA interoperability was verified in
 isolation; RootBackend, CLI, admin endpoints and automatic-HTTPS integration
 remain incomplete. Mac Keychain writes and legacy NSS dbm execution are unverified.
+
+Admin configuration writes now stage candidate identities and listeners before
+publishing the actual root generation. Normal rejection keeps the predecessor;
+post-publication failure either restores retained application state or fences
+the runtime. Unix socket permission changes preserve inode ownership, delay
+broader admission until publication, and recheck queued writes and stops. Linux
+uses connection-bound supplementary groups; macOS exports positive group hints
+without treating absent hints as authoritative non-membership. After a started
+mode transaction, subjects relying on ACLs, capabilities or unusual filesystem
+credentials can be conservatively rejected; those OS-specific compatibility
+boundaries remain explicit. These library contracts do not complete the native
+RootBackend, CLI or certificate lifecycle integration.

@@ -6,6 +6,11 @@
 mod inherited;
 /// Capture configured inherited sockets before creating the async runtime.
 pub use inherited::capture as capture_inherited;
+#[path = "admin/candidate.rs"]
+mod candidate;
+pub use candidate::{CandidateHandle, CandidateOwner, CandidateScope};
+#[path = "admin/activation.rs"]
+mod activation;
 #[path = "admin/controller.rs"]
 mod controller;
 #[path = "admin/files.rs"]
@@ -16,6 +21,8 @@ mod ids;
 mod loader;
 #[path = "admin/loader_schema.rs"]
 mod loader_schema;
+#[path = "admin/local_access.rs"]
+mod local_access;
 #[path = "admin/policy.rs"]
 mod policy;
 #[path = "admin/remote.rs"]
@@ -34,11 +41,36 @@ pub enum AdminStopOutcome {
     Complete,
     DrainIncomplete,
     BackendStopFailed,
+    TransactionFailed,
 }
 
 pub type AdminFuture<T> = Pin<Box<dyn Future<Output = Result<T, AdminError>> + Send>>;
-/// Invoked after candidate apps and identity are ready, before publication.
-pub type AdminFinisher = Box<dyn FnOnce() -> AdminFuture<()> + Send>;
+/// Invoked after candidate listeners are staged, before atomic publication.
+/// Identity acquisition must use this candidate's explicit capability.
+pub type AdminFinisher = Box<dyn FnOnce(CandidateHandle) -> AdminFuture<()> + Send>;
+
+#[derive(Clone)]
+pub struct AdminTransaction {
+    pub config: Value,
+    pub force: bool,
+    pub expected_generation: Option<u64>,
+    /// Compensation may only reuse retained valid certificate material. It
+    /// must never issue a new certificate or run external configuration loaders.
+    /// The backend validates all required business AND administrative identities
+    /// before its finisher; rollback finishers perform no identity acquisition.
+    pub restore_only: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub struct Committed {
+    pub generation: u64,
+    pub stop_pending: bool,
+}
+#[derive(Clone, Copy, Debug)]
+pub enum StopMode {
+    Graceful(Duration),
+    Force,
+}
 
 /// Backends return safe categories and optional source lines, never raw config,
 /// keys, filesystem paths, upstream errors or credential-bearing strings.
@@ -69,43 +101,40 @@ pub struct AdaptedConfig {
     pub warnings: Vec<Value>,
 }
 pub trait AdminBackend: Send + Sync + 'static {
-    fn apply(&self, config: Value, force: bool) -> AdminFuture<()>;
-    /// Stage the candidate; commit only after finisher succeeds, otherwise restore old apps.
-    fn apply_with_finisher(
-        &self,
-        _config: Value,
-        _force: bool,
-        _finisher: AdminFinisher,
-    ) -> AdminFuture<()> {
-        Box::pin(async { Err(AdminError::new(400, "staged_backend_unavailable")) })
+    /// Cheap synchronous availability fence; never wait for a transaction or IO.
+    /// A forced root must stop control-plane reads before asynchronous cleanup.
+    fn check_available(&self) -> Result<(), AdminError> {
+        Ok(())
     }
-    /// Identity credentials with clientAuth usage, refreshed by the backend resolver.
-    fn identity_client(
+
+    /// Stage apps, invoke the finisher once, then publish synchronously. Errors
+    /// preserve the predecessor. Close candidate capabilities on every outcome.
+    /// StopRequested may still publish an accepted candidate; forced stop must
+    /// discard it. Ok identifies the actual monotonically increasing generation.
+    /// A mismatched expected_generation rejects before the finisher or any
+    /// publication. The finisher must complete/drop before this future resolves;
+    /// never detach it. Post-publication internal failure must force-stop Root.
+    fn transact(
         &self,
-        _candidate: Value,
-    ) -> AdminFuture<Arc<dyn rustls::client::ResolvesClientCert>> {
-        Box::pin(async {
-            Err(AdminError::new(
-                400,
-                "admin_client_identity_backend_unavailable",
-            ))
-        })
-    }
+        transaction: AdminTransaction,
+        finisher: AdminFinisher,
+    ) -> AdminFuture<Committed>;
+    /// Stateless adaptation; never obtain the Root transaction lock here,
+    /// because a candidate's delay-zero loader may call it from its finisher.
     fn adapt(
         &self,
         input: Vec<u8>,
         adapter: Option<String>,
         filename: Option<String>,
     ) -> AdminFuture<AdaptedConfig>;
-    fn stop(&self) -> AdminFuture<()>;
-    /// Prepare and maintain all admin.identity identifiers before publication.
-    /// The returned resolver must observe renewals without replacing listeners.
-    fn identity(
-        &self,
-        _candidate: Value,
-    ) -> AdminFuture<Arc<dyn rustls::server::ResolvesServerCert>> {
-        Box::pin(async { Err(AdminError::new(400, "admin_identity_backend_unavailable")) })
+    /// Read the committed clientAuth identity without obtaining a transaction lock.
+    fn active_identity_client(&self) -> Option<Arc<dyn rustls::client::ResolvesClientCert>> {
+        None
     }
+    /// Force must synchronously fence publication/admission when called; its
+    /// future owns the bounded join. This also holds during runtime teardown;
+    /// the call must not wait for a lock held by a suspended transaction.
+    fn stop(&self, mode: StopMode) -> AdminFuture<()>;
 }
 
 #[derive(Clone)]
@@ -157,4 +186,12 @@ pub fn resume_config(autosave: &std::path::Path, fallback: &Value) -> Result<Val
 /// Validate the local administrative schema without binding a listener.
 pub fn validate(config: &Value) -> Result<(), AdminError> {
     policy::LocalPolicy::parse(config).map(|_| ())
+}
+
+/// Share the validated loader schema with the root lifecycle, including delayed
+/// loaders whose client identity must be ready before configuration publication.
+pub fn client_identity_required(config: &Value) -> Result<bool, AdminError> {
+    Ok(policy::LocalPolicy::parse(config)?
+        .loader
+        .is_some_and(|plan| plan.http.tls.is_some_and(|tls| tls.use_server_identity)))
 }

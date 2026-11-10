@@ -1,7 +1,7 @@
 //! HTTP config acquisition is independent of the serialized publication queue.
 //! A generation fence prevents old upstream results overriding a newer config.
 use super::{
-    AdminError,
+    AdminBackend, AdminError, CandidateHandle,
     controller::Inner,
     loader_schema::{HttpLoader, LoaderPlan},
 };
@@ -26,6 +26,48 @@ impl Loaded {
 }
 fn cancelled() -> AdminError {
     AdminError::new(503, "config_loader_cancelled")
+}
+/// Acquisition can adapt and resolve an explicitly scoped identity; it cannot
+/// access the controller's write queue or implicitly re-enter a transaction.
+pub(super) struct LoaderContext {
+    backend: Arc<dyn AdminBackend>,
+    cpu: Arc<tokio::sync::Semaphore>,
+    candidate: Option<CandidateHandle>,
+}
+impl LoaderContext {
+    pub(super) fn new(inner: &Inner, candidate: Option<CandidateHandle>) -> Self {
+        Self {
+            backend: inner.backend.clone(),
+            cpu: inner.cpu.clone(),
+            candidate,
+        }
+    }
+    pub(super) fn with_candidate(self, candidate: CandidateHandle) -> Self {
+        Self {
+            candidate: Some(candidate),
+            ..self
+        }
+    }
+    pub(super) async fn offload<
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, AdminError> + Send + 'static,
+    >(
+        &self,
+        work: F,
+    ) -> Result<T, AdminError> {
+        let permit = self
+            .cpu
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| AdminError::new(503, "admin_write_queue_unavailable"))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        })
+        .await
+        .map_err(|_| AdminError::new(500, "admin_cpu_task_failed"))?
+    }
 }
 fn expand(mut loader: HttpLoader) -> Result<HttpLoader, AdminError> {
     let failed = std::cell::Cell::new(false);
@@ -65,27 +107,30 @@ fn expand(mut loader: HttpLoader) -> Result<HttpLoader, AdminError> {
 }
 
 pub(super) async fn load(
-    inner: &Arc<Inner>,
+    ctx: &LoaderContext,
     plan: LoaderPlan,
-    candidate: Arc<Value>,
     cancel: CancellationToken,
 ) -> Result<Loaded, AdminError> {
-    let http = inner.offload(move || expand(plan.http)).await?;
+    let http = ctx.offload(move || expand(plan.http)).await?;
     if cancel.is_cancelled() {
         return Err(cancelled());
     }
     let identity = if http.tls.as_ref().is_some_and(|t| t.use_server_identity) {
-        let copy = inner
-            .offload(move || Ok(candidate.as_ref().clone()))
-            .await?;
-        Some(
-            tokio::select! {_ = cancel.cancelled()=>return Err(cancelled()),result=inner.backend.identity_client(copy)=>result?},
-        )
+        Some(match &ctx.candidate {
+            Some(handle) => tokio::select! {
+                _ = cancel.cancelled()=>return Err(cancelled()),
+                result=handle.identity_client()=>result?,
+            },
+            None => ctx
+                .backend
+                .active_identity_client()
+                .ok_or_else(|| AdminError::new(400, "admin_client_identity_backend_unavailable"))?,
+        })
     } else {
         None
     };
     let adapter = http.adapter.clone();
-    let (bytes, content) = fetch::fetch(http, identity, cancel.clone(), inner.cpu.clone()).await?;
+    let (bytes, content) = fetch::fetch(http, identity, cancel.clone(), ctx.cpu.clone()).await?;
     let adapter = if adapter.is_empty() {
         super::server::content_adapter(content.as_deref())?
     } else {
@@ -94,7 +139,7 @@ pub(super) async fn load(
     if adapter.is_none() {
         return Ok(Loaded::Json(bytes));
     }
-    let value = tokio::select! {_=cancel.cancelled()=>return Err(cancelled()),result=inner.backend.adapt(bytes,adapter,None)=>result?.result};
+    let value = tokio::select! {_=cancel.cancelled()=>return Err(cancelled()),result=ctx.backend.adapt(bytes,adapter,None)=>result?.result};
     Ok(Loaded::Adapted(value))
 }
 
@@ -140,8 +185,8 @@ pub(super) fn restart(
             if snapshot.generation != generation {
                 return;
             }
-            let candidate = snapshot.raw.clone();
-            let value = match load(&inner, plan.clone(), candidate, cancel.clone()).await {
+            let ctx = LoaderContext::new(&inner, None);
+            let value = match load(&ctx, plan.clone(), cancel.clone()).await {
                 Ok(value) => value,
                 Err(error) => {
                     if cancel.is_cancelled() {
