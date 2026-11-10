@@ -118,9 +118,12 @@ reloads; a matching failed renewal can withdraw the leaf without interrupting
 existing connections. Selection reads one atomic policy snapshot and separately
 checks certificate/staple expiry. Loader registrations bind immutable certificate
 validity, and inactive expired records can be reclaimed. Diagnostic latest-status
-exports are not persistence. The root still must create the shared guard, restore
-authenticated cache before acceptance, connect producers directly, and implement
-renewal ownership and bounded retries; these lifecycle gates remain incomplete.
+exports are not persistence. Authenticated OCSP producers now update a pinned leaf state before cache
+ownership, cancellation and diagnostic bookkeeping checks. External inventory
+readers use immutable getters so the response and shared state stay bound. The
+root still must create the shared guard, restore authenticated cache before
+acceptance, and implement renewal ownership and bounded retries; these lifecycle
+gates remain incomplete.
 
 Build with the current official stable Rust, pinned to 1.99.1 for this phase.
 Keep all QA, fixtures, private configuration, keys, logs, and build output in the

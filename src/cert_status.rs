@@ -284,6 +284,8 @@ impl OcspManager {
             generation: certificate.generation,
             names: certificate.names.clone(),
             chain_der: Vec::new(),
+            leaf_state: certificate.leaf_state.clone(),
+            leaf_sha256: certificate.leaf_sha256,
         };
         let result = self.refresh_one_inner(certificate, cancel.clone()).await;
         if let Err(error) = &result {
@@ -444,7 +446,21 @@ impl OcspManager {
                 verify::validate_issuer(&leaf_der, &issuer_for_check, checked_at)
             })
             .await??;
-            let known = self.observed(&certificate.identity)?;
+            let known = match self.observed(&certificate.identity) {
+                Ok(known) => known,
+                Err(_) => {
+                    // Diagnostic bookkeeping cannot prevent authentication of
+                    // a newly received fact. The later observe still reports
+                    // the error, after the shared leaf has learned the fact.
+                    self.emit(
+                        &certificate,
+                        "ocsp_observation_state_unavailable",
+                        None,
+                        quiet,
+                    );
+                    None
+                }
+            };
             if let Some(observed) = known.as_ref().filter(|o| o.status.state != OcspState::Good) {
                 self.apply_negative(&certificate, &observed.status, quiet)
                     .await?;
@@ -466,12 +482,16 @@ impl OcspManager {
                 .await
                 {
                     Ok(status) => {
+                        if let Err(error) = record_leaf(&certificate, &status) {
+                            self.preserve_negative(&certificate, &status, quiet, None)
+                                .await?;
+                            return Err(error);
+                        }
                         let accepted = match self.observe(&certificate, &status, true) {
                             Ok(value) => value,
                             Err(error) => {
-                                if status.state != OcspState::Good {
-                                    self.apply_negative(&certificate, &status, quiet).await?;
-                                }
+                                self.preserve_negative(&certificate, &status, quiet, None)
+                                    .await?;
                                 return Err(error);
                             }
                         };
@@ -530,22 +550,30 @@ impl OcspManager {
                     config.no_next_update_max_age,
                 )
                 .await?;
+                // Authentication establishes a leaf fact independently of
+                // whether this job still owns permission to write the cache.
+                if let Err(error) = record_leaf(&certificate, &status) {
+                    self.preserve_negative(
+                        &certificate,
+                        &status,
+                        quiet,
+                        Some((&cache_key, &raw, &lease)),
+                    )
+                    .await?;
+                    return Err(error);
+                }
                 lease.check().await?;
                 ensure!(!work.is_cancelled(), "OCSP refresh cancelled");
                 let accepted = match self.observe(&certificate, &status, false) {
                     Ok(value) => value,
                     Err(error) => {
-                        if status.state != OcspState::Good {
-                            if let Err(persist_error) = self
-                                .inner
-                                .store
-                                .store_fenced(&cache_key, &raw, &lease)
-                                .await
-                            {
-                                self.cache_error(&certificate, &persist_error, quiet);
-                            }
-                            self.apply_negative(&certificate, &status, quiet).await?;
-                        }
+                        self.preserve_negative(
+                            &certificate,
+                            &status,
+                            quiet,
+                            Some((&cache_key, &raw, &lease)),
+                        )
+                        .await?;
                         return Err(error);
                     }
                 };
@@ -730,6 +758,23 @@ impl OcspManager {
             observed.persisted = persisted;
         }
         Ok(())
+    }
+    async fn preserve_negative(
+        &self,
+        certificate: &OcspCertificate,
+        status: &VerifiedStatus,
+        quiet: bool,
+        cache: Option<(&str, &[u8], &crate::certstore::StorageLease)>,
+    ) -> Result<()> {
+        if status.state == OcspState::Good {
+            return Ok(());
+        }
+        if let Some((key, raw, lease)) = cache
+            && let Err(error) = self.inner.store.store_fenced(key, raw, lease).await
+        {
+            self.cache_error(certificate, &error, quiet);
+        }
+        self.apply_negative(certificate, status, quiet).await
     }
     async fn apply_negative(
         &self,
@@ -966,6 +1011,21 @@ impl OcspManager {
         result
     }
 }
+fn record_leaf(certificate: &OcspCertificate, status: &VerifiedStatus) -> Result<()> {
+    use crate::leaf_guard::{Observation, Status};
+    certificate.observe_leaf(Observation {
+        status: match status.state {
+            OcspState::Good => Status::Good,
+            OcspState::Revoked => Status::Revoked,
+            OcspState::Unknown => Status::Unknown,
+        },
+        this_update: status.this_update,
+        produced_at: status.produced_at,
+        valid_until: status.valid_until,
+        reason: status.revocation_reason,
+    })
+}
+
 async fn verify_owned(
     raw: Vec<u8>,
     leaf: Vec<u8>,

@@ -4,7 +4,7 @@
 //! those policies. Successful replacement affects future handshakes only.
 
 use crate::challenge::{ACME_ALPN, ChallengeRegistry, normalize_domain};
-use crate::leaf_guard::{LeafGuard, LeafState, leaf_id};
+use crate::leaf_guard::{LeafGuard, LeafState, Observation, leaf_id};
 use anyhow::{Result, anyhow, ensure};
 use rustls::{
     SignatureScheme,
@@ -72,10 +72,39 @@ pub struct CertificateInput<'a> {
 /// Public certificate data only. The generation identifies a single loaded
 /// instance, including reloads of byte-identical certificate material.
 pub struct OcspCertificate {
-    pub identity: [u8; 32],
-    pub generation: u64,
-    pub names: Vec<String>,
-    pub chain_der: Vec<Vec<u8>>,
+    pub(crate) identity: [u8; 32],
+    pub(crate) generation: u64,
+    pub(crate) names: Vec<String>,
+    pub(crate) chain_der: Vec<Vec<u8>>,
+    pub(crate) leaf_state: Arc<LeafState>,
+    pub(crate) leaf_sha256: [u8; 32],
+}
+impl OcspCertificate {
+    pub fn identity(&self) -> [u8; 32] {
+        self.identity
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+    pub fn chain_der(&self) -> &[Vec<u8>] {
+        &self.chain_der
+    }
+    /// Merge an authenticated fact before cache ownership/bookkeeping checks.
+    /// Inventory construction binds the pinned state to this immutable leaf.
+    pub(crate) fn observe_leaf(&self, observation: Observation) -> Result<()> {
+        let leaf = self
+            .chain_der
+            .first()
+            .ok_or_else(|| anyhow!("OCSP leaf missing"))?;
+        ensure!(
+            leaf_id(leaf) == self.leaf_sha256,
+            "OCSP leaf binding mismatch"
+        );
+        self.leaf_state.observe(observation)
+    }
 }
 
 #[derive(Clone)]
@@ -88,6 +117,7 @@ struct Staple {
 struct LoadedCertificate {
     key: Arc<CertifiedKey>,
     leaf_state: Arc<LeafState>,
+    leaf_sha256: [u8; 32],
     identity: [u8; 32],
     instance_generation: u64,
     staple: Option<Staple>,
@@ -287,6 +317,8 @@ impl HotCertificateResolver {
                     .or_insert_with(|| OcspCertificate {
                         identity: cert.identity,
                         generation: cert.instance_generation,
+                        leaf_state: cert.leaf_state.clone(),
+                        leaf_sha256: cert.leaf_sha256,
                         names: Vec::new(),
                         chain_der: cert
                             .key
@@ -551,12 +583,13 @@ fn load_certificate(
         !signature_profile.is_empty(),
         "certificate has unsupported signing profile"
     );
+    let leaf_sha256 = leaf_id(&blocks[0].1);
     Ok((
         names,
         LoadedCertificate {
             key: Arc::new(certified),
-            leaf_state: leaf_guard
-                .intern(leaf_id(&blocks[0].1), leaf.validity().not_after.timestamp())?,
+            leaf_state: leaf_guard.intern(leaf_sha256, leaf.validity().not_after.timestamp())?,
+            leaf_sha256,
             identity,
             instance_generation: 0,
             staple: None,
