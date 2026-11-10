@@ -160,3 +160,8 @@ identities receive a complete response and graceful connection drain. Existing
 streams retain their accepted lifetime unless an explicit close delay applies.
 Session resumption checks the actual stored leaf and current ClientHello policy.
 These HTTP lifecycle components do not complete the root backend or module set.
+
+New Ed25519 account keys retain the existing PEM label and use PKCS8 integer
+version zero for generic-reader interoperability. The outer structure uses the
+pkcs8 encoder; the inner CurvePrivateKey octet string has a fixed two-byte prefix.
+Existing account-key files are imported without rewriting their identity.

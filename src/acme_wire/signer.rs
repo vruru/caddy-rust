@@ -133,8 +133,18 @@ impl AccountSigner {
                 let mut seed = Zeroizing::new([0u8; 32]);
                 OsRng.fill_bytes(seed.as_mut());
                 let key = ed25519_dalek::SigningKey::from_bytes(&seed);
-                let der = key
-                    .to_pkcs8_der()
+                // RFC 8410's version-0 form is accepted by the original Go
+                // reader and OpenSSL 3.0. Dalek's default version-1 export adds
+                // an optional public key that older generic readers reject.
+                // Keep the existing PEM label and derive the public key on load.
+                let mut private = Zeroizing::new([0u8; 34]);
+                private[..2].copy_from_slice(&[0x04, 0x20]);
+                private[2..].copy_from_slice(seed.as_ref());
+                let info = ed25519_dalek::pkcs8::PrivateKeyInfo::new(
+                    ed25519_dalek::pkcs8::ALGORITHM_ID,
+                    private.as_ref(),
+                );
+                let der = ed25519_dalek::pkcs8::SecretDocument::encode_msg(&info)
                     .map_err(|_| anyhow!("ACME Ed25519 export failed"))?;
                 let encoded = Zeroizing::new(
                     base64::engine::general_purpose::STANDARD.encode(der.as_bytes()),
