@@ -49,6 +49,19 @@ Hyper and hyper-util
 The vendored crates retain their own MIT licenses. See vendor/VENDOR.md for
 pinned versions, source checksums, functional changes and opt-in behavior.
 
+rustls and OpenSSL bindings
+--------------------------
+
+vendor/rustls-0.23.46 retains its upstream Apache-2.0, ISC and MIT licenses.
+Its VENDOR.md documents the negotiated-protocol accessor and source checksum.
+vendor/openssl-sys-0.9.118 retains its upstream MIT license. Its VENDOR.md
+documents the pinned OpenSSL source dependency; the FFI and build source are
+unchanged. The openssl Rust wrapper and OpenSSL 4.0.3 are Apache-2.0 licensed;
+the openssl-src build wrapper is dual MIT/Apache-2.0 licensed. These dependencies
+retain their licenses in their original registry distributions. The Apache-2.0
+license text is also provided in LICENSE. No upstream project endorses this
+implementation or its compatibility claims.
+
 Caddy and CertMagic
 ------------------
 
