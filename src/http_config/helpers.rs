@@ -129,38 +129,41 @@ pub(crate) fn initialize_globals() {
     let now = chrono::Local::now();
     let _ = local_zone_name(now.timestamp(), &now.format("%z").to_string());
 }
+/// Local UTC offset in seconds east of UTC and the platform timezone abbreviation.
+/// Call only during blocking preparation/encoding after timezone initialization.
 #[cfg(unix)]
 #[allow(deprecated)] // Use libc's exact declared time_t ABI, including musl targets.
-fn local_zone_name(timestamp: i64, fallback: &str) -> String {
+pub(crate) fn local_zone_info(timestamp: i64) -> Option<(i32, String)> {
     // time_t may be narrower on other Unix targets.
     #[allow(clippy::useless_conversion)]
-    let timestamp: libc::time_t = match timestamp.try_into() {
-        Ok(value) => value,
-        Err(_) => return fallback.to_owned(),
-    };
+    let timestamp: libc::time_t = timestamp.try_into().ok()?;
     let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
     // localtime_r writes a complete caller-owned tm on success. The timezone
     // database is warmed in blocking provisioning, never from request input.
     let result = unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()) };
     if result.is_null() {
-        return fallback.to_owned();
+        return None;
     }
     // A non-null result establishes initialization; libc owns the zone string.
     let local = unsafe { local.assume_init() };
     if local.tm_zone.is_null() {
-        return fallback.to_owned();
+        return None;
     }
     // POSIX localtime_r supplies a valid NUL-terminated abbreviation in tm_zone.
     let zone = unsafe { std::ffi::CStr::from_ptr(local.tm_zone) }.to_string_lossy();
     if zone.is_empty() {
-        fallback.to_owned()
-    } else {
-        zone.into_owned()
+        return None;
     }
+    Some((local.tm_gmtoff.try_into().ok()?, zone.into_owned()))
 }
 #[cfg(not(unix))]
-fn local_zone_name(_timestamp: i64, fallback: &str) -> String {
-    fallback.to_owned()
+pub(crate) fn local_zone_info(_timestamp: i64) -> Option<(i32, String)> {
+    None
+}
+fn local_zone_name(timestamp: i64, fallback: &str) -> String {
+    local_zone_info(timestamp)
+        .map(|(_, zone)| zone)
+        .unwrap_or_else(|| fallback.to_owned())
 }
 pub(crate) fn global_lookup(name: &str) -> Option<String> {
     Some(match name {

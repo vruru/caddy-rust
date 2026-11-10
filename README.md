@@ -358,3 +358,7 @@ from Go's typed-struct field order while retaining the same JSON configuration.
 The shared JSON writer also provides bounded non-HTML-escaped typed output for
 reflected log values. It retains Go float formatting, sorted map keys and escaped
 U+2028/U+2029; ordinary Admin encoding, raw adaptation and ETags remain HTML-safe.
+
+The HTTP and logging libraries share one warmed local-timezone lookup for the
+platform UTC offset and abbreviation. It runs only during blocking preparation
+or bounded encoding work; the existing placeholder fallback is preserved.
