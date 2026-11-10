@@ -8,7 +8,6 @@ use std::{
     ops::RangeInclusive,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 pub(super) async fn serve(
     ctx: &mut Context,
@@ -19,13 +18,20 @@ pub(super) async fn serve(
     let root = ctx.expand(root.unwrap_or("{http.vars.root}"))?;
     let decoded = decoded_path(ctx.req().uri().path())?;
     let mut path = safe_join(std::path::Path::new(&root), &decoded)?;
-    let mut metadata = match tokio::fs::metadata(&path).await {
+    let stat_path = path.clone();
+    let mut metadata = match ctx
+        .resources
+        .metadata
+        .run(move || std::fs::metadata(stat_path))
+        .await
+        .map_err(|error| super::request::budget_failure(ctx, error))?
+    {
         Ok(meta) => meta,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
             return Err(failure(StatusCode::FORBIDDEN));
         }
-        Err(_) => return Err(anyhow::anyhow!("file metadata unavailable")),
+        Err(error) => return Err(super::request::file_io_failure(ctx, &error)),
     };
     if hidden(ctx, &path, hide)? {
         return Ok(None);
@@ -37,7 +43,19 @@ pub(super) async fn serve(
             if hidden(ctx, &candidate, hide)? {
                 continue;
             }
-            if let Ok(meta) = tokio::fs::metadata(&candidate).await
+            let stat_path = candidate.clone();
+            let lookup = ctx
+                .resources
+                .metadata
+                .run(move || std::fs::metadata(stat_path))
+                .await
+                .map_err(|error| super::request::budget_failure(ctx, error))?;
+            if let Err(error) = &lookup
+                && super::request::descriptor_exhausted(error)
+            {
+                return Err(super::request::file_io_failure(ctx, error));
+            }
+            if let Ok(meta) = lookup
                 && meta.is_file()
             {
                 path = candidate;
@@ -73,18 +91,29 @@ pub(super) async fn serve(
         http::header::VARY,
         HeaderValue::from_static("Accept-Encoding"),
     );
+    // Bound open descriptors before opening; queued bodies hold no file FD.
+    // This slot is independent of per-chunk read work and slow network writes.
+    let admission = Arc::new(
+        ctx.resources
+            .streams
+            .acquire()
+            .await
+            .map_err(|error| super::request::budget_failure(ctx, error))?,
+    );
+    let open_admission = admission.clone();
     let opened_path = path.clone();
-    let opened = tokio::task::spawn_blocking(move || {
-        crate::http_config::helpers::open_regular_file(opened_path)
-    })
-    .await?;
-    let mut file = tokio::fs::File::from_std(opened.map_err(|error| {
-        if error.kind() == io::ErrorKind::PermissionDenied {
-            failure(StatusCode::FORBIDDEN)
-        } else {
-            anyhow::anyhow!("file cannot be opened")
-        }
-    })?);
+    let (file, opened_metadata, admission) = ctx
+        .resources
+        .metadata
+        .run(move || {
+            let file = crate::http_config::helpers::open_regular_file(opened_path)?;
+            let metadata = file.metadata()?;
+            Ok::<_, io::Error>((file, metadata, open_admission))
+        })
+        .await
+        .map_err(|error| super::request::budget_failure(ctx, error))?
+        .map_err(|error| super::request::file_io_failure(ctx, &error))?;
+    let file = Arc::new(file);
     if !matches!(*ctx.req().method(), Method::GET | Method::HEAD)
         && !ctx.values.contains_key("http.error.status_code")
     {
@@ -94,7 +123,7 @@ pub(super) async fn serve(
     }
     // Use fstat after opening. A rename between metadata and open must not give
     // a new representation the old file's ETag/length.
-    metadata = file.metadata().await?;
+    metadata = opened_metadata;
     let size = metadata.len();
     let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
     let nanos = match modified.duration_since(UNIX_EPOCH) {
@@ -278,11 +307,15 @@ pub(super) async fn serve(
     let initial = if multipart {
         Mode::Header
     } else {
-        file.seek(io::SeekFrom::Start(*ranges[0].start())).await?;
         Mode::Body(ranges[0].end() - ranges[0].start() + 1)
     };
+    let offset = *ranges[0].start();
     let state = FileState {
         file,
+        admission,
+        offset,
+        read_timeout: ctx.resources.read_timeout,
+        read_budget: ctx.resources.reads.clone(),
         ranges,
         index: 0,
         boundary,
@@ -298,7 +331,7 @@ pub(super) async fn serve(
                     let range = &state.ranges[state.index];
                     let header =
                         part_header(&state.boundary, &state.content_type, range, state.size);
-                    state.file.seek(io::SeekFrom::Start(*range.start())).await?;
+                    state.offset = *range.start();
                     state.mode = Mode::Body(range.end() - range.start() + 1);
                     return Ok::<_, io::Error>(Some((
                         hyper::body::Frame::data(Bytes::from(header)),
@@ -306,15 +339,26 @@ pub(super) async fn serve(
                     )));
                 }
                 Mode::Body(remaining) if remaining > 0 => {
-                    let mut bytes = vec![0; remaining.min(64 * 1024) as usize];
-                    let read = state.file.read(&mut bytes).await?;
+                    let bytes = super::resource_budget::read_chunk(
+                        state.file.clone(),
+                        state.admission.clone(),
+                        state.read_budget.clone(),
+                        state.offset,
+                        remaining.min(64 * 1024) as usize,
+                        state.read_timeout,
+                    )
+                    .await?;
+                    let read = bytes.len();
                     if read == 0 {
                         return Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "file changed during response",
                         ));
                     }
-                    bytes.truncate(read);
+                    state.offset = state
+                        .offset
+                        .checked_add(read as u64)
+                        .ok_or_else(|| io::Error::other("file offset overflow"))?;
                     state.mode = Mode::Body(remaining - read as u64);
                     return Ok(Some((hyper::body::Frame::data(Bytes::from(bytes)), state)));
                 }
@@ -362,7 +406,11 @@ enum Mode {
     Done,
 }
 struct FileState {
-    file: tokio::fs::File,
+    file: Arc<std::fs::File>,
+    admission: Arc<tokio::sync::OwnedSemaphorePermit>,
+    offset: u64,
+    read_timeout: Duration,
+    read_budget: super::resource_budget::BlockingBudget,
     ranges: Vec<RangeInclusive<u64>>,
     index: usize,
     boundary: String,

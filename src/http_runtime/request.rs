@@ -9,7 +9,6 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
 };
-use tokio::sync::Semaphore;
 
 struct LazyMap {
     source: String,
@@ -19,6 +18,7 @@ struct LazyMap {
 }
 pub(super) struct Context {
     pub request: Option<Request<Body>>,
+    pub resources: Arc<super::resource_budget::Resources>,
     pub peer: SocketAddr,
     pub local: SocketAddr,
     pub tls: bool,
@@ -256,6 +256,7 @@ pub(super) async fn handle(
     let body = IdleBody::new(body, server.plan.read_idle_timeout).boxed_unsync();
     let mut ctx = Context {
         request: Some(Request::from_parts(parts, body)),
+        resources: inner.resources.clone(),
         peer,
         local,
         tls,
@@ -312,6 +313,44 @@ enum Flow {
     Continue,
     Stop,
     Response(Response<Body>),
+}
+pub(super) fn descriptor_exhausted(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::EMFILE) | Some(libc::ENFILE)
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
+pub(super) fn file_io_failure(ctx: &mut Context, error: &std::io::Error) -> anyhow::Error {
+    if descriptor_exhausted(error) {
+        return budget_failure(ctx, super::resource_budget::BudgetError::Overloaded);
+    }
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        return failure(StatusCode::FORBIDDEN);
+    }
+    anyhow::anyhow!("file operation unavailable")
+}
+pub(super) fn budget_failure(
+    ctx: &mut Context,
+    error: super::resource_budget::BudgetError,
+) -> anyhow::Error {
+    match error {
+        super::resource_budget::BudgetError::Overloaded => {
+            ctx.immediate
+                .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+            failure(StatusCode::SERVICE_UNAVAILABLE)
+        }
+        super::resource_budget::BudgetError::WorkerFailed => {
+            failure(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 #[derive(Debug)]
 struct HttpError {
@@ -629,7 +668,11 @@ fn handlers<'a>(
                         defaults: defaults.clone(),
                     });
                 }
-                Handler::Authentication { accounts, realm } => {
+                Handler::Authentication {
+                    accounts,
+                    realm,
+                    cache,
+                } => {
                     let authorization = ctx
                         .req()
                         .headers()
@@ -637,32 +680,71 @@ fn handlers<'a>(
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or_default();
                     let decoded = authorization
-                        .strip_prefix("Basic ")
-                        .and_then(|value| {
-                            base64::engine::general_purpose::STANDARD.decode(value).ok()
+                        .get(..6)
+                        .filter(|prefix| prefix.eq_ignore_ascii_case("Basic "))
+                        .and_then(|_| {
+                            base64::engine::GeneralPurpose::new(
+                                &base64::alphabet::STANDARD,
+                                base64::engine::general_purpose::GeneralPurposeConfig::new()
+                                    .with_decode_allow_trailing_bits(true),
+                            )
+                            .decode(&authorization[6..])
+                            .ok()
                         })
-                        .and_then(|value| String::from_utf8(value).ok());
-                    let credentials = decoded.as_deref().and_then(|s| s.split_once(':'));
+                        .map(zeroize::Zeroizing::new);
+                    let credentials = decoded.as_ref().and_then(|bytes| {
+                        let colon = bytes.iter().position(|b| *b == b':')?;
+                        let user = String::from_utf8(bytes[..colon].to_vec()).ok();
+                        Some((user, zeroize::Zeroizing::new(bytes[colon + 1..].to_vec())))
+                    });
+                    drop(decoded);
                     let mut authenticated = None;
-                    if let Some((username, password)) = credentials
-                        && let Some(account) = accounts.iter().find(|a| a.username == username)
-                    {
-                        static WORKERS: std::sync::OnceLock<Arc<Semaphore>> =
-                            std::sync::OnceLock::new();
-                        let permit = WORKERS
-                            .get_or_init(|| Arc::new(Semaphore::new(16)))
-                            .clone()
-                            .acquire_owned()
-                            .await?;
-                        let hash = account.password.clone();
-                        let password = zeroize::Zeroizing::new(password.to_owned());
-                        let accepted = tokio::task::spawn_blocking(move || {
-                            let _permit = permit;
-                            bcrypt::verify(password.as_str(), &hash).unwrap_or(false)
-                        })
-                        .await?;
-                        if accepted {
-                            authenticated = Some(username.to_owned());
+                    if let Some((username, password)) = credentials {
+                        let account = username
+                            .as_deref()
+                            .and_then(|name| accounts.iter().find(|a| a.username == name));
+                        let exists = account.is_some();
+                        let hash = account
+                            .map(|a| a.password.as_str())
+                            .unwrap_or(super::auth_cache::FAKE_BCRYPT_HASH)
+                            .to_owned();
+                        let result = if let Some(cache) = cache {
+                            cache.verify(ctx.resources.clone(), hash, password).await
+                        } else {
+                            let count = ctx.resources.auth_comparisons.clone();
+                            ctx.resources
+                                .auth
+                                .run(move || {
+                                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    bcrypt::verify(password.as_slice(), &hash)
+                                        .map_err(|_| super::auth_cache::AuthError::HashInvalid)
+                                })
+                                .await
+                                .map_err(|e| match e {
+                                    super::resource_budget::BudgetError::Overloaded => {
+                                        super::auth_cache::AuthError::Overloaded
+                                    }
+                                    super::resource_budget::BudgetError::WorkerFailed => {
+                                        super::auth_cache::AuthError::WorkerFailed
+                                    }
+                                })
+                                .and_then(std::convert::identity)
+                        };
+                        let accepted = match result {
+                            Ok(value) => value,
+                            Err(super::auth_cache::AuthError::HashInvalid) => false,
+                            Err(super::auth_cache::AuthError::Overloaded) => {
+                                return Err(budget_failure(
+                                    ctx,
+                                    super::resource_budget::BudgetError::Overloaded,
+                                ));
+                            }
+                            Err(super::auth_cache::AuthError::WorkerFailed) => {
+                                return Err(failure(StatusCode::INTERNAL_SERVER_ERROR));
+                            }
+                        };
+                        if accepted && exists {
+                            authenticated = username;
                         }
                     }
                     if let Some(username) = authenticated {
@@ -845,7 +927,19 @@ fn matches<'a>(
                 for candidate in try_files {
                     let candidate = ctx.expand(candidate)?;
                     let path = safe_join(Path::new(&base), &candidate)?;
-                    if let Ok(metadata) = tokio::fs::metadata(&path).await {
+                    let lookup_path = path.clone();
+                    let lookup = ctx
+                        .resources
+                        .metadata
+                        .run(move || std::fs::metadata(lookup_path))
+                        .await
+                        .map_err(|error| budget_failure(ctx, error))?;
+                    if let Err(error) = &lookup
+                        && descriptor_exhausted(error)
+                    {
+                        return Err(file_io_failure(ctx, error));
+                    }
+                    if let Ok(metadata) = lookup {
                         if metadata.is_dir() != candidate.ends_with('/') {
                             continue;
                         }
@@ -1116,7 +1210,6 @@ where
         self.inner.size_hint()
     }
 }
-
 
 fn header_pattern(pattern: &str, value: &str) -> bool {
     let pattern = pattern.to_ascii_lowercase();

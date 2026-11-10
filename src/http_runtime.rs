@@ -1,6 +1,8 @@
 //! Native HTTP listeners with request-scoped configuration snapshots. Preparation is
 //! isolated from publication; failed binds and certificate loads preserve the
 //! active generation. This module never starts a Go process.
+#[path = "http_runtime/auth_cache.rs"]
+pub(crate) mod auth_cache;
 #[path = "http_runtime/connection_identity.rs"]
 mod connection_identity;
 #[path = "http_runtime/connection_sessions.rs"]
@@ -18,8 +20,12 @@ mod path_glob;
 pub(crate) use path_glob::go_path_glob;
 #[path = "http_runtime/proxy.rs"]
 mod proxy;
+#[path = "http_runtime/resource_budget.rs"]
+mod resource_budget;
+pub use resource_budget::{BudgetSnapshot, ResourceDiagnostics, ResourceLimits};
 #[path = "http_runtime/request.rs"]
 mod request;
+
 #[path = "http_runtime/rewrite_uri.rs"]
 mod rewrite_uri;
 #[path = "http_runtime/sniff.rs"]
@@ -87,6 +93,7 @@ struct Inner {
     managed: Arc<HotCertificateResolver>,
     tasks: TaskTracker,
     upgrades: TaskTracker,
+    resources: Arc<resource_budget::Resources>,
     stopped: CancellationToken,
 }
 struct Generation {
@@ -148,6 +155,31 @@ impl CandidateResolver {
 }
 impl HttpRuntime {
     pub fn new(registry: ChallengeRegistry, resolver: Arc<HotCertificateResolver>) -> Self {
+        Self::from_resources(
+            registry,
+            resolver,
+            Arc::new(resource_budget::Resources::automatic()),
+        )
+    }
+    /// Explicit native resource policy. `None` disables an independent timer;
+    /// `Some(Duration::ZERO)` is rejected. Operation/waiter counts stay bounded.
+    /// These options do not introduce or ignore fields in Caddy JSON.
+    pub fn with_resource_limits(
+        registry: ChallengeRegistry,
+        resolver: Arc<HotCertificateResolver>,
+        limits: ResourceLimits,
+    ) -> Result<Self> {
+        Ok(Self::from_resources(
+            registry,
+            resolver,
+            Arc::new(resource_budget::Resources::from_limits(limits)?),
+        ))
+    }
+    fn from_resources(
+        registry: ChallengeRegistry,
+        resolver: Arc<HotCertificateResolver>,
+        resources: Arc<resource_budget::Resources>,
+    ) -> Self {
         let initial = Generation {
             id: 0,
             servers: HashMap::new(),
@@ -161,10 +193,15 @@ impl HttpRuntime {
                 managed: resolver,
                 tasks: TaskTracker::new(),
                 upgrades: TaskTracker::new(),
+                resources,
                 stopped: CancellationToken::new(),
             }),
             control: Arc::new(lifecycle::Lifecycle::new()),
         }
+    }
+    /// CPU-adaptive HTTP work admission; snapshots contain counts only.
+    pub fn resource_diagnostics(&self) -> ResourceDiagnostics {
+        self.inner.resources.snapshot()
     }
     pub fn generation(&self) -> u64 {
         self.inner.current.load().id

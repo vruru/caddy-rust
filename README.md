@@ -151,6 +151,14 @@ rounding while rejecting integer overflow instead of wrapping. JSON integer
 durations retain nanosecond semantics. Callers keep their own negative-value
 policy and error context; this helper does not provision a runtime.
 
+HTTP file descriptors, disk reads, metadata and password verification have
+separate bounded admission. A slow download does not hold a disk-read worker.
+The per-handler bcrypt cache follows the configuration's optional `hash_cache`;
+omitting it keeps verification uncached. These limits and cache ownership are
+library behavior, with remaining transport and product integration tracked in
+COMPATIBILITY.md. The process explicitly bounds Tokio's blocking pool while
+choosing async worker threads from every CPU available to the process.
+
 Production runtime construction detects this process's available CPUs on every
 startup rather than hard-coding a worker count. Test cgroup CPU limits remain
 confined to isolated QA containers and must not enter production service units.

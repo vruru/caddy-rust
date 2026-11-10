@@ -69,6 +69,7 @@ pub(crate) enum Handler {
     Authentication {
         accounts: Vec<Account>,
         realm: String,
+        cache: Option<std::sync::Arc<crate::http_runtime::auth_cache::AuthCache>>,
     },
     FileServer {
         root: Option<String>,

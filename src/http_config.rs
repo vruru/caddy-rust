@@ -820,11 +820,19 @@ fn parse_handler(value: &Value, depth: usize) -> Result<Handler> {
                     "unsupported authentication hash"
                 );
             }
-            if basic.contains_key("hash_cache") {
-                return Err(unsupported(
-                    "/authentication/providers/http_basic/hash_cache",
-                ));
-            }
+            let cache = match basic.get("hash_cache") {
+                None | Some(Value::Null) => None,
+                Some(value) => {
+                    let cache_config =
+                        object(value, "/authentication/providers/http_basic/hash_cache")?;
+                    deny_unknown(
+                        cache_config,
+                        &[],
+                        "/authentication/providers/http_basic/hash_cache",
+                    )?;
+                    Some(crate::http_runtime::auth_cache::AuthCache::new()?)
+                }
+            };
             let mut accounts = Vec::new();
             for value in required(basic, "accounts")?
                 .as_array()
@@ -846,6 +854,7 @@ fn parse_handler(value: &Value, depth: usize) -> Result<Handler> {
             );
             Handler::Authentication {
                 accounts,
+                cache,
                 realm: basic
                     .get("realm")
                     .map(|v| string(v, path))

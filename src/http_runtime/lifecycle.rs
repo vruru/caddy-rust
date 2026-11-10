@@ -346,6 +346,7 @@ impl HttpRuntime {
             }
             self.inner.tasks.wait().await;
             self.inner.upgrades.wait().await;
+            self.inner.resources.wait().await;
         })
         .await
         .map_err(|_| anyhow::anyhow!("HTTP shutdown deadline elapsed with pending work"))?;
@@ -377,5 +378,6 @@ impl HttpRuntime {
         current.drain.cancel();
         self.inner.tasks.close();
         self.inner.upgrades.close();
+        self.inner.resources.close();
     }
 }
