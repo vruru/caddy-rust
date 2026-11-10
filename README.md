@@ -62,6 +62,17 @@ a local filesystem. Recover all outstanding transactions before returning the
 store to the original server. This does not provide distributed fencing with Go
 writers or establish NFS or physical power-loss guarantees.
 
+Certificate snapshots also expose an OCSP attachment primitive. The caller must
+authenticate the response before attachment. Updates bind to the exact DER
+chain and loaded instance, and expired responses are excluded from new
+handshakes without I/O or certificate parsing. Required certificate material
+and optional staples use independent budgets; optional cache pressure cannot
+prevent certificate publication. Byte-identical reloads can inherit unexpired
+verified status while rejecting stale publishers. A policy change must use a
+fresh resolver or explicitly clear inherited status. Conflict, capacity and
+expiry errors are distinct types. This primitive is not an OCSP fetcher or a
+complete certificate-policy service.
+
 The official Caddy v2.11.7 and CertMagic v0.25.6 implementation provide the pinned
 behavioral reference. The original Go plugins have no native cross-language ABI:
 module configuration and behavior require individual Rust implementations.

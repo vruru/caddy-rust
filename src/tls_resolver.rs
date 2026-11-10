@@ -11,10 +11,14 @@ use rustls::{
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use x509_parser::extensions::GeneralName;
@@ -25,6 +29,35 @@ const MAX_CERT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_KEY_BYTES: usize = 128 * 1024;
 const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_UPSERT_ATTEMPTS: usize = 8;
+const MAX_OCSP_BYTES: usize = 1024 * 1024;
+const MAX_STAPLE_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug)]
+pub struct OcspPublishConflict;
+impl std::fmt::Display for OcspPublishConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OCSP update conflicted with concurrent publication; retry required")
+    }
+}
+impl std::error::Error for OcspPublishConflict {}
+
+#[derive(Debug)]
+pub struct OcspPublishCapacity;
+impl std::fmt::Display for OcspPublishCapacity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OCSP staple data limit exceeded")
+    }
+}
+impl std::error::Error for OcspPublishCapacity {}
+
+#[derive(Debug)]
+pub struct OcspPublishExpired;
+impl std::fmt::Display for OcspPublishExpired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OCSP response already expired")
+    }
+}
+impl std::error::Error for OcspPublishExpired {}
 
 /// Input is borrowed and never included in Debug or error strings. DNS aliases
 /// are explicit, must be covered by the leaf SAN, and may include one leading
@@ -35,8 +68,27 @@ pub struct CertificateInput<'a> {
     pub private_key_pem: &'a [u8],
 }
 
+/// Public certificate data only. The generation identifies a single loaded
+/// instance, including reloads of byte-identical certificate material.
+pub struct OcspCertificate {
+    pub identity: [u8; 32],
+    pub generation: u64,
+    pub names: Vec<String>,
+    pub chain_der: Vec<Vec<u8>>,
+}
+
+#[derive(Clone)]
+struct Staple {
+    key: Arc<CertifiedKey>,
+    valid_until: i64,
+}
+
+#[derive(Clone)]
 struct LoadedCertificate {
     key: Arc<CertifiedKey>,
+    identity: [u8; 32],
+    instance_generation: u64,
+    staple: Option<Staple>,
     not_before: i64,
     not_after: i64,
     size: usize,
@@ -54,6 +106,7 @@ struct Snapshot {
 pub struct HotCertificateResolver {
     challenges: ChallengeRegistry,
     certificates: RwLock<Arc<Snapshot>>,
+    next_instance: AtomicU64,
 }
 
 impl fmt::Debug for HotCertificateResolver {
@@ -68,7 +121,16 @@ impl HotCertificateResolver {
         Self {
             challenges,
             certificates: RwLock::new(Arc::new(Snapshot::default())),
+            next_instance: AtomicU64::new(1),
         }
+    }
+
+    fn instance_generation(&self) -> Result<u64> {
+        self.next_instance
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| anyhow!("certificate instance generation exhausted"))
     }
 
     /// Validate the entire candidate outside the lock, then publish one snapshot.
@@ -79,6 +141,12 @@ impl HotCertificateResolver {
             inputs.len() <= MAX_CERTIFICATES,
             "certificate count limit exceeded"
         );
+        let base = self
+            .certificates
+            .read()
+            .map_err(|_| anyhow!("certificate state unavailable"))?
+            .clone();
+        let now = clock_now()?;
         let mut bytes = 0usize;
         let mut next: HashMap<String, Vec<Arc<LoadedCertificate>>> = HashMap::new();
         for input in inputs {
@@ -87,7 +155,9 @@ impl HotCertificateResolver {
                 .and_then(|n| n.checked_add(input.private_key_pem.len()))
                 .ok_or_else(|| anyhow!("certificate data limit exceeded"))?;
             ensure!(bytes <= MAX_TOTAL_BYTES, "certificate data limit exceeded");
-            let (names, cert) = load_certificate(input)?;
+            let (names, mut cert) = load_certificate(input)?;
+            cert.instance_generation = self.instance_generation()?;
+            inherit_staple(&mut cert, &base.names, now);
             let cert = Arc::new(cert);
             for name in names {
                 ensure!(
@@ -102,6 +172,8 @@ impl HotCertificateResolver {
                 candidates.push(cert.clone());
             }
         }
+        prune_staples(&mut next, now, true)?;
+        validate_snapshot_size(&next)?;
         let mut guard = self
             .certificates
             .write()
@@ -127,14 +199,18 @@ impl HotCertificateResolver {
     /// candidate cannot replace the current key. This does not remove aliases
     /// omitted by the caller: full configuration reload must use replace().
     pub fn upsert(&self, input: &CertificateInput<'_>) -> Result<()> {
-        let (names, cert) = load_certificate(input)?;
-        let cert = Arc::new(cert);
+        let (names, mut cert) = load_certificate(input)?;
+        cert.instance_generation = self.instance_generation()?;
         for _ in 0..MAX_UPSERT_ATTEMPTS {
             let base = self
                 .certificates
                 .read()
                 .map_err(|_| anyhow!("certificate state unavailable"))?
                 .clone();
+            let now = clock_now()?;
+            let mut candidate_cert = cert.clone();
+            inherit_staple(&mut candidate_cert, &base.names, now);
+            let cert = Arc::new(candidate_cert);
             // Cloning, merging, capacity checks and destruction of discarded
             // candidates do not block certificate lookups or other publishers.
             let mut next = base.names.clone();
@@ -153,6 +229,7 @@ impl HotCertificateResolver {
                 );
                 candidates.push(cert.clone());
             }
+            prune_staples(&mut next, now, true)?;
             validate_snapshot_size(&next)?;
             let generation = base
                 .generation
@@ -184,6 +261,126 @@ impl HotCertificateResolver {
         Some(self.certificates.read().ok()?.generation)
     }
 
+    /// Clone only public certificate data, outside the short snapshot lock.
+    /// Call this from a bounded worker when inventories are large.
+    pub fn ocsp_certificates(&self) -> Result<Vec<OcspCertificate>> {
+        let snapshot = self
+            .certificates
+            .read()
+            .map_err(|_| anyhow!("certificate state unavailable"))?
+            .clone();
+        let mut certificates: HashMap<u64, OcspCertificate> = HashMap::new();
+        for (name, candidates) in &snapshot.names {
+            for cert in candidates {
+                let entry = certificates
+                    .entry(cert.instance_generation)
+                    .or_insert_with(|| OcspCertificate {
+                        identity: cert.identity,
+                        generation: cert.instance_generation,
+                        names: Vec::new(),
+                        chain_der: cert
+                            .key
+                            .cert
+                            .iter()
+                            .map(|der| der.as_ref().to_vec())
+                            .collect(),
+                    });
+                entry.names.push(name.clone());
+            }
+        }
+        let mut certificates = certificates.into_values().collect::<Vec<_>>();
+        for certificate in &mut certificates {
+            certificate.names.sort();
+            certificate.names.dedup();
+        }
+        certificates.sort_by_key(|certificate| certificate.generation);
+        Ok(certificates)
+    }
+
+    /// Attach only an already verified OCSP response to this exact loaded
+    /// certificate instance. The status manager owns response authentication.
+    /// A stale worker cannot attach to a byte-identical reloaded certificate.
+    pub fn set_ocsp(
+        &self,
+        identity: &[u8; 32],
+        generation: u64,
+        staple: Option<(Vec<u8>, i64)>,
+    ) -> Result<bool> {
+        if let Some((bytes, valid_until)) = &staple {
+            let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
+            ensure!(
+                !bytes.is_empty() && bytes.len() <= MAX_OCSP_BYTES,
+                "OCSP response size outside bounds"
+            );
+            if *valid_until <= now {
+                return Err(anyhow::Error::new(OcspPublishExpired));
+            }
+        }
+        for _ in 0..MAX_UPSERT_ATTEMPTS {
+            let base = self
+                .certificates
+                .read()
+                .map_err(|_| anyhow!("certificate state unavailable"))?
+                .clone();
+            let Some(old) =
+                base.names.values().flatten().find(|cert| {
+                    cert.identity == *identity && cert.instance_generation == generation
+                })
+            else {
+                return Ok(false);
+            };
+            if staple.is_none() && old.staple.is_none() {
+                return Ok(true);
+            }
+            let mut next_cert = old.as_ref().clone();
+            next_cert.staple = if let Some((bytes, valid_until)) = &staple {
+                ensure!(
+                    *valid_until <= old.not_after,
+                    "OCSP validity exceeds certificate expiry"
+                );
+                let mut key = old.key.as_ref().clone();
+                key.ocsp = Some(bytes.clone());
+                Some(Staple {
+                    key: Arc::new(key),
+                    valid_until: *valid_until,
+                })
+            } else {
+                None
+            };
+            let next_cert = Arc::new(next_cert);
+            let mut names = base.names.clone();
+            for candidates in names.values_mut() {
+                for cert in candidates {
+                    if cert.identity == *identity && cert.instance_generation == generation {
+                        *cert = next_cert.clone();
+                    }
+                }
+            }
+            prune_staples(&mut names, clock_now()?, false)?;
+            validate_snapshot_size(&names)?;
+            let candidate = Arc::new(Snapshot {
+                generation: base
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("certificate generation exhausted"))?,
+                names,
+            });
+            let mut guard = self
+                .certificates
+                .write()
+                .map_err(|_| anyhow!("certificate state unavailable"))?;
+            if !Arc::ptr_eq(&base, &guard) {
+                drop(guard);
+                continue;
+            }
+            let previous = std::mem::replace(&mut *guard, candidate);
+            drop(guard);
+            drop(previous);
+            return Ok(true);
+        }
+        Err(anyhow::Error::new(OcspPublishConflict))
+    }
+
     /// Pure selection entry used by the rustls trait and isolated TLS QA. An
     /// offered ACME protocol is never allowed to fall through to ordinary TLS.
     pub fn select(
@@ -209,7 +406,13 @@ impl HotCertificateResolver {
                         && now < entry.not_after
                         && entry.key.key.choose_scheme(signature_schemes).is_some()
                 })
-                .map(|entry| entry.key.clone())
+                .map(|entry| {
+                    entry
+                        .staple
+                        .as_ref()
+                        .filter(|staple| now < staple.valid_until)
+                        .map_or_else(|| entry.key.clone(), |staple| staple.key.clone())
+                })
         };
         if let Some(key) = snapshot.names.get(&sni).and_then(select) {
             return Some(key);
@@ -229,6 +432,15 @@ impl ResolvesServerCert for HotCertificateResolver {
             .unwrap_or_default();
         self.select(hello.server_name(), &alpn, hello.signature_schemes())
     }
+}
+
+fn staple_size(key: &CertifiedKey) -> Result<usize> {
+    key.cert
+        .iter()
+        .try_fold(key.ocsp.as_ref().map_or(0, Vec::len), |size, der| {
+            size.checked_add(der.len())
+                .ok_or_else(|| anyhow!("certificate size accounting overflow"))
+        })
 }
 
 fn load_certificate(input: &CertificateInput<'_>) -> Result<(Vec<String>, LoadedCertificate)> {
@@ -253,6 +465,14 @@ fn load_certificate(input: &CertificateInput<'_>) -> Result<(Vec<String>, Loaded
         chain.push(CertificateDer::from(der.to_vec()));
     }
     let key = crate::certmagic::signing_key(input.private_key_pem, "tls-candidate")?;
+    let mut identity = Sha256::new();
+    identity.update(b"caddy-native-ocsp-chain-v1\0");
+    identity.update((chain.len() as u64).to_be_bytes());
+    for der in &chain {
+        identity.update((der.len() as u64).to_be_bytes());
+        identity.update(der.as_ref());
+    }
+    let identity = identity.finalize().into();
     let certified = CertifiedKey::new(chain, key);
     certified
         .keys_match()
@@ -319,6 +539,9 @@ fn load_certificate(input: &CertificateInput<'_>) -> Result<(Vec<String>, Loaded
         names,
         LoadedCertificate {
             key: Arc::new(certified),
+            identity,
+            instance_generation: 0,
+            staple: None,
             signature_profile,
             size: input.certificate_pem.len() + input.private_key_pem.len(),
             not_before: leaf.validity().not_before.timestamp(),
@@ -327,9 +550,84 @@ fn load_certificate(input: &CertificateInput<'_>) -> Result<(Vec<String>, Loaded
     ))
 }
 
+fn clock_now() -> Result<i64> {
+    Ok(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+    )?)
+}
+fn inherit_staple(
+    cert: &mut LoadedCertificate,
+    names: &HashMap<String, Vec<Arc<LoadedCertificate>>>,
+    now: i64,
+) {
+    let Some(staple) = names
+        .values()
+        .flatten()
+        .filter(|old| old.identity == cert.identity)
+        .filter_map(|old| old.staple.as_ref())
+        .filter(|staple| staple.valid_until > now)
+        .max_by_key(|staple| staple.valid_until)
+    else {
+        return;
+    };
+    let mut key = cert.key.as_ref().clone();
+    key.ocsp = staple.key.ocsp.clone();
+    cert.staple = Some(Staple {
+        key: Arc::new(key),
+        valid_until: staple.valid_until,
+    });
+}
+// Optional status data must never prevent publication of required certificate
+// material. Certificate publication may evict cached staples; OCSP attachment
+// instead rejects over-budget candidates. All aliases keep one instance Arc.
+fn prune_staples(
+    names: &mut HashMap<String, Vec<Arc<LoadedCertificate>>>,
+    now: i64,
+    evict: bool,
+) -> Result<()> {
+    let mut instances: HashMap<u64, Arc<LoadedCertificate>> = names
+        .values()
+        .flatten()
+        .map(|cert| (cert.instance_generation, cert.clone()))
+        .collect();
+    let mut order = instances.keys().copied().collect::<Vec<_>>();
+    order.sort_unstable();
+    let mut bytes = 0usize;
+    for generation in order {
+        let cert = instances
+            .get_mut(&generation)
+            .ok_or_else(|| anyhow!("certificate instance missing"))?;
+        if let Some(staple) = &cert.staple {
+            let size = staple_size(&staple.key)?;
+            let keep = staple.valid_until > now
+                && (!evict
+                    || bytes
+                        .checked_add(size)
+                        .is_some_and(|total| total <= MAX_STAPLE_BYTES));
+            if keep {
+                bytes = bytes
+                    .checked_add(size)
+                    .ok_or_else(|| anyhow!("OCSP staple data limit exceeded"))?;
+            } else {
+                let mut unstapled = cert.as_ref().clone();
+                unstapled.staple = None;
+                *cert = Arc::new(unstapled);
+            }
+        }
+    }
+    for cert in names.values_mut().flatten() {
+        *cert = instances
+            .get(&cert.instance_generation)
+            .ok_or_else(|| anyhow!("certificate instance missing"))?
+            .clone();
+    }
+    Ok(())
+}
+
 fn validate_snapshot_size(names: &HashMap<String, Vec<Arc<LoadedCertificate>>>) -> Result<()> {
     let mut unique = HashSet::new();
     let mut size = 0usize;
+    let mut staple_bytes = 0usize;
     for cert in names.values().flatten() {
         if unique.insert(Arc::as_ptr(cert)) {
             ensure!(
@@ -340,6 +638,14 @@ fn validate_snapshot_size(names: &HashMap<String, Vec<Arc<LoadedCertificate>>>) 
                 .checked_add(cert.size)
                 .ok_or_else(|| anyhow!("certificate data limit exceeded"))?;
             ensure!(size <= MAX_TOTAL_BYTES, "certificate data limit exceeded");
+            if let Some(staple) = &cert.staple {
+                staple_bytes = staple_bytes
+                    .checked_add(staple_size(&staple.key)?)
+                    .ok_or_else(|| anyhow!("OCSP staple data limit exceeded"))?;
+                if staple_bytes > MAX_STAPLE_BYTES {
+                    return Err(anyhow::Error::new(OcspPublishCapacity));
+                }
+            }
         }
     }
     Ok(())
