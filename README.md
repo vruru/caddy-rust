@@ -141,3 +141,9 @@ The shared duration parser preserves the original day-unit float conversion and
 rounding while rejecting integer overflow instead of wrapping. JSON integer
 durations retain nanosecond semantics. Callers keep their own negative-value
 policy and error context; this helper does not provision a runtime.
+
+Production runtime construction detects this process's available CPUs on every
+startup rather than hard-coding a worker count. Test cgroup CPU limits remain
+confined to isolated QA containers and must not enter production service units.
+The runtime constructor is a product-integration primitive; the current
+inspection CLI does not create it.
