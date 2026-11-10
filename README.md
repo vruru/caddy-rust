@@ -41,9 +41,16 @@ The future certificate manager must retain the validated candidate and retry wit
 bounded backoff outside handshake and publication locks; it must not treat that
 result as a successful renewal or re-register an ACME account because of it.
 
-The TLS key provider preserves the ring cipher and verification policy, using
-AWS-LC only for RSA private signing keys larger than 4096 and up to 8192 bits.
+The TLS provider retains ring cipher suites and key exchange, uses AWS-LC for
+RSA private signing keys larger than 4096 and up to 8192 bits, and restricts
+OpenSSL 4.0.3 to the additional key/signature compatibility backend.
 Certificate/private-key matching remains mandatory before publication. The
+native certificate resolver also prepares separate TLS 1.2 generic EC-signature
+and TLS 1.3 curve-bound profiles at load time. The negotiated protocol controls
+the final choice; a TLS 1.2-only certificate cannot authorize a TLS 1.3 handshake.
+Full certificate-path, name, time and purpose validation remain required.
+These library profiles do not establish completed HTTP session or upstream
+client-certificate integration; those are separate compatibility gates. The
 process installs this explicit provider before constructing implicit TLS clients;
 an incompatible existing default is an error. This key compatibility primitive
 does not implement a production TLS listener or certificate lifecycle.

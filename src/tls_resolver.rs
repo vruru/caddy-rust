@@ -7,7 +7,7 @@ use crate::challenge::{ACME_ALPN, ChallengeRegistry, normalize_domain};
 use crate::leaf_guard::{LeafGuard, LeafState, Observation, leaf_id};
 use anyhow::{Result, anyhow, ensure};
 use rustls::{
-    SignatureScheme,
+    ProtocolVersion, SignatureScheme,
     pki_types::CertificateDer,
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
@@ -69,6 +69,31 @@ pub struct CertificateInput<'a> {
     pub private_key_pem: &'a [u8],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignatureCompatibility {
+    Tls12Or13,
+    Tls12Only,
+}
+impl SignatureCompatibility {
+    pub fn allows(self, version: ProtocolVersion) -> bool {
+        version == ProtocolVersion::TLSv1_2
+            || (self == Self::Tls12Or13 && version == ProtocolVersion::TLSv1_3)
+    }
+}
+/// Preselection is not protocol authorization. Only `select_for_version` uses
+/// the authoritative, already negotiated protocol to return its bound key.
+#[derive(Clone)]
+pub struct CertificateSelection {
+    pub key: Arc<CertifiedKey>,
+    pub signature_compatibility: SignatureCompatibility,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SignatureProfile {
+    tls12: Vec<SignatureScheme>,
+    tls13: Vec<SignatureScheme>,
+}
+
 /// Public certificate data only. The generation identifies a single loaded
 /// instance, including reloads of byte-identical certificate material.
 pub struct OcspCertificate {
@@ -110,12 +135,14 @@ impl OcspCertificate {
 #[derive(Clone)]
 struct Staple {
     key: Arc<CertifiedKey>,
+    tls13_key: Option<Arc<CertifiedKey>>,
     valid_until: i64,
 }
 
 #[derive(Clone)]
 struct LoadedCertificate {
     key: Arc<CertifiedKey>,
+    tls13_key: Option<Arc<CertifiedKey>>,
     leaf_state: Arc<LeafState>,
     leaf_sha256: [u8; 32],
     identity: [u8; 32],
@@ -124,7 +151,7 @@ struct LoadedCertificate {
     not_before: i64,
     not_after: i64,
     size: usize,
-    signature_profile: Vec<SignatureScheme>,
+    signature_profile: SignatureProfile,
 }
 
 #[derive(Default)]
@@ -380,12 +407,7 @@ impl HotCertificateResolver {
                     *valid_until <= old.not_after,
                     "OCSP validity exceeds certificate expiry"
                 );
-                let mut key = old.key.as_ref().clone();
-                key.ocsp = Some(bytes.clone());
-                Some(Staple {
-                    key: Arc::new(key),
-                    valid_until: *valid_until,
-                })
+                Some(make_staple(old, bytes, *valid_until))
             } else {
                 None
             };
@@ -431,11 +453,57 @@ impl HotCertificateResolver {
         offered_alpn: &[&[u8]],
         signature_schemes: &[SignatureScheme],
     ) -> Option<Arc<CertifiedKey>> {
+        self.select_candidate(sni, offered_alpn, signature_schemes)
+            .map(|selected| selected.key)
+    }
+
+    pub fn select_candidate(
+        &self,
+        sni: Option<&str>,
+        offered_alpn: &[&[u8]],
+        signature_schemes: &[SignatureScheme],
+    ) -> Option<CertificateSelection> {
+        self.select_internal(sni, offered_alpn, signature_schemes, None)
+    }
+
+    pub fn select_for_version(
+        &self,
+        sni: Option<&str>,
+        offered_alpn: &[&[u8]],
+        signature_schemes: &[SignatureScheme],
+        version: ProtocolVersion,
+    ) -> Option<CertificateSelection> {
+        self.select_internal(sni, offered_alpn, signature_schemes, Some(version))
+    }
+
+    fn select_internal(
+        &self,
+        sni: Option<&str>,
+        offered_alpn: &[&[u8]],
+        signature_schemes: &[SignatureScheme],
+        version: Option<ProtocolVersion>,
+    ) -> Option<CertificateSelection> {
+        if version
+            .is_some_and(|v| !matches!(v, ProtocolVersion::TLSv1_2 | ProtocolVersion::TLSv1_3))
+        {
+            return None;
+        }
         let sni = normalize_domain(sni?).ok()?;
         if offered_alpn.contains(&ACME_ALPN) {
-            let key = self.challenges.lookup_tls(&sni, offered_alpn)?;
+            let mut key = self.challenges.lookup_tls(&sni, offered_alpn)?;
+            if version == Some(ProtocolVersion::TLSv1_3) {
+                let signer = crate::crypto::tls13_signer(&key.key)?;
+                if !Arc::ptr_eq(&signer, &key.key) {
+                    let mut bounded = key.as_ref().clone();
+                    bounded.key = signer;
+                    key = Arc::new(bounded);
+                }
+            }
             key.key.choose_scheme(signature_schemes)?;
-            return Some(key);
+            return Some(CertificateSelection {
+                key,
+                signature_compatibility: SignatureCompatibility::Tls12Or13,
+            });
         }
         let snapshot = self.certificates.read().ok()?.clone();
         let now =
@@ -443,20 +511,30 @@ impl HotCertificateResolver {
         let select = |candidates: &Vec<Arc<LoadedCertificate>>| {
             candidates.iter().find_map(|entry| {
                 let admission = entry.leaf_state.admission();
-                if !admission.allow_certificate
-                    || now < entry.not_before
-                    || now >= entry.not_after
-                    || entry.key.key.choose_scheme(signature_schemes).is_none()
+                if !admission.allow_certificate || now < entry.not_before || now >= entry.not_after
                 {
                     return None;
                 }
-                Some(
-                    entry
-                        .staple
-                        .as_ref()
-                        .filter(|staple| admission.allow_staple && now < staple.valid_until)
-                        .map_or_else(|| entry.key.clone(), |staple| staple.key.clone()),
-                )
+                let staple = entry
+                    .staple
+                    .as_ref()
+                    .filter(|staple| admission.allow_staple && now < staple.valid_until);
+                let key = if version == Some(ProtocolVersion::TLSv1_3) {
+                    staple
+                        .and_then(|s| s.tls13_key.clone())
+                        .or_else(|| entry.tls13_key.clone())?
+                } else {
+                    staple.map_or_else(|| entry.key.clone(), |s| s.key.clone())
+                };
+                key.key.choose_scheme(signature_schemes)?;
+                Some(CertificateSelection {
+                    key,
+                    signature_compatibility: if entry.tls13_key.is_some() {
+                        SignatureCompatibility::Tls12Or13
+                    } else {
+                        SignatureCompatibility::Tls12Only
+                    },
+                })
             })
         };
         if let Some(key) = snapshot.names.get(&sni).and_then(select) {
@@ -475,7 +553,13 @@ impl ResolvesServerCert for HotCertificateResolver {
             .alpn()
             .map(|v| v.collect::<Vec<_>>())
             .unwrap_or_default();
-        self.select(hello.server_name(), &alpn, hello.signature_schemes())
+        self.select_for_version(
+            hello.server_name(),
+            &alpn,
+            hello.signature_schemes(),
+            hello.negotiated_version()?,
+        )
+        .map(|selected| selected.key)
     }
 }
 
@@ -486,6 +570,37 @@ fn staple_size(key: &CertifiedKey) -> Result<usize> {
             size.checked_add(der.len())
                 .ok_or_else(|| anyhow!("certificate size accounting overflow"))
         })
+}
+
+fn status_size(staple: &Staple) -> Result<usize> {
+    let base = staple_size(&staple.key)?;
+    if let Some(key) = &staple.tls13_key
+        && !Arc::ptr_eq(key, &staple.key)
+    {
+        return base
+            .checked_add(staple_size(key)?)
+            .ok_or_else(|| anyhow!("OCSP data size overflow"));
+    }
+    Ok(base)
+}
+fn make_staple(cert: &LoadedCertificate, bytes: &[u8], valid_until: i64) -> Staple {
+    let mut base = cert.key.as_ref().clone();
+    base.ocsp = Some(bytes.to_vec());
+    let key = Arc::new(base);
+    let tls13_key = cert.tls13_key.as_ref().map(|other| {
+        if Arc::ptr_eq(other, &cert.key) {
+            key.clone()
+        } else {
+            let mut bound = other.as_ref().clone();
+            bound.ocsp = Some(bytes.to_vec());
+            Arc::new(bound)
+        }
+    });
+    Staple {
+        key,
+        tls13_key,
+        valid_until,
+    }
 }
 
 fn load_certificate(
@@ -512,7 +627,8 @@ fn load_certificate(
         ensure!(remaining.is_empty(), "trailing certificate DER");
         chain.push(CertificateDer::from(der.to_vec()));
     }
-    let key = crate::certmagic::signing_key(input.private_key_pem, "tls-candidate")?;
+    let preferred = crate::certmagic::signing_key(input.private_key_pem, "tls-candidate")?;
+    let key = crate::crypto::tls12_signer(&preferred, input.private_key_pem)?;
     let mut identity = Sha256::new();
     identity.update(b"caddy-native-ocsp-chain-v1\0");
     identity.update((chain.len() as u64).to_be_bytes());
@@ -569,32 +685,73 @@ fn load_certificate(
             "certificate SAN does not cover alias"
         );
     }
-    let signature_profile = [
+    let key = Arc::new(certified);
+    let tls13_key = crate::crypto::tls13_signer(&preferred).map(|signer| {
+        if Arc::ptr_eq(&signer, &key.key) {
+            key.clone()
+        } else {
+            let mut bound = key.as_ref().clone();
+            bound.key = signer;
+            Arc::new(bound)
+        }
+    });
+    let schemes = [
         SignatureScheme::ECDSA_NISTP256_SHA256,
         SignatureScheme::ECDSA_NISTP384_SHA384,
+        SignatureScheme::ECDSA_NISTP521_SHA512,
         SignatureScheme::RSA_PSS_SHA256,
+        SignatureScheme::RSA_PSS_SHA384,
+        SignatureScheme::RSA_PSS_SHA512,
         SignatureScheme::RSA_PKCS1_SHA256,
+        SignatureScheme::RSA_PKCS1_SHA384,
+        SignatureScheme::RSA_PKCS1_SHA512,
         SignatureScheme::ED25519,
-    ]
-    .into_iter()
-    .filter(|scheme| certified.key.choose_scheme(&[*scheme]).is_some())
-    .collect::<Vec<_>>();
+    ];
+    let signature_profile = SignatureProfile {
+        tls12: schemes
+            .into_iter()
+            .filter(|scheme| key.key.choose_scheme(&[*scheme]).is_some())
+            .collect(),
+        tls13: schemes
+            .into_iter()
+            .filter(|scheme| {
+                tls13_key
+                    .as_ref()
+                    .is_some_and(|key| key.key.choose_scheme(&[*scheme]).is_some())
+            })
+            .collect(),
+    };
     ensure!(
-        !signature_profile.is_empty(),
+        !signature_profile.tls12.is_empty(),
         "certificate has unsupported signing profile"
     );
+    let extra_key_bytes = if tls13_key
+        .as_ref()
+        .is_some_and(|other| !Arc::ptr_eq(other, &key))
+    {
+        staple_size(&key)?
+    } else {
+        0
+    };
+    let size = input
+        .certificate_pem
+        .len()
+        .checked_add(input.private_key_pem.len())
+        .and_then(|v| v.checked_add(extra_key_bytes))
+        .ok_or_else(|| anyhow!("certificate size overflow"))?;
     let leaf_sha256 = leaf_id(&blocks[0].1);
     Ok((
         names,
         LoadedCertificate {
-            key: Arc::new(certified),
+            key,
+            tls13_key,
             leaf_state: leaf_guard.intern(leaf_sha256, leaf.validity().not_after.timestamp())?,
             leaf_sha256,
             identity,
             instance_generation: 0,
             staple: None,
             signature_profile,
-            size: input.certificate_pem.len() + input.private_key_pem.len(),
+            size,
             not_before: leaf.validity().not_before.timestamp(),
             not_after: leaf.validity().not_after.timestamp(),
         },
@@ -621,12 +778,9 @@ fn inherit_staple(
     else {
         return;
     };
-    let mut key = cert.key.as_ref().clone();
-    key.ocsp = staple.key.ocsp.clone();
-    cert.staple = Some(Staple {
-        key: Arc::new(key),
-        valid_until: staple.valid_until,
-    });
+    if let Some(bytes) = &staple.key.ocsp {
+        cert.staple = Some(make_staple(cert, bytes, staple.valid_until));
+    }
 }
 // Optional status data must never prevent publication of required certificate
 // material. Certificate publication may evict cached staples; OCSP attachment
@@ -649,7 +803,7 @@ fn prune_staples(
             .get_mut(&generation)
             .ok_or_else(|| anyhow!("certificate instance missing"))?;
         if let Some(staple) = &cert.staple {
-            let size = staple_size(&staple.key)?;
+            let size = status_size(staple)?;
             let keep = staple.valid_until > now
                 && (!evict
                     || bytes
@@ -691,7 +845,7 @@ fn validate_snapshot_size(names: &HashMap<String, Vec<Arc<LoadedCertificate>>>) 
             ensure!(size <= MAX_TOTAL_BYTES, "certificate data limit exceeded");
             if let Some(staple) = &cert.staple {
                 staple_bytes = staple_bytes
-                    .checked_add(staple_size(&staple.key)?)
+                    .checked_add(status_size(staple)?)
                     .ok_or_else(|| anyhow!("OCSP staple data limit exceeded"))?;
                 if staple_bytes > MAX_STAPLE_BYTES {
                     return Err(anyhow::Error::new(OcspPublishCapacity));
