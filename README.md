@@ -170,3 +170,11 @@ Known revocation now vetoes cached and terminal-checkpoint readiness without
 changing issuer/winner selection. A stored revoked leaf starts a fresh-key cycle.
 This does not implement root force-renew failure evidence, withdrawal, rescan,
 compromised-key archival or startup OCSP restoration; those remain migration gates.
+
+The local PKI library preserves existing CA files, journals certificate/key pair
+updates and signs authorized CSRs through independent authority workers. Optional
+trust installation is explicit and supervised, including atomic Java-store
+updates. The caller must authorize names, own leaf keys and integrate generation
+lifecycle and rollback recovery. Native CA interoperability was verified in
+isolation; RootBackend, CLI, admin endpoints and automatic-HTTPS integration
+remain incomplete. Mac Keychain writes and legacy NSS dbm execution are unverified.

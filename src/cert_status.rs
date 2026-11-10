@@ -28,6 +28,7 @@ pub struct VerifiedStatus {
     pub revocation_reason: Option<u8>,
 }
 
+pub(crate) use verify::verify_signature as verify_x509_signature;
 pub use verify::{
     request as create_request, validate_issuer, verify_response, verify_response_with_max_age,
 };

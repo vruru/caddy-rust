@@ -17,7 +17,7 @@ x509-parser = "0.18"
 zeroize = "1"
 pem = "3"
 rustix = { version = "1", features = ["fs", "process"] }
-rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto", "pem"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "aws_lc_rs", "crypto", "pem", "x509-parser"] }
 rsa = { version = "0.9", features = ["pem", "sha2"] }
 ryu = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
