@@ -38,6 +38,13 @@ The future certificate manager must retain the validated candidate and retry wit
 bounded backoff outside handshake and publication locks; it must not treat that
 result as a successful renewal or re-register an ACME account because of it.
 
+The TLS key provider preserves the ring cipher and verification policy, using
+AWS-LC only for RSA private signing keys larger than 4096 and up to 8192 bits.
+Certificate/private-key matching remains mandatory before publication. The
+process installs this explicit provider before constructing implicit TLS clients;
+an incompatible existing default is an error. This key compatibility primitive
+does not implement a production TLS listener or certificate lifecycle.
+
 The official Caddy v2.11.7 and CertMagic v0.25.6 implementation provide the pinned
 behavioral reference. The original Go plugins have no native cross-language ABI:
 module configuration and behavior require individual Rust implementations.

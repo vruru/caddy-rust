@@ -14,6 +14,7 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    caddy_compat_native::crypto::install_default()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let report = match args.as_slice() {
         [flag] if flag == "--help" => {
