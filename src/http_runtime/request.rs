@@ -230,7 +230,7 @@ fn proof_for_authority<B>(
     }
     None
 }
-pub(super) async fn handle(
+pub(super) async fn handle_business(
     inner: Arc<Inner>,
     server: Arc<ActiveServer>,
     request: Request<Incoming>,
@@ -243,9 +243,6 @@ pub(super) async fn handle(
         Ok(authority) => authority,
         Err(()) => return simple(StatusCode::BAD_REQUEST, "Bad Request\n"),
     };
-    if let Some(response) = proof_for_authority(&inner.registry, &request, &authority) {
-        return response;
-    }
     let trusted = server
         .plan
         .trusted_proxies

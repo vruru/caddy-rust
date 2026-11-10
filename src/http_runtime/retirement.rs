@@ -162,6 +162,7 @@ pub(super) struct BusinessGeneration {
     pub id: u64,
     pub policy: HttpShutdownPolicy,
     pub superseded: CancellationToken,
+    pub admission_closed: CancellationToken,
     pub drain: CancellationToken,
     pub hard_stop: CancellationToken,
     active: AtomicUsize,
@@ -175,6 +176,7 @@ impl BusinessGeneration {
             id,
             policy,
             superseded: CancellationToken::new(),
+            admission_closed: CancellationToken::new(),
             drain: CancellationToken::new(),
             hard_stop: CancellationToken::new(),
             active: AtomicUsize::new(0),
@@ -251,6 +253,7 @@ impl BusinessGeneration {
     }
     pub fn close_admission(&self) {
         self.admitting.store(false, Ordering::Release);
+        self.admission_closed.cancel();
     }
     pub fn force(&self) {
         self.close_admission();

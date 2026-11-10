@@ -1,10 +1,9 @@
 # Native compatibility implementation
 
 Standalone Rust implementation in progress for the existing Caddy deployment.
-This is a separate project from GoEdge. The default build provides configuration
-utilities and migration inspection. The opt-in `native-run` build can serve
-supported configurations in development. Production replacement requires
-the remaining compatibility and rollout gates.
+This is a separate project from GoEdge. The current build provides **configuration utilities and read-only migration
+inspection**, not a traffic-serving replacement. Existing production
+Caddy remains unchanged until the replacement passes the applicable contracts.
 
 The user requires original functionality and module behavior to remain available,
 especially automatic certificate issuance and renewal. See COMPATIBILITY.md for
@@ -15,19 +14,13 @@ Current commands:
 
 - `fmt [FLAGS] [FILE]`: format, preview differences or overwrite a Caddyfile.
 - `adapt [FLAGS]`: adapt implemented Caddyfile directives, with compatible env-file
-  and flag behavior; `--validate` provisions supported runtime modules when built
-  with the opt-in `native-run` development feature.
-- `validate [FLAGS]`: load the original config source/env/adapter path, remove raw
-  metadata and provision supported modules without starting listeners or issuing
-  ACME certificates. This also requires `native-run`.
+  and flag behavior; `--validate` remains an explicit provisioning integration gate.
 - `inspect-config FILE`: extract a privacy-safe configuration feature inventory.
 - `inspect-storage ROOT`: inspect CertMagic certificate/account layout and validate
   supported certificate/key pairs without writing or registering an ACME account.
 
-Provisioning validation may initialize local storage or PKI material, while the
-inspection commands remain read-only. Formatting can overwrite the explicit input
-file. These configuration and inspection commands do not serve traffic, renew
-certificates or reload a running process. Inspection reports must not contain private keys, account email,
+These commands do not serve traffic, renew a certificate, reload a running process,
+or replaces existing state. Reports must not contain private keys, account email,
 account URLs, domain names, or credential values. Schema pointers use documented
 redaction for dynamic map keys; they are not Admin API mutation paths.
 
@@ -336,68 +329,16 @@ Failed candidates preserve their predecessor; compensation uses retained verifie
 material rather than fetching or issuing certificates. Owned shutdown survives
 caller timeout/drop and retains delayed predecessor services until their actual
 HTTP admission closes. Provision-only validation uses the same server path
-without binding listeners or activating certificate jobs. The opt-in serving
-CLI uses this backend. Remaining module and CLI acceptance gates still apply.
+without binding listeners or activating certificate jobs. This feature does not
+yet expose a serving CLI or waive the remaining module/CLI acceptance gates.
 
-OCSP restoration and CPU verification now use distinct admission budgets. The
-same certificate CPU budget is shared across default application policies and
-configuration generations, while standalone OCSP managers keep their own bounded
-CPU budget. A full set of cache-restoration candidates cannot deadlock by each
-holding one restore slot and waiting for another to inspect its certificate.
-Actual blocking verification owns its CPU permit through completion, and no CPU
-permit spans responder network or storage I/O. Signature checks, certificate
-identity, revocation/guard policy and cache freshness remain mandatory.
 
-CLI typed decoding preserves integral fields instead of applying the Admin map's
-float64 normalization. Application digests likewise preserve distinct integral
-configuration values when fencing retained rollback material. Literal null in
-validation is rejected with a controlled error instead of reproducing the pinned
-Go command's nil-configuration panic. The existing depth/resource bounds and
-unsupported-module gates remain explicit; this is not full serving acceptance.
-Caddyfile adaptation uses deterministic JSON object ordering, which can differ
-from Go's typed-struct field order while retaining the same JSON configuration.
-The shared JSON writer also provides bounded non-HTML-escaped typed output for
-reflected log values. It retains Go float formatting, sorted map keys and escaped
-U+2028/U+2029; ordinary Admin encoding, raw adaptation and ETags remain HTML-safe.
-
-The HTTP and logging libraries share one warmed local-timezone lookup for the
-platform UTC offset and abbreviation. It runs only during blocking preparation
-or bounded encoding work; the existing placeholder fallback is preserved.
-
-OCSP groups can now select their own immutable certificate inventory before
-copying DER chains. Complete aliases and distinct loaded generations remain
-authoritative, including multiple instances of one chain. Already authenticated
-negative status still reaches every matching instance. Normal cancellation joins
-owned work before returning without reporting a spurious maintenance failure.
-
-Direct typed JSON and inline module decoding retain their separate number
-semantics. A signed integer field accepts a literal negative-zero integer,
-while arbitrary values retain floating negative zero and unsigned fields keep
-their original rejection behavior. Inline modules apply the same float64
-roundtrip as the reference before strict decoding; a nested route reuses its
-already normalized subtree. This includes issuer and HTTP configuration
-loaders. Configuration acceptance does not establish support for provisional
-HTTP responses; runtime handling of 100 and 103 remains a separate gate.
-
-The configuration DOM has explicit depth and byte limits. Compact arrays can
-still expand considerably in memory; aggregate concurrent configuration work
-requires separate memory admission and load acceptance before rollout.
-
-With `native-run`, `run`, `start`, `reload` and `stop` expose the native
-development lifecycle. Initial and accepted configuration can be saved to the
-original autosave location; `run --resume` uses it when present. Background
-start reports readiness only after publication and authenticates its local
-child handshake. An interrupted start owns the child through shutdown. The
-process uses every CPU available at startup and raises only its own descriptor
-limit where possible. Signals provide graceful drain, and a forced shutdown
-has a bounded wait for owned cleanup.
-
-File monitoring survives temporary read failures and retries transient
-configuration admission failures. A successful external load preserves
-monitoring only when the source marker matches the original absolute lexical
-path and adapter. Different directories, unresolved aliases, and absent or
-different source markers revoke monitoring. HTTP markers never provide a new
-path for the process to open. TCP, filesystem Unix sockets, and Linux abstract
-Unix sockets are supported by the administrative commands; the server can
-capture declared inherited TCP descriptors before runtime construction.
-This is not the complete Caddy command or module surface.
+TLS certificate acquisition uses the active listener's policy and exact
+certificate scope. Already authenticated requests can finish during a
+configured retirement delay. Admission and handshake work is bounded by
+the host's actual CPU and descriptor resources. ACME proof traffic retains
+independent capacity on a shared port: when a proof replacement is needed,
+it can cancel an older incomplete connection and wait for its actual
+release. Expired or unrelated requests do not evict other connections.
+These limits protect runtime capacity; they do not establish complete
+automatic HTTPS or on-demand TLS compatibility.

@@ -32,6 +32,7 @@ struct Pending {
     retirement: HttpRetirement,
 }
 struct ListenerControl {
+    admission:Arc<connection_budget::ListenerBudget>,
     cancel: CancellationToken,
     actual: SocketAddr,
     proof: Arc<ArcSwap<ProofListener>>,
@@ -55,6 +56,7 @@ struct LeaseRecord {
 /// The completion token is signalled only after the actual descriptor closes,
 /// including an unpolled or unwinding accept task.
 pub(super) struct ListenerSocket {
+    pub(super) admission:Arc<connection_budget::ListenerBudget>,
     socket: Option<TcpListener>,
     finished: CancellationToken,
 }
@@ -349,6 +351,7 @@ impl HttpRuntime {
             &self.inner.managed,
             &self.inner.challenge_resolver,
             None,
+            None,
             &self.inner.resources,
         );
         tokio::select! {
@@ -387,6 +390,7 @@ impl HttpRuntime {
             managed,
             &self.inner.challenge_resolver,
             Some(manual),
+            None,
             &self.inner.resources,
         );
         tokio::select! {
@@ -412,7 +416,7 @@ impl HttpRuntime {
         config: PreparedConfig,
         managed: Arc<HotCertificateResolver>,
     ) -> Result<HttpStage> {
-        self.stage_inner(config, managed, None).await
+        self.stage_inner(config, managed, None, None).await
     }
     /// The supplied inventory is already provisioned by the TLS app. Raw
     /// load_files must have been consumed there, not silently ignored here.
@@ -425,13 +429,26 @@ impl HttpRuntime {
         managed: Arc<HotCertificateResolver>,
         manual: ManualCertificates,
     ) -> Result<HttpStage> {
-        self.stage_inner(config, managed, Some(manual)).await
+        self.stage_inner(config, managed, Some(manual), None).await
+    }
+    /// Attach this generation's immutable automation-policy capability. It is
+    /// never consulted by tagged manual selection or ACME proof handshakes.
+    pub async fn stage_with_certificates_and_provider(
+        &self,
+        config: PreparedConfig,
+        managed: Arc<HotCertificateResolver>,
+        manual: ManualCertificates,
+        provider: Arc<dyn ScopedCertificateProvider>,
+    ) -> Result<HttpStage> {
+        self.stage_inner(config, managed, Some(manual), Some(provider))
+            .await
     }
     async fn stage_inner(
         &self,
         config: PreparedConfig,
         managed: Arc<HotCertificateResolver>,
         manual: Option<ManualCertificates>,
+        provider: Option<Arc<dyn ScopedCertificateProvider>>,
     ) -> Result<HttpStage> {
         ensure!(
             Arc::ptr_eq(&self.inner.managed.leaf_guard(), &managed.leaf_guard()),
@@ -479,6 +496,7 @@ impl HttpRuntime {
             &managed,
             &self.inner.challenge_resolver,
             manual.as_ref(),
+            provider.as_ref(),
             &self.inner.resources,
         );
         let (servers, managed_names) = tokio::select! {
@@ -487,6 +505,9 @@ impl HttpRuntime {
             result = prepared => result?,
         };
         ensure!(!guard.cancel.is_cancelled(), "HTTP candidate was stopped");
+        if servers.values().any(|server| server.tls.is_some()) {
+            ensure_tls_executor(&self.inner).await?;
+        }
         // Proof uses only the runtime registry resolver, never a candidate's
         // ordinary certificates. Building TLS state is outside the control lock.
         let proof_tls = proof_tls_config(self.inner.challenge_resolver.clone())?;
@@ -532,6 +553,7 @@ impl HttpRuntime {
                             &proof_tls,
                             false,
                             &mut launches,
+                            &self.inner.connections,
                         )?;
                         configure_proof(&listener, *kind, &proof_tls);
                         let capability = current
@@ -632,6 +654,12 @@ impl HttpRuntime {
             overridden,
         })
     }
+    /// Currently owned accepting descriptors. Old streams remain in global counts.
+    pub fn listener_connection_diagnostics(&self)->Vec<(SocketAddr,SocketAddr,ConnectionDiagnostics)> {
+        let state=self.control.lock();
+        let mut rows=state.pool.iter().filter_map(|(key,slot)|slot.owner.upgrade().map(|owner|(*key,slot.actual,owner.admission.snapshot()))).collect::<Vec<_>>();
+        rows.sort_by_key(|row|row.0);rows
+    }
     pub async fn bound_addresses(&self) -> Vec<SocketAddr> {
         self.control
             .lock()
@@ -686,6 +714,9 @@ impl HttpRuntime {
         self.inner.tasks.wait().await;
         self.inner.upgrades.wait().await;
         self.inner.resources.wait().await;
+        if let Some(executor) = self.inner.tls_executor.get() {
+            executor.shutdown().await?;
+        }
         Ok(())
     }
     pub fn force_shutdown(&self) {
@@ -730,6 +761,9 @@ impl HttpRuntime {
         // The accept-side snapshot retry must observe stop before a current
         // generation can become drained without a published successor.
         self.inner.stopped.cancel();
+        if let Some(executor) = self.inner.tls_executor.get() {
+            executor.close();
+        }
         let current = self.inner.current.load_full();
         current.drain.cancel();
         self.inner.tasks.close();
@@ -800,6 +834,9 @@ async fn stop_runtime(inner: Arc<Inner>, lifecycle: Arc<Lifecycle>, signal: Http
             forced
         };
         inner.stopped.cancel();
+        if let Some(executor) = inner.tls_executor.get() {
+            executor.close();
+        }
         inner.tasks.close();
         inner.upgrades.close();
         inner.resources.close();
@@ -890,6 +927,7 @@ fn own_socket(
     tls: &Arc<rustls::ServerConfig>,
     coverage: bool,
     launches: &mut Vec<Launch>,
+    connections:&Arc<connection_budget::Budgets>,
 ) -> Result<(Arc<ListenerControl>, bool)> {
     if let Some(key) = pool_key(control, address, coverage) {
         ensure!(
@@ -910,7 +948,9 @@ fn own_socket(
     let socket =
         bind_listener(address).map_err(|_| anyhow::anyhow!("HTTP listener bind failed"))?;
     let finished = CancellationToken::new();
+    let admission=connections.listener();
     let socket = ListenerSocket {
+        admission:admission.clone(),
         socket: Some(socket),
         finished: finished.clone(),
     };
@@ -924,6 +964,7 @@ fn own_socket(
         cancel: cancel.clone(),
     }));
     let owner = Arc::new(ListenerControl {
+        admission,
         cancel: cancel.clone(),
         actual,
         proof: proof.clone(),
@@ -1061,6 +1102,9 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
             let control = weak_control
                 .upgrade()
                 .ok_or_else(|| anyhow::anyhow!("HTTP runtime unavailable"))?;
+            if bindings.iter().any(|(_, kind)| *kind == ListenerKind::Tls) {
+                ensure_tls_executor(&inner).await?;
+            }
             let tls = proof_tls_config(inner.challenge_resolver.clone())?;
             loop {
                 ensure!(
@@ -1117,7 +1161,7 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
                         let mut launches = Vec::new();
                         for (address, kind) in &bindings {
                             let (owner, reused) =
-                                own_socket(&mut state, *address, *kind, &tls, true, &mut launches)?;
+                                own_socket(&mut state, *address, *kind, &tls, true, &mut launches,&inner.connections)?;
                             let key =
                                 pool_key(&state, *address, true).expect("new or pinned listener");
                             // Separate input addresses can resolve to one wildcard

@@ -1,14 +1,27 @@
 //! Native HTTP listeners with request-scoped configuration snapshots. Preparation is
 //! isolated from publication; failed binds and certificate loads preserve the
 //! active generation. This module never starts a Go process.
+#[path = "http_runtime/pressure.rs"]
+mod pressure;
+#[path = "http_runtime/connection_budget.rs"]
+mod connection_budget;
+#[path = "http_runtime/descriptor_budget.rs"]
+mod descriptor_budget;
+pub use connection_budget::{ConnectionLimits,ConnectionDiagnostics,ConnectionPoolSnapshot};
 #[path = "http_runtime/auth_cache.rs"]
 pub(crate) mod auth_cache;
+#[path = "http_runtime/certificate_provider.rs"]
+mod certificate_provider;
+pub use certificate_provider::ScopedCertificateProvider;
 #[path = "http_runtime/connection_identity.rs"]
 mod connection_identity;
 #[path = "http_runtime/connection_sessions.rs"]
 mod connection_sessions;
 #[path = "http_runtime/files.rs"]
 mod files;
+#[path = "http_runtime/tls_executor.rs"]
+mod tls_executor;
+pub use tls_executor::TlsHandshakeDiagnostics;
 use connection_identity::{TlsIdentity, TlsVerdict};
 #[path = "http_runtime/lifecycle.rs"]
 mod lifecycle;
@@ -99,6 +112,11 @@ impl HttpRuntime {
     }
 }
 struct Inner {
+    connections:Arc<connection_budget::Budgets>,
+    tls_executor: std::sync::OnceLock<tls_executor::TlsExecutor>,
+    tls_executor_init: std::sync::Mutex<()>,
+    tls_executor_failure: std::sync::atomic::AtomicU8,
+    tls_executor_attempts: std::sync::atomic::AtomicU64,
     current: ArcSwap<Generation>,
     registry: ChallengeRegistry,
     managed: Arc<HotCertificateResolver>,
@@ -135,12 +153,15 @@ struct ActiveServer {
     sessions: Arc<connection_sessions::SharedSessions>,
     clients: Arc<HashMap<usize, proxy::ProxyClient>>,
 }
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CertificateOrigin { Manual, Managed, Proof }
 struct CandidateResolver {
     challenges: Arc<HotCertificateResolver>,
     static_certificates: Arc<HotCertificateResolver>,
     managed: Arc<HotCertificateResolver>,
     allowed_managed: Vec<String>,
     allowed_static: std::collections::HashSet<[u8; 32]>,
+    provider: Option<Arc<dyn ScopedCertificateProvider>>,
 }
 impl fmt::Debug for CandidateResolver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -177,18 +198,26 @@ impl CandidateResolver {
         })
     }
     fn select_for_version(
-        &self,
-        sni: Option<&str>,
-        alpn: &[&[u8]],
-        schemes: &[rustls::SignatureScheme],
-        version: rustls::ProtocolVersion,
+        &self, sni: Option<&str>, alpn: &[&[u8]], schemes: &[rustls::SignatureScheme], version: rustls::ProtocolVersion,
     ) -> Option<crate::tls_resolver::CertificateSelection> {
-        self.select_using(sni, alpn, |resolver, sni, allowed| match allowed {
-            Some(identities) => {
-                resolver.select_for_version_filtered(Some(sni), alpn, schemes, version, identities)
-            }
-            None => resolver.select_for_version(Some(sni), alpn, schemes, version),
-        })
+        self.select_for_version_with_origin(sni,alpn,schemes,version).map(|(selection,_)|selection)
+    }
+    fn select_for_version_with_origin(
+        &self, sni: Option<&str>, alpn: &[&[u8]], schemes: &[rustls::SignatureScheme], version: rustls::ProtocolVersion,
+    ) -> Option<(crate::tls_resolver::CertificateSelection, CertificateOrigin)> {
+        let sni=sni?;
+        if alpn.contains(&ACME_ALPN) {
+            return self.challenges.select_for_version(Some(sni),alpn,schemes,version).map(|key|(key,CertificateOrigin::Proof));
+        }
+        self.static_certificates.select_for_version_filtered(Some(sni),alpn,schemes,version,&self.allowed_static)
+            .map(|key|(key,CertificateOrigin::Manual))
+            .or_else(|| self.managed_name_allowed(sni)
+                .then(||self.managed.select_for_version(Some(sni),alpn,schemes,version)).flatten()
+                .map(|key|(key,CertificateOrigin::Managed)))
+    }
+    fn managed_name_allowed(&self, sni:&str)->bool {
+        self.allowed_managed.iter().any(|name|dns_covers(name,sni))
+            || self.provider.as_ref().is_some_and(|provider|provider.cached_name(sni))
     }
     fn select_using(
         &self,
@@ -205,9 +234,7 @@ impl CandidateResolver {
             return select(&self.challenges, sni, None);
         }
         select(&self.static_certificates, sni, Some(&self.allowed_static)).or_else(|| {
-            self.allowed_managed
-                .iter()
-                .any(|name| dns_covers(name, sni))
+            self.managed_name_allowed(sni)
                 .then(|| select(&self.managed, sni, None))
                 .flatten()
         })
@@ -219,6 +246,7 @@ impl HttpRuntime {
             registry,
             resolver,
             Arc::new(resource_budget::Resources::automatic()),
+            connection_budget::Budgets::new(ConnectionLimits::automatic()).expect("valid automatic connection budgets"),
         )
     }
     /// Explicit native resource policy. `None` disables an independent timer;
@@ -229,16 +257,24 @@ impl HttpRuntime {
         resolver: Arc<HotCertificateResolver>,
         limits: ResourceLimits,
     ) -> Result<Self> {
-        Ok(Self::from_resources(
-            registry,
-            resolver,
-            Arc::new(resource_budget::Resources::from_limits(limits)?),
-        ))
+        Self::with_limits(registry,resolver,limits,ConnectionLimits::automatic())
     }
+    /// Native admission options do not add or ignore Caddy JSON fields.
+    pub fn with_connection_limits(registry:ChallengeRegistry,resolver:Arc<HotCertificateResolver>,limits:ConnectionLimits)->Result<Self> {
+        Self::with_limits(registry,resolver,ResourceLimits::automatic(),limits)
+    }
+    pub fn with_limits(registry:ChallengeRegistry,resolver:Arc<HotCertificateResolver>,resources:ResourceLimits,connections:ConnectionLimits)->Result<Self> {
+        let resources=Arc::new(resource_budget::Resources::from_limits(resources)?);
+        let connections=connection_budget::Budgets::new(connections)?;
+        Ok(Self::from_resources(registry,resolver,resources,connections))
+    }
+    /// Independent-pool diagnostics; not one atomic cross-pool snapshot.
+    pub fn connection_diagnostics(&self)->ConnectionDiagnostics { self.inner.connections.snapshot() }
     fn from_resources(
         registry: ChallengeRegistry,
         resolver: Arc<HotCertificateResolver>,
         resources: Arc<resource_budget::Resources>,
+        connections:Arc<connection_budget::Budgets>,
     ) -> Self {
         let activity =
             BusinessGeneration::new(0, crate::http_config::HttpShutdownPolicy::default());
@@ -257,12 +293,17 @@ impl HttpRuntime {
         Self {
             inner: Arc::new(Inner {
                 current: ArcSwap::from_pointee(initial),
+                tls_executor: std::sync::OnceLock::new(),
+                tls_executor_init: std::sync::Mutex::new(()),
+                tls_executor_failure: std::sync::atomic::AtomicU8::new(0),
+                tls_executor_attempts: std::sync::atomic::AtomicU64::new(0),
                 registry,
                 managed: resolver,
                 challenge_resolver,
                 tasks: TaskTracker::new(),
                 upgrades: TaskTracker::new(),
                 resources,
+                connections,
                 stopped: CancellationToken::new(),
             }),
             control: Arc::new(lifecycle::Lifecycle::new()),
@@ -272,11 +313,125 @@ impl HttpRuntime {
     pub fn resource_diagnostics(&self) -> ResourceDiagnostics {
         self.inner.resources.snapshot()
     }
+    /// Counts describe live handshake running/waiting lanes. CPU work executes
+    /// on the separate all-available-CPU runtime; this snapshot is not atomic
+    /// across pools and does not include pre-ClientHello socket admission.
+    pub fn tls_handshake_diagnostics(&self)->Option<TlsHandshakeDiagnostics> {
+        self.inner.tls_executor.get().map(tls_executor::TlsExecutor::diagnostics)
+    }
+    /// Last safe failure category; retained after a successful retry.
+    pub fn last_tls_executor_initialization_failure(&self)->Option<&'static str> {
+        tls_initialization_failure_name(self.inner.tls_executor_failure.load(std::sync::atomic::Ordering::Acquire))
+    }
+    /// Number of actual constructor attempts, excluding already initialized reads.
+    pub fn tls_executor_initialization_attempts(&self)->u64 {
+        self.inner.tls_executor_attempts.load(std::sync::atomic::Ordering::Relaxed)
+    }
     pub fn generation(&self) -> u64 {
         self.inner.current.load().id
     }
     pub fn active_managed_names(&self) -> Vec<Vec<String>> {
         self.inner.current.load().managed_names.clone()
+    }
+}
+
+async fn ensure_tls_executor(inner: &Arc<Inner>) -> Result<()> {
+    ensure!(!inner.stopped.is_cancelled(), "HTTP runtime is stopping");
+    // An initialized runtime does not need another blocking-pool admission.
+    if inner.tls_executor.get().is_some() {
+        return Ok(());
+    }
+    let observer = inner.clone();
+    let inner = inner.clone();
+    let resources = inner.resources.clone();
+    let result = resources
+        .metadata
+        .run(move || {
+            // This mutex protects only initialization ordering, not user data. It
+            // is never acquired on an HTTP reactor. Recovering a poisoned unit
+            // lock is safe: the success-only OnceLock remains authoritative.
+            let _initializing = match inner.tls_executor_init.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    inner
+                        .tls_executor_failure
+                        .store(6, std::sync::atomic::Ordering::Release);
+                    poisoned.into_inner()
+                }
+            };
+            ensure!(!inner.stopped.is_cancelled(), "HTTP runtime is stopping");
+            if inner.tls_executor.get().is_none() {
+                inner
+                    .tls_executor_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let created = match tls_executor::TlsExecutor::new() {
+                    Ok(created) => created,
+                    Err(error) => {
+                        let code = tls_initialization_failure(&error);
+                        inner
+                            .tls_executor_failure
+                            .store(code, std::sync::atomic::Ordering::Release);
+                        anyhow::bail!(
+                            "TLS executor initialization failed: {}",
+                            tls_initialization_failure_name(code).unwrap_or("system")
+                        );
+                    }
+                };
+                // Only this serialized owned worker writes the cell. It publishes
+                // even if its caller was cancelled, so shutdown can close and join
+                // a late successful constructor after joining metadata work.
+                inner.tls_executor.get_or_init(|| created);
+            }
+            let executor = inner
+                .tls_executor
+                .get()
+                .ok_or_else(|| anyhow::anyhow!("TLS executor initialization state unavailable"))?;
+            if inner.stopped.is_cancelled() {
+                executor.close();
+                anyhow::bail!("HTTP runtime is stopping");
+            }
+            Ok(())
+        })
+        .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => {
+            if observer.stopped.is_cancelled() {
+                anyhow::bail!("HTTP runtime is stopping");
+            }
+            observer
+                .tls_executor_failure
+                .store(5, std::sync::atomic::Ordering::Release);
+            anyhow::bail!("TLS executor initialization failed: worker-unavailable")
+        }
+    }
+}
+fn tls_initialization_failure(error: &std::io::Error) -> u8 {
+    #[cfg(unix)]
+    if error.raw_os_error().is_some_and(|code| {
+        [libc::EAGAIN, libc::ENOMEM, libc::EMFILE, libc::ENFILE].contains(&code)
+    }) {
+        return 1;
+    }
+    match error.kind() {
+        std::io::ErrorKind::WouldBlock
+        | std::io::ErrorKind::OutOfMemory
+        | std::io::ErrorKind::ResourceBusy => 1,
+        std::io::ErrorKind::PermissionDenied => 2,
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported => 3,
+        _ => 4,
+    }
+}
+fn tls_initialization_failure_name(code: u8) -> Option<&'static str> {
+    match code {
+        0 => None,
+        1 => Some("resource-exhausted"),
+        2 => Some("permission-denied"),
+        3 => Some("unsupported-configuration"),
+        4 => Some("system"),
+        5 => Some("worker-unavailable"),
+        6 => Some("initializer-poisoned"),
+        _ => Some("system"),
     }
 }
 
@@ -286,6 +441,7 @@ async fn prepare_servers(
     managed: &Arc<HotCertificateResolver>,
     challenges: &Arc<HotCertificateResolver>,
     manual: Option<&ManualCertificates>,
+    provider: Option<&Arc<dyn ScopedCertificateProvider>>,
     resources: &Arc<resource_budget::Resources>,
 ) -> Result<(HashMap<SocketAddr, Arc<ActiveServer>>, Vec<Vec<String>>)> {
     let standalone;
@@ -401,6 +557,7 @@ async fn prepare_servers(
                 challenges: challenges.clone(),
                 static_certificates: manual.resolver.clone(),
                 allowed_static,
+                provider: if server.certificate_tags.is_empty() { provider.cloned() } else { None },
                 managed: managed.clone(),
                 allowed_managed: if server.certificate_tags.is_empty() {
                     managed_names.clone()
@@ -655,42 +812,57 @@ async fn accept_loop(
         let local = canonical(stream.local_addr().unwrap_or(key));
         let _ = stream.set_nodelay(true);
         let task_inner = inner.clone();
+        let class=if server.is_some(){connection_budget::ConnectionClass::Classifying}else{connection_budget::ConnectionClass::Proof};
+        let admission=tokio::select! {biased;
+            _=cancel.cancelled()=>break,
+            _=inner.stopped.cancelled()=>break,
+            result=socket.admission.admit_with_pressure(class,&cancel)=>match result{Ok(admission)=>admission,Err(_)=>{drop(stream);continue;}},
+        };
+        let stream=connection_budget::AdmittedIo::new(stream,admission);
+        let admission=stream.admission();
+        let eviction=stream.eviction_token();
         if let Some(server) = server {
-            inner.tasks.spawn(async move {
+            spawn_admitted(&inner,eviction,async move {
                 if server.tls.is_some() {
-                    let handshake = connection_identity::accept(&task_inner, stream, key);
+                    let deadline=tokio::time::Instant::now().checked_add(server.plan.read_header_timeout);
+                    let Some(deadline)=deadline else { return; };
+                    let handshake = connection_identity::accept(&task_inner, stream, key,Some(deadline));
                     let accepted = tokio::select! {
                         biased;
                         _ = task_inner.stopped.cancelled() => return,
-                        result = tokio::time::timeout(Duration::from_secs(30), handshake) => match result {
-                            Ok(Ok(accepted)) => accepted,
-                            _ => return,
+                        result = handshake => match result {
+                            Ok(accepted) => accepted,
+                            Err(_) => return,
                         },
                     };
                     let negotiated_h2 = accepted.stream.get_ref().1.alpn_protocol() == Some(b"h2");
                     serve_connection(task_inner, TokioIo::new(accepted.stream), peer, local, ConnectionView {
-                        key, server: accepted.server,
+                        key, server: accepted.server, admission,
                         negotiated_tls_h2: Some(negotiated_h2), identity: Some(accepted.identity),
                     }).await;
                 } else {
-                    serve_connection(task_inner, TokioIo::new(stream), peer, local, ConnectionView { key, server, negotiated_tls_h2: None, identity: None }).await;
+                    serve_connection(task_inner, TokioIo::new(stream), peer, local, ConnectionView { key, server, admission, negotiated_tls_h2: None, identity: None }).await;
                 }
             });
         } else {
             let proof = fallback.load_full();
             // A proof connection accepted before commit cannot turn into a
             // business connection after commit, even if it delays its headers.
-            inner.tasks.spawn(async move {
+            spawn_admitted(&inner,eviction,async move {
                 if proof.cancel.is_cancelled() {
                     return;
                 }
                 if let Some(tls) = proof.tls.clone() {
-                    let handshake = tokio_rustls::TlsAcceptor::from(tls).accept(stream);
+                    let Some(executor)=task_inner.tls_executor.get() else { return; };
+                    let handshake=executor.execute_proof(async move {
+                        let stream=tokio_rustls::TlsAcceptor::from(tls).accept(stream).await?;
+                        drop(stream);Ok(())
+                    },proof.cancel.child_token(),None);
                     tokio::select! {
                         biased;
                         _ = proof.cancel.cancelled() => {},
                         _ = task_inner.stopped.cancelled() => {},
-                        _ = tokio::time::timeout(Duration::from_secs(30), handshake) => {},
+                        _ = handshake => {},
                     }
                     // ACME ALPN never speaks HTTP after its handshake.
                 } else {
@@ -700,6 +872,9 @@ async fn accept_loop(
             });
         }
     }
+}
+fn spawn_admitted(inner:&Arc<Inner>,eviction:CancellationToken,future:impl std::future::Future<Output=()>+Send+'static) {
+    inner.tasks.spawn(async move {tokio::select!{biased;_=eviction.cancelled()=>{},_=future=>{}}});
 }
 async fn serve_proof_connection<I>(inner: Arc<Inner>, io: I, cancel: CancellationToken)
 where
@@ -719,7 +894,7 @@ where
         .http1()
         .keep_alive(false)
         .timer(TokioTimer::new())
-        .header_read_timeout(Duration::from_secs(60));
+        .header_read_timeout(None);
     let connection = builder.serve_connection(io, service);
     tokio::pin!(connection);
     tokio::select! {
@@ -729,6 +904,7 @@ where
     }
 }
 struct ConnectionView {
+    admission:std::sync::Weak<connection_budget::Admission>,
     key: SocketAddr,
     server: Arc<ActiveServer>,
     negotiated_tls_h2: Option<bool>,
@@ -748,6 +924,7 @@ async fn serve_connection<I>(
         server,
         negotiated_tls_h2,
         identity,
+        admission,
     } = view;
     let tls = negotiated_tls_h2.is_some();
     let svc_inner = inner.clone();
@@ -759,6 +936,7 @@ async fn serve_connection<I>(
         let accepted_server = svc_server.clone();
         let identity = identity.clone();
         let requested_drain = service_drain.clone();
+        let admission=admission.clone();
         async move {
             // Count admission before confirming that this exact view is still
             // current. A retire/join cannot observe zero and later miss a live
@@ -827,6 +1005,20 @@ async fn serve_connection<I>(
                     "Service Unavailable\n",
                 ));
             };
+            // Pin this lookup once: an expired proof cannot later fall through
+            // to business routes while still using the proof connection pool.
+            let proof=request::proof_response(&inner.registry,&request).unwrap_or_default();
+            let classified=if proof.is_some() {
+                connection_budget::classify_proof(&admission,None).await
+            }else{
+                connection_budget::classify(&admission,connection_budget::ConnectionClass::Business)
+            };
+            if classified.is_err() {
+                let mut response=simple(StatusCode::SERVICE_UNAVAILABLE,"Service Unavailable\n");
+                if request.version()==http::Version::HTTP_2 { requested_drain.cancel(); }
+                else {response.headers_mut().insert(http::header::CONNECTION,http::HeaderValue::from_static("close"));}
+                return Ok(response);
+            }
             let activity = business.generation().clone();
             let close_after = verdict == TlsVerdict::ServeThenClose
                 || current.plan.read_header_timeout != accepted_server.plan.read_header_timeout;
@@ -853,7 +1045,10 @@ async fn serve_connection<I>(
                     if !request_h2 { response.headers_mut().insert(http::header::CONNECTION,http::HeaderValue::from_static("close")); }
                     return Ok(response);
                 },
-                response = request::handle(inner,current,request,peer,local,tls,business.clone()) => response,
+                response = async {
+                    if let Some(proof)=proof { proof }
+                    else { request::handle_business(inner,current,request,peer,local,tls,business.clone()).await }
+                } => response,
             };
             if close_after {
                 if request_h2 {
