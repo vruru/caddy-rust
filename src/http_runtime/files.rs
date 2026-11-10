@@ -1,4 +1,4 @@
-use super::request::{Context, decoded_path, failure, go_path_glob, safe_join};
+use super::request::{Context, decoded_path, failure, safe_join};
 use super::*;
 use futures_util::stream;
 use http::{HeaderValue, Method};

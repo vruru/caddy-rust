@@ -13,6 +13,9 @@ mod lifecycle;
 pub use lifecycle::{CommitOutcome, HttpStage, StagedAddress};
 #[path = "http_runtime/mime.rs"]
 mod mime;
+#[path = "http_runtime/path_glob.rs"]
+mod path_glob;
+pub(crate) use path_glob::go_path_glob;
 #[path = "http_runtime/proxy.rs"]
 mod proxy;
 #[path = "http_runtime/request.rs"]
