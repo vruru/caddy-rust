@@ -190,10 +190,65 @@ struct LoadedCertificate {
     signature_profile: SignatureProfile,
 }
 
+/// Public inventory retains only the immutable base key, never an optional
+/// stapled-key clone. Clearing a staple therefore cannot hide retained bytes
+/// from its independent cache budget.
+struct InventoryEntry {
+    key: Arc<CertifiedKey>,
+    leaf_state: Arc<LeafState>,
+    leaf_sha256: [u8; 32],
+    identity: [u8; 32],
+    generation: u64,
+    names: Vec<String>,
+}
+impl InventoryEntry {
+    fn certificate(&self) -> OcspCertificate {
+        OcspCertificate {
+            identity: self.identity,
+            generation: self.generation,
+            names: self.names.clone(),
+            chain_der: self
+                .key
+                .cert
+                .iter()
+                .map(|der| der.as_ref().to_vec())
+                .collect(),
+            leaf_state: self.leaf_state.clone(),
+            leaf_sha256: self.leaf_sha256,
+        }
+    }
+}
+fn certificate_inventory(
+    names: &HashMap<String, Vec<Arc<LoadedCertificate>>>,
+) -> Arc<HashMap<u64, InventoryEntry>> {
+    let mut result: HashMap<u64, InventoryEntry> = HashMap::new();
+    for (name, certificates) in names {
+        for certificate in certificates {
+            let entry = result
+                .entry(certificate.instance_generation)
+                .or_insert_with(|| InventoryEntry {
+                    key: certificate.key.clone(),
+                    leaf_state: certificate.leaf_state.clone(),
+                    leaf_sha256: certificate.leaf_sha256,
+                    identity: certificate.identity,
+                    generation: certificate.instance_generation,
+                    names: Vec::new(),
+                });
+            entry.names.push(name.clone());
+        }
+    }
+    for entry in result.values_mut() {
+        entry.names.sort();
+        entry.names.dedup();
+    }
+    Arc::new(result)
+}
+
 #[derive(Default)]
 struct Snapshot {
     generation: u64,
     names: HashMap<String, Vec<Arc<LoadedCertificate>>>,
+    inventory: Arc<HashMap<u64, InventoryEntry>>,
 }
 
 /// Each map is an immutable snapshot behind one short-held lock. Returning an
@@ -279,6 +334,7 @@ impl HotCertificateResolver {
         }
         prune_staples(&mut next, now, true)?;
         validate_snapshot_size(&next)?;
+        let inventory = certificate_inventory(&next);
         let mut guard = self
             .certificates
             .write()
@@ -292,6 +348,7 @@ impl HotCertificateResolver {
             Arc::new(Snapshot {
                 generation,
                 names: next,
+                inventory,
             }),
         );
         drop(guard);
@@ -375,6 +432,7 @@ impl HotCertificateResolver {
                 .ok_or_else(|| anyhow!("certificate generation exhausted"))?;
             let candidate = Arc::new(Snapshot {
                 generation,
+                inventory: certificate_inventory(&next),
                 names: next,
             });
             let mut guard = self
@@ -448,6 +506,7 @@ impl HotCertificateResolver {
                     .generation
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("certificate generation exhausted"))?,
+                inventory: certificate_inventory(&names),
                 names,
             });
             let mut guard = self
@@ -480,34 +539,68 @@ impl HotCertificateResolver {
             .read()
             .map_err(|_| anyhow!("certificate state unavailable"))?
             .clone();
-        let mut certificates: HashMap<u64, OcspCertificate> = HashMap::new();
-        for (name, candidates) in &snapshot.names {
-            for cert in candidates {
-                let entry = certificates
-                    .entry(cert.instance_generation)
-                    .or_insert_with(|| OcspCertificate {
-                        identity: cert.identity,
-                        generation: cert.instance_generation,
-                        leaf_state: cert.leaf_state.clone(),
-                        leaf_sha256: cert.leaf_sha256,
-                        names: Vec::new(),
-                        chain_der: cert
-                            .key
-                            .cert
-                            .iter()
-                            .map(|der| der.as_ref().to_vec())
-                            .collect(),
-                    });
-                entry.names.push(name.clone());
-            }
-        }
-        let mut certificates = certificates.into_values().collect::<Vec<_>>();
-        for certificate in &mut certificates {
-            certificate.names.sort();
-            certificate.names.dedup();
-        }
-        certificates.sort_by_key(|certificate| certificate.generation);
-        Ok(certificates)
+        let mut result = snapshot
+            .inventory
+            .values()
+            .map(InventoryEntry::certificate)
+            .collect::<Vec<_>>();
+        result.sort_by_key(|certificate| certificate.generation);
+        Ok(result)
+    }
+    /// Scope filtering precedes DER cloning, but each returned record retains
+    /// its complete actual alias set for exact-instance publication checks.
+    pub(crate) fn ocsp_certificates_for_names(
+        &self,
+        names: &HashSet<String>,
+    ) -> Result<Vec<OcspCertificate>> {
+        let snapshot = self
+            .certificates
+            .read()
+            .map_err(|_| anyhow!("certificate state unavailable"))?
+            .clone();
+        let ids = names
+            .iter()
+            .filter_map(|name| snapshot.names.get(name))
+            .flatten()
+            .map(|certificate| certificate.instance_generation)
+            .collect::<HashSet<_>>();
+        let mut result = ids
+            .into_iter()
+            .filter_map(|id| snapshot.inventory.get(&id))
+            .map(InventoryEntry::certificate)
+            .collect::<Vec<_>>();
+        result.sort_by_key(|certificate| certificate.generation);
+        Ok(result)
+    }
+    pub(crate) fn ocsp_certificates_for_identity(
+        &self,
+        identity: &[u8; 32],
+    ) -> Result<Vec<OcspCertificate>> {
+        let snapshot = self
+            .certificates
+            .read()
+            .map_err(|_| anyhow!("certificate state unavailable"))?
+            .clone();
+        let mut result = snapshot
+            .inventory
+            .values()
+            .filter(|entry| entry.identity == *identity)
+            .map(InventoryEntry::certificate)
+            .collect::<Vec<_>>();
+        result.sort_by_key(|certificate| certificate.generation);
+        Ok(result)
+    }
+    pub(crate) fn ocsp_identities(&self) -> Result<HashSet<[u8; 32]>> {
+        let snapshot = self
+            .certificates
+            .read()
+            .map_err(|_| anyhow!("certificate state unavailable"))?
+            .clone();
+        Ok(snapshot
+            .inventory
+            .values()
+            .map(|entry| entry.identity)
+            .collect())
     }
 
     /// Attach only an already verified OCSP response to this exact loaded
@@ -571,6 +664,7 @@ impl HotCertificateResolver {
                     .generation
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("certificate generation exhausted"))?,
+                inventory: base.inventory.clone(),
                 names,
             });
             let mut guard = self

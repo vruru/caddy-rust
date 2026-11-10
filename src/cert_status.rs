@@ -231,6 +231,7 @@ struct Inner {
     cpu_slots: Arc<Semaphore>,
     resources: Arc<OcspResources>,
     inventory: OcspInventorySelector,
+    names_scope: Option<Arc<HashSet<String>>>,
     entries: Mutex<HashMap<CertificateKey, Entry>>,
     observations: Mutex<HashMap<[u8; 32], Observed>>,
     events: broadcast::Sender<OcspEvent>,
@@ -334,6 +335,7 @@ impl OcspManager {
                 cpu_slots: cpu,
                 resources,
                 inventory,
+                names_scope: None,
                 options,
                 policy,
                 entries: Mutex::new(HashMap::new()),
@@ -360,6 +362,15 @@ impl OcspManager {
                 persisted: o.persisted,
             })
             .collect())
+    }
+    /// Set once before sharing/running the manager. The inventory selector is
+    /// still applied to each complete record; this only avoids cloning public
+    /// DER belonging to unrelated scopes.
+    pub(crate) fn with_names_scope(mut self, names: Vec<String>) -> Result<Self> {
+        let inner =
+            Arc::get_mut(&mut self.inner).ok_or_else(|| anyhow!("OCSP scope already shared"))?;
+        inner.names_scope = Some(Arc::new(names.into_iter().collect()));
+        Ok(self)
     }
     pub fn subscribe(&self) -> broadcast::Receiver<OcspEvent> {
         self.inner.events.subscribe()
@@ -1011,13 +1022,7 @@ impl OcspManager {
         if !observations.contains_key(identity) && observations.len() >= 4096 {
             // Retired identities are also pruned here for explicit refresh_one
             // callers which do not run the inventory maintenance loop.
-            let current: HashSet<_> = self
-                .inner
-                .resolver
-                .ocsp_certificates()?
-                .into_iter()
-                .map(|certificate| certificate.identity)
-                .collect();
+            let current = self.inner.resolver.ocsp_identities()?;
             observations.retain(|identity, _| current.contains(identity));
         }
         ensure!(
@@ -1087,7 +1092,13 @@ impl OcspManager {
         let mut conflict = None;
         for _ in 0..8 {
             let resolver = self.inner.resolver.clone();
-            let all = tokio::task::spawn_blocking(move || resolver.ocsp_certificates()).await??;
+            let identity = certificate.identity;
+            let all = crate::cert_cpu::run(
+                self.inner.cpu_slots.clone(),
+                CancellationToken::new(),
+                move || resolver.ocsp_certificates_for_identity(&identity),
+            )
+            .await?;
             let mut retired = false;
             let mut found = false;
             for current in all
@@ -1255,7 +1266,8 @@ impl OcspManager {
             if refresh_inventory||tokio::time::Instant::now()>=next_scan {
                 refresh_inventory=false;next_scan=tokio::time::Instant::now()+self.inner.options.check_interval;
                 let resolver=self.inner.resolver.clone();
-                let certificates=tokio::task::spawn_blocking(move||resolver.ocsp_certificates()).await??;
+                let names=self.inner.names_scope.clone();
+                let certificates=crate::cert_cpu::run(self.inner.cpu_slots.clone(),cancel.clone(),move||match names {Some(names)=>resolver.ocsp_certificates_for_names(&names),None=>resolver.ocsp_certificates()}).await?;
                 let certificates=certificates.into_iter().filter(|certificate|(self.inner.inventory)(certificate)).collect::<Vec<_>>();
                 ensure!(certificates.len()<=4096,"OCSP inventory exceeds resolver certificate limit");
                 let current:HashSet<_>=certificates.iter().map(|c|(c.identity,c.generation)).collect();
@@ -1302,7 +1314,11 @@ impl OcspManager {
         // Drain instead of dropping futures: their bounded blocking crypto and
         // lease-loss watcher tasks must finish and release the held scope.
         while tasks.next().await.is_some() {}
-        result
+        if cancel.is_cancelled() {
+            Ok(())
+        } else {
+            result
+        }
     }
 }
 fn record_leaf(certificate: &OcspCertificate, status: &VerifiedStatus) -> Result<()> {

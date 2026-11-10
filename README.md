@@ -362,3 +362,9 @@ U+2028/U+2029; ordinary Admin encoding, raw adaptation and ETags remain HTML-saf
 The HTTP and logging libraries share one warmed local-timezone lookup for the
 platform UTC offset and abbreviation. It runs only during blocking preparation
 or bounded encoding work; the existing placeholder fallback is preserved.
+
+OCSP groups can now select their own immutable certificate inventory before
+copying DER chains. Complete aliases and distinct loaded generations remain
+authoritative, including multiple instances of one chain. Already authenticated
+negative status still reaches every matching instance. Normal cancellation joins
+owned work before returning without reporting a spurious maintenance failure.
