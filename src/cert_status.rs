@@ -114,6 +114,28 @@ pub struct OcspEvent {
     pub persisted: Option<bool>,
 }
 
+/// Classification of stored OCSP restoration. Only Restored carries an
+/// accepted authenticated status; missing/rejected outcomes are never Good.
+/// This path never queries AIA or an OCSP responder.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CacheRestore {
+    Disabled,
+    NotApplicable,
+    Missing,
+    NeedsIssuer,
+    Expired,
+    Invalid,
+    StaleStatus,
+    StaleGeneration,
+    Restored { status: VerifiedStatus },
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefreshMode {
+    Online,
+    CacheOnly,
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct KnownOcspStatus {
     pub identity: [u8; 32],
@@ -151,6 +173,7 @@ struct Inner {
     options: OcspOptions,
     policy: PolicySelector,
     global: Semaphore,
+    restore_slots: Semaphore,
     responders: Mutex<HashMap<String, Weak<Semaphore>>>,
     gates: Mutex<HashMap<CertificateKey, Weak<AsyncMutex<()>>>>,
     entries: Mutex<HashMap<CertificateKey, Entry>>,
@@ -210,6 +233,7 @@ impl OcspManager {
                 store,
                 resolver,
                 global: Semaphore::new(options.max_concurrent),
+                restore_slots: Semaphore::new(options.max_concurrent * 2),
                 options,
                 policy,
                 responders: Mutex::new(HashMap::new()),
@@ -288,7 +312,10 @@ impl OcspManager {
             leaf_state: certificate.leaf_state.clone(),
             leaf_sha256: certificate.leaf_sha256,
         };
-        let result = self.refresh_one_inner(certificate, cancel.clone()).await;
+        let result = self
+            .refresh_one_inner(certificate, cancel.clone(), RefreshMode::Online)
+            .await
+            .map(|_| ());
         if let Err(error) = &result {
             if cancel.is_cancelled() {
                 return result;
@@ -331,11 +358,46 @@ impl OcspManager {
         result
     }
 
+    /// Revalidate stored OCSP before accepting connections. No network or
+    /// cache mutation is performed. A timeout cancels then joins the in-flight
+    /// verification/lease work; cancellation does not detach blocking IO.
+    pub async fn restore_cached_one(
+        &self,
+        certificate: OcspCertificate,
+        cancel: CancellationToken,
+    ) -> Result<CacheRestore> {
+        let _slot = self
+            .inner
+            .restore_slots
+            .try_acquire()
+            .map_err(|_| anyhow!("OCSP cache restore capacity exhausted"))?;
+        ensure!(!cancel.is_cancelled(), "OCSP cache restore cancelled");
+        let work = cancel.child_token();
+        let operation =
+            self.refresh_one_inner(Arc::new(certificate), work.clone(), RefreshMode::CacheOnly);
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                work.cancel();
+                let _ = operation.await;
+                Err(anyhow!("OCSP cache restore cancelled"))
+            }
+            result = &mut operation => result,
+            _ = tokio::time::sleep(self.inner.options.request_timeout) => {
+                work.cancel();
+                let _ = operation.await;
+                Err(anyhow!("OCSP cache restore deadline exceeded"))
+            }
+        }
+    }
+
     async fn refresh_one_inner(
         &self,
         certificate: Arc<OcspCertificate>,
         cancel: CancellationToken,
-    ) -> Result<()> {
+        mode: RefreshMode,
+    ) -> Result<CacheRestore> {
         let key = (certificate.identity, certificate.generation);
         let gate = {
             let mut gates = self
@@ -368,7 +430,7 @@ impl OcspManager {
                 .resolver
                 .set_ocsp(&certificate.identity, certificate.generation, None)?;
             self.record(&certificate, None, None)?;
-            return Ok(());
+            return Ok(CacheRestore::Disabled);
         }
         ensure!(
             !certificate.chain_der.is_empty(),
@@ -387,26 +449,43 @@ impl OcspManager {
                 .resolver
                 .set_ocsp(&certificate.identity, certificate.generation, None)?;
             self.record(&certificate, None, None)?;
-            return Ok(());
+            return Ok(CacheRestore::NotApplicable);
         };
+        if mode == RefreshMode::CacheOnly && certificate.chain_der.len() < 2 {
+            return Ok(CacheRestore::NeedsIssuer);
+        }
         let responder = config
             .responder_overrides
             .get(&original)
             .cloned()
             .unwrap_or_else(|| original.clone());
         let query_disabled = responder.is_empty();
-        let transport = OcspTransport::new(
-            self.inner.options.request_timeout,
-            1024 * 1024,
-            config.http_proxy.as_deref(),
-            &config.extra_ca_pem,
-        )?;
-        let limiter = self.responder_limit(if query_disabled {
-            &original
+        let transport = if mode == RefreshMode::Online {
+            Some(OcspTransport::new(
+                self.inner.options.request_timeout,
+                1024 * 1024,
+                config.http_proxy.as_deref(),
+                &config.extra_ca_pem,
+            )?)
         } else {
-            &responder
-        })?;
-        let _responder_permit = tokio::select! {_ =cancel.cancelled()=>return Err(anyhow!("OCSP refresh cancelled")),permit=limiter.acquire()=>permit?};
+            None
+        };
+        let limiter = if mode == RefreshMode::Online {
+            Some(self.responder_limit(if query_disabled {
+                &original
+            } else {
+                &responder
+            })?)
+        } else {
+            None
+        };
+        let _responder_permit = if let Some(limiter) = &limiter {
+            Some(
+                tokio::select! {_ =cancel.cancelled()=>return Err(anyhow!("OCSP refresh cancelled")),permit=limiter.acquire()=>permit?},
+            )
+        } else {
+            None
+        };
         let _permit = tokio::select! {_ =cancel.cancelled()=>return Err(anyhow!("OCSP refresh cancelled")),permit=self.inner.global.acquire()=>permit?};
         let cache_key = cache_key(&certificate.names, &certificate.chain_der);
         let scope = format!("ocsp_{}", hex(&Sha256::digest(cache_key.as_bytes())));
@@ -433,12 +512,17 @@ impl OcspManager {
                 tokio::select! {_ =lost.cancelled()=>work.cancel(),_ =stop.cancelled()=>{}}
             })
         };
+        let mut restored = CacheRestore::Missing;
         let result = async {
             let issuer = if certificate.chain_der.len() > 1 {
                 certificate.chain_der[1].clone()
             } else {
                 let url = aia.ok_or_else(|| anyhow!("OCSP issuer URL absent"))?;
-                transport.get(&url, &work).await?
+                transport
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("cached OCSP issuer absent"))?
+                    .get(&url, &work)
+                    .await?
             };
             let leaf_der = certificate.chain_der[0].clone();
             let issuer_for_check = issuer.clone();
@@ -471,6 +555,10 @@ impl OcspManager {
                 .map(|o| o.status);
             if let Some(raw) = self.inner.store.load(&cache_key).await? {
                 if raw.len() > 1024 * 1024 {
+                    if mode == RefreshMode::CacheOnly {
+                        restored = CacheRestore::Invalid;
+                        return Ok(());
+                    }
                     self.inner.store.delete_fenced(&cache_key, &lease).await?;
                     return Err(anyhow!("OCSP cache exceeds response size limit"));
                 }
@@ -488,6 +576,16 @@ impl OcspManager {
                                 .await?;
                             return Err(error);
                         }
+                        // Preserve the shared leaf fact before consulting the
+                        // producer-local history. A predecessor may already
+                        // know a newer Revoked/Unknown state for this leaf.
+                        if mode == RefreshMode::CacheOnly
+                            && status.state == OcspState::Good
+                            && !certificate.leaf_state.admission().allow_staple
+                        {
+                            restored = CacheRestore::StaleStatus;
+                            return Ok(());
+                        }
                         let accepted = match self.observe(&certificate, &status, true) {
                             Ok(value) => value,
                             Err(error) => {
@@ -497,6 +595,9 @@ impl OcspManager {
                             }
                         };
                         if accepted {
+                            restored = CacheRestore::Restored {
+                                status: status.clone(),
+                            };
                             if status.state == OcspState::Good {
                                 lease.check().await?;
                                 ensure!(!work.is_cancelled(), "OCSP refresh cancelled");
@@ -505,12 +606,13 @@ impl OcspManager {
                                     certificate.generation,
                                     Some((raw.to_vec(), status.valid_until)),
                                 )? {
+                                    restored = CacheRestore::StaleGeneration;
                                     return Ok(());
                                 }
                                 let fresh =
                                     status.next_update.is_some() && checked_at < status.refresh_at;
                                 previous = Some(status.clone());
-                                if fresh {
+                                if fresh || mode == RefreshMode::CacheOnly {
                                     self.record(&certificate, Some(status.clone()), None)?;
                                     self.emit(
                                         &certificate,
@@ -522,13 +624,42 @@ impl OcspManager {
                                 }
                             } else {
                                 self.apply_negative(&certificate, &status, quiet).await?;
+                                if mode == RefreshMode::CacheOnly
+                                    && !self.inner.resolver.set_ocsp(
+                                        &certificate.identity,
+                                        certificate.generation,
+                                        None,
+                                    )?
+                                {
+                                    restored = CacheRestore::StaleGeneration;
+                                }
                             }
+                        } else {
+                            restored = CacheRestore::StaleStatus;
                         }
                     }
-                    Err(_) => {
-                        self.inner.store.delete_fenced(&cache_key, &lease).await?;
+                    Err(error) => {
+                        if mode == RefreshMode::CacheOnly {
+                            restored = if error.is::<verify::ExpiredStatus>() {
+                                CacheRestore::Expired
+                            } else {
+                                CacheRestore::Invalid
+                            };
+                        } else {
+                            self.inner.store.delete_fenced(&cache_key, &lease).await?;
+                        }
                     }
                 }
+            }
+            if mode == RefreshMode::CacheOnly {
+                if let Some(known) = self
+                    .observed(&certificate.identity)?
+                    .filter(|observed| observed.status.state != OcspState::Good)
+                {
+                    self.apply_negative(&certificate, &known.status, quiet)
+                        .await?;
+                }
+                return Ok(());
             }
             if query_disabled {
                 if previous.is_none() {
@@ -543,7 +674,11 @@ impl OcspManager {
             }
             let fetched = async {
                 let request = create_request(&certificate.chain_der[0], &issuer)?;
-                let raw = transport.post(&responder, &request, &work).await?;
+                let raw = transport
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("OCSP network is unavailable in cached-only mode"))?
+                    .post(&responder, &request, &work)
+                    .await?;
                 let status = verify_owned(
                     raw.clone(),
                     certificate.chain_der[0].clone(),
@@ -666,7 +801,8 @@ impl OcspManager {
             .await
             .map_err(|_| anyhow!("OCSP lease watcher failed"));
         let release = lease.release().await;
-        result.and(watcher_result).and(release)
+        result.and(watcher_result).and(release)?;
+        Ok(restored)
     }
 
     fn responder_limit(&self, responder: &str) -> Result<Arc<Semaphore>> {

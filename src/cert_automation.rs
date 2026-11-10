@@ -152,6 +152,12 @@ pub enum OrderResolution {
     ConfirmNoOrder,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoadMode {
+    Online,
+    CacheOnly,
+}
+
 #[derive(Clone)]
 pub struct CertificateManager {
     inner: Arc<ManagerInner>,
@@ -487,11 +493,7 @@ impl CertificateManager {
         self.ensure_inner(names, cancel.child_token()).await
     }
 
-    async fn ensure_inner(
-        &self,
-        names: Vec<String>,
-        cancel: CancellationToken,
-    ) -> Result<ManagedCertificate> {
+    async fn name_gate(&self, names: &[String]) -> Result<Arc<Mutex<()>>> {
         let gate_key = digest(names.join("\0").as_bytes());
         let gate = {
             let mut gates = self.inner.gates.lock().await;
@@ -505,6 +507,45 @@ impl CertificateManager {
                 gate
             }
         };
+        Ok(gate)
+    }
+
+    /// Restore complete, currently valid stored material into this manager's
+    /// resolver without contacting the CA, checking ARI, registering accounts or
+    /// creating an order. A due renewal is still returned with its original
+    /// deadline; normal ensure/run will renew it after candidate validation.
+    /// Local storage transactions may be recovered. Unstored ACME candidates are
+    /// deliberately left for normal ensure, never promoted by this read path.
+    pub async fn load_cached(
+        &self,
+        names: &[String],
+        cancel: CancellationToken,
+    ) -> Result<Option<ManagedCertificate>> {
+        let names = normalize_names(names)?;
+        self.startup_recovery(cancel.clone()).await?;
+        let gate = self.name_gate(&names).await?;
+        let _gate = tokio::select! {biased;_=cancel.cancelled()=>return Err(anyhow!("ACME cache load cancelled")),guard=gate.lock()=>guard};
+        let _global = tokio::select! {biased;_=cancel.cancelled()=>return Err(anyhow!("ACME cache load cancelled")),permit=self.inner.global.acquire()=>permit.map_err(|_|anyhow!("ACME manager closed"))?};
+        let lease = self
+            .inner
+            .store
+            .lock(&format!("issue_cert_{}", names[0]), cancel.clone())
+            .await?;
+        let result = self
+            .load_existing(&names, &lease, &cancel, LoadMode::CacheOnly)
+            .await;
+        let release = lease.release().await;
+        let (cached, _) = result?;
+        release?;
+        Ok(cached)
+    }
+
+    async fn ensure_inner(
+        &self,
+        names: Vec<String>,
+        cancel: CancellationToken,
+    ) -> Result<ManagedCertificate> {
+        let gate = self.name_gate(&names).await?;
         let _gate = tokio::select! {biased;_=cancel.cancelled()=>return Err(anyhow!("ACME operation cancelled")),guard=gate.lock()=>guard};
         let _global = tokio::select! {biased;_=cancel.cancelled()=>return Err(anyhow!("ACME operation cancelled")),permit=self.inner.global.acquire()=>permit.map_err(|_|anyhow!("ACME manager closed"))?};
         // Queueing for a per-name/global permit is cancellable but is not
@@ -742,7 +783,8 @@ impl CertificateManager {
                 recovery_issue: None,
             });
         }
-        self.load_existing(names, lease, cancel).await
+        self.load_existing(names, lease, cancel, LoadMode::Online)
+            .await
     }
     async fn read_reservation(
         &self,
@@ -918,6 +960,7 @@ impl CertificateManager {
         names: &[String],
         lease: &StorageLease,
         cancel: &CancellationToken,
+        mode: LoadMode,
     ) -> Result<(Option<ManagedCertificate>, Option<Replacement>)> {
         let key = names_key(names)?;
         let active_attempt = self.load_attempt(names).await?;
@@ -953,6 +996,7 @@ impl CertificateManager {
             .await;
             let Some((bundle, info)) = (match material {
                 Ok(value) => value,
+                Err(error) if mode == LoadMode::CacheOnly => return Err(error),
                 Err(_) => {
                     let _ = self.inner.events.send(AutomationEvent {
                         names: names.to_vec(),
@@ -1001,11 +1045,18 @@ impl CertificateManager {
             // Preserve the attempt/winner selection above. A revocation vetoes
             // cached readiness; it must not select an older issuer's leaf.
             let revoked = info.not_after > now && self.material_revocation(&info)?.is_some();
-            if info.not_before <= now && info.not_after > now {
+            if mode == LoadMode::Online && info.not_before > now {
+                // A stored future leaf can mean local clock skew. Preserve the
+                // selected winner/base and wait rather than creating another
+                // order (possibly another future leaf) at each scheduler pass.
+                return Err(FutureCertificate(info.not_before).into());
+            }
+            if mode == LoadMode::Online && info.not_before <= now && info.not_after > now {
                 self.publish(names, &bundle, cancel).await?;
             }
             let mut ari = parse_ari(&bundle.metadata);
-            if !revoked
+            if mode == LoadMode::Online
+                && !revoked
                 && issuer.ca.next_allowed_unix.load(Ordering::Acquire) <= now
                 && info.not_after > now
                 && ari.as_ref().is_none_or(|a| a.refresh_after_unix <= now)
@@ -1066,10 +1117,14 @@ impl CertificateManager {
                 &info.leaf_sha256,
             )?;
             if !revoked
-                && now < renew_at
+                && (mode == LoadMode::CacheOnly || now < renew_at)
+                && info.not_before <= now
                 && info.not_after > now
                 && self.material_revocation(&info)?.is_none()
             {
+                if mode == LoadMode::CacheOnly {
+                    self.publish(names, &bundle, cancel).await?;
+                }
                 return Ok((
                     Some(ManagedCertificate {
                         names: names.to_vec(),
@@ -2007,6 +2062,17 @@ impl std::error::Error for ActiveOrderError {
     }
 }
 #[derive(Debug)]
+struct FutureCertificate(i64);
+impl std::fmt::Display for FutureCertificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "stored certificate is not valid yet; check the local clock and retry after notBefore",
+        )
+    }
+}
+impl std::error::Error for FutureCertificate {}
+
+#[derive(Debug)]
 struct RetryAfterError(i64);
 impl std::fmt::Display for RetryAfterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2018,8 +2084,16 @@ fn error_retry_delay(error: &anyhow::Error) -> Duration {
     if let Some(error) = error.downcast_ref::<ActiveOrderError>() {
         return error_retry_delay(&error.0);
     }
-    if let Some(error) = error.downcast_ref::<RetryAfterError>() {
-        return Duration::from_secs((error.0 - now()).max(1) as u64);
+    let deadline = error
+        .downcast_ref::<RetryAfterError>()
+        .map(|e| e.0)
+        .or_else(|| error.downcast_ref::<FutureCertificate>().map(|e| e.0));
+    if let Some(deadline) = deadline {
+        // Periodically recheck local state even for extreme clock skew. The
+        // stored notBefore/CA deadline remains authoritative on the next pass;
+        // this bound prevents constructing an overflowing runtime timer.
+        return Duration::from_secs(deadline.saturating_sub(now()).max(1) as u64)
+            .min(Duration::from_secs(86400));
     }
     error
         .downcast_ref::<ProtocolError>()

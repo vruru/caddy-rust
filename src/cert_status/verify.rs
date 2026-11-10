@@ -1,4 +1,15 @@
 //! One DER interpretation; crypto libraries receive original TBS bytes only.
+/// Parsed response rejected at the freshness deadline. This is not an accepted
+/// certificate-status observation and relaxes no signature or time check.
+#[derive(Debug)]
+pub(super) struct ExpiredStatus;
+impl std::fmt::Display for ExpiredStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OCSP response or responder certificate expired")
+    }
+}
+impl std::error::Error for ExpiredStatus {}
+
 use super::{OcspState, VerifiedStatus};
 use anyhow::{Result, anyhow, ensure};
 use aws_lc_rs::signature as aws;
@@ -335,10 +346,9 @@ pub fn verify_response_with_max_age(
     let valid_until = effective_next
         .min(responder.validity().not_after.timestamp())
         .min(leaf.validity().not_after.timestamp());
-    ensure!(
-        valid_until > now,
-        "OCSP response or responder certificate expired"
-    );
+    if valid_until <= now {
+        return Err(ExpiredStatus.into());
+    }
     let legacy_signature = is_sha1_oid(&algorithm.algorithm.to_id_string())
         || algorithm
             .parameters
