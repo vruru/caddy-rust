@@ -5,15 +5,12 @@ production binaries expose the same 135 standard modules and no additional
 third-party modules. The live configuration uses a subset; that observation does
 not authorize removing capabilities from the requested replacement.
 
-Current CLI stage: Caddyfile formatting/adaptation and read-only feature/storage
-inspection. Full provisioning validation and serving commands remain incomplete. The library adds
-bounded in-memory challenge leases and validated certificate snapshot selection;
-these primitives are not connected to a production listener or ACME issuer.
-All traffic serving,
-Caddyfile adaptation, Admin API mutation, automatic issuance/renewal, and standard
-module behavior remain unimplemented until their respective code and differential
-tests are complete. This document must track implementation and verification
-separately. No production migration is authorized by this inspection build.
+Current CLI stage: formatting, adaptation, inspection and provision-only
+validation, with opt-in native run/start/reload/stop for supported development
+configurations. The native library includes transactional HTTP/Admin and
+certificate application components, and currently rejects unsupported
+configuration before replacing a working listener. Full command, module,
+resource and production rollout acceptance remain separate gates.
 
 Required feature families:
 

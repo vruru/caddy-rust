@@ -63,8 +63,7 @@ impl SocketOwner {
         if !self.same_inode(&before) {
             return Err(failure("admin_socket_replaced"));
         }
-        self.admission
-            .restrict(u32::from(mode.bits()), self.gid);
+        self.admission.restrict(u32::from(mode.bits()), self.gid);
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
@@ -1177,6 +1176,23 @@ async fn dispatch(
         }
         ("POST", "/adapt") | ("POST", "/load") => {
             let adapter = content_adapter(content.as_deref())?;
+            let source = if path == "/load" {
+                use std::os::unix::ffi::OsStringExt;
+                super::source::Action::Load {
+                    file: request
+                        .headers()
+                        .get("caddy-config-source-file")
+                        .map(|h| std::ffi::OsString::from_vec(h.as_bytes().to_vec()))
+                        .unwrap_or_default(),
+                    adapter: request
+                        .headers()
+                        .get("caddy-config-source-adapter")
+                        .map(|h| String::from_utf8_lossy(h.as_bytes()).into_owned())
+                        .unwrap_or_default(),
+                }
+            } else {
+                super::source::Action::None
+            };
             let filename = request
                 .headers_mut()
                 .remove("x-caddy-filename")
@@ -1220,7 +1236,13 @@ async fn dispatch(
                         Some(adapted.result),
                         tag.as_deref(),
                         force,
-                        Authorization { grant: grant.clone(), local: local.clone() },
+                        super::controller::ChangeAdmission {
+                            authorization: Authorization {
+                                grant: grant.clone(),
+                                local: local.clone(),
+                            },
+                            source,
+                        },
                     )
                     .await?;
                 if adapted.warnings.is_empty() {
@@ -1285,7 +1307,13 @@ async fn dispatch(
                     value,
                     tag.as_deref(),
                     force,
-                    Authorization { grant: grant.clone(), local: local.clone() },
+                    super::controller::ChangeAdmission {
+                        authorization: Authorization {
+                            grant: grant.clone(),
+                            local: local.clone(),
+                        },
+                        source: super::source::Action::None,
+                    },
                 )
                 .await?;
             reply(200, Vec::new())

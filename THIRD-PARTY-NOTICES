@@ -125,3 +125,10 @@ Vendored functional source retains its original dual license: Apache-2.0 or
 MIT, at your option. See vendor/serde_json-1.0.154/LICENSE-APACHE and
 vendor/serde_json-1.0.154/LICENSE-MIT. See vendor/VENDOR.md for registry
 provenance and the scope of the local changes.
+
+Go runtime descriptor limit policy
+----------------------------------
+
+The startup logic in src/cli/file_limit.rs follows the Go Authors' syscall
+rlimit policy in Go 1.27.3, including the Darwin per-process limit. The Go
+BSD 3-Clause license retained above also covers this derivative.

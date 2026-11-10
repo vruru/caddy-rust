@@ -32,6 +32,8 @@ mod remote_pin;
 #[path = "admin/server.rs"]
 mod server;
 pub use controller::AdminController;
+#[path = "admin/source.rs"]
+mod source;
 use serde_json::Value;
 pub use server::AdminServerHandle;
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
@@ -184,6 +186,17 @@ impl AdminOptions {
 
 /// Resolve --resume without mutating an active process. Missing autosave falls
 /// back to the supplied config; a present corrupt or unsafe file is an error.
+/// Read the last autosave without conflating a missing file with JSON null.
+pub fn read_autosave(path: &std::path::Path) -> Result<Option<Value>, AdminError> {
+    files::read(path, 100 * 1024 * 1024)?
+        .map(|bytes| {
+            let bytes = zeroize::Zeroizing::new(bytes);
+            crate::admin_json::decoded(&bytes)
+                .map_err(|_| AdminError::new(400, "corrupt_autosave_configuration"))
+        })
+        .transpose()
+}
+
 pub fn resume_config(autosave: &std::path::Path, fallback: &Value) -> Result<Value, AdminError> {
     files::resume(autosave, fallback)
 }

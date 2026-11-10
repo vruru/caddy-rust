@@ -2,6 +2,18 @@
 use super::*;
 
 pub fn load(path: Option<&OsStr>, adapter: Option<&OsStr>) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    Ok(load_with_source(path, adapter)?.bytes)
+}
+
+pub struct LoadedConfig {
+    pub bytes: zeroize::Zeroizing<Vec<u8>>,
+    #[cfg(feature = "native-run")]
+    pub path: Option<PathBuf>,
+    #[cfg(feature = "native-run")]
+    pub adapter: Option<String>,
+}
+
+pub fn load_with_source(path: Option<&OsStr>, adapter: Option<&OsStr>) -> Result<LoadedConfig> {
     let explicit = nonempty(path);
     let adapter = nonempty(adapter);
     ensure!(
@@ -52,7 +64,13 @@ pub fn load(path: Option<&OsStr>, adapter: Option<&OsStr>) -> Result<zeroize::Ze
         // overflow rejection, but retains the original bytes for typed decode.
         let _ = admin_json::decoded(&bytes).map_err(|e| anyhow!(e.category))?;
     }
-    Ok(bytes)
+    Ok(LoadedConfig {
+        bytes,
+        #[cfg(feature = "native-run")]
+        path,
+        #[cfg(feature = "native-run")]
+        adapter,
+    })
 }
 
 pub fn strip_metadata(input: &[u8]) -> Result<Vec<u8>> {

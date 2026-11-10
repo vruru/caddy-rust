@@ -12,6 +12,9 @@ mod line_diff;
 #[cfg(feature = "native-run")]
 #[path = "cli/paths.rs"]
 mod paths;
+#[cfg(feature = "native-run")]
+#[path = "cli/serving.rs"]
+mod serving;
 #[path = "cli/validation.rs"]
 mod validation;
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -234,6 +237,13 @@ pub unsafe fn dispatch_early(input: &[OsString]) -> Result<Option<i32>> {
     let Some(command) = input.first().and_then(|s| s.to_str()) else {
         return Ok(None);
     };
+    #[cfg(feature = "native-run")]
+    if let Some(specs) = serving::specs(command) {
+        // SAFETY: same single-threaded startup contract as validation.
+        return Ok(Some(unsafe {
+            serving::command(command, args::parse(&input[1..], &specs)?)?
+        }));
+    }
     match command {
         "fmt" => {
             let mut specs = COMMON.to_vec();

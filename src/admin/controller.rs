@@ -82,6 +82,8 @@ pub(super) struct Inner {
     pub cpu: Arc<tokio::sync::Semaphore>,
     pub cancel: tokio_util::sync::CancellationToken,
     stop_events: tokio::sync::watch::Sender<Option<super::AdminStopOutcome>>,
+    force_join: tokio::sync::watch::Sender<Option<Result<(), AdminError>>>,
+    source: Option<super::source::Tracked>,
     pub loader: Mutex<Option<tokio_util::sync::CancellationToken>>,
     reply_slots: Arc<tokio::sync::Semaphore>,
     responses: tokio_util::task::TaskTracker,
@@ -101,10 +103,15 @@ struct Change {
     local: Option<super::local_access::LocalAdmission>,
     expected_generation: Option<u64>,
     loader_budget: u8,
+    source: super::source::Action,
 }
 pub(super) struct Authorization {
     pub grant: Option<super::remote::Grant>,
     pub local: Option<super::local_access::LocalAdmission>,
+}
+pub(super) struct ChangeAdmission {
+    pub authorization: Authorization,
+    pub source: super::source::Action,
 }
 enum Work {
     Change(Change),
@@ -140,15 +147,27 @@ impl AdminController {
         options: AdminOptions,
         backend: Arc<dyn AdminBackend>,
     ) -> Result<Self, AdminError> {
+        Self::new_with_source(initial, options, backend, None)
+    }
+    /// The path is captured by the executable, never adopted from HTTP.
+    pub fn new_with_source(
+        initial: Value,
+        options: AdminOptions,
+        backend: Arc<dyn AdminBackend>,
+        source: Option<(std::path::PathBuf, std::path::PathBuf, Option<String>)>,
+    ) -> Result<Self, AdminError> {
         options.validate()?;
         let initial =
             crate::admin_json::decoded(&crate::admin_json::encoded(&initial).map_err(dom)?)
                 .map_err(dom)?;
         LocalPolicy::parse(&initial)?;
         let indexed = Indexed::new(initial)?;
-        let (sender, receiver) = mpsc::channel(options.queue_capacity);
+        // Changes are independently bounded by reply_slots. Reserve one
+        // channel position for stop and one for the drain barrier.
+        let (sender, receiver) = mpsc::channel(options.queue_capacity + 3);
         let requests = Arc::new(tokio::sync::Semaphore::new(options.max_requests));
         let (stop_events, _) = tokio::sync::watch::channel(None);
+        let (force_join, _) = tokio::sync::watch::channel(None);
         let reply_slots = Arc::new(tokio::sync::Semaphore::new(options.queue_capacity + 1));
         let inner = Arc::new(Inner {
             state: ArcSwap::from_pointee(Published {
@@ -171,6 +190,9 @@ impl AdminController {
             )),
             cancel: tokio_util::sync::CancellationToken::new(),
             stop_events,
+            force_join,
+            source: source
+                .map(|(cwd, path, adapter)| super::source::Tracked::new(cwd, path, adapter)),
             loader: Mutex::new(None),
             reply_slots,
             responses: tokio_util::task::TaskTracker::new(),
@@ -187,6 +209,48 @@ impl AdminController {
     }
     pub fn stop_events(&self) -> tokio::sync::watch::Receiver<Option<super::AdminStopOutcome>> {
         self.inner.stop_events.subscribe()
+    }
+    pub fn source_active(&self) -> bool {
+        self.inner
+            .source
+            .as_ref()
+            .is_some_and(super::source::Tracked::active)
+    }
+    pub async fn reload_from_source(&self, body: Value, force: bool) -> Result<(), AdminError> {
+        self.inner
+            .enqueue(Work::Change(Change {
+                method: "POST".into(),
+                path: "/config".into(),
+                body: Some(super::loader::Loaded::Adapted(body)),
+                if_match: None,
+                force,
+                grant: None,
+                local: None,
+                expected_generation: None,
+                loader_budget: 16,
+                source: super::source::Action::ProcessFile,
+            }))
+            .await
+    }
+    /// Drain Admin ingress and accepted response owners. The executable also
+    /// drains its application backend, independently of Admin being enabled.
+    pub async fn shutdown(&self) -> Result<(), AdminError> {
+        self.inner.shutdown().await
+    }
+    pub async fn force_shutdown(&self) -> Result<(), AdminError> {
+        reject_reentrant()?;
+        let mut joined = self.inner.force_join.subscribe();
+        self.inner.halt();
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                if let Some(outcome) = *joined.borrow_and_update() {
+                    return outcome;
+                }
+                joined.changed().await.map_err(|_| unavailable())?;
+            }
+        })
+        .await
+        .map_err(|_| AdminError::new(503, "admin_forced_shutdown_incomplete"))?
     }
     pub async fn remote_address(&self) -> Option<String> {
         self.inner
@@ -265,6 +329,19 @@ impl AdminController {
             generation: committed.generation,
             access: guard.stage.access.clone(),
         }));
+        if policy.persist
+            && let Some(path) = self.inner.options.autosave.clone()
+        {
+            let raw = previous.raw.clone();
+            if self
+                .inner
+                .offload(move || files::save(&path, &raw))
+                .await
+                .is_err()
+            {
+                eprintln!("admin event=autosave_failed category=admin_file_operation_failed");
+            }
+        }
         let accepting = !self.inner.cancel.is_cancelled() && !committed.stop_pending;
         if accepting {
             if let Some(ready) = guard.stage.local.take() {
@@ -308,6 +385,7 @@ impl AdminController {
                 local: None,
                 expected_generation: None,
                 loader_budget: 16,
+                source: super::source::Action::None,
             }))
             .await
     }
@@ -318,9 +396,12 @@ impl AdminController {
         body: Option<Value>,
         if_match: Option<&str>,
         force: bool,
-        authorization: Authorization,
+        admission: ChangeAdmission,
     ) -> Result<(), AdminError> {
-        let Authorization { grant, local } = authorization;
+        let ChangeAdmission {
+            authorization: Authorization { grant, local },
+            source,
+        } = admission;
         if let Some(local) = &local {
             local.check()?;
         }
@@ -334,6 +415,7 @@ impl AdminController {
                 local,
                 expected_generation: None,
                 loader_budget: 16,
+                source,
                 grant,
             }))
             .await
@@ -413,15 +495,29 @@ impl Inner {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let inner = self.clone();
             runtime.spawn(async move {
-                if let Some(running) = inner.remote_listener.lock().await.take() {
-                    running.force_shutdown().await;
-                }
-                if let Some(running) = inner.listener.lock().await.take() {
-                    running.force_shutdown().await;
-                }
-                if let Ok(stop) = stop {
-                    let _ = std::panic::AssertUnwindSafe(stop).catch_unwind().await;
-                }
+                let remote = async {
+                    if let Some(running) = inner.remote_listener.lock().await.take() {
+                        running.force_shutdown().await;
+                    }
+                };
+                let local = async {
+                    if let Some(running) = inner.listener.lock().await.take() {
+                        running.force_shutdown().await;
+                    }
+                };
+                let backend = async {
+                    match stop {
+                        Ok(stop) => std::panic::AssertUnwindSafe(stop)
+                            .catch_unwind()
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(AdminError::new(503, "admin_forced_backend_shutdown_failed"))
+                            }),
+                        Err(_) => Err(AdminError::new(503, "admin_forced_backend_shutdown_failed")),
+                    }
+                };
+                let (_, _, result) = tokio::join!(remote, local, backend);
+                inner.force_join.send_replace(Some(result));
             });
         }
     }
@@ -516,6 +612,7 @@ impl Inner {
                     local: None,
                     expected_generation: Some(generation),
                     loader_budget: budget,
+                    source: super::source::Action::None,
                 }),
                 reply,
                 reply_slot: Some(reply_slot),
@@ -549,12 +646,17 @@ impl Inner {
             .await
             .map_err(|_| AdminError::new(503, "admin_shutdown_incomplete"));
         let teardown = async {
-            if let Some(running) = self.remote_listener.lock().await.take() {
-                running.shutdown().await;
-            }
-            if let Some(running) = self.listener.lock().await.take() {
-                running.shutdown().await;
-            }
+            let remote = async {
+                if let Some(running) = self.remote_listener.lock().await.take() {
+                    running.shutdown().await;
+                }
+            };
+            let local = async {
+                if let Some(running) = self.listener.lock().await.take() {
+                    running.shutdown().await;
+                }
+            };
+            tokio::join!(remote, local);
         };
         let closed = tokio::time::timeout(std::time::Duration::from_secs(36), teardown).await;
         if closed.is_err() {
@@ -788,6 +890,12 @@ fn prepare_change(
 async fn apply(inner: &Arc<Inner>, change: Change) -> Result<Applied, AdminError> {
     inner.check_readable()?;
     let previous = inner.state.load_full();
+    let source_action = change.source.clone();
+    if matches!(&source_action, super::source::Action::ProcessFile)
+        && inner.source.as_ref().is_none_or(|source| !source.active())
+    {
+        return Err(AdminError::new(409, "process_config_source_changed"));
+    }
     let Some(Candidate {
         previous,
         candidate,
@@ -799,6 +907,9 @@ async fn apply(inner: &Arc<Inner>, change: Change) -> Result<Applied, AdminError
         .offload(move || prepare_change(previous, change))
         .await?
     else {
+        if let Some(source) = &inner.source {
+            source.accepted(&source_action);
+        }
         return Ok(Applied {
             changed: false,
             completion: None,
@@ -940,6 +1051,9 @@ async fn apply(inner: &Arc<Inner>, change: Change) -> Result<Applied, AdminError
         generation: committed.generation,
         access: guard.stage.access.clone(),
     }));
+    if let Some(source) = &inner.source {
+        source.accepted(&source_action);
+    }
     let mut retired = Vec::new();
     let accepting = !committed.stop_pending && !inner.cancel.is_cancelled();
     if policy.disabled {

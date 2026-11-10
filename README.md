@@ -1,9 +1,10 @@
 # Native compatibility implementation
 
 Standalone Rust implementation in progress for the existing Caddy deployment.
-This is a separate project from GoEdge. The current build provides **configuration utilities and read-only migration
-inspection**, not a traffic-serving replacement. Existing production
-Caddy remains unchanged until the replacement passes the applicable contracts.
+This is a separate project from GoEdge. The default build provides configuration
+utilities and migration inspection. The opt-in `native-run` build can serve
+supported configurations in development. Production replacement requires
+the remaining compatibility and rollout gates.
 
 The user requires original functionality and module behavior to remain available,
 especially automatic certificate issuance and renewal. See COMPATIBILITY.md for
@@ -25,8 +26,8 @@ Current commands:
 
 Provisioning validation may initialize local storage or PKI material, while the
 inspection commands remain read-only. Formatting can overwrite the explicit input
-file. These commands do not serve traffic, renew certificates or reload a running
-process. Inspection reports must not contain private keys, account email,
+file. These configuration and inspection commands do not serve traffic, renew
+certificates or reload a running process. Inspection reports must not contain private keys, account email,
 account URLs, domain names, or credential values. Schema pointers use documented
 redaction for dynamic map keys; they are not Admin API mutation paths.
 
@@ -335,8 +336,8 @@ Failed candidates preserve their predecessor; compensation uses retained verifie
 material rather than fetching or issuing certificates. Owned shutdown survives
 caller timeout/drop and retains delayed predecessor services until their actual
 HTTP admission closes. Provision-only validation uses the same server path
-without binding listeners or activating certificate jobs. This feature does not
-yet expose a serving CLI or waive the remaining module/CLI acceptance gates.
+without binding listeners or activating certificate jobs. The opt-in serving
+CLI uses this backend. Remaining module and CLI acceptance gates still apply.
 
 OCSP restoration and CPU verification now use distinct admission budgets. The
 same certificate CPU budget is shared across default application policies and
@@ -381,3 +382,22 @@ HTTP responses; runtime handling of 100 and 103 remains a separate gate.
 The configuration DOM has explicit depth and byte limits. Compact arrays can
 still expand considerably in memory; aggregate concurrent configuration work
 requires separate memory admission and load acceptance before rollout.
+
+With `native-run`, `run`, `start`, `reload` and `stop` expose the native
+development lifecycle. Initial and accepted configuration can be saved to the
+original autosave location; `run --resume` uses it when present. Background
+start reports readiness only after publication and authenticates its local
+child handshake. An interrupted start owns the child through shutdown. The
+process uses every CPU available at startup and raises only its own descriptor
+limit where possible. Signals provide graceful drain, and a forced shutdown
+has a bounded wait for owned cleanup.
+
+File monitoring survives temporary read failures and retries transient
+configuration admission failures. A successful external load preserves
+monitoring only when the source marker matches the original absolute lexical
+path and adapter. Different directories, unresolved aliases, and absent or
+different source markers revoke monitoring. HTTP markers never provide a new
+path for the process to open. TCP, filesystem Unix sockets, and Linux abstract
+Unix sockets are supported by the administrative commands; the server can
+capture declared inherited TCP descriptors before runtime construction.
+This is not the complete Caddy command or module surface.
