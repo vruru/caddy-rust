@@ -38,10 +38,9 @@ pub struct CertificateResources {
 }
 impl CertificateResources {
     pub fn new() -> Result<Self> {
-        Self::with_shared(
-            Arc::new(AutomationResources::new(10, 2)?),
-            Arc::new(OcspResources::new(8, 2)?),
-        )
+        let issuance = Arc::new(AutomationResources::new(10, 2)?);
+        let ocsp = Arc::new(OcspResources::with_cpu(8, 2, issuance.cpu_slots())?);
+        Self::with_shared(issuance, ocsp)
     }
     pub fn with_shared(
         issuance: Arc<AutomationResources>,

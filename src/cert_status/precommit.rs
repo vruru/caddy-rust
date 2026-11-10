@@ -46,19 +46,24 @@ impl OcspManager {
             !certificate.chain_der.is_empty(),
             "OCSP certificate chain empty"
         );
-        let chain=certificate.chain_der.clone();
-        let (inspection,slot)=tokio::task::spawn_blocking(move || {
-            let inspection=inspect_certificate(&chain)?;
-            Ok::<_,anyhow::Error>((inspection,slot))
-        }).await??;
-        ensure!(!cancel.is_cancelled(),"OCSP cache probe cancelled");
-        let quiet=inspection.quiet;
+        let chain = certificate.chain_der.clone();
+        let cpu = tokio::select! {biased;_=cancel.cancelled()=>return Err(anyhow!("OCSP cache probe cancelled")),slot=self.inner.cpu_slots.clone().acquire_owned()=>slot.map_err(|_|anyhow!("OCSP CPU dispatch stopped"))?};
+        let (inspection, slot) = tokio::task::spawn_blocking(move || {
+            let _cpu = cpu;
+            let inspection = inspect_certificate(&chain)?;
+            Ok::<_, anyhow::Error>((inspection, slot))
+        })
+        .await??;
+        ensure!(!cancel.is_cancelled(), "OCSP cache probe cancelled");
+        let quiet = inspection.quiet;
         if inspection.responder.is_none() {
             if inspection.must_staple {
                 self.emit(&certificate, "ocsp_must_staple_unavailable", None, false);
             }
-            self.inner.resolver.set_ocsp(&certificate.identity,certificate.generation,None)?;
-            self.record(&certificate,None,None)?;
+            self.inner
+                .resolver
+                .set_ocsp(&certificate.identity, certificate.generation, None)?;
+            self.record(&certificate, None, None)?;
             return Ok(CacheRestore::NotApplicable);
         }
         if certificate.chain_der.len() < 2 {
@@ -83,6 +88,7 @@ impl OcspManager {
             config.no_next_update_max_age,
             Some(slot),
             None,
+            acquire_cpu(self.inner.cpu_slots.clone(), &cancel).await?,
         )
         .await;
         let status = match verified {

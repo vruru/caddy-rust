@@ -2,10 +2,10 @@
 //! validator; certificate status never causes network IO in a TLS handshake.
 #[path = "cert_status/network.rs"]
 mod network;
-#[path = "cert_status/verify.rs"]
-mod verify;
 #[path = "cert_status/precommit.rs"]
 mod precommit;
+#[path = "cert_status/verify.rs"]
+mod verify;
 pub use precommit::OcspProbeBusy;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -62,6 +62,7 @@ pub type OcspInventorySelector = Arc<dyn Fn(&OcspCertificate) -> bool + Send + S
 pub struct OcspResources {
     global: Arc<Semaphore>,
     restore_slots: Arc<Semaphore>,
+    cpu_slots: Arc<Semaphore>,
     work_slots: Semaphore,
     responders: Mutex<HashMap<String, Weak<Semaphore>>>,
     gates: Mutex<HashMap<CertificateGateKey, Weak<AsyncMutex<()>>>>,
@@ -69,12 +70,33 @@ pub struct OcspResources {
     max_per_responder: usize,
 }
 impl OcspResources {
-    pub fn limits(&self) -> (usize, usize) { (self.max_concurrent, self.max_per_responder) }
+    pub fn limits(&self) -> (usize, usize) {
+        (self.max_concurrent, self.max_per_responder)
+    }
     pub fn new(max_concurrent: usize, max_per_responder: usize) -> Result<Self> {
-        ensure!((1..=128).contains(&max_concurrent) && (1..=max_concurrent).contains(&max_per_responder), "invalid OCSP concurrency limits");
+        let cpu = Arc::new(Semaphore::new(
+            std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(4),
+        ));
+        Self::with_cpu(max_concurrent, max_per_responder, cpu)
+    }
+    /// Network/restore admission and CPU dispatch are distinct budgets. Share
+    /// the caller's existing certificate CPU budget across policies/generations.
+    pub(crate) fn with_cpu(
+        max_concurrent: usize,
+        max_per_responder: usize,
+        cpu: Arc<Semaphore>,
+    ) -> Result<Self> {
+        ensure!(
+            (1..=128).contains(&max_concurrent)
+                && (1..=max_concurrent).contains(&max_per_responder),
+            "invalid OCSP concurrency limits"
+        );
         Ok(Self {
             global: Arc::new(Semaphore::new(max_concurrent)),
             restore_slots: Arc::new(Semaphore::new(max_concurrent * 2)),
+            cpu_slots: cpu,
             work_slots: Semaphore::new(4096),
             responders: Mutex::new(HashMap::new()),
             gates: Mutex::new(HashMap::new()),
@@ -206,6 +228,7 @@ struct Inner {
     policy: PolicySelector,
     global: Arc<Semaphore>,
     restore_slots: Arc<Semaphore>,
+    cpu_slots: Arc<Semaphore>,
     resources: Arc<OcspResources>,
     inventory: OcspInventorySelector,
     entries: Mutex<HashMap<CertificateKey, Entry>>,
@@ -241,8 +264,18 @@ impl OcspManager {
         options: OcspOptions,
         policy: PolicySelector,
     ) -> Result<Self> {
-        let resources = Arc::new(OcspResources::new(options.max_concurrent, options.max_concurrent_per_responder)?);
-        Self::with_resources_and_inventory(store, resolver, options, policy, Arc::new(|_| true), resources)
+        let resources = Arc::new(OcspResources::new(
+            options.max_concurrent,
+            options.max_concurrent_per_responder,
+        )?);
+        Self::with_resources_and_inventory(
+            store,
+            resolver,
+            options,
+            policy,
+            Arc::new(|_| true),
+            resources,
+        )
     }
     /// Both selectors describe one immutable generation. Out-of-scope entries
     /// are untouched, including their existing staple and failure bookkeeping.
@@ -254,12 +287,30 @@ impl OcspManager {
         inventory: OcspInventorySelector,
         resources: Arc<OcspResources>,
     ) -> Result<Self> {
+        let cpu = resources.cpu_slots.clone();
+        Self::with_resources_and_inventory_cpu(
+            store, resolver, options, policy, inventory, resources, cpu,
+        )
+    }
+    pub(crate) fn with_resources_and_inventory_cpu(
+        store: FsStore,
+        resolver: Arc<HotCertificateResolver>,
+        options: OcspOptions,
+        policy: PolicySelector,
+        inventory: OcspInventorySelector,
+        resources: Arc<OcspResources>,
+        cpu: Arc<Semaphore>,
+    ) -> Result<Self> {
         ensure!(
             (1..=128).contains(&options.max_concurrent)
                 && (1..=options.max_concurrent).contains(&options.max_concurrent_per_responder),
             "invalid OCSP concurrency limits"
         );
-        ensure!(options.max_concurrent == resources.max_concurrent && options.max_concurrent_per_responder == resources.max_per_responder, "OCSP resource budgets differ from manager options");
+        ensure!(
+            options.max_concurrent == resources.max_concurrent
+                && options.max_concurrent_per_responder == resources.max_per_responder,
+            "OCSP resource budgets differ from manager options"
+        );
         ensure!(
             options.check_interval >= Duration::from_secs(1)
                 && options.check_interval <= Duration::from_secs(86400),
@@ -280,6 +331,7 @@ impl OcspManager {
                 resolver,
                 global: resources.global.clone(),
                 restore_slots: resources.restore_slots.clone(),
+                cpu_slots: cpu,
                 resources,
                 inventory,
                 options,
@@ -340,9 +392,20 @@ impl OcspManager {
         certificate: Arc<OcspCertificate>,
         cancel: CancellationToken,
     ) -> Result<()> {
-        if !(self.inner.inventory)(&certificate) { return Ok(()); }
-        let _work = self.inner.resources.work_slots.try_acquire().map_err(|_| anyhow!("OCSP queued work capacity exhausted"))?;
-        let quiet = self.inspect(&certificate,cancel.clone()).await.map(|value|value.quiet).unwrap_or(false);
+        if !(self.inner.inventory)(&certificate) {
+            return Ok(());
+        }
+        let _work = self
+            .inner
+            .resources
+            .work_slots
+            .try_acquire()
+            .map_err(|_| anyhow!("OCSP queued work capacity exhausted"))?;
+        let quiet = self
+            .inspect(&certificate, cancel.clone())
+            .await
+            .map(|value| value.quiet)
+            .unwrap_or(false);
         let leaf_sha256 = leaf_hash(&certificate);
         let summary = OcspCertificate {
             identity: certificate.identity,
@@ -406,7 +469,9 @@ impl OcspManager {
         certificate: OcspCertificate,
         cancel: CancellationToken,
     ) -> Result<CacheRestore> {
-        if !(self.inner.inventory)(&certificate) { return Ok(CacheRestore::NotApplicable); }
+        if !(self.inner.inventory)(&certificate) {
+            return Ok(CacheRestore::NotApplicable);
+        }
         let _slot = self
             .inner
             .restore_slots
@@ -437,7 +502,10 @@ impl OcspManager {
         // A resolver owns its generation counter. Include its pinned Arc
         // identity so separate generations with the same counter never share
         // an in-process waiter; online cache writes still use the file lease.
-        let gate_key = (Arc::as_ptr(&self.inner.resolver) as usize, (certificate.identity, certificate.generation));
+        let gate_key = (
+            Arc::as_ptr(&self.inner.resolver) as usize,
+            (certificate.identity, certificate.generation),
+        );
         Ok({
             let mut gates = self
                 .inner
@@ -456,9 +524,16 @@ impl OcspManager {
             }
         })
     }
-    async fn inspect(&self, certificate: &OcspCertificate, cancel: CancellationToken) -> Result<CertificateInspection> {
+    async fn inspect(
+        &self,
+        certificate: &OcspCertificate,
+        cancel: CancellationToken,
+    ) -> Result<CertificateInspection> {
         let chain = certificate.chain_der.clone();
-        crate::cert_cpu::run(self.inner.restore_slots.clone(),cancel,move || inspect_certificate(&chain)).await
+        crate::cert_cpu::run(self.inner.cpu_slots.clone(), cancel, move || {
+            inspect_certificate(&chain)
+        })
+        .await
     }
     fn configuration(&self, certificate: &OcspCertificate) -> Result<OcspConfig> {
         let mut config = (self.inner.policy)(certificate)?;
@@ -472,9 +547,17 @@ impl OcspManager {
         );
         Ok(config)
     }
-    async fn reconcile_known_negative(&self, certificate: &OcspCertificate, quiet: bool) -> Result<()> {
-        if let Some(known) = self.observed(&certificate.identity)?.filter(|observed| observed.status.state != OcspState::Good) {
-            self.apply_negative(certificate, &known.status, quiet).await?;
+    async fn reconcile_known_negative(
+        &self,
+        certificate: &OcspCertificate,
+        quiet: bool,
+    ) -> Result<()> {
+        if let Some(known) = self
+            .observed(&certificate.identity)?
+            .filter(|observed| observed.status.state != OcspState::Good)
+        {
+            self.apply_negative(certificate, &known.status, quiet)
+                .await?;
         }
         Ok(())
     }
@@ -485,7 +568,9 @@ impl OcspManager {
         cancel: CancellationToken,
         mode: RefreshMode,
     ) -> Result<CacheRestore> {
-        if !(self.inner.inventory)(&certificate) { return Ok(CacheRestore::NotApplicable); }
+        if !(self.inner.inventory)(&certificate) {
+            return Ok(CacheRestore::NotApplicable);
+        }
         let gate = self.certificate_gate(&certificate)?;
         let _guard = tokio::select! {_ =cancel.cancelled()=>return Err(anyhow!("OCSP refresh cancelled")),guard=gate.lock()=>guard};
         let config = self.configuration(&certificate)?;
@@ -500,9 +585,9 @@ impl OcspManager {
             !certificate.chain_der.is_empty(),
             "OCSP certificate chain empty"
         );
-        let inspection = self.inspect(&certificate,cancel.clone()).await?;
+        let inspection = self.inspect(&certificate, cancel.clone()).await?;
         let quiet = inspection.quiet;
-        let (responder,aia) = (inspection.responder,inspection.aia);
+        let (responder, aia) = (inspection.responder, inspection.aia);
         let Some(original) = responder else {
             if inspection.must_staple {
                 self.emit(&certificate, "ocsp_must_staple_unavailable", None, false);
@@ -549,7 +634,10 @@ impl OcspManager {
             None
         };
         let global_permit = tokio::select! {_ =cancel.cancelled()=>return Err(anyhow!("OCSP refresh cancelled")),permit=self.inner.global.clone().acquire_owned()=>permit?};
-        let budget=Arc::new(OcspNetworkBudget { _global:global_permit,_responder:responder_permit });
+        let budget = Arc::new(OcspNetworkBudget {
+            _global: global_permit,
+            _responder: responder_permit,
+        });
         let cache_key = inspection.cache_key;
         let scope = format!("ocsp_{}", hex(&Sha256::digest(cache_key.as_bytes())));
         let lock_cancel = cancel.child_token();
@@ -590,9 +678,11 @@ impl OcspManager {
             let leaf_der = certificate.chain_der[0].clone();
             let issuer_for_check = issuer.clone();
             let checked_at = now()?;
-            let issuer_budget=budget.clone();
+            let issuer_budget = budget.clone();
+            let cpu = acquire_cpu(self.inner.cpu_slots.clone(), &work).await?;
             tokio::task::spawn_blocking(move || {
-                let _budget=issuer_budget;
+                let _cpu = cpu;
+                let _budget = issuer_budget;
                 verify::validate_issuer(&leaf_der, &issuer_for_check, checked_at)
             })
             .await??;
@@ -634,6 +724,7 @@ impl OcspManager {
                     config.no_next_update_max_age,
                     None,
                     Some(budget.clone()),
+                    acquire_cpu(self.inner.cpu_slots.clone(), &work).await?,
                 )
                 .await
                 {
@@ -747,6 +838,7 @@ impl OcspManager {
                     config.no_next_update_max_age,
                     None,
                     Some(budget.clone()),
+                    acquire_cpu(self.inner.cpu_slots.clone(), &work).await?,
                 )
                 .await?;
                 // Authentication establishes a leaf fact independently of
@@ -1236,20 +1328,41 @@ struct CertificateInspection {
     cache_key: String,
 }
 fn inspect_certificate(chain: &[Vec<u8>]) -> Result<CertificateInspection> {
-    ensure!(!chain.is_empty(),"OCSP certificate chain empty");
+    ensure!(!chain.is_empty(), "OCSP certificate chain empty");
     let leaf = verify::certificate(&chain[0])?;
     let parsed_staple = verify::must_staple(&leaf);
-    let quiet = leaf.validity().not_after.timestamp() - leaf.validity().not_before.timestamp() < 7*86400 && !parsed_staple.as_ref().copied().unwrap_or(true);
-    let (responder,aia)=verify::endpoints(&chain[0])?;
+    let quiet = leaf.validity().not_after.timestamp() - leaf.validity().not_before.timestamp()
+        < 7 * 86400
+        && !parsed_staple.as_ref().copied().unwrap_or(true);
+    let (responder, aia) = verify::endpoints(&chain[0])?;
     // Preserve the existing error boundary: a malformed TLS feature matters
     // here only when there is no responder; online verification is unchanged.
-    let must_staple = if responder.is_none() { parsed_staple? } else { parsed_staple.unwrap_or(true) };
-    Ok(CertificateInspection { quiet,must_staple,responder,aia,cache_key:cache_key(&[],chain) })
+    let must_staple = if responder.is_none() {
+        parsed_staple?
+    } else {
+        parsed_staple.unwrap_or(true)
+    };
+    Ok(CertificateInspection {
+        quiet,
+        must_staple,
+        responder,
+        aia,
+        cache_key: cache_key(&[], chain),
+    })
 }
 
 struct OcspNetworkBudget {
     _global: tokio::sync::OwnedSemaphorePermit,
     _responder: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+async fn acquire_cpu(
+    cpu: Arc<Semaphore>,
+    cancel: &CancellationToken,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    tokio::select! {biased;
+        _ = cancel.cancelled() => Err(anyhow!("OCSP CPU dispatch cancelled")),
+        permit = cpu.acquire_owned() => permit.map_err(|_|anyhow!("OCSP CPU dispatch stopped")),
+    }
 }
 async fn verify_owned(
     raw: Vec<u8>,
@@ -1258,9 +1371,11 @@ async fn verify_owned(
     max_age: Duration,
     admission: Option<tokio::sync::OwnedSemaphorePermit>,
     budget: Option<Arc<OcspNetworkBudget>>,
+    cpu: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<VerifiedStatus> {
-    let now = now()?;
     tokio::task::spawn_blocking(move || {
+        let _cpu = cpu;
+        let now = now()?;
         let _admission = admission;
         let _budget = budget;
         verify_response_with_max_age(&raw, &leaf, &issuer, now, max_age)

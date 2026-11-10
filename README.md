@@ -331,3 +331,12 @@ caller timeout/drop and retains delayed predecessor services until their actual
 HTTP admission closes. Provision-only validation uses the same server path
 without binding listeners or activating certificate jobs. This feature does not
 yet expose a serving CLI or waive the remaining module/CLI acceptance gates.
+
+OCSP restoration and CPU verification now use distinct admission budgets. The
+same certificate CPU budget is shared across default application policies and
+configuration generations, while standalone OCSP managers keep their own bounded
+CPU budget. A full set of cache-restoration candidates cannot deadlock by each
+holding one restore slot and waiting for another to inspect its certificate.
+Actual blocking verification owns its CPU permit through completion, and no CPU
+permit spans responder network or storage I/O. Signature checks, certificate
+identity, revocation/guard policy and cache freshness remain mandatory.
