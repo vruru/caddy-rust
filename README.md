@@ -293,3 +293,11 @@ window. Read-only retirement receipts distinguish business admission from shared
 socket ownership. Force still reaches older upgraded streams after admission
 closes. Root certificate/CLI integration and full production acceptance remain
 separate gates.
+
+Scoped certificate cache removal now requires an opaque owner and an exact
+publication receipt, including resolver, loaded generation, complete alias set
+and full chain identity. Stale work cannot evict a renewed or replaced instance;
+metadata-only OCSP updates preserve valid ownership. Cache eviction does not
+create a global revocation fact, and accepted TLS streams retain their owned
+keys. On-demand permission, renewal and HTTP request integration remain separate
+compatibility gates.

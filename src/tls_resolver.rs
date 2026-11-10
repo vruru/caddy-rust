@@ -102,6 +102,27 @@ pub struct ManualCertificateInfo {
     pub tags: Vec<String>,
 }
 
+/// Unforgeable local ownership for one certificate-management scope. Clone
+/// this capability for that scope only; it is not a global revocation signal.
+#[derive(Clone, Default)]
+pub struct CertificateScope(Arc<()>);
+impl CertificateScope {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Compare-and-remove receipt for one actual publication. No private material
+/// is retained. A reload, renewal, owner change or alias change invalidates it.
+#[derive(Clone)]
+pub struct ScopedCertificate {
+    resolver: Arc<()>,
+    owner: CertificateScope,
+    identity: [u8; 32],
+    instance_generation: u64,
+    names: Vec<String>,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct SignatureProfile {
     tls12: Vec<SignatureScheme>,
@@ -161,6 +182,7 @@ struct LoadedCertificate {
     leaf_sha256: [u8; 32],
     identity: [u8; 32],
     instance_generation: u64,
+    owner: Option<CertificateScope>,
     staple: Option<Staple>,
     not_before: i64,
     not_after: i64,
@@ -181,6 +203,7 @@ pub struct HotCertificateResolver {
     leaf_guard: Arc<LeafGuard>,
     certificates: RwLock<Arc<Snapshot>>,
     next_instance: AtomicU64,
+    scope_identity: Arc<()>,
 }
 
 impl fmt::Debug for HotCertificateResolver {
@@ -199,6 +222,7 @@ impl HotCertificateResolver {
             leaf_guard,
             certificates: RwLock::new(Arc::new(Snapshot::default())),
             next_instance: AtomicU64::new(1),
+            scope_identity: Arc::new(()),
         }
     }
 
@@ -280,8 +304,41 @@ impl HotCertificateResolver {
     /// candidate cannot replace the current key. This does not remove aliases
     /// omitted by the caller: full configuration reload must use replace().
     pub fn upsert(&self, input: &CertificateInput<'_>) -> Result<()> {
+        self.upsert_owned(input, None).map(|_| ())
+    }
+
+    /// Same validation and publication as upsert, with a scope-bound receipt.
+    /// OCSP updates keep this receipt valid; loading even identical DER again
+    /// creates a new instance and invalidates the old receipt.
+    pub fn upsert_scoped(
+        &self,
+        input: &CertificateInput<'_>,
+        owner: &CertificateScope,
+    ) -> Result<ScopedCertificate> {
+        let receipt = self.upsert_owned(input, Some(owner.clone()))?;
+        receipt.ok_or_else(|| anyhow!("certificate scope unavailable"))
+    }
+
+    fn upsert_owned(
+        &self,
+        input: &CertificateInput<'_>,
+        owner: Option<CertificateScope>,
+    ) -> Result<Option<ScopedCertificate>> {
         let (names, mut cert) = load_certificate(input, &self.leaf_guard)?;
         cert.instance_generation = self.instance_generation()?;
+        cert.owner = owner.clone();
+        let receipt = owner.map(|owner| {
+            let mut names = names.clone();
+            names.sort();
+            names.dedup();
+            ScopedCertificate {
+                resolver: self.scope_identity.clone(),
+                owner,
+                identity: cert.identity,
+                instance_generation: cert.instance_generation,
+                names,
+            }
+        });
         for _ in 0..MAX_UPSERT_ATTEMPTS {
             let base = self
                 .certificates
@@ -331,10 +388,83 @@ impl HotCertificateResolver {
             let previous = std::mem::replace(&mut *guard, candidate);
             drop(guard);
             drop(previous);
-            return Ok(());
+            return Ok(receipt);
         }
         Err(anyhow!(
             "certificate update conflicted with concurrent publication; retry required"
+        ))
+    }
+
+    /// Evict only this resolver's exact loaded instance under the same owner.
+    /// A stale task returns false without touching a replacement or other scope.
+    /// Already accepted connections keep their Arc keys; LeafGuard is unchanged.
+    pub fn remove_scoped(
+        &self,
+        owner: &CertificateScope,
+        receipt: &ScopedCertificate,
+    ) -> Result<bool> {
+        if !Arc::ptr_eq(&owner.0, &receipt.owner.0)
+            || !Arc::ptr_eq(&self.scope_identity, &receipt.resolver)
+        {
+            return Ok(false);
+        }
+        let matches = |cert: &LoadedCertificate| {
+            cert.instance_generation == receipt.instance_generation
+                && cert.identity == receipt.identity
+                && cert
+                    .owner
+                    .as_ref()
+                    .is_some_and(|scope| Arc::ptr_eq(&scope.0, &owner.0))
+        };
+        for _ in 0..MAX_UPSERT_ATTEMPTS {
+            let base = self
+                .certificates
+                .read()
+                .map_err(|_| anyhow!("certificate state unavailable"))?
+                .clone();
+            let mut aliases = base
+                .names
+                .iter()
+                .filter_map(|(name, candidates)| {
+                    candidates
+                        .iter()
+                        .any(|cert| matches(cert))
+                        .then_some(name.clone())
+                })
+                .collect::<Vec<_>>();
+            aliases.sort();
+            if aliases != receipt.names {
+                return Ok(false);
+            }
+            let mut names = base.names.clone();
+            for name in &receipt.names {
+                if let Some(candidates) = names.get_mut(name) {
+                    candidates.retain(|cert| !matches(cert));
+                }
+            }
+            names.retain(|_, candidates| !candidates.is_empty());
+            let candidate = Arc::new(Snapshot {
+                generation: base
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("certificate generation exhausted"))?,
+                names,
+            });
+            let mut guard = self
+                .certificates
+                .write()
+                .map_err(|_| anyhow!("certificate state unavailable"))?;
+            if !Arc::ptr_eq(&base, &guard) {
+                drop(guard);
+                continue;
+            }
+            let previous = std::mem::replace(&mut *guard, candidate);
+            drop(guard);
+            drop(previous);
+            return Ok(true);
+        }
+        Err(anyhow!(
+            "scoped certificate removal conflicted with concurrent publication; retry required"
         ))
     }
 
@@ -809,6 +939,7 @@ fn load_certificate(
             leaf_sha256,
             identity,
             instance_generation: 0,
+            owner: None,
             staple: None,
             signature_profile,
             size,
