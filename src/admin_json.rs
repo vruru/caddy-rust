@@ -7,8 +7,11 @@
 use serde_json::{Map, Value};
 use std::fmt;
 
+#[path = "admin_json/adapt.rs"]
+mod adapt;
 #[path = "admin_json/codec.rs"]
 mod codec;
+pub use adapt::encoded_adapt_raw;
 
 /// An explicit control-plane resource bound, rather than serde's implicit
 /// 128-level parser bound. The original Go scanner accepts up to 10000 levels;
@@ -453,6 +456,13 @@ fn write_encoded_string<S: EncodingSink>(value: &str, sink: &mut S) -> Result<()
     let mut start = 0;
     let mut index = 0;
     while index < bytes.len() {
+        if let Some((escaped, consumed)) = html_escape(bytes, index) {
+            sink.put(&bytes[start..index])?;
+            sink.put(escaped)?;
+            index += consumed;
+            start = index;
+            continue;
+        }
         let mut control = *b"\\u0000";
         let (escaped, consumed): (&[u8], usize) = match bytes[index] {
             b'"' => (b"\\\"", 1),
@@ -462,17 +472,12 @@ fn write_encoded_string<S: EncodingSink>(value: &str, sink: &mut S) -> Result<()
             b'\n' => (b"\\n", 1),
             b'\r' => (b"\\r", 1),
             b'\t' => (b"\\t", 1),
-            b'<' => (b"\\u003c", 1),
-            b'>' => (b"\\u003e", 1),
-            b'&' => (b"\\u0026", 1),
             b @ 0..=31 => {
                 const HEX: &[u8; 16] = b"0123456789abcdef";
                 control[4] = HEX[(b >> 4) as usize];
                 control[5] = HEX[(b & 15) as usize];
                 (&control, 1)
             }
-            0xe2 if bytes[index..].starts_with(b"\xe2\x80\xa8") => (b"\\u2028", 3),
-            0xe2 if bytes[index..].starts_with(b"\xe2\x80\xa9") => (b"\\u2029", 3),
             _ => {
                 index += 1;
                 if index - start >= 256 {
@@ -489,6 +494,17 @@ fn write_encoded_string<S: EncodingSink>(value: &str, sink: &mut S) -> Result<()
     }
     sink.put(&bytes[start..])?;
     sink.put(b"\"")
+}
+
+fn html_escape(bytes: &[u8], index: usize) -> Option<(&'static [u8], usize)> {
+    match bytes[index] {
+        b'<' => Some((b"\\u003c", 1)),
+        b'>' => Some((b"\\u003e", 1)),
+        b'&' => Some((b"\\u0026", 1)),
+        0xe2 if bytes[index..].starts_with(b"\xe2\x80\xa8") => Some((b"\\u2028", 3)),
+        0xe2 if bytes[index..].starts_with(b"\xe2\x80\xa9") => Some((b"\\u2029", 3)),
+        _ => None,
+    }
 }
 
 pub fn etag(path: &str, value: Option<&Value>) -> Result<String, ConfigError> {

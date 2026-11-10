@@ -63,6 +63,10 @@ configuration snapshot instead of cloning the full document. This is a DOM
 primitive, not an exposed Admin endpoint or a configuration transaction backend.
 Input and mutation paths currently have a 256-level resource limit, below the
 original decoder's 10000-level limit; that difference remains a migration gap.
+Raw JSON adaptation response encoding has a separate path that preserves number
+lexemes, duplicate keys and existing escapes. Its measured raw depth limit is
+9999, and its output budget includes the response wrapper and newline. This
+codec does not change configuration-map normalization or ETag encoding.
 
 The `certstore` library preserves CertMagic account/certificate layout, with a
 separate private transaction journal, bounded blocking I/O and canonical group
