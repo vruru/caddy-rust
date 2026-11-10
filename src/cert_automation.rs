@@ -266,6 +266,7 @@ impl Drop for PendingAccount {
 struct MaterialInfo {
     not_before: i64,
     not_after: i64,
+    leaf_id: crate::leaf_guard::LeafId,
     leaf_sha256: String,
 }
 #[derive(Clone)]
@@ -997,11 +998,15 @@ impl CertificateManager {
         if let Some((index, mut bundle, info)) = best.or(fallback) {
             let issuer = &self.inner.issuers[index];
             let now = now();
+            // Preserve the attempt/winner selection above. A revocation vetoes
+            // cached readiness; it must not select an older issuer's leaf.
+            let revoked = info.not_after > now && self.material_revocation(&info)?.is_some();
             if info.not_before <= now && info.not_after > now {
                 self.publish(names, &bundle, cancel).await?;
             }
             let mut ari = parse_ari(&bundle.metadata);
-            if issuer.ca.next_allowed_unix.load(Ordering::Acquire) <= now
+            if !revoked
+                && issuer.ca.next_allowed_unix.load(Ordering::Acquire) <= now
                 && info.not_after > now
                 && ari.as_ref().is_none_or(|a| a.refresh_after_unix <= now)
             {
@@ -1060,7 +1065,11 @@ impl CertificateManager {
                 ari.as_ref(),
                 &info.leaf_sha256,
             )?;
-            if now < renew_at && info.not_after > now {
+            if !revoked
+                && now < renew_at
+                && info.not_after > now
+                && self.material_revocation(&info)?.is_none()
+            {
                 return Ok((
                     Some(ManagedCertificate {
                         names: names.to_vec(),
@@ -1474,6 +1483,7 @@ impl CertificateManager {
                 if job.stored_leaf_sha256.as_deref() == Some(&info.leaf_sha256)
                     && info.not_before <= now()
                     && now() < renew_at
+                    && self.material_revocation(&info)?.is_none()
                 {
                     ensure!(
                         self.claim_winner(
@@ -1876,6 +1886,18 @@ impl CertificateManager {
         }
         bail!("certificate publication retry budget exhausted")
     }
+    fn material_revocation(
+        &self,
+        info: &MaterialInfo,
+    ) -> Result<Option<crate::leaf_guard::Revocation>> {
+        self.inner
+            .resolver
+            .leaf_guard()
+            .intern(info.leaf_id, info.not_after)?
+            .revocation()
+    }
+    // Both callers have checked current validity: either freshly issued
+    // material or a stored certificate still before its renewal deadline.
     fn managed(
         &self,
         names: &[String],
@@ -1884,6 +1906,10 @@ impl CertificateManager {
         info: MaterialInfo,
         obtained: bool,
     ) -> Result<ManagedCertificate> {
+        ensure!(
+            self.material_revocation(&info)?.is_none(),
+            "managed certificate is revoked"
+        );
         Ok(ManagedCertificate {
             names: names.to_vec(),
             issuer_key: issuer.to_owned(),
@@ -2203,6 +2229,7 @@ fn material_info(bundle: &CertificateBundle, names: &[String]) -> Result<Materia
     Ok(MaterialInfo {
         not_before: cert.validity().not_before.timestamp(),
         not_after: cert.validity().not_after.timestamp(),
+        leaf_id: crate::leaf_guard::leaf_id(&blocks[0].1),
         leaf_sha256: digest(&blocks[0].1),
     })
 }

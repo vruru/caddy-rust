@@ -165,3 +165,8 @@ New Ed25519 account keys retain the existing PEM label and use PKCS8 integer
 version zero for generic-reader interoperability. The outer structure uses the
 pkcs8 encoder; the inner CurvePrivateKey octet string has a fixed two-byte prefix.
 Existing account-key files are imported without rewriting their identity.
+
+Known revocation now vetoes cached and terminal-checkpoint readiness without
+changing issuer/winner selection. A stored revoked leaf starts a fresh-key cycle.
+This does not implement root force-renew failure evidence, withdrawal, rescan,
+compromised-key archival or startup OCSP restoration; those remain migration gates.
