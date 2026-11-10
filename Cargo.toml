@@ -16,8 +16,12 @@ rustls-pemfile = "2"
 x509-parser = "0.18"
 zeroize = "1"
 pem = "3"
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto"] }
 rsa = { version = "0.9", features = ["pem"] }
 ryu = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+time = { version = "0.3", features = ["formatting", "parsing", "serde-human-readable"] }
+url = "2"

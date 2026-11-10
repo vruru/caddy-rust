@@ -52,6 +52,16 @@ primitive, not an exposed Admin endpoint or a configuration transaction backend.
 Input and mutation paths currently have a 256-level resource limit, below the
 original decoder's 10000-level limit; that difference remains a migration gap.
 
+The `certstore` library preserves CertMagic account/certificate layout, with a
+separate private transaction journal, bounded blocking I/O and canonical group
+gates retained through cancelled writes. A recovery report isolates unresolved
+groups; it is not permission to ignore their blockers or reissue certificates.
+Scoped recovery remains mandatory before an issuance operation. Use one stable
+native-state directory for each data root, one active issuer implementation and
+a local filesystem. Recover all outstanding transactions before returning the
+store to the original server. This does not provide distributed fencing with Go
+writers or establish NFS or physical power-loss guarantees.
+
 The official Caddy v2.11.7 and CertMagic v0.25.6 implementation provide the pinned
 behavioral reference. The original Go plugins have no native cross-language ABI:
 module configuration and behavior require individual Rust implementations.
