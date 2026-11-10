@@ -226,3 +226,13 @@ Private read buffers have a fixed validated size and a zeroized EOF probe, so
 file growth cannot leave a reallocated secret buffer. This contract relies on
 atomic replacement of published material and does not establish protection from
 a same-user adversary, in-place external writers or physical power loss.
+
+Manual certificate inventories now share one resolver with serving and OCSP for
+each generation. Per-server tag filters apply to complete chain identities
+before selection, and tagged servers cannot fall back to managed certificates.
+The HTTP runtime validates inventory identities, counts, names and shared leaf
+guard before publication. Unknown tags are rejected before publication, stricter
+than accepting an unusable configuration. Challenge listeners use scoped shared
+leases; releasing one owner cannot close a listener retained by a staged or
+active generation. These contracts do not complete the remaining modules,
+shutdown-delay semantics or production integration.

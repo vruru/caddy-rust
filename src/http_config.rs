@@ -141,7 +141,7 @@ pub fn validate_json(value: &Value) -> Result<PreparedConfig> {
 pub fn managed_names(config: &PreparedConfig) -> Vec<Vec<String>> {
     let mut names = std::collections::BTreeSet::new();
     for server in &config.servers {
-        if server.tls && server.manage_certificates {
+        if server.tls && server.manage_certificates && server.certificate_tags.is_empty() {
             for name in server_names(server) {
                 if !server
                     .skip_manage

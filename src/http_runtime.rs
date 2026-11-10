@@ -12,7 +12,14 @@ mod files;
 use connection_identity::{TlsIdentity, TlsVerdict};
 #[path = "http_runtime/lifecycle.rs"]
 mod lifecycle;
+#[path = "http_runtime/manual_certificates.rs"]
+mod manual_certificates;
 pub use lifecycle::{CommitOutcome, HttpStage, StagedAddress};
+#[path = "http_runtime/listener_lease.rs"]
+mod listener_lease;
+pub use listener_lease::{
+    ChallengeBindingRequest, ChallengeListenerLease, ChallengeListenerProvider,
+};
 #[path = "http_runtime/mime.rs"]
 mod mime;
 #[path = "http_runtime/path_glob.rs"]
@@ -42,7 +49,7 @@ pub use upstream_tls::NativeTrustDiagnostics;
 use crate::{
     challenge::{ACME_ALPN, ChallengeRegistry},
     http_config::{PreparedConfig, ServerConfig, types::*},
-    tls_resolver::{CertificateInput, HotCertificateResolver},
+    tls_resolver::{CertificateInput, HotCertificateResolver, ManualCertificates},
 };
 use anyhow::{Result, ensure};
 use arc_swap::ArcSwap;
@@ -91,6 +98,7 @@ struct Inner {
     current: ArcSwap<Generation>,
     registry: ChallengeRegistry,
     managed: Arc<HotCertificateResolver>,
+    challenge_resolver: Arc<HotCertificateResolver>,
     tasks: TaskTracker,
     upgrades: TaskTracker,
     resources: Arc<resource_budget::Resources>,
@@ -111,9 +119,11 @@ struct ActiveServer {
     clients: Arc<HashMap<usize, proxy::ProxyClient>>,
 }
 struct CandidateResolver {
+    challenges: Arc<HotCertificateResolver>,
     static_certificates: Arc<HotCertificateResolver>,
     managed: Arc<HotCertificateResolver>,
     allowed_managed: Vec<String>,
+    allowed_static: std::collections::HashSet<[u8; 32]>,
 }
 impl fmt::Debug for CandidateResolver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -142,8 +152,11 @@ impl CandidateResolver {
         alpn: &[&[u8]],
         schemes: &[rustls::SignatureScheme],
     ) -> Option<crate::tls_resolver::CertificateSelection> {
-        self.select_using(sni, alpn, |resolver, sni| {
-            resolver.select_candidate(Some(sni), alpn, schemes)
+        self.select_using(sni, alpn, |resolver, sni, allowed| match allowed {
+            Some(identities) => {
+                resolver.select_candidate_filtered(Some(sni), alpn, schemes, identities)
+            }
+            None => resolver.select_candidate(Some(sni), alpn, schemes),
         })
     }
     fn select_for_version(
@@ -153,8 +166,11 @@ impl CandidateResolver {
         schemes: &[rustls::SignatureScheme],
         version: rustls::ProtocolVersion,
     ) -> Option<crate::tls_resolver::CertificateSelection> {
-        self.select_using(sni, alpn, |resolver, sni| {
-            resolver.select_for_version(Some(sni), alpn, schemes, version)
+        self.select_using(sni, alpn, |resolver, sni, allowed| match allowed {
+            Some(identities) => {
+                resolver.select_for_version_filtered(Some(sni), alpn, schemes, version, identities)
+            }
+            None => resolver.select_for_version(Some(sni), alpn, schemes, version),
         })
     }
     fn select_using(
@@ -164,17 +180,18 @@ impl CandidateResolver {
         mut select: impl FnMut(
             &HotCertificateResolver,
             &str,
+            Option<&std::collections::HashSet<[u8; 32]>>,
         ) -> Option<crate::tls_resolver::CertificateSelection>,
     ) -> Option<crate::tls_resolver::CertificateSelection> {
         let sni = sni?;
         if alpn.contains(&ACME_ALPN) {
-            return select(&self.managed, sni);
+            return select(&self.challenges, sni, None);
         }
-        select(&self.static_certificates, sni).or_else(|| {
+        select(&self.static_certificates, sni, Some(&self.allowed_static)).or_else(|| {
             self.allowed_managed
                 .iter()
                 .any(|name| dns_covers(name, sni))
-                .then(|| select(&self.managed, sni))
+                .then(|| select(&self.managed, sni, None))
                 .flatten()
         })
     }
@@ -212,11 +229,16 @@ impl HttpRuntime {
             drain: CancellationToken::new(),
             managed_names: Vec::new(),
         };
+        let challenge_resolver = Arc::new(HotCertificateResolver::with_leaf_guard(
+            registry.clone(),
+            resolver.leaf_guard(),
+        ));
         Self {
             inner: Arc::new(Inner {
                 current: ArcSwap::from_pointee(initial),
                 registry,
                 managed: resolver,
+                challenge_resolver,
                 tasks: TaskTracker::new(),
                 upgrades: TaskTracker::new(),
                 resources,
@@ -241,60 +263,61 @@ async fn prepare_servers(
     config: &PreparedConfig,
     registry: &ChallengeRegistry,
     managed: &Arc<HotCertificateResolver>,
+    challenges: &Arc<HotCertificateResolver>,
+    manual: Option<&ManualCertificates>,
+    resources: &Arc<resource_budget::Resources>,
 ) -> Result<(HashMap<SocketAddr, Arc<ActiveServer>>, Vec<Vec<String>>)> {
+    let standalone;
+    let manual = if let Some(manual) = manual {
+        ensure!(
+            config.certificates.is_empty(),
+            "external manual inventory conflicts with raw TLS load_files"
+        );
+        manual
+    } else {
+        standalone = manual_certificates::load(config, registry, managed, resources).await?;
+        &standalone
+    };
+    ensure!(
+        Arc::ptr_eq(&manual.resolver.leaf_guard(), &managed.leaf_guard()),
+        "manual inventory must share the runtime leaf guard"
+    );
+    let validation = manual.clone();
+    resources
+        .metadata
+        .run(move || manual_certificates::validate(&validation))
+        .await
+        .map_err(|_| anyhow::anyhow!("manual inventory worker unavailable"))??;
     let mut actual_managed = std::collections::BTreeSet::new();
     let mut redirects = HashMap::<SocketAddr, Vec<Route>>::new();
     let mut output = HashMap::new();
     for server in &config.servers {
-        let local = Arc::new(HotCertificateResolver::with_leaf_guard(
-            registry.clone(),
-            managed.leaf_guard(),
-        ));
-        let mut materials = Vec::new();
-        if server.tls {
-            for file in &config.certificates {
-                if !server.certificate_tags.is_empty()
-                    && !file
+        // One generation owns one manual resolver. Tags are per-server
+        // identity filters, not separate key/OCSP snapshots.
+        let selected_manual = manual
+            .certificates
+            .iter()
+            .filter(|certificate| {
+                server.certificate_tags.is_empty()
+                    || certificate
                         .tags
                         .iter()
                         .any(|tag| server.certificate_tags.contains(tag))
-                {
-                    continue;
-                }
-                let certificate_path = crate::http_config::helpers::replace(
-                    &file.certificate,
-                    true,
-                    crate::http_config::helpers::global_lookup,
-                )?;
-                let key_path = crate::http_config::helpers::replace(
-                    &file.key,
-                    true,
-                    crate::http_config::helpers::global_lookup,
-                )?;
-                let chain = read_bounded(&certificate_path, 4 * 1024 * 1024).await?;
-                let key = zeroize::Zeroizing::new(read_bounded(&key_path, 128 * 1024).await?);
-                let names = certificate_names(&chain)?;
-                materials.push((names, chain, key));
-            }
-            let inputs = materials
-                .iter()
-                .map(|(names, chain, key)| CertificateInput {
-                    names,
-                    certificate_pem: chain,
-                    private_key_pem: key,
-                })
-                .collect::<Vec<_>>();
-            local.replace(&inputs)?;
-            ensure!(
-                server.certificate_tags.is_empty() || !materials.is_empty(),
-                "TLS certificate tags matched no certificate"
-            );
-        }
-        let loaded_names = materials
-            .iter()
-            .flat_map(|(names, _, _)| names.iter())
+            })
             .collect::<Vec<_>>();
-        let managed_names = if server.manage_certificates {
+        ensure!(
+            !server.tls || server.certificate_tags.is_empty() || !selected_manual.is_empty(),
+            "TLS certificate tags matched no certificate"
+        );
+        let allowed_static = selected_manual
+            .iter()
+            .map(|certificate| certificate.identity)
+            .collect::<std::collections::HashSet<_>>();
+        let loaded_names = selected_manual
+            .iter()
+            .flat_map(|certificate| certificate.names.iter())
+            .collect::<Vec<_>>();
+        let managed_names = if server.manage_certificates && server.certificate_tags.is_empty() {
             crate::http_config::server_names(server)
                 .into_iter()
                 .filter(|name| {
@@ -354,7 +377,9 @@ async fn prepare_servers(
         }
         let (tls, resolver) = if server.tls {
             let resolver = Arc::new(CandidateResolver {
-                static_certificates: local,
+                challenges: challenges.clone(),
+                static_certificates: manual.resolver.clone(),
+                allowed_static,
                 managed: managed.clone(),
                 allowed_managed: if server.certificate_tags.is_empty() {
                     managed_names.clone()
@@ -508,27 +533,6 @@ fn bind_listener(address: SocketAddr) -> Result<TcpListener> {
     Ok(TcpListener::from_std(socket.into())?)
 }
 
-async fn read_bounded(path: &str, limit: u64) -> Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt;
-    let path = path.to_owned();
-    let file =
-        tokio::task::spawn_blocking(move || crate::http_config::helpers::open_regular_file(path))
-            .await?
-            .map_err(|_| anyhow::anyhow!("configured TLS material unavailable"))?;
-    let file = tokio::fs::File::from_std(file);
-    let meta = file.metadata().await?;
-    ensure!(
-        meta.is_file() && meta.len() > 0 && meta.len() <= limit,
-        "configured TLS material outside bounds"
-    );
-    let mut bytes = Vec::with_capacity(meta.len() as usize);
-    file.take(limit + 1).read_to_end(&mut bytes).await?;
-    ensure!(
-        bytes.len() as u64 <= limit,
-        "TLS material grew beyond limit"
-    );
-    Ok(bytes)
-}
 fn certificate_names(chain: &[u8]) -> Result<Vec<String>> {
     let (_, pem) = x509_parser::pem::parse_x509_pem(chain)
         .map_err(|_| anyhow::anyhow!("invalid TLS certificate PEM"))?;
@@ -581,11 +585,11 @@ impl ResolvesServerCert for ProofResolver {
             .map(|selection| selection.key)
     }
 }
-fn proof_tls_config(managed: Arc<HotCertificateResolver>) -> Result<Arc<rustls::ServerConfig>> {
+fn proof_tls_config(challenges: Arc<HotCertificateResolver>) -> Result<Arc<rustls::ServerConfig>> {
     let mut tls = rustls::ServerConfig::builder_with_provider(crate::crypto::provider())
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
-        .with_cert_resolver(Arc::new(ProofResolver(managed)));
+        .with_cert_resolver(Arc::new(ProofResolver(challenges)));
     tls.alpn_protocols = vec![ACME_ALPN.to_vec()];
     tls.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
     tls.send_tls13_tickets = 0;
@@ -593,23 +597,27 @@ fn proof_tls_config(managed: Arc<HotCertificateResolver>) -> Result<Arc<rustls::
 }
 async fn accept_loop(
     inner: Arc<Inner>,
-    socket: TcpListener,
+    socket: lifecycle::ListenerSocket,
     key: SocketAddr,
     cancel: CancellationToken,
-    fallback: Option<ProofListener>,
+    fallback: Arc<ArcSwap<ProofListener>>,
 ) {
     loop {
         let accepted = tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
             _ = inner.stopped.cancelled() => break,
-            result = socket.accept() => result,
+            result = socket.socket().accept() => result,
         };
         let Ok((stream, peer)) = accepted else {
             if cancel.is_cancelled() {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::select! { biased;
+                _ = cancel.cancelled() => break,
+                _ = inner.stopped.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {},
+            }
             continue;
         };
         // Proof/business mode is fixed at accept. A TLS ClientHello selects
@@ -649,14 +657,15 @@ async fn accept_loop(
                     serve_connection(task_inner, TokioIo::new(stream), peer, local, ConnectionView { key, server, negotiated_tls_h2: None, identity: None }).await;
                 }
             });
-        } else if let Some(proof) = fallback.clone() {
+        } else {
+            let proof = fallback.load_full();
             // A proof connection accepted before commit cannot turn into a
             // business connection after commit, even if it delays its headers.
             inner.tasks.spawn(async move {
                 if proof.cancel.is_cancelled() {
                     return;
                 }
-                if let Some(tls) = proof.tls {
+                if let Some(tls) = proof.tls.clone() {
                     let handshake = tokio_rustls::TlsAcceptor::from(tls).accept(stream);
                     tokio::select! {
                         biased;
@@ -666,7 +675,8 @@ async fn accept_loop(
                     }
                     // ACME ALPN never speaks HTTP after its handshake.
                 } else {
-                    serve_proof_connection(task_inner, TokioIo::new(stream), proof.cancel).await;
+                    serve_proof_connection(task_inner, TokioIo::new(stream), proof.cancel.clone())
+                        .await;
                 }
             });
         }
@@ -685,12 +695,13 @@ where
         };
         async { Ok::<_, Infallible>(response) }
     });
-    let mut builder = Builder::new(TokioExecutor::new());
+    let mut builder = Builder::new(TokioExecutor::new()).http1_only();
     builder
         .http1()
+        .keep_alive(false)
         .timer(TokioTimer::new())
         .header_read_timeout(Duration::from_secs(60));
-    let connection = builder.serve_connection_with_upgrades(io, service);
+    let connection = builder.serve_connection(io, service);
     tokio::pin!(connection);
     tokio::select! {
         _ = &mut connection => {},

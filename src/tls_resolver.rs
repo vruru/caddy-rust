@@ -88,6 +88,20 @@ pub struct CertificateSelection {
     pub signature_compatibility: SignatureCompatibility,
 }
 
+/// One generation's immutable manual-certificate metadata. Serving and OCSP
+/// both use the same resolver; metadata contains no key or certificate copies.
+#[derive(Clone)]
+pub struct ManualCertificates {
+    pub resolver: Arc<HotCertificateResolver>,
+    pub certificates: Arc<Vec<ManualCertificateInfo>>,
+}
+#[derive(Clone)]
+pub struct ManualCertificateInfo {
+    pub identity: [u8; 32],
+    pub names: Vec<String>,
+    pub tags: Vec<String>,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct SignatureProfile {
     tls12: Vec<SignatureScheme>,
@@ -463,7 +477,7 @@ impl HotCertificateResolver {
         offered_alpn: &[&[u8]],
         signature_schemes: &[SignatureScheme],
     ) -> Option<CertificateSelection> {
-        self.select_internal(sni, offered_alpn, signature_schemes, None)
+        self.select_internal(sni, offered_alpn, signature_schemes, None, None)
     }
 
     pub fn select_for_version(
@@ -473,7 +487,40 @@ impl HotCertificateResolver {
         signature_schemes: &[SignatureScheme],
         version: ProtocolVersion,
     ) -> Option<CertificateSelection> {
-        self.select_internal(sni, offered_alpn, signature_schemes, Some(version))
+        self.select_internal(sni, offered_alpn, signature_schemes, Some(version), None)
+    }
+
+    pub fn select_candidate_filtered(
+        &self,
+        sni: Option<&str>,
+        offered_alpn: &[&[u8]],
+        signature_schemes: &[SignatureScheme],
+        allowed_identities: &HashSet<[u8; 32]>,
+    ) -> Option<CertificateSelection> {
+        self.select_internal(
+            sni,
+            offered_alpn,
+            signature_schemes,
+            None,
+            Some(allowed_identities),
+        )
+    }
+
+    pub fn select_for_version_filtered(
+        &self,
+        sni: Option<&str>,
+        offered_alpn: &[&[u8]],
+        signature_schemes: &[SignatureScheme],
+        version: ProtocolVersion,
+        allowed_identities: &HashSet<[u8; 32]>,
+    ) -> Option<CertificateSelection> {
+        self.select_internal(
+            sni,
+            offered_alpn,
+            signature_schemes,
+            Some(version),
+            Some(allowed_identities),
+        )
     }
 
     fn select_internal(
@@ -482,6 +529,7 @@ impl HotCertificateResolver {
         offered_alpn: &[&[u8]],
         signature_schemes: &[SignatureScheme],
         version: Option<ProtocolVersion>,
+        allowed_identities: Option<&HashSet<[u8; 32]>>,
     ) -> Option<CertificateSelection> {
         if version
             .is_some_and(|v| !matches!(v, ProtocolVersion::TLSv1_2 | ProtocolVersion::TLSv1_3))
@@ -490,6 +538,9 @@ impl HotCertificateResolver {
         }
         let sni = normalize_domain(sni?).ok()?;
         if offered_alpn.contains(&ACME_ALPN) {
+            if allowed_identities.is_some() {
+                return None;
+            }
             let mut key = self.challenges.lookup_tls(&sni, offered_alpn)?;
             if version == Some(ProtocolVersion::TLSv1_3) {
                 let signer = crate::crypto::tls13_signer(&key.key)?;
@@ -510,6 +561,9 @@ impl HotCertificateResolver {
             i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs()).ok()?;
         let select = |candidates: &Vec<Arc<LoadedCertificate>>| {
             candidates.iter().find_map(|entry| {
+                if allowed_identities.is_some_and(|allowed| !allowed.contains(&entry.identity)) {
+                    return None;
+                }
                 let admission = entry.leaf_state.admission();
                 if !admission.allow_certificate || now < entry.not_before || now >= entry.not_after
                 {
@@ -603,6 +657,19 @@ fn make_staple(cert: &LoadedCertificate, bytes: &[u8], valid_until: i64) -> Stap
     }
 }
 
+/// Stable identity used by the OCSP cache and manual tag selection. Framing
+/// includes chain length and each DER length, so different chains stay distinct.
+pub fn certificate_chain_identity(chain: &[CertificateDer<'_>]) -> [u8; 32] {
+    let mut identity = Sha256::new();
+    identity.update(b"caddy-native-ocsp-chain-v1\0");
+    identity.update((chain.len() as u64).to_be_bytes());
+    for der in chain {
+        identity.update((der.len() as u64).to_be_bytes());
+        identity.update(der.as_ref());
+    }
+    identity.finalize().into()
+}
+
 fn load_certificate(
     input: &CertificateInput<'_>,
     leaf_guard: &LeafGuard,
@@ -629,14 +696,7 @@ fn load_certificate(
     }
     let preferred = crate::certmagic::signing_key(input.private_key_pem, "tls-candidate")?;
     let key = crate::crypto::tls12_signer(&preferred, input.private_key_pem)?;
-    let mut identity = Sha256::new();
-    identity.update(b"caddy-native-ocsp-chain-v1\0");
-    identity.update((chain.len() as u64).to_be_bytes());
-    for der in &chain {
-        identity.update((der.len() as u64).to_be_bytes());
-        identity.update(der.as_ref());
-    }
-    let identity = identity.finalize().into();
+    let identity = certificate_chain_identity(&chain);
     let certified = CertifiedKey::new(chain, key);
     certified
         .keys_match()
