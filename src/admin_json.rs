@@ -292,60 +292,158 @@ fn canonical_index(segment: &str) -> Result<usize, ConfigError> {
 /// Match encoding/json's map ordering, float64 numbers, HTML-safe escaping,
 /// and Encoder.Encode trailing newline, which participate in Caddy ETags.
 pub fn encoded(value: &Value) -> Result<Vec<u8>, ConfigError> {
-    fn write(value: &Value, output: &mut Vec<u8>, depth: usize) -> Result<(), ConfigError> {
-        if depth > MAX_CONFIG_DEPTH {
-            return Err(failure("configuration_depth_limit"));
-        }
-        match value {
-            Value::Null => output.extend_from_slice(b"null"),
-            Value::Bool(value) => output.extend_from_slice(if *value { b"true" } else { b"false" }),
-            Value::Number(value) => {
-                let number = value
-                    .as_f64()
-                    .ok_or_else(|| failure("invalid_json_number"))?;
-                output.extend_from_slice(go_float(number)?.as_bytes());
-            }
-            Value::String(value) => {
-                let text = serde_json::to_string(value)
-                    .map_err(|_| failure("json_encoding_failed"))?
-                    .replace('<', "\\u003c")
-                    .replace('>', "\\u003e")
-                    .replace('&', "\\u0026")
-                    .replace('\u{2028}', "\\u2028")
-                    .replace('\u{2029}', "\\u2029");
-                output.extend_from_slice(text.as_bytes());
-            }
-            Value::Array(values) => {
-                output.push(b'[');
-                for (index, value) in values.iter().enumerate() {
-                    if index > 0 {
-                        output.push(b',');
-                    }
-                    write(value, output, depth + 1)?;
-                }
-                output.push(b']');
-            }
-            Value::Object(values) => {
-                output.push(b'{');
-                let mut keys = values.keys().collect::<Vec<_>>();
-                keys.sort_unstable();
-                for (index, key) in keys.into_iter().enumerate() {
-                    if index > 0 {
-                        output.push(b',');
-                    }
-                    write(&Value::String(key.clone()), output, depth + 1)?;
-                    output.push(b':');
-                    write(&values[key], output, depth + 1)?;
-                }
-                output.push(b'}');
-            }
+    let mut bytes = Vec::new();
+    let mut sink = EncodingBytes(&mut bytes);
+    write_encoded(value, &mut sink, 0)?;
+    sink.put(b"\n")?;
+    Ok(bytes)
+}
+
+/// Count the same canonical bytes as `encoded`, including its final newline.
+/// Stop at the byte limit without constructing the encoded result or escaped
+/// strings. Sorting an object's borrowed keys still uses O(number of keys) space.
+/// Number formatting retains the existing bounded temporary float string.
+/// A limit reached before a later encoding error takes precedence over that error.
+pub fn encoded_len(value: &Value, limit: usize) -> Result<usize, ConfigError> {
+    let mut sink = EncodingCount { count: 0, limit };
+    write_encoded(value, &mut sink, 0)?;
+    sink.put(b"\n")?;
+    Ok(sink.count)
+}
+
+trait EncodingSink {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), ConfigError>;
+    fn lower_bound(&self, _length: usize) -> Result<(), ConfigError> {
+        Ok(())
+    }
+}
+
+struct EncodingBytes<'a>(&'a mut Vec<u8>);
+impl EncodingSink for EncodingBytes<'_> {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), ConfigError> {
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+struct EncodingCount {
+    count: usize,
+    limit: usize,
+}
+impl EncodingSink for EncodingCount {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), ConfigError> {
+        self.lower_bound(bytes.len())?;
+        self.count += bytes.len();
+        Ok(())
+    }
+    fn lower_bound(&self, length: usize) -> Result<(), ConfigError> {
+        if self.count.checked_add(length).is_none_or(|n| n > self.limit) {
+            return Err(encoding_byte_limit());
         }
         Ok(())
     }
-    let mut bytes = Vec::new();
-    write(value, &mut bytes, 0)?;
-    bytes.push(b'\n');
-    Ok(bytes)
+}
+
+fn encoding_byte_limit() -> ConfigError {
+    ConfigError {
+        status: 413,
+        category: "json_encoding_byte_limit",
+    }
+}
+
+fn write_encoded<S: EncodingSink>(
+    value: &Value,
+    sink: &mut S,
+    depth: usize,
+) -> Result<(), ConfigError> {
+    if depth > MAX_CONFIG_DEPTH {
+        return Err(failure("configuration_depth_limit"));
+    }
+    match value {
+        Value::Null => sink.put(b"null"),
+        Value::Bool(value) => sink.put(if *value { b"true" } else { b"false" }),
+        Value::Number(value) => {
+            let number = value
+                .as_f64()
+                .ok_or_else(|| failure("invalid_json_number"))?;
+            sink.put(go_float(number)?.as_bytes())
+        }
+        Value::String(value) => write_encoded_string(value, sink),
+        Value::Array(values) => {
+            sink.put(b"[")?;
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    sink.put(b",")?;
+                }
+                write_encoded(value, sink, depth + 1)?;
+            }
+            sink.put(b"]")
+        }
+        Value::Object(values) => {
+            sink.put(b"{")?;
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    sink.put(b",")?;
+                }
+                // The previous encoder visited a synthetic String at depth + 1.
+                // Preserve that boundary without cloning the borrowed key.
+                if depth + 1 > MAX_CONFIG_DEPTH {
+                    return Err(failure("configuration_depth_limit"));
+                }
+                write_encoded_string(key, sink)?;
+                sink.put(b":")?;
+                write_encoded(&values[key], sink, depth + 1)?;
+            }
+            sink.put(b"}")
+        }
+    }
+}
+
+fn write_encoded_string<S: EncodingSink>(value: &str, sink: &mut S) -> Result<(), ConfigError> {
+    sink.lower_bound(value.len().checked_add(2).ok_or_else(encoding_byte_limit)?)?;
+    sink.put(b"\"")?;
+    let bytes = value.as_bytes();
+    let mut start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let mut control = *b"\\u0000";
+        let (escaped, consumed): (&[u8], usize) = match bytes[index] {
+            b'"' => (b"\\\"", 1),
+            b'\\' => (b"\\\\", 1),
+            8 => (b"\\b", 1),
+            12 => (b"\\f", 1),
+            b'\n' => (b"\\n", 1),
+            b'\r' => (b"\\r", 1),
+            b'\t' => (b"\\t", 1),
+            b'<' => (b"\\u003c", 1),
+            b'>' => (b"\\u003e", 1),
+            b'&' => (b"\\u0026", 1),
+            b @ 0..=31 => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                control[4] = HEX[(b >> 4) as usize];
+                control[5] = HEX[(b & 15) as usize];
+                (&control, 1)
+            }
+            0xe2 if bytes[index..].starts_with(b"\xe2\x80\xa8") => (b"\\u2028", 3),
+            0xe2 if bytes[index..].starts_with(b"\xe2\x80\xa9") => (b"\\u2029", 3),
+            _ => {
+                index += 1;
+                if index - start >= 256 {
+                    sink.put(&bytes[start..index])?;
+                    start = index;
+                }
+                continue;
+            }
+        };
+        sink.put(&bytes[start..index])?;
+        sink.put(escaped)?;
+        index += consumed;
+        start = index;
+    }
+    sink.put(&bytes[start..])?;
+    sink.put(b"\"")
 }
 
 pub fn etag(path: &str, value: Option<&Value>) -> Result<String, ConfigError> {
