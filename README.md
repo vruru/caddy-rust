@@ -147,3 +147,8 @@ startup rather than hard-coding a worker count. Test cgroup CPU limits remain
 confined to isolated QA containers and must not enter production service units.
 The runtime constructor is a product-integration primitive; the current
 inspection CLI does not create it.
+
+Configuration-adapter primitives now include source formatting, directive order,
+route sorting, named matchers and a subset of global options and handlers. They
+are not yet exposed through a complete adapter entry point. Aggregate resource
+budgeting, remaining directives and runtime integration remain explicit gaps.
