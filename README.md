@@ -49,8 +49,10 @@ native certificate resolver also prepares separate TLS 1.2 generic EC-signature
 and TLS 1.3 curve-bound profiles at load time. The negotiated protocol controls
 the final choice; a TLS 1.2-only certificate cannot authorize a TLS 1.3 handshake.
 Full certificate-path, name, time and purpose validation remain required.
-These library profiles do not establish completed HTTP session or upstream
-client-certificate integration; those are separate compatibility gates. The
+HTTP handshakes now choose a final profile only after protocol negotiation and
+bind session admission to the certificate actually selected. Preselection never
+authorizes a TLS 1.2-only profile for TLS 1.3. Upstream client-certificate profile
+integration and complete transport policies remain separate compatibility gates. The
 process installs this explicit provider before constructing implicit TLS clients;
 an incompatible existing default is an error. This key compatibility primitive
 does not implement a production TLS listener or certificate lifecycle.

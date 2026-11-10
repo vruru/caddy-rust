@@ -9,6 +9,7 @@ const CACHE_CAPACITY: usize = 256;
 
 pub(super) struct HandshakeState {
     pub identity: OnceLock<Arc<TlsIdentity>>,
+    pub selected_chain: OnceLock<[u8; 32]>,
     resumed: Mutex<Option<Arc<TlsIdentity>>>,
 }
 
@@ -16,6 +17,7 @@ impl HandshakeState {
     pub(super) fn new() -> Self {
         Self {
             identity: OnceLock::new(),
+            selected_chain: OnceLock::new(),
             resumed: Mutex::new(None),
         }
     }
@@ -81,29 +83,23 @@ impl fmt::Debug for SharedSessions {
 pub(super) struct PerConnectionSessions {
     shared: Arc<SharedSessions>,
     handshake: Arc<HandshakeState>,
-    current_chain: [u8; 32],
 }
 
 impl PerConnectionSessions {
-    pub(super) fn new(
-        shared: Arc<SharedSessions>,
-        handshake: Arc<HandshakeState>,
-        current_chain: [u8; 32],
-    ) -> Self {
-        Self {
-            shared,
-            handshake,
-            current_chain,
-        }
+    pub(super) fn new(shared: Arc<SharedSessions>, handshake: Arc<HandshakeState>) -> Self {
+        Self { shared, handshake }
     }
     fn lookup(&self, key: &[u8], consume: bool) -> Option<Vec<u8>> {
+        // rustls 0.23.46 calls the version-aware resolver before consulting
+        // session storage. An absent actual selection must never use a hint.
+        let current_chain = self.handshake.selected_chain.get()?;
         let (result, discarded) = {
             let mut cache = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             let entry = cache.entries.get(key)?;
             // An unfinished handshake has not established an identity yet.
             // Leave its entry intact and safely fall back to a full handshake.
             let identity = entry.owner.identity.get()?.clone();
-            if !identity.resumable_for(&self.current_chain) {
+            if !identity.resumable_for(current_chain) {
                 cache.order.retain(|k| k.as_slice() != key);
                 (None, cache.entries.remove(key))
             } else {

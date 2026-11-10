@@ -126,31 +126,57 @@ impl ResolvesServerCert for CandidateResolver {
             .alpn()
             .map(|x| x.collect::<Vec<_>>())
             .unwrap_or_default();
-        self.select(hello.server_name(), &alpn, hello.signature_schemes())
+        self.select_for_version(
+            hello.server_name(),
+            &alpn,
+            hello.signature_schemes(),
+            hello.negotiated_version()?,
+        )
+        .map(|selection| selection.key)
     }
 }
 impl CandidateResolver {
-    fn select(
+    fn select_candidate(
         &self,
         sni: Option<&str>,
         alpn: &[&[u8]],
         schemes: &[rustls::SignatureScheme],
-    ) -> Option<Arc<CertifiedKey>> {
+    ) -> Option<crate::tls_resolver::CertificateSelection> {
+        self.select_using(sni, alpn, |resolver, sni| {
+            resolver.select_candidate(Some(sni), alpn, schemes)
+        })
+    }
+    fn select_for_version(
+        &self,
+        sni: Option<&str>,
+        alpn: &[&[u8]],
+        schemes: &[rustls::SignatureScheme],
+        version: rustls::ProtocolVersion,
+    ) -> Option<crate::tls_resolver::CertificateSelection> {
+        self.select_using(sni, alpn, |resolver, sni| {
+            resolver.select_for_version(Some(sni), alpn, schemes, version)
+        })
+    }
+    fn select_using(
+        &self,
+        sni: Option<&str>,
+        alpn: &[&[u8]],
+        mut select: impl FnMut(
+            &HotCertificateResolver,
+            &str,
+        ) -> Option<crate::tls_resolver::CertificateSelection>,
+    ) -> Option<crate::tls_resolver::CertificateSelection> {
         let sni = sni?;
         if alpn.contains(&ACME_ALPN) {
-            // The same challenge registry backs both resolvers. Only the
-            // managed resolver needs to answer validation certificates.
-            return self.managed.select(Some(sni), alpn, schemes);
+            return select(&self.managed, sni);
         }
-        self.static_certificates
-            .select(Some(sni), alpn, schemes)
-            .or_else(|| {
-                self.allowed_managed
-                    .iter()
-                    .any(|name| dns_covers(name, sni))
-                    .then(|| self.managed.select(Some(sni), alpn, schemes))
-                    .flatten()
-            })
+        select(&self.static_certificates, sni).or_else(|| {
+            self.allowed_managed
+                .iter()
+                .any(|name| dns_covers(name, sni))
+                .then(|| select(&self.managed, sni))
+                .flatten()
+        })
     }
 }
 impl HttpRuntime {
@@ -546,7 +572,13 @@ impl ResolvesServerCert for ProofResolver {
             return None;
         }
         self.0
-            .select(hello.server_name(), &protocols, hello.signature_schemes())
+            .select_for_version(
+                hello.server_name(),
+                &protocols,
+                hello.signature_schemes(),
+                hello.negotiated_version()?,
+            )
+            .map(|selection| selection.key)
     }
 }
 fn proof_tls_config(managed: Arc<HotCertificateResolver>) -> Result<Arc<rustls::ServerConfig>> {

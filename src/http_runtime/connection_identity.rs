@@ -2,14 +2,17 @@
 //! operation is admitted against the currently published route/TLS policy.
 use super::*;
 use crate::leaf_guard::{LeafState, leaf_id};
-use rustls::SignatureScheme;
+use crate::tls_resolver::CertificateSelection;
+use rustls::{ProtocolVersion, SignatureScheme};
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 
 pub(super) struct TlsIdentity {
     sni: String,
     offered_alpn: Vec<Vec<u8>>,
     schemes: Vec<SignatureScheme>,
     chain_hash: [u8; 32],
+    version: ProtocolVersion,
     leaf: Arc<LeafState>,
 }
 fn chain_hash(key: &CertifiedKey) -> [u8; 32] {
@@ -46,14 +49,12 @@ impl TlsIdentity {
             .iter()
             .map(Vec::as_slice)
             .collect::<Vec<_>>();
-        let Some(key) = current
-            .resolver
-            .as_ref()
-            .and_then(|r| r.select(Some(&self.sni), &alpn, &self.schemes))
-        else {
+        let Some(key) = current.resolver.as_ref().and_then(|r| {
+            r.select_for_version(Some(&self.sni), &alpn, &self.schemes, self.version)
+        }) else {
             return TlsVerdict::Reject;
         };
-        if chain_hash(&key) == self.chain_hash {
+        if chain_hash(&key.key) == self.chain_hash {
             TlsVerdict::Serve
         } else {
             TlsVerdict::ServeThenClose
@@ -61,9 +62,12 @@ impl TlsIdentity {
     }
 }
 struct FixedResolver {
-    key: Arc<CertifiedKey>,
+    resolver: Arc<CandidateResolver>,
+    state: Arc<connection_sessions::HandshakeState>,
+    selection: OnceLock<(ProtocolVersion, CertificateSelection)>,
     sni: String,
     acme: bool,
+    offered_alpn: Vec<Vec<u8>>,
 }
 impl fmt::Debug for FixedResolver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -83,6 +87,13 @@ impl ResolvesServerCert for FixedResolver {
             .alpn()
             .map(|a| a.collect::<Vec<_>>())
             .unwrap_or_default();
+        if !protocols
+            .iter()
+            .copied()
+            .eq(self.offered_alpn.iter().map(Vec::as_slice))
+        {
+            return None;
+        }
         if protocols.contains(&ACME_ALPN) {
             if !self.acme || protocols != [ACME_ALPN] {
                 return None;
@@ -90,8 +101,33 @@ impl ResolvesServerCert for FixedResolver {
         } else if self.acme {
             return None;
         }
-        self.key.key.choose_scheme(hello.signature_schemes())?;
-        Some(self.key.clone())
+        let version = hello.negotiated_version()?;
+        if self.selection.get().is_none() {
+            let selection = self.resolver.select_for_version(
+                Some(&self.sni),
+                &protocols,
+                hello.signature_schemes(),
+                version,
+            )?;
+            if !selection.signature_compatibility.allows(version) {
+                return None;
+            }
+            let _ = self.selection.set((version, selection));
+        }
+        let (selected_version, selection) = self.selection.get()?;
+        if *selected_version != version || !selection.signature_compatibility.allows(version) {
+            return None;
+        }
+        selection.key.key.choose_scheme(hello.signature_schemes())?;
+        let hash = chain_hash(&selection.key);
+        if let Some(previous) = self.state.selected_chain.get() {
+            if previous != &hash {
+                return None;
+            }
+        } else if self.state.selected_chain.set(hash).is_err() {
+            return None;
+        }
+        Some(selection.key.clone())
     }
 }
 pub(super) struct AcceptedTls {
@@ -132,24 +168,29 @@ pub(super) async fn accept(
         !protocols.contains(&ACME_ALPN) || protocols == [ACME_ALPN],
         "mixed ACME ALPN offer"
     );
-    let key = resolver
-        .select(Some(&sni), &protocols, &schemes)
+    // This is only an availability hint: protocol authorization occurs in the
+    // real resolver callback after rustls has negotiated the protocol version.
+    resolver
+        .select_candidate(Some(&sni), &protocols, &schemes)
         .ok_or_else(|| anyhow::anyhow!("TLS identity unavailable"))?;
     let mut config = (**server
         .tls
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("TLS listener policy changed"))?)
     .clone();
-    config.cert_resolver = Arc::new(FixedResolver {
-        key: key.clone(),
+    let state = Arc::new(connection_sessions::HandshakeState::new());
+    let fixed = Arc::new(FixedResolver {
+        resolver: resolver.clone(),
+        state: state.clone(),
+        selection: OnceLock::new(),
         sni: sni.clone(),
         acme: protocols == [ACME_ALPN],
+        offered_alpn: protocols.iter().map(|p| p.to_vec()).collect(),
     });
-    let state = Arc::new(connection_sessions::HandshakeState::new());
+    config.cert_resolver = fixed.clone();
     config.session_storage = Arc::new(connection_sessions::PerConnectionSessions::new(
         server.sessions.clone(),
         state.clone(),
-        chain_hash(&key),
     ));
     let offered_alpn = protocols.iter().map(|p| p.to_vec()).collect();
     // RFC8737 certificates have a mandatory unknown critical extension, so the
@@ -161,6 +202,16 @@ pub(super) async fn accept(
         drop(stream);
         anyhow::bail!("TLS validation completed");
     }
+    let stream = start.into_stream(Arc::new(config)).await?;
+    let (version, selection) = fixed
+        .selection
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("TLS actual selection unavailable"))?;
+    ensure!(
+        stream.get_ref().1.protocol_version() == Some(*version),
+        "TLS selection version mismatch"
+    );
+    let key = &selection.key;
     let leaf_certificate = key
         .cert
         .first()
@@ -175,10 +226,10 @@ pub(super) async fn accept(
         sni: sni.clone(),
         offered_alpn,
         schemes,
-        chain_hash: chain_hash(&key),
+        chain_hash: chain_hash(key),
+        version: *version,
         leaf,
     });
-    let stream = start.into_stream(Arc::new(config)).await?;
     if stream.get_ref().1.handshake_kind() == Some(rustls::HandshakeKind::Resumed) {
         let resumed = state
             .resumed()
