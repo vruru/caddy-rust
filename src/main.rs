@@ -31,7 +31,7 @@ fn run() -> Result<()> {
     let report = match args.as_slice() {
         [flag] if flag == "--help" => {
             println!(
-                "caddy-compat-native fmt [FLAGS] [FILE] | adapt [FLAGS] | inspect-config FILE | inspect-storage CERTMAGIC_ROOT\nNative compatibility development. This build does not serve traffic or replace Caddy."
+                "caddy-compat-native fmt [FLAGS] [FILE] | adapt [FLAGS] | validate [FLAGS] | inspect-config FILE | inspect-storage CERTMAGIC_ROOT\nNative compatibility development. Provisioning requires native-run. This build does not serve traffic or replace Caddy."
             );
             return Ok(());
         }

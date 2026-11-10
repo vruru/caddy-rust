@@ -715,7 +715,8 @@ fn prepare(raw: Value) -> Result<Prepared, AdminError> {
     let http = http_config::validate_json(&json!({"apps":{"http":http}}))
         .map_err(|_| failed("invalid_http_application"))?;
     let digest = Sha256::digest(
-        crate::admin_json::encoded(&raw).map_err(|_| failed("invalid_configuration_encoding"))?,
+        crate::admin_json::encoded_typed(&raw)
+            .map_err(|_| failed("invalid_configuration_encoding"))?,
     )
     .into();
     Ok(Prepared {

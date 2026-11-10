@@ -14,13 +14,19 @@ Current commands:
 
 - `fmt [FLAGS] [FILE]`: format, preview differences or overwrite a Caddyfile.
 - `adapt [FLAGS]`: adapt implemented Caddyfile directives, with compatible env-file
-  and flag behavior; `--validate` remains an explicit provisioning integration gate.
+  and flag behavior; `--validate` provisions supported runtime modules when built
+  with the opt-in `native-run` development feature.
+- `validate [FLAGS]`: load the original config source/env/adapter path, remove raw
+  metadata and provision supported modules without starting listeners or issuing
+  ACME certificates. This also requires `native-run`.
 - `inspect-config FILE`: extract a privacy-safe configuration feature inventory.
 - `inspect-storage ROOT`: inspect CertMagic certificate/account layout and validate
   supported certificate/key pairs without writing or registering an ACME account.
 
-These commands do not serve traffic, renew a certificate, reload a running process,
-or replaces existing state. Reports must not contain private keys, account email,
+Provisioning validation may initialize local storage or PKI material, while the
+inspection commands remain read-only. Formatting can overwrite the explicit input
+file. These commands do not serve traffic, renew certificates or reload a running
+process. Inspection reports must not contain private keys, account email,
 account URLs, domain names, or credential values. Schema pointers use documented
 redaction for dynamic map keys; they are not Admin API mutation paths.
 
@@ -340,3 +346,15 @@ holding one restore slot and waiting for another to inspect its certificate.
 Actual blocking verification owns its CPU permit through completion, and no CPU
 permit spans responder network or storage I/O. Signature checks, certificate
 identity, revocation/guard policy and cache freshness remain mandatory.
+
+CLI typed decoding preserves integral fields instead of applying the Admin map's
+float64 normalization. Application digests likewise preserve distinct integral
+configuration values when fencing retained rollback material. Literal null in
+validation is rejected with a controlled error instead of reproducing the pinned
+Go command's nil-configuration panic. The existing depth/resource bounds and
+unsupported-module gates remain explicit; this is not full serving acceptance.
+Caddyfile adaptation uses deterministic JSON object ordering, which can differ
+from Go's typed-struct field order while retaining the same JSON configuration.
+The shared JSON writer also provides bounded non-HTML-escaped typed output for
+reflected log values. It retains Go float formatting, sorted map keys and escaped
+U+2028/U+2029; ordinary Admin encoding, raw adaptation and ETags remain HTML-safe.

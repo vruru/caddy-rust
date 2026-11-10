@@ -62,7 +62,7 @@ fn write_raw<S: EncodingSink>(input: &[u8], sink: &mut S) -> Result<(), ConfigEr
         }
         if quotes.inside
             && !quotes.escaped
-            && let Some((escaped, consumed)) = html_escape(input, index)
+            && let Some((escaped, consumed)) = html_escape(input, index, true)
         {
             sink.put(&input[start..index])?;
             sink.put(escaped)?;

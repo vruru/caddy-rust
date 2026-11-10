@@ -1,12 +1,19 @@
 //! CLI startup happens before runtime/worker construction, including env files.
 #[path = "cli/args.rs"]
 mod args;
+#[path = "cli/config.rs"]
+mod config;
 #[path = "cli/envfile.rs"]
 mod envfile;
 #[path = "cli/json_indent.rs"]
 mod json_indent;
 #[path = "cli/line_diff.rs"]
 mod line_diff;
+#[cfg(feature = "native-run")]
+#[path = "cli/paths.rs"]
+mod paths;
+#[path = "cli/validation.rs"]
+mod validation;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use args::{Flag, Kind};
 use caddy_compat_native::{admin_json, caddyfile_adapter, caddyfile_parser};
@@ -90,6 +97,9 @@ fn help(command: &str) {
         ),
         "adapt" => println!(
             "Usage: caddy-compat-native adapt [--config PATH] [--adapter caddyfile] [--pretty] [--validate] [--envfile PATH]\n  -c, --config PATH\n  -a, --adapter NAME\n  -p, --pretty\n      --validate\n      --envfile PATHS\n  -h, --help"
+        ),
+        "validate" => println!(
+            "Usage: caddy-compat-native validate [--config PATH] [--adapter caddyfile] [--envfile PATH]\n  -c, --config PATH\n  -a, --adapter NAME\n      --envfile PATHS\n  -h, --help"
         ),
         _ => {}
     }
@@ -197,7 +207,14 @@ unsafe fn adapt(flags: args::Flags) -> Result<i32> {
         out.write_all(b"\n")?;
         out.flush()?;
     }
-    for warning in result.warnings {
+    emit_warnings(result.warnings);
+    if flags.boolean("validate") {
+        validation::configuration(result.config)?;
+    }
+    Ok(0)
+}
+fn emit_warnings(warnings: Vec<caddyfile_adapter::Warning>) {
+    for warning in warnings {
         let message = if warning.directive.is_empty() {
             warning.message
         } else {
@@ -208,13 +225,9 @@ unsafe fn adapt(flags: args::Flags) -> Result<i32> {
             serde_json::json!({"level":"warn","logger":"caddyfile","msg":message,"file":warning.file,"line":warning.line})
         );
     }
-    if flags.boolean("validate") {
-        bail!("configuration provisioning validation integration pending")
-    }
-    Ok(0)
 }
 /// Dispatch only implemented CLI commands. Inspectors and serving commands have
-/// separate entry paths. No unknown flag is ignored, and no runtime is started.
+/// separate entry paths. Provisioning creates its runtime only after env files.
 /// # Safety
 /// Must run before any threads or foreign runtimes can observe the environment.
 pub unsafe fn dispatch_early(input: &[OsString]) -> Result<Option<i32>> {
@@ -264,6 +277,25 @@ pub unsafe fn dispatch_early(input: &[OsString]) -> Result<Option<i32>> {
             ]);
             // SAFETY: caller provides the single-threaded startup boundary.
             Ok(Some(unsafe { adapt(args::parse(&input[1..], &specs)?)? }))
+        }
+        "validate" => {
+            let mut specs = COMMON.to_vec();
+            specs.extend([
+                Flag {
+                    name: "adapter",
+                    short: Some(b'a'),
+                    kind: Kind::Text,
+                },
+                Flag {
+                    name: "envfile",
+                    short: None,
+                    kind: Kind::List,
+                },
+            ]);
+            // SAFETY: same single-threaded startup boundary as adapt.
+            Ok(Some(unsafe {
+                validation::command(args::parse(&input[1..], &specs)?)?
+            }))
         }
         _ => Ok(None),
     }

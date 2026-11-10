@@ -19,6 +19,22 @@ pub use adapt::encoded_adapt_raw;
 pub const MAX_CONFIG_DEPTH: usize = 256;
 
 pub fn decoded(input: &[u8]) -> Result<Value, ConfigError> {
+    let value = decoded_typed(input)?;
+    // Go's any -> marshal -> typed-decode path rounds all numbers to f64.
+    // Re-read the canonical representation to retain integral typed fields.
+    let bytes = encoded(&value)?;
+    let mut decoder = serde_json::Deserializer::from_slice(&bytes);
+    decoder.disable_recursion_limit();
+    serde::Deserialize::deserialize(&mut decoder).map_err(|_| ConfigError {
+        status: 400,
+        category: "invalid_json_configuration",
+    })
+}
+
+/// Decode a direct typed configuration without passing its integer fields
+/// through the Admin map's f64 normalization. The same Unicode and explicit
+/// depth bounds still apply. CLI validation needs this distinct original path.
+pub fn decoded_typed(input: &[u8]) -> Result<Value, ConfigError> {
     let sanitized = codec::sanitize(input, MAX_CONFIG_DEPTH)?;
     let mut decoder = serde_json::Deserializer::from_slice(&sanitized);
     decoder.disable_recursion_limit();
@@ -30,15 +46,7 @@ pub fn decoded(input: &[u8]) -> Result<Value, ConfigError> {
         status: 400,
         category: "invalid_json_configuration",
     })?;
-    // Go's any -> marshal -> typed-decode path rounds all numbers to f64.
-    // Re-read the canonical representation to retain integral typed fields.
-    let bytes = encoded(&value)?;
-    let mut decoder = serde_json::Deserializer::from_slice(&bytes);
-    decoder.disable_recursion_limit();
-    serde::Deserialize::deserialize(&mut decoder).map_err(|_| ConfigError {
-        status: 400,
-        category: "invalid_json_configuration",
-    })
+    Ok(value)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -319,7 +327,7 @@ pub fn encoded_len(value: &Value, limit: usize) -> Result<usize, ConfigError> {
 pub fn encoded_typed(value: &Value) -> Result<Vec<u8>, ConfigError> {
     let mut bytes = Vec::new();
     let mut sink = EncodingBytes(&mut bytes);
-    write_encoded_inner(value, &mut sink, 0, NumberMode::Typed)?;
+    write_encoded_inner(value, &mut sink, 0, NumberMode::Typed, true)?;
     sink.put(b"\n")?;
     Ok(bytes)
 }
@@ -327,9 +335,23 @@ pub fn encoded_typed(value: &Value) -> Result<Vec<u8>, ConfigError> {
 /// Count the very same typed bytes, including the Encoder.Encode newline.
 pub fn encoded_len_typed(value: &Value, limit: usize) -> Result<usize, ConfigError> {
     let mut sink = EncodingCount { count: 0, limit };
-    write_encoded_inner(value, &mut sink, 0, NumberMode::Typed)?;
+    write_encoded_inner(value, &mut sink, 0, NumberMode::Typed, true)?;
     sink.put(b"\n")?;
     Ok(sink.count)
+}
+
+/// Go typed JSON with SetEscapeHTML(false), including the Encode newline.
+/// Used for reflected structured logging values, not Admin maps or their ETags.
+/// Every append is checked before allocation; oversized strings and objects
+/// fail from a lower bound without first constructing their encoded output.
+pub fn encoded_typed_no_html(value: &Value, limit: usize) -> Result<Vec<u8>, ConfigError> {
+    let mut sink = EncodingBoundedBytes {
+        bytes: Vec::new(),
+        limit,
+    };
+    write_encoded_inner(value, &mut sink, 0, NumberMode::Typed, false)?;
+    sink.put(b"\n")?;
+    Ok(sink.bytes)
 }
 
 trait EncodingSink {
@@ -350,6 +372,45 @@ impl EncodingSink for EncodingBytes<'_> {
 struct EncodingCount {
     count: usize,
     limit: usize,
+}
+
+struct EncodingBoundedBytes {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+impl EncodingSink for EncodingBoundedBytes {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), ConfigError> {
+        self.lower_bound(bytes.len())?;
+        let required = self.bytes.len() + bytes.len();
+        if required > self.bytes.capacity() {
+            let capacity = self
+                .bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(64)
+                .max(required)
+                .min(self.limit);
+            self.bytes
+                .try_reserve_exact(capacity - self.bytes.len())
+                .map_err(|_| ConfigError {
+                    status: 503,
+                    category: "json_encoding_allocation_failed",
+                })?;
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+    fn lower_bound(&self, length: usize) -> Result<(), ConfigError> {
+        if self
+            .bytes
+            .len()
+            .checked_add(length)
+            .is_none_or(|n| n > self.limit)
+        {
+            return Err(encoding_byte_limit());
+        }
+        Ok(())
+    }
 }
 impl EncodingSink for EncodingCount {
     fn put(&mut self, bytes: &[u8]) -> Result<(), ConfigError> {
@@ -387,7 +448,7 @@ fn write_encoded<S: EncodingSink>(
     sink: &mut S,
     depth: usize,
 ) -> Result<(), ConfigError> {
-    write_encoded_inner(value, sink, depth, NumberMode::GoFloat)
+    write_encoded_inner(value, sink, depth, NumberMode::GoFloat, true)
 }
 
 fn write_encoded_inner<S: EncodingSink>(
@@ -395,6 +456,7 @@ fn write_encoded_inner<S: EncodingSink>(
     sink: &mut S,
     depth: usize,
     mode: NumberMode,
+    escape_html: bool,
 ) -> Result<(), ConfigError> {
     if depth > MAX_CONFIG_DEPTH {
         return Err(failure("configuration_depth_limit"));
@@ -416,19 +478,36 @@ fn write_encoded_inner<S: EncodingSink>(
                 .ok_or_else(|| failure("invalid_json_number"))?;
             sink.put(go_float(number)?.as_bytes())
         }
-        Value::String(value) => write_encoded_string(value, sink),
+        Value::String(value) => write_encoded_string(value, sink, escape_html),
         Value::Array(values) => {
             sink.put(b"[")?;
             for (index, value) in values.iter().enumerate() {
                 if index > 0 {
                     sink.put(b",")?;
                 }
-                write_encoded_inner(value, sink, depth + 1, mode)?;
+                write_encoded_inner(value, sink, depth + 1, mode, escape_html)?;
             }
             sink.put(b"]")
         }
         Value::Object(values) => {
             sink.put(b"{")?;
+            if !escape_html {
+                // Bound the borrowed-key sort before allocating its vector.
+                // An entry needs at least quotes, colon, one value byte, and
+                // comma/closing brace; actual escaping may require more.
+                let minimum = values
+                    .len()
+                    .checked_mul(5)
+                    .ok_or_else(encoding_byte_limit)?;
+                sink.lower_bound(minimum.max(1))?;
+                let mut minimum = minimum;
+                for key in values.keys() {
+                    minimum = minimum
+                        .checked_add(key.len())
+                        .ok_or_else(encoding_byte_limit)?;
+                    sink.lower_bound(minimum)?;
+                }
+            }
             let mut keys = values.keys().collect::<Vec<_>>();
             keys.sort_unstable();
             for (index, key) in keys.into_iter().enumerate() {
@@ -440,23 +519,27 @@ fn write_encoded_inner<S: EncodingSink>(
                 if depth + 1 > MAX_CONFIG_DEPTH {
                     return Err(failure("configuration_depth_limit"));
                 }
-                write_encoded_string(key, sink)?;
+                write_encoded_string(key, sink, escape_html)?;
                 sink.put(b":")?;
-                write_encoded_inner(&values[key], sink, depth + 1, mode)?;
+                write_encoded_inner(&values[key], sink, depth + 1, mode, escape_html)?;
             }
             sink.put(b"}")
         }
     }
 }
 
-fn write_encoded_string<S: EncodingSink>(value: &str, sink: &mut S) -> Result<(), ConfigError> {
+fn write_encoded_string<S: EncodingSink>(
+    value: &str,
+    sink: &mut S,
+    escape_html: bool,
+) -> Result<(), ConfigError> {
     sink.lower_bound(value.len().checked_add(2).ok_or_else(encoding_byte_limit)?)?;
     sink.put(b"\"")?;
     let bytes = value.as_bytes();
     let mut start = 0;
     let mut index = 0;
     while index < bytes.len() {
-        if let Some((escaped, consumed)) = html_escape(bytes, index) {
+        if let Some((escaped, consumed)) = html_escape(bytes, index, escape_html) {
             sink.put(&bytes[start..index])?;
             sink.put(escaped)?;
             index += consumed;
@@ -496,11 +579,11 @@ fn write_encoded_string<S: EncodingSink>(value: &str, sink: &mut S) -> Result<()
     sink.put(b"\"")
 }
 
-fn html_escape(bytes: &[u8], index: usize) -> Option<(&'static [u8], usize)> {
+fn html_escape(bytes: &[u8], index: usize, escape_html: bool) -> Option<(&'static [u8], usize)> {
     match bytes[index] {
-        b'<' => Some((b"\\u003c", 1)),
-        b'>' => Some((b"\\u003e", 1)),
-        b'&' => Some((b"\\u0026", 1)),
+        b'<' if escape_html => Some((b"\\u003c", 1)),
+        b'>' if escape_html => Some((b"\\u003e", 1)),
+        b'&' if escape_html => Some((b"\\u0026", 1)),
         0xe2 if bytes[index..].starts_with(b"\xe2\x80\xa8") => Some((b"\\u2028", 3)),
         0xe2 if bytes[index..].starts_with(b"\xe2\x80\xa9") => Some((b"\\u2029", 3)),
         _ => None,
