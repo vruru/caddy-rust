@@ -106,7 +106,7 @@ impl NativeGate {
         let mut guard = self
             .file
             .lock()
-            .map_err(|_| anyhow!("native gate state unavailable"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Closing the last open file description releases flock even when the
         // CertMagic owner check failed. Gate files themselves are never unlinked.
         drop(guard.take());
@@ -191,6 +191,32 @@ fn stale(meta: &LockMeta) -> Result<bool> {
     Ok(OffsetDateTime::now_utc() - reference > time::Duration::seconds(10))
 }
 
+// Move the whole guard into the blocking task, including while it is queued.
+// A dropped async waiter must not hide an I/O error or a worker panic.
+struct LostOnFailure(Option<CancellationToken>);
+impl LostOnFailure {
+    fn new(token: &CancellationToken) -> Self {
+        Self(Some(token.clone()))
+    }
+    fn fire(&mut self) {
+        if let Some(token) = self.0.take() {
+            token.cancel();
+        }
+    }
+    fn settle<T>(&mut self, result: &Result<T>) {
+        if result.is_ok() {
+            self.0 = None;
+        } else {
+            self.fire();
+        }
+    }
+}
+impl Drop for LostOnFailure {
+    fn drop(&mut self) {
+        self.fire();
+    }
+}
+
 impl StorageLease {
     pub fn name(&self) -> &str {
         &self.inner.name
@@ -214,47 +240,65 @@ impl StorageLease {
         T: Send + 'static,
         F: FnOnce() -> Result<T> + Send + 'static,
     {
+        let guard = LostOnFailure::new(&self.inner.lost);
         let inner = self.inner.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let _mutation = inner
                 .mutation
                 .lock()
                 .map_err(|_| anyhow!("lease mutation state unavailable"))?;
-            inner.verify(false)?;
-            let value = operation()?;
-            inner.verify(false)?;
-            Ok(value)
+            // Rebind after acquiring the mutex: unwind cancels before unlock.
+            let mut guard = guard;
+            let result = (|| {
+                inner.verify(false)?;
+                let value = operation()?;
+                inner.verify(false)?;
+                Ok(value)
+            })();
+            // Cancel before releasing the mutation mutex so a queued writer
+            // cannot pass verification between this failure and cancellation.
+            guard.settle(&result);
+            result
         })
         .await
-        .map_err(|_| anyhow!("fenced mutation task failed"))?;
-        if result.is_err() {
+        .map_err(|_| {
             self.inner.lost.cancel();
-        }
-        result
+            anyhow!("fenced mutation task failed")
+        })?
     }
     pub async fn check(&self) -> Result<()> {
+        let guard = LostOnFailure::new(&self.inner.lost);
         let inner = self.inner.clone();
-        let outcome = tokio::task::spawn_blocking(move || inner.verify(false))
-            .await
-            .map_err(|_| anyhow!("lease check task failed"))?;
-        if outcome.is_err() {
+        tokio::task::spawn_blocking(move || {
+            let mut guard = guard;
+            let result = inner.verify(false);
+            guard.settle(&result);
+            result
+        })
+        .await
+        .map_err(|_| {
             self.inner.lost.cancel();
-        }
-        outcome
+            anyhow!("lease check task failed")
+        })?
     }
     pub async fn release(self) -> Result<()> {
         self.inner.stop.cancel();
         if self.inner.released.swap(true, Ordering::AcqRel) {
             bail!("lease already released");
         }
+        let guard = LostOnFailure::new(&self.inner.lost);
         let inner = self.inner.clone();
-        let result = tokio::task::spawn_blocking(move || inner.remove())
-            .await
-            .map_err(|_| anyhow!("lease release task failed"))?;
-        if result.is_err() {
+        tokio::task::spawn_blocking(move || {
+            let mut guard = guard;
+            let result = inner.remove();
+            guard.settle(&result);
+            result
+        })
+        .await
+        .map_err(|_| {
             self.inner.lost.cancel();
-        }
-        result
+            anyhow!("lease release task failed")
+        })?
     }
 }
 
@@ -351,7 +395,7 @@ impl Inner {
         let mutation = self.mutation.lock();
         let poisoned = mutation.is_err();
         let _mutation = mutation.unwrap_or_else(std::sync::PoisonError::into_inner);
-        let outcome = (|| -> Result<()> {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
             let mut file = self
                 .file
                 .lock()
@@ -359,12 +403,26 @@ impl Inner {
             self.identity(&file)?;
             self.read_meta(&mut file)?;
             self.core.data.delete(&self.key)
-        })();
+        }));
+        // Close the native gate even if cleanup panics. Detached operations
+        // have already finished because the mutation mutex is still held.
         let unlocked = self.gate.close();
-        outcome?;
-        unlocked?;
-        ensure!(!poisoned, "lease mutation state poisoned during release");
-        Ok(())
+        let result = match outcome {
+            Ok(outcome) => (|| {
+                outcome?;
+                unlocked?;
+                ensure!(!poisoned, "lease mutation state poisoned during release");
+                Ok(())
+            })(),
+            Err(panic) => {
+                self.lost.cancel();
+                std::panic::resume_unwind(panic)
+            }
+        };
+        if result.is_err() {
+            self.lost.cancel();
+        }
+        result
     }
 }
 

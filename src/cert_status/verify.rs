@@ -6,7 +6,7 @@ use der::{
     Decode, Encode,
     asn1::{Null, ObjectIdentifier, OctetString},
 };
-use rsa::{pkcs1::DecodeRsaPublicKey, pkcs1v15, signature::Verifier};
+use rsa::{pkcs1v15, signature::Verifier};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use x509_ocsp::{
@@ -453,7 +453,31 @@ fn tlv(bytes: &[u8]) -> Result<(usize, usize)> {
     Ok((header, total))
 }
 
-fn verify_signature(
+fn decode_rsa_public(key: &SubjectPublicKeyInfo<'_>) -> Result<rsa::RsaPublicKey> {
+    ensure!(
+        key.subject_public_key.unused_bits == 0,
+        "invalid RSA public-key bit string"
+    );
+    let raw = key.subject_public_key.data.as_ref();
+    ensure!(raw.len() <= 2048, "RSA public key DER outside bounds");
+    let parsed = rsa::pkcs1::RsaPublicKey::from_der(raw)
+        .map_err(|_| anyhow!("malformed RSA public key DER"))?;
+    let modulus = parsed.modulus.as_bytes();
+    let exponent = parsed.public_exponent.as_bytes();
+    ensure!(
+        modulus.len() <= 1024 && exponent.len() <= 8,
+        "RSA public key components outside bounds"
+    );
+    let modulus = rsa::BigUint::from_bytes_be(modulus);
+    ensure!(
+        (1024..=8192).contains(&modulus.bits()),
+        "RSA public key size outside bounds"
+    );
+    rsa::RsaPublicKey::new_with_max_size(modulus, rsa::BigUint::from_bytes_be(exponent), 8192)
+        .map_err(|_| anyhow!("invalid RSA public key exponent or modulus"))
+}
+
+pub(crate) fn verify_signature(
     key: &SubjectPublicKeyInfo<'_>,
     algorithm: &AlgorithmIdentifier<'_>,
     signature: &[u8],
@@ -478,12 +502,7 @@ fn verify_signature(
             key_oid == "1.2.840.113549.1.1.1" && null_params,
             "invalid RSA signature key or parameters"
         );
-        let public = rsa::RsaPublicKey::from_pkcs1_der(&key.subject_public_key.data)?;
-        use rsa::traits::PublicKeyParts;
-        ensure!(
-            (1024..=8192).contains(&public.n().bits()),
-            "OCSP RSA key size out of range"
-        );
+        let public = decode_rsa_public(key)?;
         let sig = pkcs1v15::Signature::try_from(signature)?;
         let valid = match oid.as_str() {
             "1.2.840.113549.1.1.5" | "1.3.14.3.2.29" => {
@@ -532,12 +551,7 @@ fn verify_signature(
                 && mgf.parameters.is_none_or(|p| p == der::asn1::AnyRef::NULL),
             "invalid PSS hash parameters"
         );
-        let public = rsa::RsaPublicKey::from_pkcs1_der(&key.subject_public_key.data)?;
-        use rsa::traits::PublicKeyParts;
-        ensure!(
-            (1024..=8192).contains(&public.n().bits()),
-            "OCSP RSA key size out of range"
-        );
+        let public = decode_rsa_public(key)?;
         let sig = rsa::pss::Signature::try_from(signature)?;
         let valid = match params.hash.oid.to_string().as_str() {
             "2.16.840.1.101.3.4.2.1" => {
