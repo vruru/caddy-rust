@@ -37,6 +37,45 @@ pub(super) struct Signature {
     modified: i128,
     changed: i128,
 }
+impl Signature {
+    fn from_stat(st: &fs::Stat) -> Self {
+        Self {
+            dev: device_id(st),
+            ino: st.st_ino,
+            size: st.st_size as u64,
+            modified: st.st_mtime as i128 * 1_000_000_000 + st.st_mtime_nsec as i128,
+            changed: st.st_ctime as i128 * 1_000_000_000 + st.st_ctime_nsec as i128,
+        }
+    }
+}
+
+/// Retain the actual read inode until every member of a group is verified.
+/// Published files use atomic replacement; retaining their descriptors prevents
+/// unlinked inode numbers being reused during a grouped snapshot check.
+pub(super) struct PinnedRead {
+    file: File,
+    bytes: Zeroizing<Vec<u8>>,
+    signature: Signature,
+    uid: u32,
+    private: bool,
+}
+impl PinnedRead {
+    pub fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    pub fn verify(&self) -> Result<()> {
+        let current = fs::fstat(&self.file).map_err(|_| anyhow!("file metadata unavailable"))?;
+        validate_file(&current, self.uid, self.private)?;
+        ensure!(
+            self.signature == Signature::from_stat(&current),
+            "storage generation changed during grouped read"
+        );
+        Ok(())
+    }
+    pub fn into_bytes(self) -> Zeroizing<Vec<u8>> {
+        self.bytes
+    }
+}
 
 pub(super) fn random_id() -> Result<String> {
     let mut bytes = [0u8; 16];
@@ -124,13 +163,7 @@ impl Root {
             st.st_size >= 0 && st.st_size as u64 <= MAX_FILE as u64,
             "storage value size limit exceeded"
         );
-        Ok(Some(Signature {
-            dev: device_id(&st),
-            ino: st.st_ino,
-            size: st.st_size as u64,
-            modified: st.st_mtime as i128 * 1_000_000_000 + st.st_mtime_nsec as i128,
-            changed: st.st_ctime as i128 * 1_000_000_000 + st.st_ctime_nsec as i128,
-        }))
+        Ok(Some(Signature::from_stat(&st)))
     }
     pub fn stat(&self, key: &str) -> Result<Option<(bool, i128, u64)>> {
         let Some((parent, name)) = self.parent(key, false)? else {
@@ -263,6 +296,11 @@ impl Root {
     }
 
     pub fn load(&self, key: &str, private: bool) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        self.load_pinned(key, private)
+            .map(|value| value.map(PinnedRead::into_bytes))
+    }
+
+    pub fn load_pinned(&self, key: &str, private: bool) -> Result<Option<PinnedRead>> {
         let Some((parent, name)) = self.parent(key, false)? else {
             return Ok(None);
         };
@@ -283,11 +321,26 @@ impl Root {
             "storage file size limit exceeded"
         );
         let file = File::from(fd);
-        let mut bytes = Zeroizing::new(Vec::with_capacity(st.st_size as usize));
-        (&file)
-            .take(MAX_FILE as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| anyhow!("storage read failed"))?;
+        // Never grow a private-key buffer: realloc would leave its previous
+        // allocation outside Zeroizing ownership. Read exactly the bounded size.
+        let mut bytes = Zeroizing::new(vec![0u8; st.st_size as usize]);
+        let mut reader = &file;
+        reader.read_exact(&mut bytes).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                anyhow!("storage file changed during read")
+            } else {
+                anyhow!("storage read failed")
+            }
+        })?;
+        let mut probe = Zeroizing::new([0u8; 1]);
+        loop {
+            match reader.read(probe.as_mut()) {
+                Ok(0) => break,
+                Ok(_) => bail!("storage file changed during read"),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => bail!("storage read failed"),
+            }
+        }
         let after = fs::fstat(&file).map_err(|_| anyhow!("file metadata unavailable"))?;
         ensure!(
             bytes.len() as u64 == st.st_size as u64
@@ -298,7 +351,16 @@ impl Root {
                 && st.st_mtime_nsec == after.st_mtime_nsec,
             "storage file changed during read"
         );
-        Ok(Some(bytes))
+        // Single-key callers may legitimately read the old inode while a new
+        // value is renamed into place. Preserve that content-snapshot behavior;
+        // grouped callers additionally verify ctime, permissions and path identity.
+        Ok(Some(PinnedRead {
+            file,
+            bytes,
+            signature: Signature::from_stat(&st),
+            uid: self.uid,
+            private,
+        }))
     }
 
     pub fn store(&self, key: &str, bytes: &[u8]) -> Result<()> {

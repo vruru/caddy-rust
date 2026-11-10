@@ -530,10 +530,18 @@ impl FsStore {
                 !pending_core(&c, &transaction_key)?,
                 "storage transaction recovery required"
             );
-            let values = keys
+            let pinned = keys
                 .iter()
-                .map(|k| c.data.load(k, k.ends_with(".key")))
+                .map(|k| c.data.load_pinned(k, k.ends_with(".key")))
                 .collect::<Result<Vec<_>>>()?;
+            ensure!(
+                pinned
+                    .iter()
+                    .zip(&before)
+                    .all(|(value, signature)| value.as_ref().map(io::PinnedRead::signature)
+                        == signature.as_ref()),
+                "storage generation changed during grouped read"
+            );
             ensure!(
                 !pending_core(&c, &transaction_key)?,
                 "storage transaction recovery required"
@@ -546,7 +554,13 @@ impl FsStore {
                 before == after,
                 "storage generation changed during grouped read"
             );
-            Ok(values)
+            for value in pinned.iter().flatten() {
+                value.verify()?;
+            }
+            Ok(pinned
+                .into_iter()
+                .map(|value| value.map(io::PinnedRead::into_bytes))
+                .collect())
         })
         .await
     }

@@ -217,3 +217,12 @@ mode transaction, subjects relying on ACLs, capabilities or unusual filesystem
 credentials can be conservatively rejected; those OS-specific compatibility
 boundaries remain explicit. These library contracts do not complete the native
 RootBackend, CLI or certificate lifecycle integration.
+
+Grouped certificate/account reads now keep the actual file descriptors pinned
+through pending-journal, path-identity and final descriptor checks. They reject
+concurrent generation changes without waiting for an issuance lease; individual
+key reads retain their existing old-inode snapshot behavior during replacement.
+Private read buffers have a fixed validated size and a zeroized EOF probe, so
+file growth cannot leave a reallocated secret buffer. This contract relies on
+atomic replacement of published material and does not establish protection from
+a same-user adversary, in-place external writers or physical power loss.
