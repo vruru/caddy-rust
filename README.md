@@ -21,6 +21,10 @@ or replaces existing state. Reports must not contain private keys, account email
 account URLs, domain names, or credential values. Schema pointers use documented
 redaction for dynamic map keys; they are not Admin API mutation paths.
 
+The library also includes the Caddy v2.11.7 lexical tokenizer and token helpers,
+including quoted strings, heredocs, source line tracking and import-chain line
+boundaries. This is not yet a Caddyfile parser or configuration adapter.
+
 The library also contains bounded HTTP-01/TLS-ALPN-01 challenge ownership and a
 validated TLS certificate snapshot resolver. These are integration primitives,
 not an automatic-certificate service. Challenge leases are scoped by registration

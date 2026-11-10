@@ -1,3 +1,4 @@
+pub mod caddyfile_lexer;
 pub mod certmagic;
 pub mod challenge;
 pub mod surface;
