@@ -16,6 +16,7 @@ use anyhow::{Result, anyhow};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
+use super::budget::{Budget, Cost};
 use crate::caddyfile_lexer::Token;
 use crate::caddyfile_parser::Dispenser;
 
@@ -52,7 +53,12 @@ pub(super) fn extract(tokens: &[Token], definitions: &Definitions) -> Result<Ext
 }
 
 /// parse_definition parses named matcher definitions.
-pub(super) fn parse_definition(tokens: &[Token], definitions: &mut Definitions) -> Result<()> {
+pub(super) fn parse_definition(
+    tokens: &[Token],
+    definitions: &mut Definitions,
+    budget: &mut Budget,
+) -> Result<Cost> {
+    let reservation = super::site::reserve_helper(tokens, budget)?;
     let mut d = Dispenser::new(tokens.to_vec());
     if !d.next() {
         return Err(anyhow!("expected token"));
@@ -77,7 +83,7 @@ pub(super) fn parse_definition(tokens: &[Token], definitions: &mut Definitions) 
             expr_tokens[0].text = "expression".to_string();
 
             // The callback is super::matcher_atoms::parse.
-            match matcher("expression", &expr_tokens, &definition_name)? {
+            match matcher("expression", &expr_tokens, &definition_name, budget)? {
                 Some(val) => {
                     local_map.insert("expression".to_string(), val);
                 }
@@ -85,8 +91,9 @@ pub(super) fn parse_definition(tokens: &[Token], definitions: &mut Definitions) 
                     return Err(anyhow!("unsupported matcher: expression"));
                 }
             }
+            let cost = budget.finish_map(reservation, &local_map)?;
             definitions.insert(definition_name, local_map);
-            return Ok(());
+            return Ok(cost);
         }
         d.prev();
     }
@@ -109,7 +116,7 @@ pub(super) fn parse_definition(tokens: &[Token], definitions: &mut Definitions) 
     for (matcher_name, toks) in tokens_by_name {
         // Call super::matcher_atoms::parse
         // If None, explicit Err.
-        match matcher(&matcher_name, &toks, &definition_name)? {
+        match matcher(&matcher_name, &toks, &definition_name, budget)? {
             Some(val) => {
                 local_map.insert(matcher_name, val);
             }
@@ -119,17 +126,74 @@ pub(super) fn parse_definition(tokens: &[Token], definitions: &mut Definitions) 
         }
     }
 
+    let cost = budget.finish_map(reservation, &local_map)?;
     definitions.insert(definition_name, local_map);
-    Ok(())
+    Ok(cost)
 }
 
-fn matcher(name: &str, tokens: &[Token], definition_name: &str) -> Result<Option<Value>> {
-    if let Some(value) = super::matcher_atoms::parse(name, tokens)? {
-        return Ok(Some(value));
+fn matcher(
+    name: &str,
+    tokens: &[Token],
+    definition_name: &str,
+    budget: &mut Budget,
+) -> Result<Option<Value>> {
+    if name == "not" {
+        return budget.nested(|budget| parse_not(tokens, budget)).map(Some);
     }
-    super::matcher_more::parse(
+    let reservation = super::site::reserve_helper(tokens, budget)?;
+    let value = if let Some(v) = super::matcher_atoms::parse(name, tokens)? {
+        Some(v)
+    } else if let Some(v) = super::matcher_more::parse(
         name,
         tokens,
         definition_name.strip_prefix('@').unwrap_or(definition_name),
-    )
+    )? {
+        Some(v)
+    } else if let Some(v) = super::matcher_regexp::parse(
+        name,
+        tokens,
+        definition_name.strip_prefix('@').unwrap_or(definition_name),
+    )? {
+        Some(v)
+    } else if name == "file" {
+        Some(super::matcher_file::parse(tokens)?)
+    } else {
+        None
+    };
+    if let Some(value) = &value {
+        budget.finish_value(reservation, value)?;
+    }
+    Ok(value)
+}
+fn parse_not(tokens: &[Token], budget: &mut Budget) -> Result<Value> {
+    let reservation = super::site::reserve_helper(tokens, budget)?;
+    let mut d = Dispenser::new(tokens.to_vec());
+    let mut sets = Vec::new();
+    while d.next() {
+        let mut grouped: BTreeMap<String, Vec<Token>> = BTreeMap::new();
+        let nesting = d.nesting();
+        while d.next_arg() || d.next_block(nesting) {
+            if d.token().quoted() {
+                let mut expression = d.token();
+                expression.text = "expression".into();
+                grouped
+                    .entry("expression".into())
+                    .or_default()
+                    .extend([expression, d.token()]);
+                continue;
+            }
+            let name = d.val().to_owned();
+            grouped.entry(name).or_default().extend(d.next_segment());
+        }
+        let mut map = Map::new();
+        for (name, tokens) in grouped {
+            let value = matcher(&name, &tokens, "", budget)?
+                .ok_or_else(|| anyhow!("unsupported matcher: {name}"))?;
+            map.insert(name, value);
+        }
+        sets.push(Value::Object(map));
+    }
+    let value = Value::Array(sets);
+    budget.finish_value(reservation, &value)?;
+    Ok(value)
 }

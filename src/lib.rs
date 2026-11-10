@@ -20,3 +20,5 @@ pub mod duration;
 pub mod runtime;
 
 pub mod local_pki;
+
+pub mod caddyfile_adapter;

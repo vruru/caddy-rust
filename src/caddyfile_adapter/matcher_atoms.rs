@@ -129,7 +129,7 @@ fn append(map: &mut Map<String, Value>, key: String, value: String) -> Result<()
         .push(Value::String(value));
     Ok(())
 }
-fn canonical_header(field: &str) -> String {
+pub(super) fn canonical_header(field: &str) -> String {
     if !field
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))

@@ -13,6 +13,10 @@ src/caddyfile_parser/io.rs follows Go 1.27.3 path/filepath/match.go
 src/caddyfile_parser/scalar.rs follows Go internal/strconv/atof.go and atoi.go
 (Copyright 2009 The Go Authors).
 src/duration.rs follows Go time/format.go (Copyright 2010 The Go Authors).
+src/caddyfile_adapter/stable_sort.rs follows Go sort/zsortfunc.go
+(Copyright 2009 The Go Authors).
+src/caddyfile_adapter/tls_pem.rs follows Go 1.27.3 encoding/pem/pem.go
+(Copyright 2009 The Go Authors).
 These portions retain their source notices and the following BSD license:
 
 Copyright 2009 The Go Authors.
@@ -66,3 +70,32 @@ Caddy and CertMagic
 ------------------
 
 See NOTICE and LICENSE for the Apache-2.0 behavioral reference and attribution.
+
+go-humanize
+-----------
+
+The configuration byte-size parser in src/caddyfile_adapter/handler_limits.rs
+follows ParseBytes from github.com/dustin/go-humanize v1.1.0. The port retains
+the following upstream MIT license.
+
+Copyright (c) 2005-2008  Dustin Sallings <dustin@spy.net>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+<http://www.opensource.org/licenses/mit-license.php>

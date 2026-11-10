@@ -4,9 +4,9 @@
 
 // Port of Go's stable_func, symMerge_func, rotate_func to Rust.
 
-pub(super) fn stable_sort<T, F>(values: &mut [T], less: F)
+pub(super) fn stable_sort<T, F>(values: &mut [T], mut less: F)
 where
-    F: Fn(&T, &T) -> bool,
+    F: FnMut(&T, &T) -> bool,
 {
     let n = values.len();
     if n <= 1 {
@@ -19,11 +19,11 @@ where
     let mut a = 0;
     let mut b = BLOCK_SIZE;
     while b <= n {
-        insertion_sort(values, a, b, &less);
+        insertion_sort(values, a, b, &mut less);
         a = b;
         b += BLOCK_SIZE;
     }
-    insertion_sort(values, a, n, &less);
+    insertion_sort(values, a, n, &mut less);
 
     // Merge passes
     let mut block_size = BLOCK_SIZE;
@@ -31,21 +31,21 @@ where
         a = 0;
         b = 2 * block_size;
         while b <= n {
-            sym_merge(values, a, a + block_size, b, &less);
+            sym_merge(values, a, a + block_size, b, &mut less);
             a = b;
             b += 2 * block_size;
         }
         let m = a + block_size;
         if m < n {
-            sym_merge(values, a, m, n, &less);
+            sym_merge(values, a, m, n, &mut less);
         }
         block_size *= 2;
     }
 }
 
-fn insertion_sort<T, F>(values: &mut [T], a: usize, b: usize, less: &F)
+fn insertion_sort<T, F>(values: &mut [T], a: usize, b: usize, less: &mut F)
 where
-    F: Fn(&T, &T) -> bool,
+    F: FnMut(&T, &T) -> bool,
 {
     for i in (a + 1)..b {
         let mut j = i;
@@ -56,9 +56,9 @@ where
     }
 }
 
-fn sym_merge<T, F>(values: &mut [T], a: usize, m: usize, b: usize, less: &F)
+fn sym_merge<T, F>(values: &mut [T], a: usize, m: usize, b: usize, less: &mut F)
 where
-    F: Fn(&T, &T) -> bool,
+    F: FnMut(&T, &T) -> bool,
 {
     debug_assert!(a < m && m < b, "non-degenerate arguments required");
 

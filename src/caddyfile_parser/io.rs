@@ -308,7 +308,7 @@ pub(super) fn lexical_absolute(path: &Path, cwd: &Path) -> Result<PathBuf> {
     }
     Ok(result)
 }
-pub(super) fn read_source(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
+pub(crate) fn read_source(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::{fs::OpenOptions, io::Read};
     let file = OpenOptions::new()

@@ -24,6 +24,7 @@ mod graph;
 mod imports;
 #[path = "caddyfile_parser/io.rs"]
 mod io;
+pub(crate) use io::read_source as read_config_source;
 #[path = "caddyfile_parser/parser.rs"]
 mod parser;
 #[path = "caddyfile_parser/scalar.rs"]

@@ -59,7 +59,18 @@ pub(super) struct Route {
 #[derive(Clone)]
 pub(super) struct RouteValue {
     pub directive: String,
-    pub route: Route,
+    pub value: RouteKind,
+}
+#[derive(Clone)]
+pub(super) enum RouteKind {
+    Route(Route),
+}
+impl RouteValue {
+    pub(super) fn route(&self) -> Option<&Route> {
+        match &self.value {
+            RouteKind::Route(r) => Some(r),
+        }
+    }
 }
 fn single_path(route: &Route) -> Option<&str> {
     if route.matchers.len() != 1 {
@@ -85,7 +96,10 @@ pub(super) fn sort_routes(routes: &mut [RouteValue], order: &[String]) {
             return positions.get(a.directive.as_str()).copied().unwrap_or(0)
                 < positions.get(b.directive.as_str()).copied().unwrap_or(0);
         }
-        let sort_by_path = match (single_path(&a.route), single_path(&b.route)) {
+        let (Some(a_route), Some(b_route)) = (a.route(), b.route()) else {
+            return false;
+        };
+        let sort_by_path = match (single_path(a_route), single_path(b_route)) {
             (Some(ap), Some(bp)) => {
                 let at = ap.strip_suffix('*').unwrap_or(ap);
                 let bt = bp.strip_suffix('*').unwrap_or(bp);
@@ -97,7 +111,7 @@ pub(super) fn sort_routes(routes: &mut [RouteValue], order: &[String]) {
                     at.len() > bt.len()
                 }
             }
-            _ => !a.route.matchers.is_empty() && b.route.matchers.is_empty(),
+            _ => !a_route.matchers.is_empty() && b_route.matchers.is_empty(),
         };
         if a.directive == "vars" {
             !sort_by_path

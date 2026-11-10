@@ -171,10 +171,14 @@ confined to isolated QA containers and must not enter production service units.
 The runtime constructor is a product-integration primitive; the current
 inspection CLI does not create it.
 
-Configuration-adapter primitives now include source formatting, directive order,
-route sorting, named matchers and a subset of global options and handlers. They
-are not yet exposed through a complete adapter entry point. Aggregate resource
-budgeting, remaining directives and runtime integration remain explicit gaps.
+The public Caddyfile adapter entry point now assembles the implemented global
+options, handlers, named matchers, routes, certificate loaders and TLS policies.
+It preserves issuer/policy alias behavior while enforcing aggregate work,
+materialization, source and output budgets. `format_caddyfile` exposes the bounded
+source formatter. Unsupported directives remain explicit errors; the remaining
+adapter directives and their runtime integration are still migration gates.
+Go map-order ambiguities use deterministic input order, with compatible observed
+outputs rather than an attempt to reproduce randomized iteration.
 
 HTTP listener staging now reserves a non-cloneable publication ticket; graceful
 stop waits for its owner and forced stop discards late publication. Compatible
