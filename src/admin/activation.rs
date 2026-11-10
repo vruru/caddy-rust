@@ -16,6 +16,7 @@ pub(super) struct AdminStage {
     pub access: Option<Arc<RemoteAccess>>,
     pub loaded: Option<loader::Loaded>,
     pub modes: Vec<ModeChange>,
+    pub completion: Option<super::AdminFuture<()>>,
 }
 
 /// Once Root publishes, an early return, panic or cancellation must stop the
@@ -116,6 +117,7 @@ pub(super) async fn transact_admin(
     let finisher: AdminFinisher = Box::new(move |handle| {
         Box::pin(async move {
             let scope_cancel = handle.cancellation()?;
+            let completion = handle.publication_completion()?;
             let prepare = async {
                 let resolver = if policy.identity.is_some() {
                     Some(handle.identity().await?)
@@ -164,6 +166,7 @@ pub(super) async fn transact_admin(
                     access,
                     loaded,
                     modes,
+                    completion: Some(completion),
                 }));
                 if let Checkpoint::Staged(stage) = &mut *checkpoint {
                     for mode in &mut stage.modes {

@@ -135,6 +135,11 @@ pub trait AdminBackend: Send + Sync + 'static {
     /// future owns the bounded join. This also holds during runtime teardown;
     /// the call must not wait for a lock held by a suspended transaction.
     fn stop(&self, mode: StopMode) -> AdminFuture<()>;
+    /// Normal shutdown has no artificial HTTP drain deadline. Override this
+    /// facade when the backend owns a distinct unbounded drain implementation.
+    fn stop_unbounded(&self) -> AdminFuture<()> {
+        self.stop(StopMode::Graceful(Duration::MAX))
+    }
 }
 
 #[derive(Clone)]

@@ -310,3 +310,14 @@ behavior for overlapping listener settings. These are configuration conversion
 capabilities; the corresponding runtime modules remain separate implementation
 and acceptance gates. Logging output, ACME-server signing, server protocols and
 metrics must not be advertised as operational from adaptation success alone.
+
+The native Admin library can capture an exact candidate's read-only publication
+completion signal. Waiting for a delayed predecessor to stop accepting business
+requests happens outside the ordered configuration write worker, with bounded
+response ownership. A disconnected caller releases only its response wait;
+accepted publication and retirement cleanup remain owned by the backend. Stop
+admission bypasses the pending-response budget, and shutdown joins those response
+tasks. A response interrupted after publication has a distinct error category.
+Normal backend shutdown also has an explicit unbounded-drain facade; a caller's
+wait deadline must not cancel the backend's owned drain. The application Root
+and serving-command integration remain separate development gates.

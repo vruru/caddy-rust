@@ -22,6 +22,15 @@ pub trait CandidateScope: Send + Sync + 'static {
 
     /// Get a cancellation token for the scope.
     fn cancellation(&self) -> CancellationToken;
+
+    /// Capture a read-only completion signal while this exact candidate is
+    /// open. The future may outlive the owner but grants no identity, listener
+    /// or publication capability. Backends without delayed retirement complete
+    /// immediately. A finisher captures this future; it must not await it before
+    /// the candidate is published.
+    fn publication_completion(&self) -> AdminFuture<()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 struct State {
@@ -101,6 +110,11 @@ impl CandidateHandle {
     pub fn cancellation(&self) -> Result<CancellationToken, AdminError> {
         check_open(&self.0)?;
         Ok(self.0.scope.cancellation())
+    }
+
+    pub fn publication_completion(&self) -> Result<AdminFuture<()>, AdminError> {
+        check_open(&self.0)?;
+        Ok(self.0.scope.publication_completion())
     }
 }
 

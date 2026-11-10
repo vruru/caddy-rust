@@ -83,6 +83,8 @@ pub(super) struct Inner {
     pub cancel: tokio_util::sync::CancellationToken,
     stop_events: tokio::sync::watch::Sender<Option<super::AdminStopOutcome>>,
     pub loader: Mutex<Option<tokio_util::sync::CancellationToken>>,
+    reply_slots: Arc<tokio::sync::Semaphore>,
+    responses: tokio_util::task::TaskTracker,
 }
 enum Admission {
     Open,
@@ -113,6 +115,11 @@ struct Job {
     id: u64,
     work: Work,
     reply: oneshot::Sender<Result<bool, AdminError>>,
+    reply_slot: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+struct Applied {
+    changed: bool,
+    completion: Option<super::AdminFuture<()>>,
 }
 fn unavailable() -> AdminError {
     AdminError::new(503, "admin_write_queue_unavailable")
@@ -142,6 +149,7 @@ impl AdminController {
         let (sender, receiver) = mpsc::channel(options.queue_capacity);
         let requests = Arc::new(tokio::sync::Semaphore::new(options.max_requests));
         let (stop_events, _) = tokio::sync::watch::channel(None);
+        let reply_slots = Arc::new(tokio::sync::Semaphore::new(options.queue_capacity + 1));
         let inner = Arc::new(Inner {
             state: ArcSwap::from_pointee(Published {
                 indexed,
@@ -164,6 +172,8 @@ impl AdminController {
             cancel: tokio_util::sync::CancellationToken::new(),
             stop_events,
             loader: Mutex::new(None),
+            reply_slots,
+            responses: tokio_util::task::TaskTracker::new(),
         });
         let weak = Arc::downgrade(&inner);
         tokio::spawn(async move {
@@ -438,6 +448,16 @@ impl Inner {
     async fn enqueue(&self, work: Work) -> Result<(), AdminError> {
         reject_reentrant()?;
         self.check_readable()?;
+        let reply_slot = if matches!(&work, Work::Change(_)) {
+            Some(
+                self.reply_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| unavailable())?,
+            )
+        } else {
+            None
+        };
         let (reply, wait) = oneshot::channel();
         {
             let mut admission = self.admission.lock().map_err(|_| unavailable())?;
@@ -449,7 +469,12 @@ impl Inner {
                 .sequence
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.sender
-                .try_send(Job { id, work, reply })
+                .try_send(Job {
+                    id,
+                    work,
+                    reply,
+                    reply_slot,
+                })
                 .map_err(|_| unavailable())?;
             if closing {
                 *admission = Admission::StopPending(id);
@@ -465,6 +490,10 @@ impl Inner {
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<bool, AdminError> {
         self.check_readable()?;
+        let reply_slot = tokio::select! {biased;
+            _=cancel.cancelled()=>return Err(unavailable()),
+            slot=self.reply_slots.clone().acquire_owned()=>slot.map_err(|_|unavailable())?,
+        };
         let permit = tokio::select! {_ = cancel.cancelled()=>return Err(unavailable()), p=self.sender.reserve()=>p.map_err(|_|unavailable())?};
         let (reply, wait) = oneshot::channel();
         {
@@ -489,6 +518,7 @@ impl Inner {
                     loader_budget: budget,
                 }),
                 reply,
+                reply_slot: Some(reply_slot),
             });
         }
         wait.await.map_err(|_| unavailable())?
@@ -509,6 +539,7 @@ impl Inner {
                     id: 0,
                     work: Work::Drain,
                     reply,
+                    reply_slot: None,
                 })
                 .await
                 .map_err(|_| unavailable())?;
@@ -554,6 +585,8 @@ async fn worker(weak: Weak<Inner>, mut receiver: mpsc::Receiver<Job>) {
         }
         match job.work {
             Work::Drain => {
+                inner.responses.close();
+                inner.responses.wait().await;
                 let _ = job.reply.send(Ok(false));
             }
             Work::Stop(Authorization { grant, local }) => {
@@ -590,11 +623,9 @@ async fn worker(weak: Weak<Inner>, mut receiver: mpsc::Receiver<Job>) {
                         eprintln!("admin event=stop_failed category=admin_shutdown_incomplete");
                         return;
                     }
-                    let result = std::panic::AssertUnwindSafe(
-                        backend.stop(StopMode::Graceful(std::time::Duration::from_secs(35))),
-                    )
-                    .catch_unwind()
-                    .await;
+                    let result = std::panic::AssertUnwindSafe(backend.stop_unbounded())
+                        .catch_unwind()
+                        .await;
                     match result {
                         Ok(Ok(())) => {
                             inner
@@ -615,7 +646,37 @@ async fn worker(weak: Weak<Inner>, mut receiver: mpsc::Receiver<Job>) {
                     .catch_unwind()
                     .await
                     .unwrap_or_else(|_| Err(AdminError::new(500, "admin_internal_error")));
-                let _ = job.reply.send(result);
+                match result {
+                    Ok(Applied {
+                        changed,
+                        completion: Some(completion),
+                    }) => {
+                        let waiting = inner.clone();
+                        inner.responses.spawn(async move {
+                            let _slot = job.reply_slot;
+                            let mut reply = job.reply;
+                            // Publication and its cleanup are already owned by
+                            // Root. Cancelling only this response wait cannot
+                            // roll back or cancel an accepted configuration.
+                            let result = tokio::select! {biased;
+                                _=waiting.cancel.cancelled()=>Err(AdminError::new(503,"admin_configuration_published_wait_interrupted")),
+                                _=reply.closed()=>return,
+                                result=std::panic::AssertUnwindSafe(completion).catch_unwind()=>
+                                    result.unwrap_or_else(|_|Err(AdminError::new(500,"admin_completion_failed"))),
+                            };
+                            let _ = reply.send(result.map(|_| changed));
+                        });
+                    }
+                    Ok(Applied {
+                        changed,
+                        completion: None,
+                    }) => {
+                        let _ = job.reply.send(Ok(changed));
+                    }
+                    Err(error) => {
+                        let _ = job.reply.send(Err(error));
+                    }
+                }
             }
         }
     }
@@ -724,7 +785,7 @@ fn prepare_change(
         runtime,
     }))
 }
-async fn apply(inner: &Arc<Inner>, change: Change) -> Result<bool, AdminError> {
+async fn apply(inner: &Arc<Inner>, change: Change) -> Result<Applied, AdminError> {
     inner.check_readable()?;
     let previous = inner.state.load_full();
     let Some(Candidate {
@@ -738,7 +799,10 @@ async fn apply(inner: &Arc<Inner>, change: Change) -> Result<bool, AdminError> {
         .offload(move || prepare_change(previous, change))
         .await?
     else {
-        return Ok(false);
+        return Ok(Applied {
+            changed: false,
+            completion: None,
+        });
     };
     let mut local = inner.listener.lock().await;
     let mut remote = inner.remote_listener.lock().await;
@@ -923,5 +987,8 @@ async fn apply(inner: &Arc<Inner>, change: Change) -> Result<bool, AdminError> {
             eprintln!("admin event=autosave_failed category=admin_file_operation_failed");
         }
     }
-    Ok(true)
+    Ok(Applied {
+        changed: true,
+        completion: stage.completion,
+    })
 }
