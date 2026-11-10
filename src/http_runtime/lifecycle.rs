@@ -364,6 +364,19 @@ impl HttpRuntime {
         managed: &Arc<HotCertificateResolver>,
         manual: &ManualCertificates,
     ) -> Result<()> {
+        self.prepared_managed_names_with_certificates(config, managed, manual)
+            .await
+            .map(|_| ())
+    }
+    /// Run the exact provision-only server path used by stage, including tag,
+    /// manual-inventory and loaded-name exclusions. No socket is bound, solver
+    /// lease acquired, certificate requested or configuration published here.
+    pub async fn prepared_managed_names_with_certificates(
+        &self,
+        config: &PreparedConfig,
+        managed: &Arc<HotCertificateResolver>,
+        manual: &ManualCertificates,
+    ) -> Result<Vec<Vec<String>>> {
         ensure!(
             Arc::ptr_eq(&self.inner.managed.leaf_guard(), &managed.leaf_guard()),
             "HTTP candidate must share the runtime leaf guard"
@@ -379,9 +392,8 @@ impl HttpRuntime {
         tokio::select! {
             biased;
             _ = self.inner.stopped.cancelled() => anyhow::bail!("HTTP runtime is stopping"),
-            result = prepared => { let _ = result?; }
+            result = prepared => result.map(|(_,names)|names)
         }
-        Ok(())
     }
     /// Compatibility wrapper for standalone callers. Integrated reloads supply
     /// a fresh per-generation managed resolver directly to `stage`.

@@ -321,3 +321,13 @@ tasks. A response interrupted after publication has a distinct error category.
 Normal backend shutdown also has an explicit unbounded-drain facade; a caller's
 wait deadline must not cancel the backend's owned drain. The application Root
 and serving-command integration remain separate development gates.
+
+The opt-in `native-run` library feature now exposes a native application backend
+that stages HTTP listeners, prepares manual/managed certificate services and
+candidate-specific Admin identities, then publishes one configuration generation.
+Failed candidates preserve their predecessor; compensation uses retained verified
+material rather than fetching or issuing certificates. Owned shutdown survives
+caller timeout/drop and retains delayed predecessor services until their actual
+HTTP admission closes. Provision-only validation uses the same server path
+without binding listeners or activating certificate jobs. This feature does not
+yet expose a serving CLI or waive the remaining module/CLI acceptance gates.
