@@ -311,6 +311,24 @@ pub fn encoded_len(value: &Value, limit: usize) -> Result<usize, ConfigError> {
     Ok(sink.count)
 }
 
+/// Encode a typed adapter/CLI result without rounding integer durations through
+/// float64. Raw Admin configuration maps and their ETags must keep using encoded.
+pub fn encoded_typed(value: &Value) -> Result<Vec<u8>, ConfigError> {
+    let mut bytes = Vec::new();
+    let mut sink = EncodingBytes(&mut bytes);
+    write_encoded_inner(value, &mut sink, 0, NumberMode::Typed)?;
+    sink.put(b"\n")?;
+    Ok(bytes)
+}
+
+/// Count the very same typed bytes, including the Encoder.Encode newline.
+pub fn encoded_len_typed(value: &Value, limit: usize) -> Result<usize, ConfigError> {
+    let mut sink = EncodingCount { count: 0, limit };
+    write_encoded_inner(value, &mut sink, 0, NumberMode::Typed)?;
+    sink.put(b"\n")?;
+    Ok(sink.count)
+}
+
 trait EncodingSink {
     fn put(&mut self, bytes: &[u8]) -> Result<(), ConfigError>;
     fn lower_bound(&self, _length: usize) -> Result<(), ConfigError> {
@@ -337,7 +355,11 @@ impl EncodingSink for EncodingCount {
         Ok(())
     }
     fn lower_bound(&self, length: usize) -> Result<(), ConfigError> {
-        if self.count.checked_add(length).is_none_or(|n| n > self.limit) {
+        if self
+            .count
+            .checked_add(length)
+            .is_none_or(|n| n > self.limit)
+        {
             return Err(encoding_byte_limit());
         }
         Ok(())
@@ -351,10 +373,25 @@ fn encoding_byte_limit() -> ConfigError {
     }
 }
 
+#[derive(Clone, Copy)]
+enum NumberMode {
+    GoFloat,
+    Typed,
+}
+
 fn write_encoded<S: EncodingSink>(
     value: &Value,
     sink: &mut S,
     depth: usize,
+) -> Result<(), ConfigError> {
+    write_encoded_inner(value, sink, depth, NumberMode::GoFloat)
+}
+
+fn write_encoded_inner<S: EncodingSink>(
+    value: &Value,
+    sink: &mut S,
+    depth: usize,
+    mode: NumberMode,
 ) -> Result<(), ConfigError> {
     if depth > MAX_CONFIG_DEPTH {
         return Err(failure("configuration_depth_limit"));
@@ -363,6 +400,14 @@ fn write_encoded<S: EncodingSink>(
         Value::Null => sink.put(b"null"),
         Value::Bool(value) => sink.put(if *value { b"true" } else { b"false" }),
         Value::Number(value) => {
+            if matches!(mode, NumberMode::Typed) {
+                if let Some(number) = value.as_i64() {
+                    return sink.put(number.to_string().as_bytes());
+                }
+                if let Some(number) = value.as_u64() {
+                    return sink.put(number.to_string().as_bytes());
+                }
+            }
             let number = value
                 .as_f64()
                 .ok_or_else(|| failure("invalid_json_number"))?;
@@ -375,7 +420,7 @@ fn write_encoded<S: EncodingSink>(
                 if index > 0 {
                     sink.put(b",")?;
                 }
-                write_encoded(value, sink, depth + 1)?;
+                write_encoded_inner(value, sink, depth + 1, mode)?;
             }
             sink.put(b"]")
         }
@@ -394,7 +439,7 @@ fn write_encoded<S: EncodingSink>(
                 }
                 write_encoded_string(key, sink)?;
                 sink.put(b":")?;
-                write_encoded(&values[key], sink, depth + 1)?;
+                write_encoded_inner(&values[key], sink, depth + 1, mode)?;
             }
             sink.put(b"}")
         }
