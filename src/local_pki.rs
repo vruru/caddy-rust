@@ -186,7 +186,23 @@ pub struct LocalPki {
     shared: Arc<Shared>,
     authorities: Arc<Mutex<HashMap<String, Arc<Authority>>>>,
 }
+/// CPU work and queued-operation admission shared across independent CAs and
+/// configuration generations. Cancellation, trust and task ownership remain
+/// local to each LocalPki instance.
+pub struct LocalPkiResources {
+    cpu: Arc<Semaphore>,
+    pending: Arc<Semaphore>,
+}
+impl LocalPkiResources {
+    pub fn new(max_parallel: usize) -> Result<Self> {
+        ensure!((1..=128).contains(&max_parallel), "invalid PKI resource limits");
+        Ok(Self { cpu: Arc::new(Semaphore::new(max_parallel)), pending: Arc::new(Semaphore::new(4096)) })
+    }
+}
 impl LocalPki {
+    pub fn with_resources(store: crate::certstore::FsStore, configs: Vec<CaConfig>, resources: Arc<LocalPkiResources>) -> Result<Self> {
+        Self::build(store, configs, resources, Arc::new(|| Ok(i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?)))
+    }
     pub fn new(
         store: crate::certstore::FsStore,
         configs: Vec<CaConfig>,
@@ -207,12 +223,20 @@ impl LocalPki {
     /// injection, not a user-configurable way to weaken certificate validity.
     pub fn with_clock(
         store: crate::certstore::FsStore,
-        mut configs: Vec<CaConfig>,
+        configs: Vec<CaConfig>,
         max_parallel: usize,
         clock: Arc<dyn Fn() -> Result<i64> + Send + Sync>,
     ) -> Result<Self> {
+        Self::build(store, configs, Arc::new(LocalPkiResources::new(max_parallel)?), clock)
+    }
+    fn build(
+        store: crate::certstore::FsStore,
+        mut configs: Vec<CaConfig>,
+        resources: Arc<LocalPkiResources>,
+        clock: Arc<dyn Fn() -> Result<i64> + Send + Sync>,
+    ) -> Result<Self> {
         ensure!(
-            (1..=128).contains(&max_parallel) && configs.len() <= 256,
+            configs.len() <= 256,
             "invalid PKI resource limits"
         );
         if configs.is_empty() {
@@ -222,8 +246,8 @@ impl LocalPki {
         let this = Self {
             store,
             shared: Arc::new(Shared {
-                cpu: Arc::new(Semaphore::new(max_parallel)),
-                pending: Arc::new(Semaphore::new(4096)),
+                cpu: resources.cpu.clone(),
+                pending: resources.pending.clone(),
                 clock,
                 events,
                 changed: Notify::new(),

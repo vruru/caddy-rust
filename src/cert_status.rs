@@ -4,6 +4,9 @@
 mod network;
 #[path = "cert_status/verify.rs"]
 mod verify;
+#[path = "cert_status/precommit.rs"]
+mod precommit;
+pub use precommit::OcspProbeBusy;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,7 +53,36 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, broadcast};
 use tokio_util::sync::CancellationToken;
 
 type CertificateKey = ([u8; 32], u64);
+type CertificateGateKey = (usize, CertificateKey);
 type PolicySelector = Arc<dyn Fn(&OcspCertificate) -> Result<OcspConfig> + Send + Sync>;
+pub type OcspInventorySelector = Arc<dyn Fn(&OcspCertificate) -> bool + Send + Sync>;
+
+/// Shared process budgets prevent policy/generation counts multiplying the
+/// global request, queued-work and per-origin responder limits.
+pub struct OcspResources {
+    global: Arc<Semaphore>,
+    restore_slots: Arc<Semaphore>,
+    work_slots: Semaphore,
+    responders: Mutex<HashMap<String, Weak<Semaphore>>>,
+    gates: Mutex<HashMap<CertificateGateKey, Weak<AsyncMutex<()>>>>,
+    max_concurrent: usize,
+    max_per_responder: usize,
+}
+impl OcspResources {
+    pub fn limits(&self) -> (usize, usize) { (self.max_concurrent, self.max_per_responder) }
+    pub fn new(max_concurrent: usize, max_per_responder: usize) -> Result<Self> {
+        ensure!((1..=128).contains(&max_concurrent) && (1..=max_concurrent).contains(&max_per_responder), "invalid OCSP concurrency limits");
+        Ok(Self {
+            global: Arc::new(Semaphore::new(max_concurrent)),
+            restore_slots: Arc::new(Semaphore::new(max_concurrent * 2)),
+            work_slots: Semaphore::new(4096),
+            responders: Mutex::new(HashMap::new()),
+            gates: Mutex::new(HashMap::new()),
+            max_concurrent,
+            max_per_responder,
+        })
+    }
+}
 
 /// The URL override map uses exact responder URL keys, as CertMagic does.
 /// An empty override disables querying that responder. Proxy and extra roots
@@ -172,10 +204,10 @@ struct Inner {
     resolver: Arc<HotCertificateResolver>,
     options: OcspOptions,
     policy: PolicySelector,
-    global: Semaphore,
-    restore_slots: Semaphore,
-    responders: Mutex<HashMap<String, Weak<Semaphore>>>,
-    gates: Mutex<HashMap<CertificateKey, Weak<AsyncMutex<()>>>>,
+    global: Arc<Semaphore>,
+    restore_slots: Arc<Semaphore>,
+    resources: Arc<OcspResources>,
+    inventory: OcspInventorySelector,
     entries: Mutex<HashMap<CertificateKey, Entry>>,
     observations: Mutex<HashMap<[u8; 32], Observed>>,
     events: broadcast::Sender<OcspEvent>,
@@ -209,11 +241,25 @@ impl OcspManager {
         options: OcspOptions,
         policy: PolicySelector,
     ) -> Result<Self> {
+        let resources = Arc::new(OcspResources::new(options.max_concurrent, options.max_concurrent_per_responder)?);
+        Self::with_resources_and_inventory(store, resolver, options, policy, Arc::new(|_| true), resources)
+    }
+    /// Both selectors describe one immutable generation. Out-of-scope entries
+    /// are untouched, including their existing staple and failure bookkeeping.
+    pub fn with_resources_and_inventory(
+        store: FsStore,
+        resolver: Arc<HotCertificateResolver>,
+        options: OcspOptions,
+        policy: PolicySelector,
+        inventory: OcspInventorySelector,
+        resources: Arc<OcspResources>,
+    ) -> Result<Self> {
         ensure!(
             (1..=128).contains(&options.max_concurrent)
                 && (1..=options.max_concurrent).contains(&options.max_concurrent_per_responder),
             "invalid OCSP concurrency limits"
         );
+        ensure!(options.max_concurrent == resources.max_concurrent && options.max_concurrent_per_responder == resources.max_per_responder, "OCSP resource budgets differ from manager options");
         ensure!(
             options.check_interval >= Duration::from_secs(1)
                 && options.check_interval <= Duration::from_secs(86400),
@@ -232,12 +278,12 @@ impl OcspManager {
             inner: Arc::new(Inner {
                 store,
                 resolver,
-                global: Semaphore::new(options.max_concurrent),
-                restore_slots: Semaphore::new(options.max_concurrent * 2),
+                global: resources.global.clone(),
+                restore_slots: resources.restore_slots.clone(),
+                resources,
+                inventory,
                 options,
                 policy,
-                responders: Mutex::new(HashMap::new()),
-                gates: Mutex::new(HashMap::new()),
                 entries: Mutex::new(HashMap::new()),
                 observations: Mutex::new(HashMap::new()),
                 events,
@@ -294,6 +340,8 @@ impl OcspManager {
         certificate: Arc<OcspCertificate>,
         cancel: CancellationToken,
     ) -> Result<()> {
+        if !(self.inner.inventory)(&certificate) { return Ok(()); }
+        let _work = self.inner.resources.work_slots.try_acquire().map_err(|_| anyhow!("OCSP queued work capacity exhausted"))?;
         let quiet = certificate
             .chain_der
             .first()
@@ -366,6 +414,7 @@ impl OcspManager {
         certificate: OcspCertificate,
         cancel: CancellationToken,
     ) -> Result<CacheRestore> {
+        if !(self.inner.inventory)(&certificate) { return Ok(CacheRestore::NotApplicable); }
         let _slot = self
             .inner
             .restore_slots
@@ -392,31 +441,31 @@ impl OcspManager {
         }
     }
 
-    async fn refresh_one_inner(
-        &self,
-        certificate: Arc<OcspCertificate>,
-        cancel: CancellationToken,
-        mode: RefreshMode,
-    ) -> Result<CacheRestore> {
-        let key = (certificate.identity, certificate.generation);
-        let gate = {
+    fn certificate_gate(&self, certificate: &OcspCertificate) -> Result<Arc<AsyncMutex<()>>> {
+        // A resolver owns its generation counter. Include its pinned Arc
+        // identity so separate generations with the same counter never share
+        // an in-process waiter; online cache writes still use the file lease.
+        let gate_key = (Arc::as_ptr(&self.inner.resolver) as usize, (certificate.identity, certificate.generation));
+        Ok({
             let mut gates = self
                 .inner
+                .resources
                 .gates
                 .lock()
                 .map_err(|_| anyhow!("OCSP gate state unavailable"))?;
             gates.retain(|_, v| v.strong_count() > 0);
-            match gates.get(&key).and_then(Weak::upgrade) {
+            match gates.get(&gate_key).and_then(Weak::upgrade) {
                 Some(v) => v,
                 None => {
                     let v = Arc::new(AsyncMutex::new(()));
-                    gates.insert(key, Arc::downgrade(&v));
+                    gates.insert(gate_key, Arc::downgrade(&v));
                     v
                 }
             }
-        };
-        let _guard = tokio::select! {_ =cancel.cancelled()=>return Err(anyhow!("OCSP refresh cancelled")),guard=gate.lock()=>guard};
-        let mut config = (self.inner.policy)(&certificate)?;
+        })
+    }
+    fn configuration(&self, certificate: &OcspCertificate) -> Result<OcspConfig> {
+        let mut config = (self.inner.policy)(certificate)?;
         if config.no_next_update_max_age.is_zero() {
             config.no_next_update_max_age = Duration::from_secs(86400);
         }
@@ -425,6 +474,25 @@ impl OcspManager {
                 .contains(&config.no_next_update_max_age),
             "invalid no-nextUpdate OCSP maximum age"
         );
+        Ok(config)
+    }
+    async fn reconcile_known_negative(&self, certificate: &OcspCertificate, quiet: bool) -> Result<()> {
+        if let Some(known) = self.observed(&certificate.identity)?.filter(|observed| observed.status.state != OcspState::Good) {
+            self.apply_negative(certificate, &known.status, quiet).await?;
+        }
+        Ok(())
+    }
+
+    async fn refresh_one_inner(
+        &self,
+        certificate: Arc<OcspCertificate>,
+        cancel: CancellationToken,
+        mode: RefreshMode,
+    ) -> Result<CacheRestore> {
+        if !(self.inner.inventory)(&certificate) { return Ok(CacheRestore::NotApplicable); }
+        let gate = self.certificate_gate(&certificate)?;
+        let _guard = tokio::select! {_ =cancel.cancelled()=>return Err(anyhow!("OCSP refresh cancelled")),guard=gate.lock()=>guard};
+        let config = self.configuration(&certificate)?;
         if config.disable_stapling {
             self.inner
                 .resolver
@@ -567,6 +635,7 @@ impl OcspManager {
                     certificate.chain_der[0].clone(),
                     issuer.clone(),
                     config.no_next_update_max_age,
+                    None,
                 )
                 .await
                 {
@@ -652,13 +721,7 @@ impl OcspManager {
                 }
             }
             if mode == RefreshMode::CacheOnly {
-                if let Some(known) = self
-                    .observed(&certificate.identity)?
-                    .filter(|observed| observed.status.state != OcspState::Good)
-                {
-                    self.apply_negative(&certificate, &known.status, quiet)
-                        .await?;
-                }
+                self.reconcile_known_negative(&certificate, quiet).await?;
                 return Ok(());
             }
             if query_disabled {
@@ -684,6 +747,7 @@ impl OcspManager {
                     certificate.chain_der[0].clone(),
                     issuer,
                     config.no_next_update_max_age,
+                    None,
                 )
                 .await?;
                 // Authentication establishes a leaf fact independently of
@@ -811,6 +875,7 @@ impl OcspManager {
         let origin = url.origin().ascii_serialization();
         let mut limits = self
             .inner
+            .resources
             .responders
             .lock()
             .map_err(|_| anyhow!("OCSP limiter state unavailable"))?;
@@ -1100,6 +1165,7 @@ impl OcspManager {
                 refresh_inventory=false;next_scan=tokio::time::Instant::now()+self.inner.options.check_interval;
                 let resolver=self.inner.resolver.clone();
                 let certificates=tokio::task::spawn_blocking(move||resolver.ocsp_certificates()).await??;
+                let certificates=certificates.into_iter().filter(|certificate|(self.inner.inventory)(certificate)).collect::<Vec<_>>();
                 ensure!(certificates.len()<=4096,"OCSP inventory exceeds resolver certificate limit");
                 let current:HashSet<_>=certificates.iter().map(|c|(c.identity,c.generation)).collect();
                 for (key,token) in &active{if !current.contains(key){token.cancel();}}
@@ -1168,9 +1234,11 @@ async fn verify_owned(
     leaf: Vec<u8>,
     issuer: Vec<u8>,
     max_age: Duration,
+    admission: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<VerifiedStatus> {
     let now = now()?;
     tokio::task::spawn_blocking(move || {
+        let _admission = admission;
         verify_response_with_max_age(&raw, &leaf, &issuer, now, max_age)
     })
     .await?

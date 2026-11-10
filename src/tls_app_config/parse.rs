@@ -1,0 +1,334 @@
+use super::{
+    CertificateViews,
+    decode::{Object, Result, discriminator},
+    error::{ConfigError, pointer},
+    issuer_parse,
+    model::{Authority, CertificatePlan, Identity, ManualSource, Policy},
+    pki_parse,
+    schema::ObjectKind,
+};
+use crate::acme_wire::KeyType;
+use serde_json::Value;
+use std::{collections::BTreeMap, time::Duration};
+use zeroize::Zeroizing;
+
+pub(super) fn parse(views: CertificateViews<'_>) -> Result<CertificatePlan> {
+    let mut plan = CertificatePlan {
+        storage: pki_parse::parse_storage(views.storage, "/storage")?,
+        ..CertificatePlan::default()
+    };
+    let tls = Object::new(views.tls, ObjectKind::Tls, "/apps/tls")?;
+    plan.disable_ocsp = tls.boolean("disable_ocsp_stapling")?.unwrap_or(false);
+    plan.disable_storage_check = tls.boolean("disable_storage_check")?.unwrap_or(false);
+    plan.disable_storage_clean = tls.boolean("disable_storage_clean")?.unwrap_or(false);
+    for (field, feature) in [
+        ("encrypted_client_hello", "encrypted_client_hello"),
+        ("dns", "tls_dns_provider"),
+    ] {
+        if tls.value(field).is_some() {
+            return Err(ConfigError::unsupported(tls.at(field), feature));
+        }
+    }
+    if !tls.strings("resolvers")?.is_empty() {
+        return Err(ConfigError::unsupported(
+            tls.at("resolvers"),
+            "custom_dns_resolvers",
+        ));
+    }
+    if let Some(tickets) = tls.value("session_tickets") {
+        let tickets = Object::new(
+            Some(tickets),
+            ObjectKind::Tickets,
+            &tls.at("session_tickets"),
+        )?;
+        tickets.duration_ns("rotation_interval")?;
+        tickets.integer("max_keys")?;
+        tickets.boolean("disable_rotation")?;
+        tickets.boolean("disabled")?;
+        if let Some(source) = tickets.value("key_source")
+            && discriminator(source, "provider", &tickets.at("key_source"))? == "standard"
+        {
+            Object::new(
+                Some(source),
+                ObjectKind::StekStandard,
+                &tickets.at("key_source"),
+            )?;
+        }
+        return Err(ConfigError::unsupported(
+            tls.at("session_tickets"),
+            "configured_session_tickets",
+        ));
+    }
+    let cache = Object::new(tls.value("cache"), ObjectKind::Cache, &tls.at("cache"))?;
+    if let Some(value) = cache.integer("capacity")?
+        && value > 0
+    {
+        plan.cache_capacity =
+            usize::try_from(value).map_err(|_| ConfigError::invalid(cache.at("capacity")))?;
+    }
+    let certificates = Object::new(
+        tls.value("certificates"),
+        ObjectKind::Certificates,
+        &tls.at("certificates"),
+    )?;
+    plan.automate = certificates
+        .strings("automate")?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    for field in ["load_files", "load_pem"] {
+        for (index, value) in certificates.array(field)?.iter().enumerate() {
+            let path = pointer(&certificates.at(field), &index.to_string());
+            let kind = if field == "load_files" {
+                ObjectKind::FilePair
+            } else {
+                ObjectKind::PemPair
+            };
+            let pair = Object::new(Some(value), kind, &path)?;
+            let certificate = pair.string("certificate")?;
+            let key = pair.string("key")?;
+            let tags = pair.strings("tags")?.into_iter().map(Into::into).collect();
+            if certificate.is_empty() || key.is_empty() {
+                return Err(ConfigError::invalid(path));
+            }
+            if field == "load_files" {
+                if !matches!(pair.string("format")?, "" | "pem") {
+                    return Err(ConfigError::invalid(pair.at("format")));
+                }
+                plan.manual.push(ManualSource::Files {
+                    certificate: certificate.into(),
+                    key: key.into(),
+                    tags,
+                });
+            } else {
+                plan.manual.push(ManualSource::Pem {
+                    certificate: certificate.as_bytes().to_vec(),
+                    key: Zeroizing::new(key.as_bytes().to_vec()),
+                    tags,
+                });
+            }
+        }
+    }
+    plan.manual.extend(
+        certificates
+            .strings("load_folders")?
+            .into_iter()
+            .map(|path| ManualSource::Folder(path.into())),
+    );
+    if let Some(storage) = certificates.value("load_storage") {
+        let storage = Object::new(
+            Some(storage),
+            ObjectKind::StorageLoader,
+            &certificates.at("load_storage"),
+        )?;
+        for (index, value) in storage.array("pairs")?.iter().enumerate() {
+            let path = pointer(&storage.at("pairs"), &index.to_string());
+            let pair = Object::new(Some(value), ObjectKind::FilePair, &path)?;
+            let certificate = pair.string("certificate")?;
+            let key = pair.string("key")?;
+            if certificate.is_empty() || key.is_empty() {
+                return Err(ConfigError::invalid(path));
+            }
+            if !matches!(pair.string("format")?, "" | "pem") {
+                return Err(ConfigError::invalid(pair.at("format")));
+            }
+            let tags = pair.strings("tags")?.into_iter().map(Into::into).collect();
+            plan.manual.push(ManualSource::Storage {
+                certificate: certificate.into(),
+                key: key.into(),
+                tags,
+            });
+        }
+    }
+    let automation = Object::new(
+        tls.value("automation"),
+        ObjectKind::Automation,
+        &tls.at("automation"),
+    )?;
+    for (field, target) in [
+        ("ocsp_interval", &mut plan.ocsp_interval),
+        ("renew_interval", &mut plan.renew_interval),
+        ("storage_clean_interval", &mut plan.clean_interval),
+    ] {
+        let value = automation.duration_ns(field)?;
+        if value < 0 {
+            return Err(ConfigError::invalid(automation.at(field)));
+        }
+        if value > 0 {
+            *target = Duration::from_nanos(value as u64);
+        }
+    }
+    if let Some(on_demand) = automation.value("on_demand") {
+        let on_demand = Object::new(
+            Some(on_demand),
+            ObjectKind::OnDemand,
+            &automation.at("on_demand"),
+        )?;
+        on_demand.string("ask")?;
+        if let Some(permission) = on_demand.value("permission")
+            && discriminator(permission, "module", &on_demand.at("permission"))? == "http"
+        {
+            let permission = Object::new(
+                Some(permission),
+                ObjectKind::PermissionHttp,
+                &on_demand.at("permission"),
+            )?;
+            permission.string("endpoint")?;
+        }
+        return Err(ConfigError::unsupported(
+            automation.at("on_demand"),
+            "on_demand_permission",
+        ));
+    }
+    for (index, value) in automation.array("policies")?.iter().enumerate() {
+        let path = pointer(&automation.at("policies"), &index.to_string());
+        plan.policies.push(policy(value, &path)?);
+    }
+    let pki = Object::new(views.pki, ObjectKind::Pki, "/apps/pki")?;
+    if let Some(authorities) = pki.map("certificate_authorities")? {
+        for (id, value) in authorities {
+            let (config, storage) =
+                pki_parse::parse_ca(id, value, &pointer(&pki.at("certificate_authorities"), id))?;
+            plan.authorities
+                .insert(id.clone(), Authority { config, storage });
+        }
+    }
+    if views.pki.is_some() && plan.authorities.is_empty() {
+        plan.authorities.insert(
+            "local".into(),
+            Authority {
+                config: crate::local_pki::CaConfig::default(),
+                storage: None,
+            },
+        );
+    }
+    let mut ca_paths = std::collections::HashSet::new();
+    for id in plan.authorities.keys() {
+        let safe = crate::certstore::safe(id);
+        if safe.is_empty() || !ca_paths.insert(safe) {
+            return Err(ConfigError::invalid(pointer(
+                &pki.at("certificate_authorities"),
+                id,
+            )));
+        }
+    }
+    if let Some(identity) = views.identity.filter(|v| !v.is_null()) {
+        let object = Object::new(Some(identity), ObjectKind::Identity, "/admin/identity")?;
+        let identifiers: Vec<String> = object
+            .strings("identifiers")?
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        if identifiers.len() > 4096 {
+            return Err(ConfigError::invalid(object.at("identifiers")));
+        }
+        let issuers = parse_issuers(&object)?;
+        plan.identity = Some(Identity {
+            identifiers,
+            issuers,
+        });
+    }
+    if plan.policies.len() > 1024
+        || plan.authorities.len() > 256
+        || plan.manual.len() > 4096
+        || plan.automate.len() > 65536
+    {
+        return Err(ConfigError::invalid("/apps/tls".into()));
+    }
+    Ok(plan)
+}
+
+fn parse_issuers(object: &Object<'_>) -> Result<Vec<super::model::Issuer>> {
+    let issuers = object.array("issuers")?;
+    if issuers.len() > 16 {
+        return Err(ConfigError::invalid(object.at("issuers")));
+    }
+    issuers
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            issuer_parse::parse(value, &pointer(&object.at("issuers"), &index.to_string()))
+        })
+        .collect()
+}
+
+fn policy(value: &Value, path: &str) -> Result<Policy> {
+    let object = Object::new(Some(value), ObjectKind::Policy, path)?;
+    let key_type = match object.string("key_type")? {
+        "" | "p256" => KeyType::P256,
+        "p384" => KeyType::P384,
+        "rsa2048" => KeyType::Rsa2048,
+        "rsa4096" => KeyType::Rsa4096,
+        "ed25519" => KeyType::Ed25519,
+        _ => return Err(ConfigError::invalid(object.at("key_type"))),
+    };
+    let mut policy = Policy {
+        subjects: object
+            .strings("subjects")?
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        issuers: parse_issuers(&object)?,
+        storage: pki_parse::parse_storage(object.value("storage"), &object.at("storage"))?,
+        key_type,
+        on_demand: object.boolean("on_demand")?.unwrap_or(false),
+        disable_ocsp: object.boolean("disable_ocsp_stapling")?.unwrap_or(false),
+        ..Policy::default()
+    };
+    if let Some(value) = object.number("renewal_window_ratio")?
+        && value > 0.0
+        && value < 1.0
+    {
+        policy.renewal_ratio = value;
+    }
+    for (field, feature) in [
+        ("must_staple", "managed_must_staple"),
+        ("reuse_private_keys", "managed_reuse_private_keys"),
+    ] {
+        if object.boolean(field)?.unwrap_or(false) {
+            return Err(ConfigError::unsupported(object.at(field), feature));
+        }
+    }
+    let managers = object.array("get_certificate")?;
+    for (index, manager) in managers.iter().enumerate() {
+        let path = pointer(&object.at("get_certificate"), &index.to_string());
+        match discriminator(manager, "via", &path)? {
+            "http" => {
+                Object::new(Some(manager), ObjectKind::GetCertHttp, &path)?.string("url")?;
+            }
+            "tailscale" => {
+                Object::new(Some(manager), ObjectKind::Tailscale, &path)?;
+            }
+            _ => {
+                return Err(ConfigError::unsupported(
+                    path,
+                    "external_certificate_manager_module",
+                ));
+            }
+        }
+    }
+    if !managers.is_empty() {
+        return Err(ConfigError::unsupported(
+            object.at("get_certificate"),
+            "external_certificate_manager",
+        ));
+    }
+    if let Some(overrides) = object.map("ocsp_overrides")? {
+        let mut values = BTreeMap::new();
+        for (key, value) in overrides {
+            let value = match value {
+                Value::Null => "",
+                Value::String(value) => value,
+                _ => {
+                    return Err(ConfigError::invalid(pointer(
+                        &object.at("ocsp_overrides"),
+                        key,
+                    )));
+                }
+            };
+            values.insert(key.clone(), value.into());
+        }
+        policy.ocsp_overrides = values;
+    }
+    Ok(policy)
+}

@@ -311,6 +311,15 @@ fn cert_path(issuer: &str, name: &str) -> Result<String> {
 }
 
 impl FsStore {
+    /// Identity of the directory descriptor retained by this store. Runtime
+    /// pools compare it with path metadata before reusing a configured root.
+    pub(crate) fn root_identity(&self) -> (u64, u64) {
+        (self.core.data.dev, self.core.data.ino)
+    }
+    /// Fixed descriptor identity for the native sidecar and its lifetime gates.
+    pub(crate) fn state_identity(&self) -> (u64, u64) {
+        (self.core.state.dev, self.core.state.ino)
+    }
     pub fn open(root: PathBuf, state_root: PathBuf) -> Result<Self> {
         ensure!(
             root.is_absolute()

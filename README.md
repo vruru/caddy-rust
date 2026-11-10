@@ -236,3 +236,12 @@ than accepting an unusable configuration. Challenge listeners use scoped shared
 leases; releasing one owner cannot close a listener retained by a staged or
 active generation. These contracts do not complete the remaining modules,
 shutdown-delay semantics or production integration.
+
+The certificate application library now owns generation-scoped preparation,
+manual inventories, policy/store resources, business cache probes and dormant
+maintenance. Business acquisition starts after explicit activation; Admin
+identities retain synchronous acquisition. Rollback accepts an authenticated
+in-memory predecessor, and shutdown joins owned work. Uncertain ACME requests
+retain their intent across caller cancellation and storage-lease loss. This
+component still has explicit feature and CPU-offload gaps; it does not enable
+the inspection CLI to serve production traffic.

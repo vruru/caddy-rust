@@ -156,6 +156,16 @@ pub enum OrderResolution {
 enum LoadMode {
     Online,
     CacheOnly,
+    Probe,
+}
+
+/// Strict read-only candidate inspection. Busy never waits for a same-manager
+/// name gate; material is one stable grouped storage snapshot, not an issuance
+/// candidate or permission to serve an expired, future or revoked certificate.
+pub enum CachedProbe {
+    Busy,
+    Missing,
+    Material { usable: Option<ManagedCertificate>, bundle: CertificateBundle },
 }
 
 #[derive(Clone)]
@@ -167,21 +177,95 @@ struct ManagerInner {
     registry: ChallengeRegistry,
     resolver: Arc<HotCertificateResolver>,
     options: AutomationOptions,
-    global: Semaphore,
+    global: Arc<Semaphore>,
+    local: Arc<Semaphore>,
+    solver: Option<SolverPreparation>,
     issuers: Vec<IssuerState>,
     gates: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     events: broadcast::Sender<AutomationEvent>,
     recovered: OnceCell<RecoveryReport>,
     recovery_announced: AtomicBool,
 }
+/// Prepare a real listener only for the selected pending authorization. The
+/// owner must retain its listener lease through ensure and release it on every
+/// completion/cancellation path. No callback is made for cached/ARI-only work.
+pub type SolverPreparation = Arc<dyn Fn(String, ChallengeType, CancellationToken) -> futures_util::future::BoxFuture<'static, Result<()>> + Send + Sync>;
 struct CaState {
-    limiter: Semaphore,
-    next_allowed_unix: AtomicI64,
+    limiter: Arc<Semaphore>,
+    next_allowed_unix: Arc<AtomicI64>,
+}
+/// Process-shared issuance limits. Root configuration generations and distinct
+/// automation policies must reuse this object instead of multiplying budgets.
+pub struct AutomationResources {
+    global: Arc<Semaphore>,
+    local: Arc<Semaphore>,
+    cas: std::sync::Mutex<HashMap<String, Weak<Semaphore>>>,
+    cooldowns: std::sync::Mutex<HashMap<[u8; 32], Arc<AtomicI64>>>,
+    max_concurrent: usize,
+    max_per_ca: usize,
+}
+impl AutomationResources {
+    pub fn limits(&self) -> (usize, usize) { (self.max_concurrent, self.max_per_ca) }
+    pub fn new(max_concurrent: usize, max_per_ca: usize) -> Result<Self> {
+        ensure!((1..=128).contains(&max_concurrent) && (1..=32).contains(&max_per_ca), "ACME concurrency outside bounds");
+        Ok(Self {
+            global: Arc::new(Semaphore::new(max_concurrent)),
+            local: Arc::new(Semaphore::new(std::thread::available_parallelism().map_or(1, usize::from).min(4))),
+            cas: std::sync::Mutex::new(HashMap::new()),
+            cooldowns: std::sync::Mutex::new(HashMap::new()),
+            max_concurrent,
+            max_per_ca,
+        })
+    }
+    fn ca(&self, origin: String) -> Result<Arc<Semaphore>> {
+        let mut states = self.cas.lock().map_err(|_| anyhow!("ACME resource state unavailable"))?;
+        if let Some(state) = states.get(&origin).and_then(Weak::upgrade) { return Ok(state); }
+        states.retain(|_, state| state.strong_count() > 0);
+        ensure!(states.len() < 1024, "ACME origin resource limit exceeded");
+        let state = Arc::new(Semaphore::new(self.max_per_ca));
+        states.insert(origin, Arc::downgrade(&state));
+        Ok(state)
+    }
+    fn cooldown(&self, store: &FsStore, config: &AcmeIssuerConfig) -> Result<Arc<AtomicI64>> {
+        let mut hash = Sha256::new();
+        hash.update(b"acme-equivalent-issuer-retry-v1");
+        let frame = |hash: &mut Sha256, bytes: &[u8]| { hash.update((bytes.len() as u64).to_be_bytes()); hash.update(bytes); };
+        let (dev,ino) = store.root_identity();
+        hash.update(dev.to_be_bytes()); hash.update(ino.to_be_bytes());
+        frame(&mut hash, config.wire.directory.as_bytes());
+        frame(&mut hash, config.email.as_bytes());
+        frame(&mut hash, &serde_json::to_vec(&(config.account_key_type,config.leaf_key_type,&config.challenge_types))?);
+        hash.update([u8::from(config.terms_of_service_agreed), u8::from(config.wire.allow_insecure_loopback)]);
+        hash.update(config.wire.request_timeout.as_nanos().to_be_bytes());
+        hash.update((config.wire.extra_ca_pem.len() as u64).to_be_bytes());
+        for root in &config.wire.extra_ca_pem { frame(&mut hash, root); }
+        hash.update((config.wire.trusted_ca_origins.len() as u64).to_be_bytes());
+        for origin in &config.wire.trusted_ca_origins { frame(&mut hash, origin.as_bytes()); }
+        match &config.eab {
+            Some(eab) => { hash.update([1]); frame(&mut hash,eab.kid.as_bytes()); frame(&mut hash,eab.hmac_key.as_bytes()); },
+            None => hash.update([0]),
+        }
+        let key: [u8;32] = hash.finalize().into();
+        let mut cooldowns = self.cooldowns.lock().map_err(|_| anyhow!("ACME retry state unavailable"))?;
+        if let Some(state) = cooldowns.get(&key) { return Ok(state.clone()); }
+        let at = now();
+        cooldowns.retain(|_, state| Arc::strong_count(state) > 1 || state.load(Ordering::Acquire) > at);
+        ensure!(cooldowns.len() < 16_384, "ACME retry scope capacity exceeded");
+        let state = Arc::new(AtomicI64::new(0));
+        cooldowns.insert(key,state.clone());
+        Ok(state)
+    }
 }
 struct IssuerState {
     config: AcmeIssuerConfig,
     ca: Arc<CaState>,
     wire: OnceCell<AcmeWire>,
+}
+// Field order releases the global budget before its issuer admission. A caller
+// must not request another issuer while holding either permit.
+struct NetworkPermit<'a> {
+    _global: tokio::sync::SemaphorePermit<'a>,
+    _issuer: tokio::sync::SemaphorePermit<'a>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -284,11 +368,48 @@ struct Replacement {
 }
 
 impl CertificateManager {
+    async fn net_permit<'a>(&'a self, issuer: &'a IssuerState, cancel: &CancellationToken) -> Result<NetworkPermit<'a>> {
+        let issuer = tokio::select! { biased;
+            _ = cancel.cancelled() => bail!("ACME operation cancelled"),
+            permit = issuer.ca.limiter.acquire() => permit.map_err(|_| anyhow!("ACME issuer closed"))?,
+        };
+        let global = tokio::select! { biased;
+            _ = cancel.cancelled() => bail!("ACME operation cancelled"),
+            permit = self.inner.global.acquire() => permit.map_err(|_| anyhow!("ACME manager closed"))?,
+        };
+        Ok(NetworkPermit { _global: global, _issuer: issuer })
+    }
+    async fn local_permit(&self, cancel: &CancellationToken) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        tokio::select! { biased;
+            _ = cancel.cancelled() => bail!("ACME local work cancelled"),
+            permit = self.inner.local.acquire() => permit.map_err(|_| anyhow!("ACME manager closed")),
+        }
+    }
     pub fn new(
         store: FsStore,
         registry: ChallengeRegistry,
         resolver: Arc<HotCertificateResolver>,
         options: AutomationOptions,
+    ) -> Result<Self> {
+        let resources = Arc::new(AutomationResources::new(options.max_concurrent, options.max_concurrent_per_ca)?);
+        Self::with_resources(store, registry, resolver, options, resources)
+    }
+    pub fn with_resources(
+        store: FsStore,
+        registry: ChallengeRegistry,
+        resolver: Arc<HotCertificateResolver>,
+        options: AutomationOptions,
+        resources: Arc<AutomationResources>,
+    ) -> Result<Self> {
+        Self::with_resources_and_solver(store, registry, resolver, options, resources, None)
+    }
+    pub fn with_resources_and_solver(
+        store: FsStore,
+        registry: ChallengeRegistry,
+        resolver: Arc<HotCertificateResolver>,
+        options: AutomationOptions,
+        resources: Arc<AutomationResources>,
+        solver: Option<SolverPreparation>,
     ) -> Result<Self> {
         ensure!(
             !options.issuers.is_empty() && options.issuers.len() <= 16,
@@ -319,25 +440,23 @@ impl CertificateManager {
             );
             issuer_key(&issuer.wire.directory)?;
         }
-        let mut limiters = HashMap::new();
+        ensure!(options.max_concurrent == resources.max_concurrent && options.max_concurrent_per_ca == resources.max_per_ca, "ACME resource budgets differ from manager options");
         let mut issuers = Vec::new();
         for mut config in options.issuers.iter().cloned() {
             let directory = url::Url::parse(&config.wire.directory)
                 .map_err(|_| anyhow!("invalid ACME directory URL"))?;
             config.wire.directory = directory.to_string();
             let ca = directory.origin().ascii_serialization();
-            let limiter = limiters
-                .entry(ca)
-                .or_insert_with(|| {
-                    Arc::new(CaState {
-                        limiter: Semaphore::new(options.max_concurrent_per_ca),
-                        next_allowed_unix: AtomicI64::new(0),
-                    })
-                })
-                .clone();
+            // Equivalent issuer policies on one actual store keep Retry-After
+            // across per-name managers/reloads. Different accounts, TLS roots
+            // or issuer configuration never inherit an unrelated cooldown.
+            let state = Arc::new(CaState {
+                limiter: resources.ca(ca)?,
+                next_allowed_unix: resources.cooldown(&store,&config)?,
+            });
             issuers.push(IssuerState {
                 config,
-                ca: limiter,
+                ca: state,
                 wire: OnceCell::new(),
             });
         }
@@ -347,7 +466,9 @@ impl CertificateManager {
                 store,
                 registry,
                 resolver,
-                global: Semaphore::new(options.max_concurrent),
+                global: resources.global.clone(),
+                local: resources.local.clone(),
+                solver,
                 options,
                 issuers,
                 gates: Mutex::new(HashMap::new()),
@@ -441,6 +562,7 @@ impl CertificateManager {
                         .iter()
                         .find(|i| i.config.wire.directory == job.directory)
                         .ok_or_else(|| anyhow!("recovery issuer is no longer configured"))?;
+                    let _network = self.net_permit(issuer, &cancel).await?;
                     let issuer_name = issuer_key(&job.directory)?;
                     let email = if issuer.config.email.is_empty() {
                         self.inner
@@ -525,19 +647,33 @@ impl CertificateManager {
         self.startup_recovery(cancel.clone()).await?;
         let gate = self.name_gate(&names).await?;
         let _gate = tokio::select! {biased;_=cancel.cancelled()=>return Err(anyhow!("ACME cache load cancelled")),guard=gate.lock()=>guard};
-        let _global = tokio::select! {biased;_=cancel.cancelled()=>return Err(anyhow!("ACME cache load cancelled")),permit=self.inner.global.acquire()=>permit.map_err(|_|anyhow!("ACME manager closed"))?};
         let lease = self
             .inner
             .store
             .lock(&format!("issue_cert_{}", names[0]), cancel.clone())
             .await?;
         let result = self
-            .load_existing(&names, &lease, &cancel, LoadMode::CacheOnly)
+            .load_existing(&names, Some(&lease), &cancel, LoadMode::CacheOnly)
             .await;
         let release = lease.release().await;
-        let (cached, _) = result?;
+        let (cached, _, _) = result?;
         release?;
         Ok(cached)
+    }
+
+    /// No recovery, storage lease, ACME, ARI or checkpoint write. FsStore's
+    /// grouped reader rejects pending transactions and changing generations.
+    /// Local integrity/I/O errors remain errors rather than guessed misses.
+    pub async fn probe_cached(&self, names: &[String], cancel: CancellationToken) -> Result<CachedProbe> {
+        let names = normalize_names(names)?;
+        ensure!(!cancel.is_cancelled(), "ACME cache probe cancelled");
+        let gate = self.name_gate(&names).await?;
+        let Ok(_guard) = gate.try_lock() else { return Ok(CachedProbe::Busy); };
+        let (usable, _, bundle) = self.load_existing(&names, None, &cancel, LoadMode::Probe).await?;
+        Ok(match bundle {
+            Some(bundle) => CachedProbe::Material { usable, bundle },
+            None => CachedProbe::Missing,
+        })
     }
 
     async fn ensure_inner(
@@ -547,9 +683,9 @@ impl CertificateManager {
     ) -> Result<ManagedCertificate> {
         let gate = self.name_gate(&names).await?;
         let _gate = tokio::select! {biased;_=cancel.cancelled()=>return Err(anyhow!("ACME operation cancelled")),guard=gate.lock()=>guard};
-        let _global = tokio::select! {biased;_=cancel.cancelled()=>return Err(anyhow!("ACME operation cancelled")),permit=self.inner.global.acquire()=>permit.map_err(|_|anyhow!("ACME manager closed"))?};
-        // Queueing for a per-name/global permit is cancellable but is not
-        // charged to a job's execution deadline, avoiding starvation in fleets.
+        // Only per-name queueing is outside the execution deadline. Network
+        // queues are issuer-scoped first, so a busy issuer cannot occupy the
+        // global budget while its requests merely wait for that issuer.
         let operation = self.ensure_active(names, cancel.clone());
         tokio::pin!(operation);
         tokio::select! {
@@ -632,7 +768,12 @@ impl CertificateManager {
                 last_error = Some(RetryAfterError(allowed).into());
                 continue;
             }
-            let _ca = tokio::select! {biased;_=cancel.cancelled()=>return Err(anyhow!("ACME operation cancelled")),p=issuer.ca.limiter.acquire()=>p.map_err(|_|anyhow!("ACME issuer closed"))?};
+            let network = self.net_permit(issuer, &cancel).await?;
+            let allowed = issuer.ca.next_allowed_unix.load(Ordering::Acquire);
+            if allowed > now() {
+                last_error = Some(RetryAfterError(allowed).into());
+                continue;
+            }
             let wire = match issuer
                 .wire
                 .get_or_try_init(|| AcmeWire::connect(issuer.config.wire.clone(), &cancel))
@@ -670,7 +811,7 @@ impl CertificateManager {
             };
             // Registration/network setup has finished; do not hold a CA
             // permit while load_state may refresh a different issuer's ARI.
-            drop(_ca);
+            drop(network);
             let lease = self
                 .inner
                 .store
@@ -706,7 +847,9 @@ impl CertificateManager {
                             "active ACME account identity changed"
                         );
                     }
-                    let _issuance_ca = tokio::select! {biased;_=leg_cancel.cancelled()=>return Err(anyhow!("ACME operation cancelled")),permit=issuer.ca.limiter.acquire()=>permit.map_err(|_|anyhow!("ACME issuer closed"))?};
+                    let _network = self.net_permit(issuer, &leg_cancel).await?;
+                    let allowed = issuer.ca.next_allowed_unix.load(Ordering::Acquire);
+                    if allowed > now() { return Err(RetryAfterError(allowed).into()); }
                     self.issue(
                         &names,
                         issuer,
@@ -783,8 +926,8 @@ impl CertificateManager {
                 recovery_issue: None,
             });
         }
-        self.load_existing(names, lease, cancel, LoadMode::Online)
-            .await
+        self.load_existing(names, Some(lease), cancel, LoadMode::Online)
+            .await.map(|(ready, previous, _)| (ready, previous))
     }
     async fn read_reservation(
         &self,
@@ -825,6 +968,7 @@ impl CertificateManager {
         lease: &StorageLease,
         cancel: &CancellationToken,
     ) -> Result<Option<Reservation>> {
+        let _local = self.local_permit(cancel).await?;
         let Some(value) = self
             .inner
             .store
@@ -958,11 +1102,13 @@ impl CertificateManager {
     async fn load_existing(
         &self,
         names: &[String],
-        lease: &StorageLease,
+        lease: Option<&StorageLease>,
         cancel: &CancellationToken,
         mode: LoadMode,
-    ) -> Result<(Option<ManagedCertificate>, Option<Replacement>)> {
+    ) -> Result<(Option<ManagedCertificate>, Option<Replacement>, Option<CertificateBundle>)> {
         let key = names_key(names)?;
+        let selection = {
+        let _local = self.local_permit(cancel).await?;
         let active_attempt = self.load_attempt(names).await?;
         let selected = active_attempt.as_ref().and_then(|a| {
             a.winner
@@ -975,13 +1121,14 @@ impl CertificateManager {
         let mut best = None;
         let mut fallback = None;
         for (index, issuer) in self.inner.issuers.iter().enumerate() {
-            lease.check().await?;
+            ensure!(!cancel.is_cancelled(), "ACME cache inspection cancelled");
+            if let Some(lease) = lease { lease.check().await?; }
             let issuer_name = issuer_key(&issuer.config.wire.directory)?;
             let material = async {
-                self.inner
+                if let Some(lease) = lease { self.inner
                     .store
                     .recover_certificate_with_lease(&issuer_name, &key, lease)
-                    .await?;
+                    .await?; }
                 let Some(bundle) = self
                     .inner
                     .store
@@ -996,7 +1143,7 @@ impl CertificateManager {
             .await;
             let Some((bundle, info)) = (match material {
                 Ok(value) => value,
-                Err(error) if mode == LoadMode::CacheOnly => return Err(error),
+                Err(error) if mode != LoadMode::Online => return Err(error),
                 Err(_) => {
                     let _ = self.inner.events.send(AutomationEvent {
                         names: names.to_vec(),
@@ -1038,8 +1185,10 @@ impl CertificateManager {
                 }
             }
         }
+        best.or(fallback)
+        };
         let mut previous_id = None;
-        if let Some((index, mut bundle, info)) = best.or(fallback) {
+        if let Some((index, mut bundle, info)) = selection {
             let issuer = &self.inner.issuers[index];
             let now = now();
             // Preserve the attempt/winner selection above. A revocation vetoes
@@ -1052,29 +1201,38 @@ impl CertificateManager {
                 return Err(FutureCertificate(info.not_before).into());
             }
             if mode == LoadMode::Online && info.not_before <= now && info.not_after > now {
+                let _local = self.local_permit(cancel).await?;
                 self.publish(names, &bundle, cancel).await?;
             }
+            let certificate_id = {
+                let _local = self.local_permit(cancel).await?;
+                ari_certificate_id(&bundle.chain_pem)?
+            };
             let mut ari = parse_ari(&bundle.metadata);
             if mode == LoadMode::Online
+                && certificate_id.is_some()
                 && !revoked
                 && issuer.ca.next_allowed_unix.load(Ordering::Acquire) <= now
                 && info.not_after > now
                 && ari.as_ref().is_none_or(|a| a.refresh_after_unix <= now)
             {
                 let update = async {
-                    let _ari_ca=tokio::select!{biased;_=cancel.cancelled()=>return Err(anyhow!("ACME operation cancelled")),permit=issuer.ca.limiter.acquire()=>permit.map_err(|_|anyhow!("ACME issuer closed"))?};
+                    let _network = self.net_permit(issuer, cancel).await?;
+                    if issuer.ca.next_allowed_unix.load(Ordering::Acquire) > now { return Ok(None); }
                     let wire = issuer
                         .wire
                         .get_or_try_init(|| AcmeWire::connect(issuer.config.wire.clone(), cancel))
                         .await?;
-                    if let Some(cert_id) = ari_certificate_id(&bundle.chain_pem)? {
-                        return wire.renewal_info(&cert_id, cancel).await;
+                    if let Some(cert_id) = certificate_id.as_deref() {
+                        return wire.renewal_info(cert_id, cancel).await;
                     }
                     Ok(None)
                 }
                 .await;
+                ensure!(!cancel.is_cancelled(), "ACME operation cancelled");
                 match update {
                     Ok(Some(updated)) => {
+                        let _local = self.local_permit(cancel).await?;
                         // Caddy may have persisted an equivalent SAN set in a
                         // different order. Native leases use normalized first SAN.
                         bundle.metadata["sans"] = json!(names);
@@ -1084,6 +1242,7 @@ impl CertificateManager {
                             &info,
                             self.inner.options.renewal_window_ratio,
                         )?;
+                        let lease = lease.ok_or_else(||anyhow!("online cache update requires storage lease"))?;
                         lease.check().await?;
                         self.inner
                             .store
@@ -1101,7 +1260,7 @@ impl CertificateManager {
                 }
             }
             previous_id = Some(Replacement {
-                certificate_id: ari_certificate_id(&bundle.chain_pem)?,
+                certificate_id,
                 previous_leaf: info.leaf_sha256.clone(),
                 directory: issuer.config.wire.directory.clone(),
                 account: bundle.metadata["issuer_data"]["account"]
@@ -1117,7 +1276,7 @@ impl CertificateManager {
                 &info.leaf_sha256,
             )?;
             if !revoked
-                && (mode == LoadMode::CacheOnly || now < renew_at)
+                && (mode != LoadMode::Online || now < renew_at)
                 && info.not_before <= now
                 && info.not_after > now
                 && self.material_revocation(&info)?.is_none()
@@ -1135,10 +1294,12 @@ impl CertificateManager {
                         obtained: false,
                     }),
                     previous_id,
+                    (mode == LoadMode::Probe).then_some(bundle),
                 ));
             }
+            return Ok((None, previous_id, (mode == LoadMode::Probe).then_some(bundle)));
         }
-        Ok((None, previous_id))
+        Ok((None, previous_id, None))
     }
 
     async fn account(
@@ -1248,7 +1409,13 @@ impl CertificateManager {
             .account_registration_lock_name(&issuer_name, &email)
             .await?;
         let lease = self.inner.store.lock(&registration, cancel.clone()).await?;
-        let result=async {
+        // Never pass the lease's own cancellation token to network calls:
+        // caller/deadline cancellation must also stop an uncertain request.
+        // Join the operation before releasing its fenced registration lease.
+        let result = {
+        let registration_cancel = cancel.child_token();
+        let lost = lease.lost();
+        let operation=async {
             self.inner.store.recover_account_with_lease(&issuer_name,&email,&lease).await?;
             if let Some(value)=self.inner.store.journal_load(&pending_id).await?&&value["phase"]=="account_received"{
                 let pending:PendingAccount=serde_json::from_value(value).map_err(|_|anyhow!("invalid account publication checkpoint"))?;
@@ -1262,7 +1429,7 @@ impl CertificateManager {
                     ensure!(account.metadata["status"]=="valid"&&expected_location.is_none_or(|v|v==location),"stored ACME account identity changed");
                     return Ok::<_,anyhow::Error>((Some(wire.restore(signer,location)?),None));
                 }
-                let(session,response)=wire.account(signer,&email,issuer.config.terms_of_service_agreed,true,None,&lease.lost()).await?;
+                let(session,response)=wire.account(signer,&email,issuer.config.terms_of_service_agreed,true,None,&registration_cancel).await?;
                 ensure!(expected_location.is_none_or(|v|v==session.location()),"recovered account identity changed");
                 let mut metadata=account.metadata.clone();merge_account(&mut metadata,&response.metadata)?;
                 let pending=PendingAccount{version:1,directory:wire.directory_url().to_owned(),phase:"account_received".to_owned(),private_key_pem:std::str::from_utf8(&account.private_key_pem)?.to_owned(),eab:None,storage_email:Some(account_primary(&metadata)?.to_owned()),metadata:Some(metadata)};
@@ -1288,24 +1455,34 @@ impl CertificateManager {
             if pending.phase=="account_received"{return Ok((None,Some(pending)))}
             let signer=Arc::new(AccountSigner::from_pem(pending.private_key_pem.as_bytes())?);
             let recovered=if pending.phase!="key_prepared" {
-                match wire.account(signer.clone(),&email,issuer.config.terms_of_service_agreed,true,None,&lease.lost()).await {
+                match wire.account(signer.clone(),&email,issuer.config.terms_of_service_agreed,true,None,&registration_cancel).await {
                     Ok(result)=>Some(result),
                     Err(error)=>{if !error.downcast_ref::<ProtocolError>().is_some_and(|p|p.status()==400&&p.kind()=="accountDoesNotExist"){return Err(error.context("account registration remains uncertain"))}None}
                 }
             }else{None};
             let(_,response)=if let Some(result)=recovered {result}else{
                 if issuer.config.eab.is_none()&&pending.eab.is_none()&&wire.directory_url().starts_with("https://acme.zerossl.com/"){
-                    let(kid,hmac_key)=wire.zero_ssl_eab(&email,&lease.lost()).await?;pending.eab=Some(ExternalAccountBinding{kid,hmac_key});
+                    let(kid,hmac_key)=wire.zero_ssl_eab(&email,&registration_cancel).await?;pending.eab=Some(ExternalAccountBinding{kid,hmac_key});
                     self.store_checkpoint(&pending_id,serde_json::to_value(&pending)?,&lease).await?;
                 }
                 pending.phase="registration_intent".to_owned();self.store_checkpoint(&pending_id,serde_json::to_value(&pending)?,&lease).await?;
-                wire.account(signer,&email,issuer.config.terms_of_service_agreed,false,issuer.config.eab.as_ref().or(pending.eab.as_ref()).map(|e|(e.kid.as_str(),e.hmac_key.as_str())),&lease.lost()).await?
+                wire.account(signer,&email,issuer.config.terms_of_service_agreed,false,issuer.config.eab.as_ref().or(pending.eab.as_ref()).map(|e|(e.kid.as_str(),e.hmac_key.as_str())),&registration_cancel).await?
             };
             let mut metadata=pending.metadata.take().unwrap_or_else(||if email.is_empty(){json!({"contact":[]})}else{json!({"contact":[format!("mailto:{email}")]})});
             merge_account(&mut metadata,&response.metadata)?;
             pending.phase="account_received".to_owned();pending.storage_email=Some(account_primary(&metadata)?.to_owned());pending.metadata=Some(metadata);
             self.store_checkpoint(&pending_id,serde_json::to_value(&pending)?,&lease).await?;Ok((None,Some(pending)))
-        }.await;
+        };
+        tokio::pin!(operation);
+        tokio::select! {
+            result = &mut operation => result,
+            _ = lost.cancelled() => {
+                registration_cancel.cancel();
+                let _ = operation.await;
+                Err(anyhow!("account storage lease lost"))
+            }
+        }
+        };
         let released = lease.release().await;
         let (ready, pending) = result?;
         released?;
@@ -1619,7 +1796,7 @@ impl CertificateManager {
                     } else {
                         replaces
                     },
-                    &lease.lost(),
+                    cancel,
                 )
                 .await;
             let order = match result {
@@ -1641,7 +1818,7 @@ impl CertificateManager {
                             // Retry without `replaces` once, retaining key/CSR.
                             job.phase = "new_order_intent".to_owned();
                             self.save_job(&id, &job, lease).await?;
-                            match account.new_order(&identifiers, None, &lease.lost()).await {
+                            match account.new_order(&identifiers, None, cancel).await {
                                 Ok(order) => order,
                                 Err(error) => {
                                     if error.downcast_ref::<ProtocolError>().is_some_and(|p| {
@@ -1700,6 +1877,7 @@ impl CertificateManager {
                     if authorization.status=="valid" {continue}
                     ensure!(authorization.status=="pending","ACME authorization is not pending or valid");
                     let challenge=issuer.config.challenge_types.iter().find_map(|kind|authorization.challenges.iter().find(|c|c.kind==kind.as_str() && ["pending","processing"].contains(&c.status.as_str())).map(|c|(*kind,c))).ok_or_else(||anyhow!("requested ACME challenge unavailable"))?;
+                    if let Some(prepare)=&self.inner.solver {prepare(issuer.config.wire.directory.clone(),challenge.0,cancel.child_token()).await?;}
                     let token=challenge.1.token.as_deref().ok_or_else(||anyhow!("ACME challenge token missing"))?;
                     let authorization_value=format!("{token}.{}",account.thumbprint());
                     let ttl=self.inner.options.job_timeout.min(Duration::from_secs(3600));
@@ -1708,7 +1886,7 @@ impl CertificateManager {
                         ChallengeType::TlsAlpn01=>self.inner.registry.register_tls(&id,&authorization.identifier.value,&authorization_value,ttl)?,
                     };proofs.push(proof);
                     job.phase="authorizing".to_owned();self.save_job(&id,&job,lease).await?;
-                    lease.check().await?;let response=account.respond(&challenge.1.url,&lease.lost()).await?;resource.retry_after=resource.retry_after.max(response.retry_after);
+                    lease.check().await?;let response=account.respond(&challenge.1.url,cancel).await?;resource.retry_after=resource.retry_after.max(response.retry_after);
                 }
                 for _ in 0..240 {
                     if resource.value.status!="pending" {break}
@@ -1718,7 +1896,7 @@ impl CertificateManager {
             }
             if resource.value.status=="ready" {
                 job.phase="finalize_intent".to_owned();self.save_job(&id,&job,lease).await?;
-                resource=account.finalize(&resource.value.finalize,&job.csr_der,&lease.lost()).await?;
+                resource=account.finalize(&resource.value.finalize,&job.csr_der,cancel).await?;
                 job.phase="finalized".to_owned();self.save_job(&id,&job,lease).await?;
             }
             for _ in 0..240 {
@@ -2062,7 +2240,7 @@ impl std::error::Error for ActiveOrderError {
     }
 }
 #[derive(Debug)]
-struct FutureCertificate(i64);
+pub(crate) struct FutureCertificate(pub(crate) i64);
 impl std::fmt::Display for FutureCertificate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(
@@ -2080,7 +2258,7 @@ impl std::fmt::Display for RetryAfterError {
     }
 }
 impl std::error::Error for RetryAfterError {}
-fn error_retry_delay(error: &anyhow::Error) -> Duration {
+pub(crate) fn error_retry_delay(error: &anyhow::Error) -> Duration {
     if let Some(error) = error.downcast_ref::<ActiveOrderError>() {
         return error_retry_delay(&error.0);
     }
@@ -2241,7 +2419,7 @@ impl rcgen::SigningKey for CsrSigner {
         }
     }
 }
-fn generate_csr(names: &[String], kind: KeyType) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
+pub(crate) fn generate_csr(names: &[String], kind: KeyType) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
     let (signer, pem) = AccountSigner::generate(kind)?;
     let pair = CsrSigner::new(signer)?;
     let mut params = rcgen::CertificateParams::new(names.to_vec())
@@ -2367,7 +2545,7 @@ fn write_ari(meta: &mut Value, ari: &AriWindow, info: &MaterialInfo, ratio: f64)
     meta["issuer_data"]["renewal_info"] = json!({"suggestedWindow":{"start":format(ari.start_unix)?,"end":format(ari.end_unix)?},"_uniqueIdentifier":ari.certificate_id,"_retryAfter":format(ari.refresh_after_unix)?,"_selectedTime":format(renewal_time(info.not_before,info.not_after,ratio,Some(ari),&info.leaf_sha256)?)?});
     Ok(())
 }
-fn retry_backoff(failures: u32, names: &[String]) -> Duration {
+pub(crate) fn retry_backoff(failures: u32, names: &[String]) -> Duration {
     let base = (5u64.saturating_mul(1u64 << failures.min(10))).min(3600);
     let hash = Sha256::digest(format!("{}:{failures}", names.join("\0")).as_bytes());
     let jitter = u16::from_be_bytes([hash[0], hash[1]]) as u64 % (base / 4 + 1);
