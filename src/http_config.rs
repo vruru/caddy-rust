@@ -14,6 +14,19 @@ use types::*;
 pub struct PreparedConfig {
     pub(crate) servers: Vec<Arc<ServerConfig>>,
     pub(crate) certificates: Vec<FileCertificate>,
+    shutdown_policy: HttpShutdownPolicy,
+}
+/// Native shutdown settings. Zero/omitted Go grace means genuinely unlimited
+/// drain, represented by None rather than an artificial maximum duration.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HttpShutdownPolicy {
+    pub grace_period: Option<Duration>,
+    pub shutdown_delay: Duration,
+}
+impl PreparedConfig {
+    pub fn shutdown_policy(&self) -> HttpShutdownPolicy {
+        self.shutdown_policy
+    }
 }
 #[derive(Clone)]
 pub(crate) struct ServerConfig {
@@ -111,7 +124,33 @@ pub fn validate_json(value: &Value) -> Result<PreparedConfig> {
             .ok_or_else(|| anyhow::anyhow!("HTTP app required"))?,
         "/apps/http",
     )?;
-    deny_unknown(http, &["servers", "http_port", "https_port"], "/apps/http")?;
+    deny_unknown(
+        http,
+        &[
+            "servers",
+            "http_port",
+            "https_port",
+            "grace_period",
+            "shutdown_delay",
+        ],
+        "/apps/http",
+    )?;
+    let grace = http
+        .get("grace_period")
+        .filter(|value| !value.is_null())
+        .map(|value| signed_duration(value, "/apps/http/grace_period"))
+        .transpose()?
+        .unwrap_or(0);
+    let delay = http
+        .get("shutdown_delay")
+        .filter(|value| !value.is_null())
+        .map(|value| signed_duration(value, "/apps/http/shutdown_delay"))
+        .transpose()?
+        .unwrap_or(0);
+    let shutdown_policy = HttpShutdownPolicy {
+        grace_period: (grace > 0).then(|| Duration::from_nanos(grace as u64)),
+        shutdown_delay: Duration::from_nanos(delay.max(0) as u64),
+    };
     if http.contains_key("http_port") || http.contains_key("https_port") {
         return Err(unsupported("/apps/http/port_overrides"));
     }
@@ -133,6 +172,7 @@ pub fn validate_json(value: &Value) -> Result<PreparedConfig> {
     Ok(PreparedConfig {
         servers,
         certificates,
+        shutdown_policy,
     })
 }
 

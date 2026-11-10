@@ -238,7 +238,7 @@ guard before publication. Unknown tags are rejected before publication, stricter
 than accepting an unusable configuration. Challenge listeners use scoped shared
 leases; releasing one owner cannot close a listener retained by a staged or
 active generation. These contracts do not complete the remaining modules,
-shutdown-delay semantics or production integration.
+remaining product lifecycle or production integration.
 
 The certificate application library now owns generation-scoped preparation,
 manual inventories, policy/store resources, business cache probes and dormant
@@ -283,3 +283,13 @@ environment file even when configuration is read from stdin. Formatting supports
 original overwrite/diff precedence and preserves existing file modes and symlinks.
 The diff implementation has explicit work/output budgets. Serving, validation
 provisioning and the remaining lifecycle commands are still migration gates.
+
+The HTTP library now retains generation-owned shutdown delays and request/body/
+upgrade activity. Removed bindings keep their original role during delay; current
+bindings win immediately. Positive grace forces only its own generation, while
+zero or omitted grace drains without a default timer. Old and current delays run
+concurrently, and global stop preserves every generation's remaining admission
+window. Read-only retirement receipts distinguish business admission from shared
+socket ownership. Force still reaches older upgraded streams after admission
+closes. Root certificate/CLI integration and full production acceptance remain
+separate gates.

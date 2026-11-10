@@ -27,6 +27,10 @@ mod path_glob;
 pub(crate) use path_glob::go_path_glob;
 #[path = "http_runtime/proxy.rs"]
 mod proxy;
+#[path = "http_runtime/retirement.rs"]
+mod retirement;
+use retirement::{BusinessGeneration, BusinessGuard};
+pub use retirement::{HttpRetirement, RetirementOutcome};
 #[path = "http_runtime/resource_budget.rs"]
 mod resource_budget;
 pub use resource_budget::{BudgetSnapshot, ResourceDiagnostics, ResourceLimits};
@@ -106,9 +110,22 @@ struct Inner {
 }
 struct Generation {
     id: u64,
+    activity: Arc<BusinessGeneration>,
     servers: HashMap<SocketAddr, Arc<ActiveServer>>,
+    retiring: HashMap<SocketAddr, std::sync::Weak<lifecycle::RetiringBinding>>,
     drain: CancellationToken,
     managed_names: Vec<Vec<String>>,
+}
+impl Generation {
+    fn business(&self, key: &SocketAddr) -> Option<(Arc<ActiveServer>, Arc<BusinessGeneration>)> {
+        if let Some(server) = self.servers.get(key) {
+            return self.activity.is_admitting().then(|| (server.clone(),self.activity.clone()));
+        }
+        let binding = self.retiring.get(key)?.upgrade()?;
+        binding
+            .is_accepting()
+            .then(|| (binding.server.clone(), binding.activity.clone()))
+    }
 }
 #[derive(Clone)]
 struct ActiveServer {
@@ -223,10 +240,14 @@ impl HttpRuntime {
         resolver: Arc<HotCertificateResolver>,
         resources: Arc<resource_budget::Resources>,
     ) -> Self {
+        let activity =
+            BusinessGeneration::new(0, crate::http_config::HttpShutdownPolicy::default());
         let initial = Generation {
             id: 0,
+            activity: activity.clone(),
             servers: HashMap::new(),
-            drain: CancellationToken::new(),
+            retiring: HashMap::new(),
+            drain: activity.drain.clone(),
             managed_names: Vec::new(),
         };
         let challenge_resolver = Arc::new(HotCertificateResolver::with_leaf_guard(
@@ -623,13 +644,11 @@ async fn accept_loop(
         // Proof/business mode is fixed at accept. A TLS ClientHello selects
         // from one current identity view; each HTTP operation later checks its
         // actual handshake identity against the current published policy.
-        let snapshot = loop {
-            let snapshot = inner.current.load_full();
-            if !snapshot.drain.is_cancelled() || inner.stopped.is_cancelled() {
-                break snapshot;
-            }
-        };
-        let server = snapshot.servers.get(&key).cloned();
+        let server = inner
+            .current
+            .load()
+            .business(&key)
+            .map(|(server, _)| server);
         let canonical =
             |address: SocketAddr| SocketAddr::new(address.ip().to_canonical(), address.port());
         let peer = canonical(peer);
@@ -741,8 +760,34 @@ async fn serve_connection<I>(
         let identity = identity.clone();
         let requested_drain = service_drain.clone();
         async move {
-            let snapshot = inner.current.load_full();
-            let current = snapshot.servers.get(&key).cloned();
+            // Count admission before confirming that this exact view is still
+            // current. A retire/join cannot observe zero and later miss a live
+            // request admitted against a superseded snapshot.
+            let mut view_retries = 0usize;
+            let (current, business) = loop {
+                let snapshot = inner.current.load_full();
+                let Some((current, activity)) = snapshot.business(&key) else {
+                    break (None, None);
+                };
+                let business = activity.begin();
+                let latest = inner.current.load_full();
+                let same = latest.business(&key).is_some_and(|(server, group)| {
+                    Arc::ptr_eq(&activity, &group) && Arc::ptr_eq(&server, &current)
+                });
+                if !same {
+                    drop(business);
+                    view_retries += 1;
+                    if view_retries == 8 {
+                        view_retries = 0;
+                        tokio::task::yield_now().await;
+                    }
+                    continue;
+                }
+                let Ok(business) = business else {
+                    break (None, None);
+                };
+                break (Some(current), Some(business));
+            };
             let verdict = match (identity.as_ref(), current.as_ref()) {
                 (Some(identity), Some(current)) => {
                     identity.verdict(current, negotiated_tls_h2 == Some(true))
@@ -776,6 +821,13 @@ async fn serve_connection<I>(
                     "Service Unavailable\n",
                 ));
             };
+            let Some(business) = business else {
+                return Ok(simple(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Service Unavailable\n",
+                ));
+            };
+            let activity = business.generation().clone();
             let close_after = verdict == TlsVerdict::ServeThenClose
                 || current.plan.read_header_timeout != accepted_server.plan.read_header_timeout;
             let request_h2 = request.version() == http::Version::HTTP_2;
@@ -795,16 +847,14 @@ async fn serve_connection<I>(
                 request.extensions_mut().insert(metadata);
             }
             let keep = current.clone();
-            let mut response = request::handle(
-                inner,
-                current,
-                request,
-                peer,
-                local,
-                tls,
-                snapshot.drain.clone(),
-            )
-            .await;
+            let mut response = tokio::select! { biased;
+                _ = activity.hard_stop.cancelled() => {
+                    let mut response = simple(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable\n");
+                    if !request_h2 { response.headers_mut().insert(http::header::CONNECTION,http::HeaderValue::from_static("close")); }
+                    return Ok(response);
+                },
+                response = request::handle(inner,current,request,peer,local,tls,business.clone()) => response,
+            };
             if close_after {
                 if request_h2 {
                     requested_drain.cancel();
@@ -819,7 +869,17 @@ async fn serve_connection<I>(
                 return Err(h2::Error::from(h2::Reason::PROTOCOL_ERROR));
             }
             Ok(response.map(|body| {
-                trailer_policy::guard_response(RetainedBody { body, keep }.boxed_unsync(), fault)
+                trailer_policy::guard_response(
+                    RetainedBody {
+                        body,
+                        keep,
+                        _business: business,
+                        cancelled: Box::pin(activity.hard_stop.clone().cancelled_owned()),
+                        ended: false,
+                    }
+                    .boxed_unsync(),
+                    fault,
+                )
             }))
         }
     });
@@ -856,6 +916,9 @@ async fn serve_connection<I>(
 struct RetainedBody {
     body: Body,
     keep: Arc<ActiveServer>,
+    _business: Arc<BusinessGuard>,
+    cancelled: std::pin::Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+    ended: bool,
 }
 impl hyper::body::Body for RetainedBody {
     type Data = Bytes;
@@ -865,10 +928,24 @@ impl hyper::body::Body for RetainedBody {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
         let _keep = &self.keep;
-        std::pin::Pin::new(&mut self.body).poll_frame(cx)
+        if self.ended {
+            return std::task::Poll::Ready(None);
+        }
+        if std::future::Future::poll(self.cancelled.as_mut(), cx).is_ready() {
+            self.ended = true;
+            return std::task::Poll::Ready(Some(Err(std::io::Error::other(
+                "HTTP business generation stopped",
+            )
+            .into())));
+        }
+        let frame = std::pin::Pin::new(&mut self.body).poll_frame(cx);
+        if matches!(frame, std::task::Poll::Ready(None | Some(Err(_)))) {
+            self.ended = true;
+        }
+        frame
     }
     fn is_end_stream(&self) -> bool {
-        self.body.is_end_stream()
+        self.ended || self.body.is_end_stream()
     }
     fn size_hint(&self) -> hyper::body::SizeHint {
         self.body.size_hint()

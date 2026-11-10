@@ -390,8 +390,12 @@ pub(super) async fn serve(
         let drain = ctx.drain.clone();
         let delay = config.stream_close_delay;
         let hold_client = client.clone();
+        let business = ctx.business.clone();
+        let hard_stop = business.generation().hard_stop.clone();
         upgrades.spawn(async move {
             let _hold_client=hold_client;
+            let _business=business;
+            let tunnel=async {
             if let (Ok(downstream),Ok(upstream))=tokio::join!(downstream_upgrade,upstream_upgrade){
                 let mut downstream=TokioIo::new(downstream);let mut upstream=TokioIo::new(upstream);
                 let copy=tokio::io::copy_bidirectional(&mut downstream,&mut upstream);tokio::pin!(copy);
@@ -399,6 +403,8 @@ pub(super) async fn serve(
                     tokio::select!{_=&mut copy=>{},_=drain.cancelled()=>{let _=tokio::time::timeout(delay,copy).await;}}
                 } else { let _=copy.await; }
             }
+            };
+            tokio::select! {biased; _=hard_stop.cancelled()=>{},_=tunnel=>{}}
         });
     }
     let upgrade = response.status() == StatusCode::SWITCHING_PROTOCOLS;

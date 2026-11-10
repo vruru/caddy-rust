@@ -144,9 +144,8 @@ pub(super) async fn accept(
         tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream).await?;
     let generation = inner.current.load_full();
     let server = generation
-        .servers
-        .get(&address)
-        .cloned()
+        .business(&address)
+        .map(|(server, _)| server)
         .ok_or_else(|| anyhow::anyhow!("TLS listener retired"))?;
     let resolver = server
         .resolver

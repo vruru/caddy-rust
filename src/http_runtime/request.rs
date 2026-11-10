@@ -26,6 +26,7 @@ pub(super) struct Context {
     pub client_ip: IpAddr,
     pub trusted: bool,
     pub drain: CancellationToken,
+    pub business: Arc<BusinessGuard>,
     pub original_uri: Uri,
     pub values: HashMap<String, String>,
     pub immediate: HeaderMap,
@@ -65,6 +66,12 @@ impl Context {
         }
         let req = self.request.as_ref();
         Some(match name {
+            "http.shutting_down" => self.business.generation().shutting_down().to_string(),
+            "http.time_until_shutdown" => self
+                .business
+                .generation()
+                .time_until_shutdown()
+                .unwrap_or_default(),
             "http.request.hostport" => self.authority.clone(),
             "http.request.host" => hostname(&self.authority),
             "http.request.port" => self
@@ -230,7 +237,7 @@ pub(super) async fn handle(
     peer: SocketAddr,
     local: SocketAddr,
     tls: bool,
-    drain: CancellationToken,
+    business: Arc<BusinessGuard>,
 ) -> Response<Body> {
     let authority = match request_authority(&request) {
         Ok(authority) => authority,
@@ -263,7 +270,8 @@ pub(super) async fn handle(
         authority,
         client_ip,
         trusted,
-        drain,
+        drain: business.generation().drain.clone(),
+        business,
         original_uri,
         values: HashMap::new(),
         immediate: {

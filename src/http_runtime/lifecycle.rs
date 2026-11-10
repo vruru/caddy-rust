@@ -29,6 +29,7 @@ struct Pending {
     identity: Arc<()>,
     cancel: CancellationToken,
     bindings: HashMap<SocketAddr, ListenerKind>,
+    retirement: HttpRetirement,
 }
 struct ListenerControl {
     cancel: CancellationToken,
@@ -75,6 +76,8 @@ struct Control {
     listeners: HashMap<SocketAddr, Arc<ListenerControl>>,
     pool: HashMap<SocketAddr, PoolSlot>,
     leases: Vec<LeaseRecord>,
+    retirements: HashMap<u64, Arc<RetirementOwner>>,
+    stop: Option<HttpRetirement>,
 }
 pub(super) struct Lifecycle {
     state: Mutex<Control>,
@@ -90,6 +93,8 @@ impl Lifecycle {
                 listeners: HashMap::new(),
                 pool: HashMap::new(),
                 leases: Vec::new(),
+                retirements: HashMap::new(),
+                stop: None,
             }),
             changed: Notify::new(),
         }
@@ -103,6 +108,7 @@ struct PendingGuard {
     identity: Arc<()>,
     cancel: CancellationToken,
     armed: bool,
+    retirement: HttpRetirement,
 }
 impl Drop for PendingGuard {
     fn drop(&mut self) {
@@ -110,6 +116,7 @@ impl Drop for PendingGuard {
             return;
         }
         self.cancel.cancel();
+        self.retirement.complete(RetirementOutcome::Aborted);
         let cleared = {
             let mut control = self.control.lock();
             if control
@@ -128,6 +135,104 @@ impl Drop for PendingGuard {
         }
     }
 }
+/// A removed binding retains only its own shared socket ownership. Closing it
+/// never cancels a descriptor still owned by a lease or a newer generation.
+pub(super) struct RetiringBinding {
+    pub server: Arc<ActiveServer>,
+    pub activity: Arc<BusinessGeneration>,
+    group: Arc<retirement::AdmissionGroup>,
+    accepting: std::sync::atomic::AtomicBool,
+    owner: Mutex<Option<Arc<ListenerControl>>>,
+}
+impl RetiringBinding {
+    pub(super) fn is_accepting(&self) -> bool {
+        self.accepting.load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn close(&self) {
+        if self
+            .accepting
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            let owner = self.owner.lock().unwrap_or_else(|e| e.into_inner()).take();
+            drop(owner);
+            self.group.member_closed();
+        }
+    }
+}
+struct RetirementOwner {
+    group: Arc<retirement::AdmissionGroup>,
+    bindings: Vec<Arc<RetiringBinding>>,
+}
+impl RetirementOwner {
+    fn close(&self) {
+        for binding in &self.bindings {
+            binding.close();
+        }
+    }
+}
+/// Executor cancellation cannot strand a published retirement or leave its
+/// admission open. An unpublished actor must never modify the old generation.
+struct RetirementTaskGuard(Option<Arc<RetirementOwner>>);
+impl Drop for RetirementTaskGuard {
+    fn drop(&mut self) {
+        let Some(owner) = self.0.take() else {
+            return;
+        };
+        if owner.group.signal.is_published() {
+            owner.close();
+            owner.group.activity.force();
+        } else {
+            owner.group.signal.complete(RetirementOutcome::Aborted);
+        }
+    }
+}
+async fn retire_generation(
+    inner: Weak<Inner>,
+    control: Weak<Lifecycle>,
+    owner: Arc<RetirementOwner>,
+    mut safety: RetirementTaskGuard,
+) {
+    if !owner.group.signal.activated().await {
+        return;
+    }
+    if let Some(inner) = inner.upgrade() {
+        tokio::select! { biased;
+            _ = inner.stopped.cancelled() => {},
+            _ = owner.group.activity.wait_delay() => {},
+        }
+    }
+    owner.close();
+    owner.group.activity.drain.cancel();
+    let activity = &owner.group.activity;
+    if let Some(grace) = activity.policy.grace_period {
+        tokio::select! { biased;
+            _ = activity.hard_stop.cancelled() => {},
+            _ = activity.wait_idle() => {},
+            _ = tokio::time::sleep(grace) => activity.force(),
+        }
+    } else {
+        activity.wait_idle().await;
+    }
+    if let Some(control) = control.upgrade() {
+        let removed = {
+            let mut state = control.lock();
+            if state
+                .retirements
+                .get(&activity.id)
+                .is_some_and(|r| Arc::ptr_eq(r, &owner))
+            {
+                state.retirements.remove(&activity.id)
+            } else {
+                None
+            }
+        };
+        drop(removed);
+        control.changed.notify_waiters();
+    }
+    // Successful completion must not force an otherwise completed generation.
+    safety.0 = None;
+}
+
 /// Candidate listener capabilities. `declared` remains the configuration key;
 /// `actual` records the OS-selected port when the declared port was zero.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,8 +256,13 @@ pub struct HttpStage {
     next: Option<Arc<Generation>>,
     listeners: Option<HashMap<SocketAddr, Arc<ListenerControl>>>,
     addresses: Vec<StagedAddress>,
+    retirement: Arc<RetirementOwner>,
+    overridden: Vec<Arc<RetiringBinding>>,
 }
 impl HttpStage {
+    pub fn retirement(&self) -> HttpRetirement {
+        self.guard.retirement.clone()
+    }
     pub fn managed_names(&self) -> Vec<Vec<String>> {
         self.next
             .as_ref()
@@ -165,6 +275,16 @@ impl HttpStage {
     /// Every fallible preparation and task spawn completed in stage. Neither a
     /// client disconnect nor an async cancellation can interrupt this commit.
     pub fn commit(mut self) -> CommitOutcome {
+        // A destroyed executor also destroys its accept tasks. Publishing a
+        // ready ticket on another executor must not resurrect dead listeners.
+        if self.guard.retirement.is_aborted() {
+            HttpRuntime {
+                inner: self.inner.clone(),
+                control: self.guard.control.clone(),
+            }
+            .force_shutdown();
+            return CommitOutcome::Discarded;
+        }
         let Some(next) = self.next.take() else {
             return CommitOutcome::Discarded;
         };
@@ -182,15 +302,39 @@ impl HttpStage {
             {
                 return CommitOutcome::Discarded;
             }
+            if !self.guard.retirement.reserve_publication() {
+                drop(control);
+                HttpRuntime {
+                    inner: self.inner.clone(),
+                    control: self.guard.control.clone(),
+                }
+                .force_shutdown();
+                return CommitOutcome::Discarded;
+            }
             let previous = self.inner.current.swap(next);
             let old_listeners = std::mem::replace(&mut control.listeners, listeners);
+            control
+                .retirements
+                .insert(previous.id, self.retirement.clone());
+            if !self.retirement.bindings.is_empty() {
+                previous
+                    .activity
+                    .start_delay(previous.activity.policy.shutdown_delay);
+            }
+            self.retirement.group.publish();
+            for binding in &self.overridden {
+                binding.close();
+            }
+            if previous.activity.policy.shutdown_delay.is_zero() {
+                self.retirement.close();
+            }
             control.generation = generation;
             control.pending = None;
             self.guard.armed = false;
             (previous, old_listeners)
         };
         self.guard.control.changed.notify_waiters();
-        previous.drain.cancel();
+        previous.activity.superseded.cancel();
         drop(previous);
         drop(old_listeners);
         CommitOutcome::Published { generation }
@@ -291,6 +435,15 @@ impl HttpRuntime {
                 .generation
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("HTTP generation exhausted"))?;
+            ensure!(
+                control.retirements.len() < 4096,
+                "HTTP retirement capacity exhausted"
+            );
+            control
+                .retirements
+                .try_reserve(1)
+                .map_err(|_| anyhow::anyhow!("HTTP retirement allocation failed"))?;
+            let retirement = HttpRetirement::staged(control.generation, Some(generation));
             let identity = Arc::new(());
             let cancel = CancellationToken::new();
             let guard = PendingGuard {
@@ -298,11 +451,13 @@ impl HttpRuntime {
                 identity: identity.clone(),
                 cancel: cancel.clone(),
                 armed: true,
+                retirement: retirement.clone(),
             };
             control.pending = Some(Pending {
                 identity,
                 cancel,
                 bindings: HashMap::new(),
+                retirement,
             });
             (guard, generation)
         };
@@ -398,17 +553,71 @@ impl HttpRuntime {
                 }
             }
         };
+        let activity = BusinessGeneration::new(generation, config.shutdown_policy());
+        let current = self.inner.current.load_full();
+        let (retirement, retiring, overridden) = {
+            let state = self.control.lock();
+            ensure!(!guard.cancel.is_cancelled(), "HTTP candidate was stopped");
+            let mut retiring = HashMap::new();
+            let mut overridden = Vec::new();
+            for (address, weak) in &current.retiring {
+                if let Some(binding) = weak.upgrade().filter(|r| r.is_accepting()) {
+                    if servers.contains_key(address) {
+                        overridden.push(binding);
+                    } else {
+                        retiring.insert(*address, Arc::downgrade(&binding));
+                    }
+                }
+            }
+            let removed = state
+                .listeners
+                .iter()
+                .filter(|(addr, _)| !servers.contains_key(addr))
+                .collect::<Vec<_>>();
+            let group = retirement::AdmissionGroup::new(
+                guard.retirement.clone(),
+                current.activity.clone(),
+                removed.len(),
+            );
+            let mut bindings = Vec::new();
+            for (address, listener) in removed {
+                let binding = Arc::new(RetiringBinding {
+                    server: current.servers[address].clone(),
+                    activity: current.activity.clone(),
+                    group: group.clone(),
+                    accepting: std::sync::atomic::AtomicBool::new(true),
+                    owner: Mutex::new(Some(listener.clone())),
+                });
+                retiring.insert(*address, Arc::downgrade(&binding));
+                bindings.push(binding);
+            }
+            (
+                Arc::new(RetirementOwner { group, bindings }),
+                retiring,
+                overridden,
+            )
+        };
+        self.inner.tasks.spawn(retire_generation(
+            Arc::downgrade(&self.inner),
+            Arc::downgrade(&self.control),
+            retirement.clone(),
+            RetirementTaskGuard(Some(retirement.clone())),
+        ));
         Ok(HttpStage {
             inner: self.inner.clone(),
             guard,
             next: Some(Arc::new(Generation {
                 id: generation,
+                activity: activity.clone(),
                 servers,
-                drain: CancellationToken::new(),
+                retiring,
+                drain: activity.drain.clone(),
                 managed_names,
             })),
             listeners: Some(listeners),
             addresses,
+            retirement,
+            overridden,
         })
     }
     pub async fn bound_addresses(&self) -> Vec<SocketAddr> {
@@ -422,64 +631,87 @@ impl HttpRuntime {
     /// Normal stop never upgrades itself to force. Pending stage ownership must
     /// resolve first; a deadline leaves StopRequested and old listeners intact.
     pub async fn shutdown(&self, deadline: Duration) -> Result<()> {
-        tokio::time::timeout(deadline, async {
-            loop {
-                let notified = self.control.changed.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                let stopped = {
-                    let mut control = self.control.lock();
-                    if control.phase == Phase::Running {
-                        control.phase = Phase::StopRequested;
-                    }
-                    if control.pending.is_none() || control.phase == Phase::Forced {
-                        if control.phase != Phase::Forced {
-                            control.phase = Phase::Stopped;
-                        }
-                        for slot in control.pool.values() {
-                            slot.cancel.cancel();
-                        }
-                        Some(std::mem::take(&mut control.listeners))
-                    } else {
-                        None
-                    }
-                };
-                if let Some(listeners) = stopped {
-                    for listener in listeners.values() {
-                        listener.cancel.cancel();
-                    }
-                    self.stop_connections();
-                    break;
-                }
-                notified.await;
-            }
-            self.inner.tasks.wait().await;
-            self.inner.upgrades.wait().await;
-            self.inner.resources.wait().await;
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("HTTP shutdown deadline elapsed with pending work"))?;
+        self.shutdown_wait(Some(deadline)).await
+    }
+    /// Stop accepts and join owned work. None has no wait deadline. A deadline
+    /// only bounds this caller's wait; it never silently forces active streams.
+    /// Configured positive grace and delayed retirement are separate policy.
+    pub async fn shutdown_wait(&self, deadline: Option<Duration>) -> Result<()> {
+        match deadline {
+            Some(deadline) => tokio::time::timeout(deadline, self.drain_owned_work())
+                .await
+                .map_err(|_| anyhow::anyhow!("HTTP shutdown deadline elapsed with pending work"))?,
+            None => self.drain_owned_work().await,
+        }
+    }
+    /// Fence new candidates immediately and start an owned stop transition.
+    /// Pending candidates retain their right to publish; the actor then applies
+    /// that final generation's policy. The receipt's from id is the stop fence,
+    /// not a promise that an already reserved candidate cannot still commit.
+    pub fn begin_shutdown(&self) -> Result<HttpRetirement> {
+        let mut state = self.control.lock();
+        if let Some(stop) = &state.stop {
+            return Ok(stop.clone());
+        }
+        let signal = HttpRetirement::staged(state.generation, None);
+        if state.phase == Phase::Forced {
+            signal.complete(RetirementOutcome::Forced);
+            state.stop = Some(signal.clone());
+            return Ok(signal);
+        }
+        state.phase = Phase::StopRequested;
+        state.stop = Some(signal.clone());
+        let inner = self.inner.clone();
+        let control = self.control.clone();
+        let receipt = signal.clone();
+        self.inner.tasks.spawn(async move {
+            stop_runtime(inner, control, receipt).await;
+        });
+        Ok(signal)
+    }
+    async fn drain_owned_work(&self) -> Result<()> {
+        let _ = self.begin_shutdown()?;
+        self.inner.tasks.wait().await;
+        self.inner.upgrades.wait().await;
+        self.inner.resources.wait().await;
         Ok(())
     }
     pub fn force_shutdown(&self) {
-        let (listeners, pending) = {
+        let (listeners, pending, retired, stop) = {
             let mut control = self.control.lock();
             control.phase = Phase::Forced;
             for slot in control.pool.values() {
                 slot.cancel.cancel();
             }
+            let pending = control
+                .pending
+                .as_ref()
+                .map(|p| (p.cancel.clone(), p.retirement.clone()));
+            let retired = std::mem::take(&mut control.retirements);
             (
                 std::mem::take(&mut control.listeners),
-                control.pending.as_ref().map(|p| p.cancel.clone()),
+                pending,
+                retired,
+                control.stop.clone(),
             )
         };
-        if let Some(cancel) = pending {
+        if let Some((cancel, signal)) = pending {
+            signal.complete(RetirementOutcome::Forced);
             cancel.cancel();
+        }
+        if let Some(stop) = stop {
+            stop.complete(RetirementOutcome::Forced);
+        }
+        for retirement in retired.values() {
+            retirement.group.signal.complete(RetirementOutcome::Forced);
+            retirement.close();
+            retirement.group.activity.force();
         }
         for listener in listeners.values() {
             listener.cancel.cancel();
         }
         self.stop_connections();
+        self.inner.current.load().activity.force();
         self.control.changed.notify_waiters();
     }
     fn stop_connections(&self) {
@@ -492,6 +724,93 @@ impl HttpRuntime {
         self.inner.upgrades.close();
         self.inner.resources.close();
     }
+}
+
+async fn stop_runtime(inner: Arc<Inner>, lifecycle: Arc<Lifecycle>, signal: HttpRetirement) {
+    // Unlike a caller's timeout, this actor owns the transition to completion.
+    loop {
+        let notified = lifecycle.changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let done = {
+            let state = lifecycle.lock();
+            state.pending.is_none() || state.phase == Phase::Forced
+        };
+        if done {
+            break;
+        }
+        notified.await;
+    }
+    let current = inner.current.load_full();
+    // Earlier generations already own independent delay/grace clocks. Keep
+    // their registry visible to Force and wait their admission concurrently;
+    // neither an empty current app nor its shorter policy truncates them.
+    let previous = {
+        let state = lifecycle.lock();
+        state
+            .retirements
+            .values()
+            .map(|owner| owner.group.signal.clone())
+            .collect::<Vec<_>>()
+    };
+    if !current.servers.is_empty() {
+        current
+            .activity
+            .start_delay(current.activity.policy.shutdown_delay);
+    }
+    signal.published();
+    tokio::select! {biased;
+        _=inner.stopped.cancelled()=>{},
+        _=current.activity.wait_delay()=>{},
+    }
+    current.activity.close_admission();
+    current.drain.cancel();
+    let listeners = {
+        let mut state = lifecycle.lock();
+        std::mem::take(&mut state.listeners)
+    };
+    // Dropping this generation's owner cannot close a socket still held by an
+    // older retirement, a pending proof exchange or another legitimate lease.
+    drop(listeners);
+    let finish_admission = async {
+        let _ =
+            futures_util::future::join_all(previous.iter().map(HttpRetirement::acceptance_closed))
+                .await;
+        let forced = {
+            let mut state = lifecycle.lock();
+            let forced = state.phase == Phase::Forced;
+            if !forced {
+                state.phase = Phase::Stopped;
+            }
+            for slot in state.pool.values() {
+                slot.cancel.cancel();
+            }
+            forced
+        };
+        inner.stopped.cancel();
+        inner.tasks.close();
+        inner.upgrades.close();
+        inner.resources.close();
+        signal.complete(if forced {
+            RetirementOutcome::Forced
+        } else {
+            RetirementOutcome::AcceptanceClosed
+        });
+        lifecycle.changed.notify_waiters();
+    };
+    let drain_current = async {
+        let activity = &current.activity;
+        if let Some(grace) = activity.policy.grace_period {
+            tokio::select! {biased;
+                _=activity.hard_stop.cancelled()=>{},
+                _=activity.wait_idle()=>{},
+                _=tokio::time::sleep(grace)=>activity.force(),
+            }
+        } else {
+            activity.wait_idle().await;
+        }
+    };
+    tokio::join!(finish_admission, drain_current);
 }
 
 type Launch = (
@@ -738,7 +1057,10 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
                 );
                 let outcome = {
                     let mut state = control.lock();
-                    ensure!(state.phase == Phase::Running, "HTTP runtime is stopping");
+                    ensure!(
+                        matches!(state.phase, Phase::Running | Phase::StopRequested),
+                        "HTTP runtime is stopping"
+                    );
                     ensure!(
                         state.leases.len() < 4096,
                         "challenge listener lease capacity exceeded"
@@ -754,9 +1076,9 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
                         // the same short lock as stage registration and commit.
                         for (address, kind) in &bindings {
                             let key = pool_key(&state, *address, true).unwrap_or(*address);
-                            if let Some(server) = current.servers.get(&key) {
+                            if let Some((server, _)) = current.business(&key) {
                                 ensure!(
-                                    ListenerKind::of(server) == *kind,
+                                    ListenerKind::of(&server) == *kind,
                                     "challenge protocol conflicts with published listener"
                                 );
                             }
