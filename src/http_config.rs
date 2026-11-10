@@ -608,10 +608,18 @@ fn parse_matcher_sets(value: Option<&Value>, depth: usize) -> Result<Vec<Matcher
                 }
                 "file" => {
                     let m = object(v, "file matcher")?;
-                    deny_unknown(m, &["root", "try_files", "try_policy"], "file matcher")?;
+                    deny_unknown(
+                        m,
+                        &["root", "try_files", "try_policy", "split_path"],
+                        "file matcher",
+                    )?;
+                    let policy = m
+                        .get("try_policy")
+                        .map(|v| string(v, "try_policy"))
+                        .transpose()?
+                        .unwrap_or_default();
                     ensure!(
-                        m.get("try_policy")
-                            .is_none_or(|v| v.as_str() == Some("first_exist")),
+                        matches!(policy.as_str(), "" | "first_exist" | "first_exist_fallback"),
                         "unsupported file try policy"
                     );
                     Matcher::File {
@@ -621,6 +629,12 @@ fn parse_matcher_sets(value: Option<&Value>, depth: usize) -> Result<Vec<Matcher
                             .map(|v| strings(v, "try_files"))
                             .transpose()?
                             .unwrap_or_else(|| vec!["{http.request.uri.path}".into()]),
+                        split_path: m
+                            .get("split_path")
+                            .map(|v| strings(v, "file split_path"))
+                            .transpose()?
+                            .unwrap_or_default(),
+                        fallback: policy == "first_exist_fallback",
                     }
                 }
                 _ => return Err(unsupported("/apps/http/servers/*/routes/*/match/module")),
@@ -974,6 +988,11 @@ fn parse_header_ops(value: &Value, path: &str, response: bool) -> Result<HeaderO
     })
 }
 fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyConfig> {
+    let transport = m.get("transport").map(|v| object(v, path)).transpose()?;
+    let is_fastcgi = transport
+        .and_then(|t| t.get("protocol"))
+        .and_then(Value::as_str)
+        == Some("fastcgi");
     deny_unknown(
         m,
         &[
@@ -983,6 +1002,7 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
             "headers",
             "flush_interval",
             "stream_close_delay",
+            "request_buffers",
         ],
         path,
     )?;
@@ -995,15 +1015,108 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
         deny_unknown(u, &["dial"], path)?;
         let dial = string(required(u, "dial")?, path)?;
         ensure!(
-            !dial.contains(['\r', '\n', '/']) && !dial.starts_with("unix"),
+            !dial.contains(['\r', '\n', '\0'])
+                && (is_fastcgi || !dial.contains('/') && !dial.starts_with("unix")),
             "unsupported upstream dial address"
         );
+        if is_fastcgi && let Some((network, address)) = dial.split_once('/') {
+            ensure!(
+                matches!(network, "tcp" | "tcp4" | "tcp6" | "unix") && !address.is_empty(),
+                "unsupported FastCGI network address"
+            );
+        }
         upstreams.push(dial);
     }
     ensure!(
         !upstreams.is_empty() && upstreams.len() <= 4096,
         "upstream count invalid"
     );
+    let fastcgi = if is_fastcgi {
+        let t = transport.expect("FastCGI protocol requires a transport object");
+        deny_unknown(
+            t,
+            &[
+                "protocol",
+                "root",
+                "split_path",
+                "resolve_root_symlink",
+                "env",
+                "dial_timeout",
+                "read_timeout",
+                "write_timeout",
+                "capture_stderr",
+            ],
+            path,
+        )?;
+        let split_path = t
+            .get("split_path")
+            .map(|v| strings(v, path))
+            .transpose()?
+            .unwrap_or_default();
+        ensure!(
+            split_path.iter().all(|pattern| pattern.is_ascii()),
+            "FastCGI split path must be ASCII"
+        );
+        let mut env = std::collections::BTreeMap::new();
+        let mut env_size = 0usize;
+        if let Some(value) = t.get("env") {
+            for (key, value) in object(value, path)? {
+                ensure!(
+                    !key.is_empty() && !key.contains('\0'),
+                    "invalid FastCGI environment key"
+                );
+                let value = string(value, path)?;
+                env_size = env_size
+                    .saturating_add(key.len())
+                    .saturating_add(value.len());
+                ensure!(
+                    env_size <= 1024 * 1024 && env.len() < 4096,
+                    "FastCGI environment budget exceeded"
+                );
+                env.insert(key.clone(), value);
+            }
+        }
+        let request_buffer = m
+            .get("request_buffers")
+            .filter(|v| !v.is_null())
+            .map(|v| {
+                v.as_i64()
+                    .ok_or_else(|| anyhow::anyhow!("invalid FastCGI request_buffers"))
+            })
+            .transpose()?
+            .unwrap_or(0);
+        ensure!(
+            cfg!(unix),
+            "FastCGI transport has not been validated on this platform"
+        );
+        ensure!(request_buffer >= -1, "invalid FastCGI request_buffers");
+        ensure!(
+            !boolean(t.get("capture_stderr"), false, path)?,
+            "FastCGI capture_stderr requires the logging runtime"
+        );
+        Some(FastCgiConfig {
+            root: t
+                .get("root")
+                .map(|v| string(v, path))
+                .transpose()?
+                .filter(|s| !s.is_empty()),
+            split_path,
+            resolve_root_symlink: boolean(t.get("resolve_root_symlink"), false, path)?,
+            env,
+            request_buffer: match request_buffer {
+                -1 => None,
+                0 => Some(4096),
+                size => Some(size as u64),
+            },
+            explicit_request_buffer: request_buffer != 0,
+        })
+    } else {
+        ensure!(
+            !m.contains_key("request_buffers"),
+            "unsupported HTTP request_buffers"
+        );
+        None
+    };
     let mut tls = None;
     let mut http2_only = false;
     let mut enable_http2 = true;
@@ -1012,87 +1125,89 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
     let mut response_header_timeout = None;
     let mut read_timeout = None;
     let mut write_timeout = None;
-    if let Some(t) = m.get("transport") {
-        let t = object(t, path)?;
-        deny_unknown(
-            t,
-            &[
-                "protocol",
-                "tls",
-                "versions",
-                "compression",
-                "dial_timeout",
-                "response_header_timeout",
-                "read_timeout",
-                "write_timeout",
-            ],
-            path,
-        )?;
-        if let Some(protocol) = t.get("protocol") {
-            ensure!(
-                string(protocol, path)? == "http",
-                "unsupported reverse proxy transport"
-            );
-        }
-        if let Some(v) = t.get("tls") {
-            let t = object(v, path)?;
+    if let Some(t) = transport {
+        if !is_fastcgi {
             deny_unknown(
                 t,
                 &[
-                    "server_name",
-                    "insecure_skip_verify",
-                    "root_ca_pem_files",
-                    "root_ca_pool",
-                    "client_certificate_file",
-                    "client_certificate_key_file",
-                    "handshake_timeout",
+                    "protocol",
+                    "tls",
+                    "versions",
+                    "compression",
+                    "dial_timeout",
+                    "response_header_timeout",
+                    "read_timeout",
+                    "write_timeout",
                 ],
                 path,
             )?;
-            tls = Some(ProxyTls {
-                server_name: t.get("server_name").map(|v| string(v, path)).transpose()?,
-                insecure_skip_verify: boolean(t.get("insecure_skip_verify"), false, path)?,
-                root_ca_pool: t
-                    .get("root_ca_pool")
-                    .map(|v| strings(v, path))
-                    .transpose()?
-                    .unwrap_or_default(),
-                client_certificate_file: t
-                    .get("client_certificate_file")
-                    .map(|v| string(v, path))
-                    .transpose()?
-                    .filter(|v| !v.is_empty()),
-                client_certificate_key_file: t
-                    .get("client_certificate_key_file")
-                    .map(|v| string(v, path))
-                    .transpose()?
-                    .filter(|v| !v.is_empty()),
-                handshake_timeout: t
-                    .get("handshake_timeout")
-                    .map(|v| duration(v, path))
-                    .transpose()?
-                    .filter(|d| !d.is_zero()),
-                root_ca_pem_files: t
-                    .get("root_ca_pem_files")
-                    .map(|v| strings(v, path))
-                    .transpose()?
-                    .unwrap_or_default(),
-            });
+            if let Some(protocol) = t.get("protocol") {
+                ensure!(
+                    string(protocol, path)? == "http",
+                    "unsupported reverse proxy transport"
+                );
+            }
+            if let Some(v) = t.get("tls") {
+                let t = object(v, path)?;
+                deny_unknown(
+                    t,
+                    &[
+                        "server_name",
+                        "insecure_skip_verify",
+                        "root_ca_pem_files",
+                        "root_ca_pool",
+                        "client_certificate_file",
+                        "client_certificate_key_file",
+                        "handshake_timeout",
+                    ],
+                    path,
+                )?;
+                tls = Some(ProxyTls {
+                    server_name: t.get("server_name").map(|v| string(v, path)).transpose()?,
+                    insecure_skip_verify: boolean(t.get("insecure_skip_verify"), false, path)?,
+                    root_ca_pool: t
+                        .get("root_ca_pool")
+                        .map(|v| strings(v, path))
+                        .transpose()?
+                        .unwrap_or_default(),
+                    client_certificate_file: t
+                        .get("client_certificate_file")
+                        .map(|v| string(v, path))
+                        .transpose()?
+                        .filter(|v| !v.is_empty()),
+                    client_certificate_key_file: t
+                        .get("client_certificate_key_file")
+                        .map(|v| string(v, path))
+                        .transpose()?
+                        .filter(|v| !v.is_empty()),
+                    handshake_timeout: t
+                        .get("handshake_timeout")
+                        .map(|v| duration(v, path))
+                        .transpose()?
+                        .filter(|d| !d.is_zero()),
+                    root_ca_pem_files: t
+                        .get("root_ca_pem_files")
+                        .map(|v| strings(v, path))
+                        .transpose()?
+                        .unwrap_or_default(),
+                });
+            }
+            if let Some(v) = t.get("versions") {
+                let versions = strings(v, path)?;
+                ensure!(
+                    versions
+                        .iter()
+                        .all(|v| matches!(v.as_str(), "1.1" | "2" | "h2c")),
+                    "unsupported upstream HTTP version"
+                );
+                // Caddy's TLS transport still permits HTTP/1 fallback. Its h2c
+                // switch affects plaintext requests only, even for ["h2c"].
+                enable_http2 =
+                    versions.is_empty() || versions.iter().any(|v| v == "2" || v == "h2c");
+                http2_only = tls.is_none() && versions.iter().any(|v| v == "h2c");
+            }
         }
-        if let Some(v) = t.get("versions") {
-            let versions = strings(v, path)?;
-            ensure!(
-                versions
-                    .iter()
-                    .all(|v| matches!(v.as_str(), "1.1" | "2" | "h2c")),
-                "unsupported upstream HTTP version"
-            );
-            // Caddy's TLS transport still permits HTTP/1 fallback. Its h2c
-            // switch affects plaintext requests only, even for ["h2c"].
-            enable_http2 = versions.is_empty() || versions.iter().any(|v| v == "2" || v == "h2c");
-            http2_only = tls.is_none() && versions.iter().any(|v| v == "h2c");
-        }
-        compression = boolean(t.get("compression"), true, path)?;
+        compression = !is_fastcgi && boolean(t.get("compression"), true, path)?;
         if let Some(v) = t.get("dial_timeout") {
             dial_timeout = duration(v, path)?;
             if dial_timeout.is_zero() {
@@ -1140,6 +1255,7 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
     }
     Ok(ProxyConfig {
         upstreams,
+        fastcgi,
         tls,
         http2_only,
         enable_http2,

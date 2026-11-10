@@ -19,6 +19,9 @@ mod connection_identity;
 mod connection_sessions;
 #[path = "http_runtime/files.rs"]
 mod files;
+
+#[path = "http_runtime/fastcgi/mod.rs"]
+mod fastcgi;
 #[path = "http_runtime/tls_executor.rs"]
 mod tls_executor;
 pub use tls_executor::TlsHandshakeDiagnostics;
@@ -836,12 +839,14 @@ async fn accept_loop(
                         },
                     };
                     let negotiated_h2 = accepted.stream.get_ref().1.alpn_protocol() == Some(b"h2");
+                    let tls_details = fastcgi::TlsDetails::of(accepted.stream.get_ref().1);
+
                     serve_connection(task_inner, TokioIo::new(accepted.stream), peer, local, ConnectionView {
                         key, server: accepted.server, admission,
-                        negotiated_tls_h2: Some(negotiated_h2), identity: Some(accepted.identity),
+                        negotiated_tls_h2: Some(negotiated_h2), identity: Some(accepted.identity), tls_details: Some(tls_details),
                     }).await;
                 } else {
-                    serve_connection(task_inner, TokioIo::new(stream), peer, local, ConnectionView { key, server, admission, negotiated_tls_h2: None, identity: None }).await;
+                    serve_connection(task_inner, TokioIo::new(stream), peer, local, ConnectionView { key, server, admission, negotiated_tls_h2: None, identity: None, tls_details: None }).await;
                 }
             });
         } else {
@@ -908,6 +913,7 @@ struct ConnectionView {
     key: SocketAddr,
     server: Arc<ActiveServer>,
     negotiated_tls_h2: Option<bool>,
+    tls_details: Option<fastcgi::TlsDetails>,
     identity: Option<Arc<TlsIdentity>>,
 }
 async fn serve_connection<I>(
@@ -923,6 +929,7 @@ async fn serve_connection<I>(
         key,
         server,
         negotiated_tls_h2,
+        tls_details,
         identity,
         admission,
     } = view;
@@ -1034,6 +1041,9 @@ async fn serve_connection<I>(
                     return Ok(response);
                 }
             };
+            if let Some(details) = tls_details {
+                request.extensions_mut().insert(details);
+            }
             let fault = metadata.fault.clone();
             if !metadata.is_empty() {
                 request.extensions_mut().insert(metadata);

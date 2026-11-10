@@ -18,6 +18,7 @@ struct LazyMap {
 }
 pub(super) struct Context {
     pub request: Option<Request<Body>>,
+    pub fastcgi_body_claimed: bool,
     pub resources: Arc<super::resource_budget::Resources>,
     pub peer: SocketAddr,
     pub local: SocketAddr,
@@ -114,6 +115,12 @@ impl Context {
             "http.request.orig_uri.query" => {
                 self.original_uri.query().unwrap_or_default().to_owned()
             }
+            "http.request.orig_uri.prefixed_query" => self
+                .original_uri
+                .query()
+                .filter(|query| !query.is_empty())
+                .map(|query| format!("?{query}"))
+                .unwrap_or_default(),
             "http.request.proto" => match req?.version() {
                 Version::HTTP_2 => "HTTP/2.0",
                 Version::HTTP_10 => "HTTP/1.0",
@@ -260,6 +267,7 @@ pub(super) async fn handle_business(
     let body = IdleBody::new(body, server.plan.read_idle_timeout).boxed_unsync();
     let mut ctx = Context {
         request: Some(Request::from_parts(parts, body)),
+        fastcgi_body_claimed: false,
         resources: inner.resources.clone(),
         peer,
         local,
@@ -936,52 +944,96 @@ fn matches<'a>(
                 "http/1.0" => ctx.req().version() == Version::HTTP_10,
                 _ => ctx.req().version() == Version::HTTP_11,
             },
-            Matcher::File { root, try_files } => {
+            Matcher::File {
+                root,
+                try_files,
+                split_path,
+                fallback,
+            } => {
                 let base = ctx.expand(root.as_deref().unwrap_or("{http.vars.root}"))?;
                 let mut found = false;
-                for candidate in try_files {
-                    let candidate = ctx.expand(candidate)?;
-                    let path = safe_join(Path::new(&base), &candidate)?;
-                    let lookup_path = path.clone();
-                    let lookup = ctx
-                        .resources
-                        .metadata
-                        .run(move || std::fs::metadata(lookup_path))
-                        .await
-                        .map_err(|error| budget_failure(ctx, error))?;
-                    if let Err(error) = &lookup
-                        && descriptor_exhausted(error)
+                for (index, pattern) in try_files.iter().enumerate() {
+                    if let Some(status) = pattern
+                        .strip_prefix('=')
+                        .and_then(|s| s.parse::<u16>().ok())
+                        && let Ok(status) = StatusCode::from_u16(status)
                     {
-                        return Err(file_io_failure(ctx, error));
+                        return Err(failure(status));
                     }
-                    if let Ok(metadata) = lookup {
-                        if metadata.is_dir() != candidate.ends_with('/') {
+                    let candidate = ctx.expand(pattern)?;
+                    let candidate = clean_path(&candidate, true);
+                    let (relative, remainder) =
+                        file_split(candidate.trim_end_matches('/'), split_path);
+                    let mut relative = if relative.starts_with('/') {
+                        relative.to_owned()
+                    } else {
+                        format!("/{relative}")
+                    };
+                    let directory = pattern.ends_with('/');
+                    if directory && !relative.ends_with('/') {
+                        relative.push('/');
+                    }
+                    let path = safe_join(Path::new(&base), &relative)?;
+                    let fallback = *fallback && index + 1 == try_files.len();
+                    if !fallback {
+                        let lookup_path = path.clone();
+                        let lookup = ctx
+                            .resources
+                            .metadata
+                            .run(move || std::fs::metadata(lookup_path))
+                            .await
+                            .map_err(|error| budget_failure(ctx, error))?;
+                        if let Err(error) = &lookup
+                            && descriptor_exhausted(error)
+                        {
+                            return Err(file_io_failure(ctx, error));
+                        }
+                        if !lookup.is_ok_and(|metadata| metadata.is_dir() == directory) {
                             continue;
                         }
-                        ctx.values
-                            .insert("http.matchers.file.relative".into(), candidate);
-                        ctx.values.insert(
-                            "http.matchers.file.absolute".into(),
-                            path.to_string_lossy().into_owned(),
-                        );
-                        ctx.values.insert(
-                            "http.matchers.file.type".into(),
-                            if metadata.is_dir() {
-                                "directory"
-                            } else {
-                                "file"
-                            }
-                            .into(),
-                        );
-                        found = true;
-                        break;
                     }
+                    ctx.values
+                        .insert("http.matchers.file.relative".into(), relative);
+                    ctx.values.insert(
+                        "http.matchers.file.absolute".into(),
+                        path.to_string_lossy().into_owned(),
+                    );
+                    ctx.values
+                        .insert("http.matchers.file.remainder".into(), remainder.to_owned());
+                    ctx.values.insert(
+                        "http.matchers.file.type".into(),
+                        if directory && !fallback {
+                            "directory"
+                        } else {
+                            "file"
+                        }
+                        .into(),
+                    );
+                    found = true;
+                    break;
                 }
                 found
             }
         })
     })
 }
+fn file_split<'a>(path: &'a str, extensions: &[String]) -> (&'a str, &'a str) {
+    for extension in extensions.iter().filter(|value| !value.is_empty()) {
+        let Some(at) = path
+            .as_bytes()
+            .windows(extension.len())
+            .position(|value| value.eq_ignore_ascii_case(extension.as_bytes()))
+        else {
+            continue;
+        };
+        let end = at + extension.len();
+        if end < path.len() && path.as_bytes()[end] == b'/' {
+            return path.split_at(end);
+        }
+    }
+    (path, "")
+}
+
 pub(super) fn apply_headers(
     headers: &mut HeaderMap,
     operations: &HeaderOps,

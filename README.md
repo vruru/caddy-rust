@@ -419,3 +419,13 @@ can remain usable across a reload without another permission lookup. Storage
 imports, renewal and eviction remain fenced to their owning generation.
 Original cache capacity, unusual permission request targets, and full
 production automatic-HTTPS acceptance remain separate gates.
+
+Native FastCGI supports dedicated TCP and Unix socket exchanges, request
+streaming, and the standard PHP front-controller route. Large configured
+request buffers can use anonymous temporary files under separate memory,
+file and disk budgets. Per-target socket admission leaves capacity for
+unrelated upstreams. An interrupted upstream response is not reported as
+complete; conflicting Content-Length fields are rejected. An already
+consumed request is not replayed as an empty request through error routes.
+Capture of upstream stderr still requires the logging integration, and
+general proxy retry, response buffering and HTTP/3 remain separate gates.

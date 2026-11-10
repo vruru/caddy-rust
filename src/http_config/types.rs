@@ -25,6 +25,8 @@ pub(crate) enum Matcher {
     File {
         root: Option<String>,
         try_files: Vec<String>,
+        split_path: Vec<String>,
+        fallback: bool,
     },
 }
 
@@ -96,6 +98,7 @@ pub(crate) struct Account {
 #[derive(Clone)]
 pub(crate) struct ProxyConfig {
     pub(crate) upstreams: Vec<String>,
+    pub(crate) fastcgi: Option<FastCgiConfig>,
     pub(crate) tls: Option<ProxyTls>,
     pub(crate) http2_only: bool,
     pub(crate) enable_http2: bool,
@@ -119,4 +122,14 @@ pub(crate) struct ProxyTls {
     pub(crate) client_certificate_file: Option<String>,
     pub(crate) client_certificate_key_file: Option<String>,
     pub(crate) handshake_timeout: Option<std::time::Duration>,
+}
+
+#[derive(Clone)]
+pub(crate) struct FastCgiConfig {
+    pub(crate) root: Option<String>,
+    pub(crate) split_path: Vec<String>,
+    pub(crate) resolve_root_symlink: bool,
+    pub(crate) env: std::collections::BTreeMap<String, String>,
+    pub(crate) request_buffer: Option<u64>,
+    pub(crate) explicit_request_buffer: bool,
 }

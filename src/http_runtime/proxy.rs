@@ -96,6 +96,9 @@ pub(super) fn prepare_clients(
                 }
                 Handler::ReverseProxy(config) => {
                     let config = config.as_ref();
+                    if config.fastcgi.is_some() {
+                        continue;
+                    }
                     let connector = PreparedTransport::prepare(config)?;
                     let http1_connector = connector.http1();
                     output.insert(
@@ -124,13 +127,13 @@ pub(super) async fn serve(
     inner: &Arc<Inner>,
 ) -> Result<Response<Body>> {
     ensure!(
+        !ctx.fastcgi_body_claimed,
+        "FastCGI request body cannot be replayed"
+    );
+    ensure!(
         config.flush_interval <= 0,
         "positive proxy flush intervals are not implemented"
     );
-    let state = server
-        .clients
-        .get(&(config as *const ProxyConfig as usize))
-        .ok_or_else(|| anyhow::anyhow!("proxy transport not provisioned"))?;
     let trailer_metadata = ctx
         .req()
         .extensions()
@@ -154,6 +157,13 @@ pub(super) async fn serve(
         .map_err(|_| anyhow::anyhow!("upstream selection entropy unavailable"))?;
     let index = (u64::from_le_bytes(random) % config.upstreams.len() as u64) as usize;
     let dial = ctx.expand(&config.upstreams[index])?;
+    if let Some(transport) = &config.fastcgi {
+        return super::fastcgi::serve(ctx, config, transport, dial).await;
+    }
+    let state = server
+        .clients
+        .get(&(config as *const ProxyConfig as usize))
+        .ok_or_else(|| anyhow::anyhow!("proxy transport not provisioned"))?;
     let scheme = if config.tls.is_some() {
         "https"
     } else {
@@ -234,53 +244,7 @@ pub(super) async fn serve(
     } else {
         None
     };
-    let mut headers = ctx.req().headers().clone();
-    let original_host = ctx.authority.clone();
-    let old_xff = if ctx.trusted {
-        headers
-            .get_all("x-forwarded-for")
-            .iter()
-            .filter_map(|h| h.to_str().ok())
-            .collect::<Vec<_>>()
-            .join(", ")
-    } else {
-        String::new()
-    };
-    let forwarded_host = if ctx.trusted {
-        headers.get("x-forwarded-host").cloned()
-    } else {
-        None
-    };
-    let forwarded_proto = if ctx.trusted {
-        headers.get("x-forwarded-proto").cloned()
-    } else {
-        None
-    };
-    remove_hop_headers(&mut headers, is_upgrade, true);
-    headers.insert(
-        "x-forwarded-for",
-        HeaderValue::from_str(&if old_xff.is_empty() {
-            ctx.peer.ip().to_string()
-        } else {
-            format!("{old_xff}, {}", ctx.peer.ip())
-        })?,
-    );
-    headers.insert(
-        "x-forwarded-host",
-        forwarded_host.unwrap_or(HeaderValue::from_str(&original_host)?),
-    );
-    headers.insert(
-        "x-forwarded-proto",
-        forwarded_proto.unwrap_or(HeaderValue::from_static(if ctx.tls {
-            "https"
-        } else {
-            "http"
-        })),
-    );
-    if !headers.contains_key(http::header::HOST) {
-        headers.insert(http::header::HOST, HeaderValue::from_str(&original_host)?);
-    }
-    apply_headers(&mut headers, &config.request_headers, ctx)?;
+    let mut headers = proxy_headers(ctx, config, ctx.req().headers().clone(), is_upgrade, false)?;
     trailer_metadata.write_upstream_declaration(&mut headers);
     // Go's empty UA is a sentinel that suppresses serialization. Hyper has
     // no automatic default UA, so absence is the equivalent wire behavior.
@@ -440,6 +404,74 @@ pub(super) async fn serve(
         super::trailer_policy::policy(body, false)
     }))
 }
+pub(super) fn proxy_headers(
+    ctx: &Context,
+    config: &ProxyConfig,
+    mut headers: HeaderMap,
+    is_upgrade: bool,
+    fastcgi: bool,
+) -> Result<HeaderMap> {
+    let original_host = ctx.authority.clone();
+    let old_xff = if ctx.trusted {
+        headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|h| h.to_str().ok())
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        String::new()
+    };
+    let forwarded_host = if ctx.trusted {
+        headers.get("x-forwarded-host").cloned()
+    } else {
+        None
+    };
+    let forwarded_proto = if ctx.trusted {
+        headers.get("x-forwarded-proto").cloned()
+    } else {
+        None
+    };
+    remove_hop_headers(&mut headers, is_upgrade, true);
+    headers.insert(
+        "x-forwarded-for",
+        HeaderValue::from_str(&if old_xff.is_empty() {
+            ctx.peer.ip().to_string()
+        } else {
+            format!("{old_xff}, {}", ctx.peer.ip())
+        })?,
+    );
+    headers.insert(
+        "x-forwarded-host",
+        forwarded_host.unwrap_or(HeaderValue::from_str(&original_host)?),
+    );
+    headers.insert(
+        "x-forwarded-proto",
+        forwarded_proto.unwrap_or(HeaderValue::from_static(if ctx.tls {
+            "https"
+        } else {
+            "http"
+        })),
+    );
+    if !headers.contains_key(http::header::HOST) {
+        headers.insert(http::header::HOST, HeaderValue::from_str(&original_host)?);
+    }
+    if fastcgi {
+        let via = match ctx.req().version() {
+            Version::HTTP_10 => "1.0 Caddy",
+            Version::HTTP_2 => "2.0 Caddy",
+            Version::HTTP_3 => "3.0 Caddy",
+            _ => "1.1 Caddy",
+        };
+        headers.append(http::header::VIA, HeaderValue::from_static(via));
+        if !headers.contains_key(http::header::USER_AGENT) {
+            headers.insert(http::header::USER_AGENT, HeaderValue::from_static(""));
+        }
+    }
+    apply_headers(&mut headers, &config.request_headers, ctx)?;
+    Ok(headers)
+}
+
 fn header_has_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool {
     headers
         .get_all(name)
@@ -447,7 +479,7 @@ fn header_has_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool 
         .filter_map(|h| h.to_str().ok())
         .any(|v| v.split(',').any(|v| v.trim().eq_ignore_ascii_case(token)))
 }
-fn remove_hop_headers(headers: &mut HeaderMap, upgrade: bool, preserve_te: bool) {
+pub(super) fn remove_hop_headers(headers: &mut HeaderMap, upgrade: bool, preserve_te: bool) {
     let connection = headers
         .get_all(http::header::CONNECTION)
         .iter()

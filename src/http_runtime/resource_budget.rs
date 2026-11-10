@@ -83,7 +83,6 @@ pub(crate) fn file_body_limit(cpu: usize, soft: Option<usize>) -> usize {
     soft.map_or(base, |n| base.min((n / 8).max(1)))
 }
 
-
 #[derive(Clone)]
 pub(crate) struct BlockingBudget {
     running: Arc<Semaphore>,
@@ -215,6 +214,12 @@ pub(crate) struct Resources {
     pub metadata: BlockingBudget,
     pub streams: BlockingBudget,
     pub reads: BlockingBudget,
+    pub fastcgi: BlockingBudget,
+    pub(super) fastcgi_admission: super::fastcgi::admission::Admission,
+    pub fastcgi_dns: BlockingBudget,
+    pub fastcgi_spool_io: BlockingBudget,
+    pub fastcgi_spool_fds: BlockingBudget,
+    pub fastcgi_spool_bytes: Arc<Semaphore>,
     pub read_timeout: Duration,
 }
 
@@ -271,6 +276,18 @@ impl Resources {
             limits.file_read_waiting,
             limits.io_queue_timeout.unwrap_or(Duration::ZERO),
         )?;
+        let cpu = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let capacity = cpu
+            .saturating_mul(8)
+            .clamp(16, 128)
+            .min(descriptor_limit().map_or(128, |limit| (limit / 16).max(1)));
+        let fastcgi =
+            BlockingBudget::new(capacity, (capacity * 4).max(16), Duration::from_secs(2))?;
+        let fastcgi_dns = BlockingBudget::new(cpu.clamp(2, 16), 64, Duration::from_secs(2))?;
+        let fastcgi_spool_io =
+            BlockingBudget::new(cpu.clamp(2, 16), capacity, Duration::from_secs(2))?;
+        let fastcgi_spool_fds = BlockingBudget::new(capacity, capacity, Duration::from_secs(2))?;
+        let fastcgi_spool_bytes = Arc::new(Semaphore::new(8192));
         let auth_leader_limit = limits
             .auth_running
             .saturating_add(limits.auth_waiting)
@@ -287,6 +304,12 @@ impl Resources {
             auth_tasks: TaskTracker::new(),
             auth_leader_limit,
             auth_follower_limit: limits.auth_followers,
+            fastcgi,
+            fastcgi_admission: super::fastcgi::admission::Admission::new(capacity),
+            fastcgi_dns,
+            fastcgi_spool_io,
+            fastcgi_spool_fds,
+            fastcgi_spool_bytes,
             read_timeout: limits.file_read_timeout.unwrap_or(Duration::ZERO),
         })
     }
@@ -296,6 +319,9 @@ impl Resources {
         self.metadata.tasks.close();
         self.streams.tasks.close();
         self.reads.tasks.close();
+        self.fastcgi.tasks.close();
+        self.fastcgi_dns.tasks.close();
+        self.fastcgi_spool_io.tasks.close();
     }
     pub(crate) async fn wait(&self) {
         // Parents complete before children: a cache leader may still submit a
@@ -305,6 +331,9 @@ impl Resources {
         self.metadata.tasks.wait().await;
         self.streams.tasks.wait().await;
         self.reads.tasks.wait().await;
+        self.fastcgi.tasks.wait().await;
+        self.fastcgi_dns.tasks.wait().await;
+        self.fastcgi_spool_io.tasks.wait().await;
     }
     pub(crate) fn snapshot(&self) -> ResourceDiagnostics {
         ResourceDiagnostics {
