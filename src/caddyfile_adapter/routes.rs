@@ -61,14 +61,31 @@ pub(super) struct RouteValue {
     pub directive: String,
     pub value: RouteKind,
 }
+pub(super) const ERROR_ROUTE_CLASS: &str = "error_route";
+/// A distinct pointer-valued Go ConfigValue, intentionally not an HTTP route.
+#[derive(Clone)]
+pub(super) struct ErrorRoute {
+    pub route: Route,
+    pub file: String,
+    pub line: usize,
+}
+impl ErrorRoute {
+    pub(super) fn matched(&self) -> bool {
+        !self.route.matchers.is_empty()
+    }
+}
 #[derive(Clone)]
 pub(super) enum RouteKind {
     Route(Route),
+    ErrorRoute(ErrorRoute),
+    Binding { file: String, line: usize },
+    Tls { file: String, line: usize },
 }
 impl RouteValue {
     pub(super) fn route(&self) -> Option<&Route> {
         match &self.value {
             RouteKind::Route(r) => Some(r),
+            RouteKind::ErrorRoute(_) | RouteKind::Binding { .. } | RouteKind::Tls { .. } => None,
         }
     }
 }

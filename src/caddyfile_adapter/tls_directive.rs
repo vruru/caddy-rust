@@ -30,6 +30,27 @@ pub(super) struct TlsDirective {
     pub renewal_window_ratio: f64,
 }
 
+impl TlsDirective {
+    /// Number of ConfigValues emitted by the original parseTLS. Ordered nested
+    /// scopes discard them, but sorting must still see every actual value.
+    pub(super) fn config_value_count(&self) -> anyhow::Result<u64> {
+        let mut count = super::budget::add(1, self.issuers.len() as u64)?;
+        count = super::budget::add(count, self.managers.len() as u64)?;
+        for enabled in [
+            !self.files.is_empty(),
+            !self.folders.is_empty(),
+            !self.key_type.is_empty(),
+            self.on_demand,
+            self.reuse_private_keys,
+            self.renewal_window_ratio > 0.0,
+            self.force_automate,
+        ] {
+            count = super::budget::add(count, u64::from(enabled))?;
+        }
+        Ok(count)
+    }
+}
+
 const SUPPORTED_PROTOCOLS: &[&str] = &["tls1.2", "tls1.3"];
 const SUPPORTED_CURVES: &[&str] = &[
     "x25519mlkem768",

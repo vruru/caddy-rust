@@ -59,9 +59,13 @@ pub(super) fn build(
                     route.group = group.clone();
                 }
             }
+            RouteKind::ErrorRoute(_) | RouteKind::Binding { .. } | RouteKind::Tls { .. } => {}
         }
         match v.value {
             RouteKind::Route(r) => routes.push(r),
+            // Original buildSubroute does not match *Subroute pointer values;
+            // the existing order check above still rejects them by default.
+            RouteKind::ErrorRoute(_) | RouteKind::Binding { .. } | RouteKind::Tls { .. } => {}
         }
     }
     Ok(consolidate(routes))

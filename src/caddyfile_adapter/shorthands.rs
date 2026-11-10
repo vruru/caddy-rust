@@ -201,3 +201,11 @@ pub(super) fn apply(tokens: &mut [Token], budget: &mut Budget) -> Result<()> {
     }
     Ok(())
 }
+
+/// Same ordered simple-placeholder test as WasReplacedPlaceholderShorthand.
+pub(super) fn destination_conflict(token: &str) -> Option<&'static str> {
+    let token = token.trim_matches(['{', '}']);
+    SIMPLE
+        .iter()
+        .find_map(|(short, long)| (token == long.trim_matches(['{', '}'])).then_some(*short))
+}

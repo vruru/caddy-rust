@@ -17,24 +17,36 @@ mod file_finalize;
 mod format;
 #[path = "caddyfile_adapter/global_admin.rs"]
 mod global_admin;
+#[path = "caddyfile_adapter/global_auxiliary.rs"]
+mod global_auxiliary;
 #[path = "caddyfile_adapter/global_atoms.rs"]
 mod global_atoms;
+#[path = "caddyfile_adapter/global_metrics.rs"]
+mod global_metrics;
 #[path = "caddyfile_adapter/global_pki.rs"]
 mod global_pki;
 #[path = "caddyfile_adapter/global_tls.rs"]
 mod global_tls;
 #[path = "caddyfile_adapter/globals.rs"]
 mod globals;
+#[path = "caddyfile_adapter/handler_auth_trace.rs"]
+mod handler_auth_trace;
 #[path = "caddyfile_adapter/handler_atoms.rs"]
 mod handler_atoms;
 #[path = "caddyfile_adapter/handler_encode.rs"]
 mod handler_encode;
+#[path = "caddyfile_adapter/handler_errors_status.rs"]
+mod handler_errors_status;
 #[path = "caddyfile_adapter/handler_files.rs"]
 mod handler_files;
 #[path = "caddyfile_adapter/handler_headers.rs"]
 mod handler_headers;
+#[path = "caddyfile_adapter/handler_invoke.rs"]
+mod handler_invoke;
 #[path = "caddyfile_adapter/handler_limits.rs"]
 mod handler_limits;
+#[path = "caddyfile_adapter/handler_map.rs"]
+mod handler_map;
 #[path = "caddyfile_adapter/handler_misc.rs"]
 mod handler_misc;
 #[path = "caddyfile_adapter/handler_observe.rs"]
@@ -55,8 +67,12 @@ mod matcher_file;
 mod matcher_more;
 #[path = "caddyfile_adapter/matcher_regexp.rs"]
 mod matcher_regexp;
+#[path = "caddyfile_adapter/matcher_urlpattern.rs"]
+mod matcher_urlpattern;
 #[path = "caddyfile_adapter/module_value.rs"]
 mod module_value;
+#[path = "caddyfile_adapter/named_routes.rs"]
+mod named_routes;
 #[path = "caddyfile_adapter/named_matchers.rs"]
 mod named_matchers;
 #[path = "caddyfile_adapter/order.rs"]

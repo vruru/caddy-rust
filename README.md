@@ -245,3 +245,13 @@ in-memory predecessor, and shutdown joins owned work. Uncertain ACME requests
 retain their intent across caller cancellation and storage-lease loss. This
 component still has explicit feature and CPU-offload gaps; it does not enable
 the inspection CLI to serve production traffic.
+
+Caddyfile adaptation now also preserves named-route reachability, error-route
+assembly, URLPattern configuration, authentication/tracing/map directives and
+the implemented storage/metrics options. Nested bind/TLS directives retain the
+original parsing side effects and sorting behavior, including shared manual
+certificate tags. Map matrix expansion is prepaid against the same adaptation
+budget. Adapter JSON equivalence does not establish execution of every emitted
+module: named routes, tracing, URLPattern and remaining server/module options
+still have explicit runtime gates. The remaining proxy/directive families and
+complete runtime behavior continue to block production replacement.

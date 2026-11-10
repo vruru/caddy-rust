@@ -141,7 +141,9 @@ fn matcher(
         return budget.nested(|budget| parse_not(tokens, budget)).map(Some);
     }
     let reservation = super::site::reserve_helper(tokens, budget)?;
-    let value = if let Some(v) = super::matcher_atoms::parse(name, tokens)? {
+    let value = if name == "url_pattern" {
+        Some(super::matcher_urlpattern::parse(tokens)?)
+    } else if let Some(v) = super::matcher_atoms::parse(name, tokens)? {
         Some(v)
     } else if let Some(v) = super::matcher_more::parse(
         name,

@@ -4,9 +4,11 @@ use super::{
     budget::{Budget, Cost, Reservation},
     builtin_state::{self, Bind},
     globals::Options,
+    handler_errors_status,
     named_matchers::{self, Definitions},
+    named_routes::Invokes,
     route_build::{self, Counter},
-    routes::{Route, RouteKind, RouteValue},
+    routes::{ERROR_ROUTE_CLASS, ErrorRoute, Route, RouteKind, RouteValue},
 };
 use crate::{
     caddyfile_lexer::Token,
@@ -15,8 +17,10 @@ use crate::{
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
 };
 /// This bound covers the fixed leaf parsers' copied dispensers, JSON
@@ -38,26 +42,42 @@ pub(super) fn reserve_helper(tokens: &[Token], budget: &mut Budget) -> Result<Re
     }
     budget.reserve_value(bytes)
 }
+#[derive(Default)]
+struct Piles {
+    binds: Vec<Bind>,
+    errors: Vec<ErrorRoute>,
+    tls: super::tls_site::SiteTls,
+}
+#[derive(Clone, Copy)]
+enum Block {
+    Route,
+    Ordered,
+}
 pub(super) struct Site {
     pub keys: Vec<super::address::Address>,
     pub binds: Vec<Bind>,
     pub values: Vec<RouteValue>,
     pub cost: Cost,
     pub tls: super::tls_site::SiteTls,
+    pub errors: Vec<ErrorRoute>,
+    pub errors_cost: Option<Cost>,
+    pub invokes: Vec<String>,
 }
-struct Scope {
+struct Scope<'state> {
     defs: Definitions,
     costs: BTreeMap<String, Cost>,
     files: Arc<Vec<String>>,
     cwd: Arc<PathBuf>,
+    tags: Rc<RefCell<&'state mut BTreeMap<String, String>>>,
 }
-impl Scope {
-    fn new(files: Vec<String>, cwd: &Path) -> Self {
+impl<'state> Scope<'state> {
+    fn new(files: Vec<String>, cwd: &Path, tags: &'state mut BTreeMap<String, String>) -> Self {
         Self {
             defs: Definitions::new(),
             costs: BTreeMap::new(),
             files: Arc::new(files),
             cwd: Arc::new(cwd.to_owned()),
+            tags: Rc::new(RefCell::new(tags)),
         }
     }
     fn copied(&self, budget: &mut Budget) -> Result<Self> {
@@ -78,6 +98,7 @@ impl Scope {
             costs: self.costs.clone(),
             files: self.files.clone(),
             cwd: self.cwd.clone(),
+            tags: self.tags.clone(),
         })
     }
     fn pre_extract(&self, tokens: &[Token], budget: &mut Budget) -> Result<()> {
@@ -109,31 +130,23 @@ pub(super) fn parse(
     cwd: &Path,
     tags: &mut BTreeMap<String, String>,
 ) -> Result<Site> {
-    let tls = super::tls_site::parse(segments, tags, options, cwd, budget)?;
-    let mut file_set = BTreeSet::new();
-    for segment in segments {
-        for token in segment {
-            budget.work(1)?;
-            file_set.insert(token.file.as_str());
-        }
-    }
-    for file in &file_set {
-        budget.materialize(file.len() as u64 + 64)?;
-    }
-    let mut scope = Scope::new(file_set.into_iter().map(str::to_owned).collect(), cwd);
-    let mut binds = Vec::new();
+    let mut scope = file_scope(segments.iter().flatten(), budget, cwd, tags)?;
+    let mut invokes = Invokes::default();
+    let mut piles = Piles::default();
     let values = parse_segments(
         segments,
         &mut scope,
         options,
         budget,
         counter,
-        Some(&mut binds),
+        Some(&mut piles),
+        &mut invokes,
     )?;
     let count = values
         .iter()
         .map(|v| match &v.value {
             RouteKind::Route(_) => 1,
+            RouteKind::ErrorRoute(_) | RouteKind::Binding { .. } | RouteKind::Tls { .. } => 0,
         })
         .sum::<usize>();
     budget.materialize(
@@ -145,20 +158,81 @@ pub(super) fn parse(
         .iter()
         .flat_map(|v| match &v.value {
             RouteKind::Route(r) => std::slice::from_ref(r),
+            RouteKind::ErrorRoute(_) | RouteKind::Binding { .. } | RouteKind::Tls { .. } => &[],
         })
         .collect::<Vec<_>>();
-    let bound = route_bound(references.iter().copied(), budget, 0)?;
-    let reservation = budget.reserve_value(bound)?;
-    let value = serde_json::to_value(&references)?;
-    let cost = budget.finish_value(reservation, &value)?;
+    let cost = pile_cost(&references, budget)?;
+    let errors_cost = if piles.errors.is_empty() {
+        None
+    } else {
+        budget.materialize(
+            (piles.errors.len() as u64)
+                .checked_mul(std::mem::size_of::<&Route>() as u64)
+                .ok_or_else(|| anyhow!("Caddyfile route reference overflow"))?,
+        )?;
+        let references = piles.errors.iter().map(|e| &e.route).collect::<Vec<_>>();
+        Some(pile_cost(&references, budget)?)
+    };
     Ok(Site {
         keys,
-        binds,
+        binds: piles.binds,
         values,
         cost,
-        tls,
+        tls: piles.tls,
+        errors: piles.errors,
+        errors_cost,
+        invokes: invokes.into_vec(),
     })
 }
+fn file_scope<'a, 'state>(
+    tokens: impl Iterator<Item = &'a Token>,
+    budget: &mut Budget,
+    cwd: &Path,
+    tags: &'state mut BTreeMap<String, String>,
+) -> Result<Scope<'state>> {
+    let mut files = BTreeSet::new();
+    for token in tokens {
+        budget.work(1)?;
+        files.insert(token.file.as_str());
+    }
+    for file in &files {
+        budget.materialize(file.len() as u64 + 64)?;
+    }
+    budget.materialize(64)?;
+    Ok(Scope::new(
+        files.into_iter().map(str::to_owned).collect(),
+        cwd,
+        tags,
+    ))
+}
+pub(super) fn named_route_body(
+    tokens: &[Token],
+    options: &Options,
+    budget: &mut Budget,
+    counter: &mut Counter,
+    cwd: &Path,
+    invokes: &mut Invokes,
+    tags: &mut BTreeMap<String, String>,
+) -> Result<Vec<Route>> {
+    let scope = file_scope(tokens.iter(), budget, cwd, tags)?;
+    block_routes(
+        tokens,
+        Block::Ordered,
+        &scope,
+        options,
+        budget,
+        counter,
+        invokes,
+    )
+}
+
+fn pile_cost(references: &[&Route], budget: &mut Budget) -> Result<Cost> {
+    let bound = route_bound(references.iter().copied(), budget, 0)?;
+    let reservation = budget.reserve_value(bound)?;
+    let value = serde_json::to_value(references)?;
+    budget.finish_value(reservation, &value)
+}
+
 fn route_bound<'a>(
     routes: impl IntoIterator<Item = &'a Route>,
     budget: &mut Budget,
@@ -188,11 +262,12 @@ fn route_bound<'a>(
 }
 fn parse_segments(
     segments: &[Segment],
-    scope: &mut Scope,
+    scope: &mut Scope<'_>,
     options: &Options,
     budget: &mut Budget,
     counter: &mut Counter,
-    mut binds: Option<&mut Vec<Bind>>,
+    mut piles: Option<&mut Piles>,
+    invokes: &mut Invokes,
 ) -> Result<Vec<RouteValue>> {
     for seg in segments {
         if let Some(first) = seg.first()
@@ -217,11 +292,89 @@ fn parse_segments(
             );
         }
         if name == "tls" {
-            if binds.is_none() {
-                bail!(
-                    "tls directive returned something other than an HTTP route; only handler directives can be used in routes"
-                );
+            let directive = {
+                let mut tags = scope.tags.borrow_mut();
+                super::tls_directive::parse(seg, &mut tags, options, &scope.cwd, budget)?
+            };
+            if let Some(piles) = piles.as_deref_mut() {
+                piles.tls.push(directive, budget)?;
+            } else {
+                let count = directive.config_value_count()?;
+                let bytes = super::budget::add(
+                    first.file.len() as u64,
+                    std::mem::size_of::<RouteValue>() as u64 + 16,
+                )?;
+                budget.materialize(super::budget::mul(count, bytes)?)?;
+                budget.work(super::budget::mul(count, first.file.len() as u64 + 1)?)?;
+                for _ in 0..count {
+                    result.push(RouteValue {
+                        directive: name.into(),
+                        value: RouteKind::Tls {
+                            file: first.file.clone(),
+                            line: first.line,
+                        },
+                    });
+                }
             }
+            continue;
+        }
+        if name == "handle_errors" {
+            let reservation = reserve_helper(seg, budget)?;
+            let status = handler_errors_status::status(seg)?;
+            let measured = status.expression.clone().map_or(Value::Null, Value::String);
+            budget.finish_value(reservation, &measured)?;
+            let children = block_routes(
+                &seg[status.args..],
+                Block::Ordered,
+                scope,
+                options,
+                budget,
+                counter,
+                invokes,
+            )?;
+            let route = Route {
+                matchers: status
+                    .expression
+                    .map(handler_errors_status::expression_matcher)
+                    .into_iter()
+                    .collect(),
+                handlers: vec![subroute_handler(children, budget)?],
+                ..Default::default()
+            };
+            charge_route(&route, budget)?;
+            budget.materialize(first.file.len() as u64 + 64)?;
+            let error = ErrorRoute {
+                route,
+                file: first.file.clone(),
+                line: first.line,
+            };
+            if let Some(piles) = piles.as_deref_mut() {
+                piles.errors.push(error);
+            } else {
+                result.push(RouteValue {
+                    directive: "handle_errors".into(),
+                    value: RouteKind::ErrorRoute(error),
+                });
+            }
+            continue;
+        }
+        if name == "invoke" {
+            scope.pre_extract(seg, budget)?;
+            let reservation = reserve_helper(seg, budget)?;
+            let (matcher, tokens) = named_matchers::extract(seg, &scope.defs)?;
+            let (target, handler) = super::handler_invoke::invoke(&tokens)?;
+            budget.finish_value(reservation, &handler)?;
+            invokes.record(&target, budget)?;
+            record_route(
+                &mut result,
+                name,
+                Route {
+                    matchers: matcher.into_iter().collect(),
+                    handlers: vec![handler],
+                    ..Default::default()
+                },
+                budget,
+            )?;
             continue;
         }
         if name == "try_files" {
@@ -229,10 +382,23 @@ fn parse_segments(
             continue;
         }
         if name == "bind" {
-            let destination=binds.as_deref_mut().ok_or_else(||anyhow!("bind directive returned something other than an HTTP route; only handler directives can be used in routes"))?;
             let reservation = reserve_helper(seg, budget)?;
-            destination.push(builtin_state::bind(seg, false)?);
+            let binding = builtin_state::bind(seg, false)?;
             budget.finish_value(reservation, &Value::Null)?;
+            if let Some(piles) = piles.as_deref_mut() {
+                piles.binds.push(binding);
+            } else {
+                // This config-only value is intentionally dropped by Go's
+                // ordered buildSubroute, after parsing and ordering checks.
+                budget.materialize(first.file.len() as u64 + 64)?;
+                result.push(RouteValue {
+                    directive: name.into(),
+                    value: RouteKind::Binding {
+                        file: first.file.clone(),
+                        line: first.line,
+                    },
+                });
+            }
             continue;
         }
         if name == "header" || name == "request_header" {
@@ -269,17 +435,13 @@ fn parse_segments(
         } else {
             let (matcher, tokens) = named_matchers::extract(seg, &scope.defs)?;
             let handler = if name == "route" || name == "handle" || name == "handle_path" {
-                let children = block_segments(&tokens, budget)?;
-                let mut nested = scope.copied(budget)?;
-                let values = budget.nested(|budget| {
-                    parse_segments(&children, &mut nested, options, budget, counter, None)
-                })?;
-                let order = if name == "route" {
-                    None
+                let block = if name == "route" {
+                    Block::Route
                 } else {
-                    Some(options.order.as_slice())
+                    Block::Ordered
                 };
-                let mut routes = route_build::build(values, counter, order, budget)?;
+                let mut routes =
+                    block_routes(&tokens, block, scope, options, budget, counter, invokes)?;
                 if name == "handle_path" {
                     let path = seg.get(1).map(|t| t.text.as_str()).unwrap_or("");
                     if !path.starts_with('/') {
@@ -313,6 +475,15 @@ fn parse_segments(
                 value
             } else if let Some(value) = super::handler_observe::parse(name, &tokens)? {
                 value
+            } else if let Some(value) = super::handler_auth_trace::parse(name, &tokens)? {
+                if name == "basicauth" {
+                    let message =
+                        "the 'basicauth' directive is deprecated, please use 'basic_auth' instead!";
+                    options.warn(&first.file, first.line, name, message, budget)?;
+                }
+                value
+            } else if name == "map" {
+                super::handler_map::parse(&tokens, budget, reservation.take().unwrap(), options)?
             } else if name == "encode" {
                 super::handler_encode::parse(&tokens)?
             } else if name == "file_server" {
@@ -325,7 +496,7 @@ fn parse_segments(
             } else {
                 bail!("Caddyfile directive {name} is registered but not implemented");
             };
-            if !["route", "handle", "handle_path", "file_server"].contains(&name) {
+            if !["route", "handle", "handle_path", "file_server", "map"].contains(&name) {
                 budget.finish_value(reservation.take().unwrap(), &handler)?;
             }
             Route {
@@ -341,17 +512,71 @@ fn parse_segments(
     }
     Ok(result)
 }
+fn block_routes(
+    tokens: &[Token],
+    block: Block,
+    scope: &Scope<'_>,
+    options: &Options,
+    budget: &mut Budget,
+    counter: &mut Counter,
+    invokes: &mut Invokes,
+) -> Result<Vec<Route>> {
+    let children = block_segments(tokens, budget)?;
+    let mut nested = scope.copied(budget)?;
+    let values = budget.nested(|budget| {
+        parse_segments(
+            &children,
+            &mut nested,
+            options,
+            budget,
+            counter,
+            None,
+            invokes,
+        )
+    })?;
+    let order = match block {
+        Block::Route => {
+            for value in &values {
+                let invalid = match &value.value {
+                    RouteKind::ErrorRoute(error) => {
+                        Some((&error.file, error.line, ERROR_ROUTE_CLASS))
+                    }
+                    RouteKind::Binding { file, line } => Some((file, *line, "bind")),
+                    RouteKind::Tls { file, line } => Some((file, *line, "tls")),
+                    RouteKind::Route(_) => None,
+                };
+                if let Some((file, line, class)) = invalid {
+                    bail!(
+                        "{file}:{line}: {} directive returned something other than an HTTP route or subroute: {class} value (only handler directives can be used in routes)",
+                        value.directive
+                    );
+                }
+            }
+            None
+        }
+        Block::Ordered => Some(options.order.as_slice()),
+    };
+    route_build::build(values, counter, order, budget)
+}
+pub(super) fn serialize_route(route: &Route, budget: &mut Budget) -> Result<(Value, Cost)> {
+    let size = route_bound(std::slice::from_ref(route), budget, 0)?;
+    let reservation = budget.reserve_value(size)?;
+    let value = serde_json::to_value(route)?;
+    let cost = budget.finish_value(reservation, &value)?;
+    Ok((value, cost))
+}
+fn charge_route(route: &Route, budget: &mut Budget) -> Result<()> {
+    serialize_route(route, budget)?;
+    Ok(())
+}
+
 fn record_route(
     result: &mut Vec<RouteValue>,
     name: &str,
     route: Route,
     budget: &mut Budget,
 ) -> Result<()> {
-    let size = route_bound(std::slice::from_ref(&route), budget, 0)?;
-    // Route is retained; only its serialization is a temporary owned copy.
-    let reservation = budget.reserve_value(size)?;
-    let value = serde_json::to_value(&route)?;
-    budget.finish_value(reservation, &value)?;
+    charge_route(&route, budget)?;
     result.push(RouteValue {
         directive: if name == "handle_path" {
             "handle".into()
@@ -405,7 +630,7 @@ fn rewrite(tokens: &[Token], defs: &Definitions, budget: &mut Budget) -> Result<
         ..Default::default()
     })
 }
-fn subroute_handler(routes: Vec<Route>, budget: &mut Budget) -> Result<Value> {
+pub(super) fn subroute_handler(routes: Vec<Route>, budget: &mut Budget) -> Result<Value> {
     let bound = route_bound(&routes, budget, 1)?
         .checked_add(512)
         .ok_or_else(|| anyhow!("Caddyfile subroute overflow"))?;

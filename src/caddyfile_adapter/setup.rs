@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(super) fn setup(
     mut blocks: Vec<ServerBlock>,
     budget: &mut Budget,
-    _warnings: &mut Vec<Warning>,
+    warnings: &mut Vec<Warning>,
     cwd: &std::path::Path,
 ) -> Result<Value> {
     for block in &blocks {
@@ -44,13 +44,11 @@ pub(super) fn setup(
         let global = blocks.remove(0);
         options.parse(&global.segments, budget)?;
     }
+    let (blocks, named) = super::named_routes::extract(blocks, &options, budget, cwd)?;
     let mut sites = Vec::new();
     let mut counter = Counter::default();
     let mut certificate_tags = BTreeMap::new();
     for mut block in blocks {
-        if block.is_named_route {
-            bail!("Caddyfile named routes are not implemented");
-        }
         if block.keys.is_empty() {
             bail!("global configuration must be the first block");
         }
@@ -79,7 +77,14 @@ pub(super) fn setup(
     let mut pairings = listeners::pairings(&sites, &options, budget)?;
     let mut staged_servers = Vec::new();
     for pair in &mut pairings {
-        staged_servers.push(server(pair, &sites, &options, budget, &mut counter)?);
+        staged_servers.push(server(
+            pair,
+            &mut sites,
+            &options,
+            &named,
+            budget,
+            &mut counter,
+        )?);
     }
     // The original server map holds pointers to CPs shared by split site
     // blocks. Encode only after all pairings have performed their mutations.
@@ -134,7 +139,16 @@ pub(super) fn setup(
     let mut config = Map::new();
     options.top(&mut config, budget)?;
     let mut apps = Map::new();
+    if let Some(events) = &options.events {
+        let cost = budget.measure(events)?;
+        budget.copies(cost, 1, 2)?;
+        apps.insert("events".into(), events.clone());
+    }
     if !servers.is_empty() {
+        if let Some(metrics) = &options.metrics {
+            let cost = budget.measure(metrics)?;
+            budget.copies(cost, 1, 2)?;
+        }
         apps.insert("http".into(), Value::Object(options.http(servers)));
     }
     let tls = super::tls_defaults::build(&sites, &pairings, &options, budget)?;
@@ -147,12 +161,14 @@ pub(super) fn setup(
     if !apps.is_empty() {
         config.insert("apps".into(), Value::Object(apps));
     }
+    warnings.append(options.diagnostics.get_mut());
     Ok(Value::Object(config))
 }
 fn server(
     pair: &mut Pairing,
-    sites: &[site::Site],
+    sites: &mut [site::Site],
     options: &Options,
+    named: &super::named_routes::NamedRoutes,
     budget: &mut Budget,
     counter: &mut Counter,
 ) -> Result<(Map<String, Value>, Vec<super::tls_connections::Connection>)> {
@@ -268,37 +284,96 @@ fn server(
             .unwrap()
             .insert("skip".into(), json!(tls.skip));
     }
+    if let Some(routes) = super::named_routes::attach(pair, sites, named, budget)? {
+        server.insert("named_routes".into(), Value::Object(routes));
+    }
     let mut routes = Vec::new();
+    let mut errors: Option<Vec<Route>> = None;
+    let single_site = pair.sites.len() == 1;
     for r in &pair.sites {
+        sort_error_pile(&mut sites[r.site], budget)?;
         let site = &sites[r.site];
         let matches = site_matchers(site, &r.keys, budget)?;
+        let error_matches = if site.errors.is_empty() {
+            None
+        } else {
+            Some(clone_matchers(&matches, budget)?)
+        };
         budget.copies(site.cost, 3, 9)?;
-        let mut children =
+        let children =
             route_build::build(site.values.clone(), counter, Some(&options.order), budget)?;
-        let host_matcher = children
-            .iter()
-            .any(|r| r.matchers.iter().any(|m| m.contains_key("host")));
-        if matches.is_empty() && pair.sites.len() == 1 && !host_matcher {
-            routes.append(&mut children);
-        } else if !matches.is_empty() || !children.is_empty() {
-            let handler = if children.is_empty() {
-                Vec::new()
-            } else {
-                vec![json!({"handler":"subroute","routes":children})]
-            };
-            routes.push(Route {
-                matchers: matches,
-                handlers: handler,
-                terminal: true,
-                ..Default::default()
-            });
+        append_site_routes(&mut routes, matches, children, single_site);
+        if let (Some(matches), Some(cost)) = (error_matches, site.errors_cost) {
+            budget.copies(cost, 3, 9)?;
+            let children = site.errors.iter().map(|e| e.route.clone()).collect();
+            append_site_routes(
+                errors.get_or_insert_with(Vec::new),
+                matches,
+                children,
+                single_site,
+            );
         }
     }
     let routes = route_build::consolidate(routes);
     if !routes.is_empty() {
         server.insert("routes".into(), serde_json::to_value(routes)?);
     }
+    if let Some(errors) = errors {
+        let mut config = Map::new();
+        if !errors.is_empty() {
+            config.insert("routes".into(), serde_json::to_value(errors)?);
+        }
+        server.insert("errors".into(), Value::Object(config));
+    }
     Ok((server, tls.connections))
+}
+
+fn append_site_routes(
+    list: &mut Vec<Route>,
+    matchers: Vec<Map<String, Value>>,
+    mut children: Vec<Route>,
+    single_site: bool,
+) {
+    let host = children
+        .iter()
+        .any(|r| r.matchers.iter().any(|m| m.contains_key("host")));
+    if matchers.is_empty() && single_site && !host {
+        list.append(&mut children);
+    } else if !matchers.is_empty() || !children.is_empty() {
+        let handlers = if children.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({"handler":"subroute","routes":children})]
+        };
+        list.push(Route {
+            matchers,
+            handlers,
+            terminal: true,
+            ..Default::default()
+        });
+    }
+}
+fn sort_error_pile(site: &mut site::Site, budget: &mut Budget) -> Result<()> {
+    let n = site.errors.len() as u64;
+    if n == 0 {
+        return Ok(());
+    }
+    let log = (u64::BITS - n.leading_zeros() + 1) as u64;
+    budget.work(mul(mul(n, log)?, mul(log, 4)?)?)?;
+    // Literal non-strict Go comparator. The shared pile is sorted again for
+    // every pairing; first server output is already an independent route list.
+    super::stable_sort::stable_sort(&mut site.errors, |a, b| a.matched() || !b.matched());
+    Ok(())
+}
+fn clone_matchers(
+    matchers: &[Map<String, Value>],
+    budget: &mut Budget,
+) -> Result<Vec<Map<String, Value>>> {
+    for matcher in matchers {
+        let cost = budget.measure_map(matcher)?;
+        budget.copies(cost, 1, 9)?;
+    }
+    Ok(matchers.to_vec())
 }
 
 fn specificity(site: &site::Site, keys: &[usize]) -> (bool, bool, usize, usize) {

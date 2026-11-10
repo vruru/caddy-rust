@@ -65,6 +65,10 @@ pub(super) struct Options {
     pub preferred: Option<Value>,
     pub on_demand: Option<Value>,
     pub ech: Option<Value>,
+    pub storage: Option<Value>,
+    pub metrics: Option<Value>,
+    pub events: Option<Value>,
+    pub diagnostics: std::cell::RefCell<Vec<super::Warning>>,
 }
 impl Options {
     pub fn new() -> Self {
@@ -82,7 +86,35 @@ impl Options {
             preferred: None,
             on_demand: None,
             ech: None,
+            storage: None,
+            metrics: None,
+            events: None,
+            diagnostics: Default::default(),
         }
+    }
+    pub(super) fn warn(
+        &self,
+        file: &str,
+        line: usize,
+        directive: &str,
+        message: &str,
+        budget: &mut Budget,
+    ) -> Result<()> {
+        let bytes = super::budget::add(
+            super::budget::add(file.len() as u64, directive.len() as u64)?,
+            super::budget::add(
+                message.len() as u64,
+                std::mem::size_of::<super::Warning>() as u64,
+            )?,
+        )?;
+        budget.materialize(bytes)?;
+        self.diagnostics.borrow_mut().push(super::Warning {
+            file: file.into(),
+            line,
+            directive: directive.into(),
+            message: message.into(),
+        });
+        Ok(())
     }
     pub fn integer(&self, name: &str, default: isize) -> isize {
         match self.atoms.get(name) {
@@ -120,6 +152,25 @@ impl Options {
             }
             (|| -> Result<()> {
             match name {
+                "events" => {
+                    self.events=Some(super::global_auxiliary::events(seg)?);
+                }
+                "filesystem" => {
+                    super::global_auxiliary::filesystem(seg)?;
+                }
+                "storage" => {
+                    let mut d = crate::caddyfile_parser::Dispenser::new(seg.to_vec());
+                    if !d.next() || !d.next() {
+                        return Err(d.arg_err());
+                    }
+                    self.storage = Some(super::module_value::normalize(
+                        super::tls_sources::storage(&d.next_segment())?,
+                    )?);
+                }
+                "metrics" => {
+                    self.metrics = Some(super::global_metrics::parse(seg)?);
+                }
+
                 "on_demand_tls"=>{self.on_demand=Some(super::global_tls::on_demand(seg)?);}
                 "ech"=>{self.ech=Some(super::global_tls::ech(seg)?);}
                 "cert_issuer" => {
@@ -203,6 +254,15 @@ impl Options {
             // Atom/type-specific validation precedes physical JSON assembly.
             // Reservation is retained; it is not reusable memory credit.
             match name {
+                "events" => {
+                    budget.finish_value(reservation, self.events.as_ref().unwrap())?;
+                }
+                "storage" => {
+                    budget.finish_value(reservation, self.storage.as_ref().unwrap())?;
+                }
+                "metrics" => {
+                    budget.finish_value(reservation, self.metrics.as_ref().unwrap())?;
+                }
                 "on_demand_tls" => {
                     budget.finish_value(reservation, self.on_demand.as_ref().unwrap())?;
                 }
@@ -257,6 +317,9 @@ impl Options {
                 result.insert(key.into(), Value::from(value));
             }
         }
+        if let Some(metrics) = &self.metrics {
+            result.insert("metrics".into(), metrics.clone());
+        }
         result
     }
     pub fn top(&self, result: &mut Map<String, Value>, budget: &mut Budget) -> Result<()> {
@@ -280,6 +343,11 @@ impl Options {
                 .as_object_mut()
                 .unwrap()
                 .insert("config".into(), json!({"persist":false}));
+        }
+        if let Some(storage) = &self.storage {
+            let cost = budget.measure(storage)?;
+            budget.copies(cost, 1, 1)?;
+            result.insert("storage".into(), storage.clone());
         }
         Ok(())
     }

@@ -134,6 +134,19 @@ impl Budget {
         self.materialized.take(upper)?;
         Ok(Reservation { bytes: upper })
     }
+    pub(super) fn extend_reservation(
+        &mut self,
+        reservation: Reservation,
+        extra: u64,
+    ) -> Result<Reservation> {
+        if extra == 0 {
+            return Ok(reservation);
+        }
+        let bytes = add(reservation.bytes, extra)?;
+        self.work.take(add(extra / 64, 1)?)?;
+        self.materialized.take(extra)?;
+        Ok(Reservation { bytes })
+    }
     pub(super) fn finish_value(&mut self, reservation: Reservation, value: &Value) -> Result<Cost> {
         let actual = self.measure(value)?;
         if actual.bytes > reservation.bytes {

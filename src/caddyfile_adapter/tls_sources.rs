@@ -47,7 +47,8 @@ pub(super) fn storage(tokens: &[Token]) -> Result<Value> {
     }
     if d.val() != "file_system" {
         return Err(d.error(format!(
-            "getting module named 'caddy.storage.{}': module not registered",
+            "getting module named 'caddy.storage.{}': module not registered: caddy.storage.{}",
+            d.val(),
             d.val()
         )));
     }
