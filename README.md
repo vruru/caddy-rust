@@ -45,6 +45,13 @@ process installs this explicit provider before constructing implicit TLS clients
 an incompatible existing default is an error. This key compatibility primitive
 does not implement a production TLS listener or certificate lifecycle.
 
+The `admin_json` library provides configuration traversal, mutation, Go-style
+JSON number/Unicode encoding and raw-path ETags. Reads can borrow the immutable
+configuration snapshot instead of cloning the full document. This is a DOM
+primitive, not an exposed Admin endpoint or a configuration transaction backend.
+Input and mutation paths currently have a 256-level resource limit, below the
+original decoder's 10000-level limit; that difference remains a migration gap.
+
 The official Caddy v2.11.7 and CertMagic v0.25.6 implementation provide the pinned
 behavioral reference. The original Go plugins have no native cross-language ABI:
 module configuration and behavior require individual Rust implementations.
