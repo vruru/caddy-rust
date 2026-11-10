@@ -100,6 +100,15 @@ The automatic-HTTPS product lifecycle, certificate-policy integration and the
 remaining issuer/module behaviors are still migration work. Library checks and
 isolated CA interoperability do not make the inspector a production server.
 
+The OCSP library authenticates cached and fetched status, performs bounded
+background retrieval and refresh, and preserves the original cache format.
+Independent responders have separate concurrency limits. Missing `nextUpdate`
+uses an explicit configurable freshness limit (24 hours by default), which is
+stricter than the original unlimited cache lifetime. Verified negative status
+clears staples and produces notices even when bookkeeping fails. Notices alone
+do not implement managed-certificate renewal or withdrawal: root lifecycle,
+startup restoration and shared leaf-policy integration remain incomplete.
+
 Build with the current official stable Rust, pinned to 1.99.1 for this phase.
 Keep all QA, fixtures, private configuration, keys, logs, and build output in the
 current LocalOps task. Do not create GitHub Actions. The authorized source

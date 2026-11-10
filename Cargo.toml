@@ -59,6 +59,13 @@ p384 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
 hmac = "0.12"
 
+aws-lc-rs="1.19.0"
+x509-ocsp={version="0.2.1",features=["std"]}
+x509-cert="0.2"
+der={version="0.7",features=["alloc","derive","oid"]}
+sha1={version="0.10",features=["oid"]}
+p224={version="0.13.2",features=["ecdsa"]}
+
 [patch.crates-io]
 hyper = {path="vendor/hyper-1.12.0"}
 hyper-util = {path="vendor/hyper-util-0.1.21"}

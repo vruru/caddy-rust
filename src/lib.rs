@@ -11,3 +11,4 @@ pub mod http_runtime;
 pub mod admin;
 pub mod acme_wire;
 pub mod cert_automation;
+pub mod cert_status;
