@@ -47,6 +47,8 @@ struct Piles {
     binds: Vec<Bind>,
     errors: Vec<ErrorRoute>,
     tls: super::tls_site::SiteTls,
+    logs: Vec<super::log_config::Entry>,
+    ca_names: Vec<String>,
 }
 #[derive(Clone, Copy)]
 enum Block {
@@ -62,22 +64,29 @@ pub(super) struct Site {
     pub errors: Vec<ErrorRoute>,
     pub errors_cost: Option<Cost>,
     pub invokes: Vec<String>,
+    pub logs: Vec<super::log_config::Entry>,
+    pub ca_names: Vec<String>,
+}
+#[derive(Default)]
+pub(super) struct State {
+    pub tags: BTreeMap<String, String>,
+    pub log_counter: usize,
 }
 struct Scope<'state> {
     defs: Definitions,
     costs: BTreeMap<String, Cost>,
     files: Arc<Vec<String>>,
     cwd: Arc<PathBuf>,
-    tags: Rc<RefCell<&'state mut BTreeMap<String, String>>>,
+    state: Rc<RefCell<&'state mut State>>,
 }
 impl<'state> Scope<'state> {
-    fn new(files: Vec<String>, cwd: &Path, tags: &'state mut BTreeMap<String, String>) -> Self {
+    fn new(files: Vec<String>, cwd: &Path, state: &'state mut State) -> Self {
         Self {
             defs: Definitions::new(),
             costs: BTreeMap::new(),
             files: Arc::new(files),
             cwd: Arc::new(cwd.to_owned()),
-            tags: Rc::new(RefCell::new(tags)),
+            state: Rc::new(RefCell::new(state)),
         }
     }
     fn copied(&self, budget: &mut Budget) -> Result<Self> {
@@ -98,7 +107,7 @@ impl<'state> Scope<'state> {
             costs: self.costs.clone(),
             files: self.files.clone(),
             cwd: self.cwd.clone(),
-            tags: self.tags.clone(),
+            state: self.state.clone(),
         })
     }
     fn pre_extract(&self, tokens: &[Token], budget: &mut Budget) -> Result<()> {
@@ -128,9 +137,9 @@ pub(super) fn parse(
     budget: &mut Budget,
     counter: &mut Counter,
     cwd: &Path,
-    tags: &mut BTreeMap<String, String>,
+    state: &mut State,
 ) -> Result<Site> {
-    let mut scope = file_scope(segments.iter().flatten(), budget, cwd, tags)?;
+    let mut scope = file_scope(segments.iter().flatten(), budget, cwd, state)?;
     let mut invokes = Invokes::default();
     let mut piles = Piles::default();
     let values = parse_segments(
@@ -147,7 +156,11 @@ pub(super) fn parse(
         .map(|v| match &v.value {
             RouteKind::Route(_) => 1,
             RouteKind::Subroute(routes) => routes.len(),
-            RouteKind::ErrorRoute(_) | RouteKind::Binding { .. } | RouteKind::Tls { .. } => 0,
+            RouteKind::Pki { .. }
+            | RouteKind::Log { .. }
+            | RouteKind::ErrorRoute(_)
+            | RouteKind::Binding { .. }
+            | RouteKind::Tls { .. } => 0,
         })
         .sum::<usize>();
     budget.materialize(
@@ -160,7 +173,11 @@ pub(super) fn parse(
         .flat_map(|v| match &v.value {
             RouteKind::Route(r) => std::slice::from_ref(r),
             RouteKind::Subroute(routes) => routes.as_slice(),
-            RouteKind::ErrorRoute(_) | RouteKind::Binding { .. } | RouteKind::Tls { .. } => &[],
+            RouteKind::Pki { .. }
+            | RouteKind::Log { .. }
+            | RouteKind::ErrorRoute(_)
+            | RouteKind::Binding { .. }
+            | RouteKind::Tls { .. } => &[],
         })
         .collect::<Vec<_>>();
     let cost = pile_cost(&references, budget)?;
@@ -184,13 +201,15 @@ pub(super) fn parse(
         errors: piles.errors,
         errors_cost,
         invokes: invokes.into_vec(),
+        logs: piles.logs,
+        ca_names: piles.ca_names,
     })
 }
 fn file_scope<'a, 'state>(
     tokens: impl Iterator<Item = &'a Token>,
     budget: &mut Budget,
     cwd: &Path,
-    tags: &'state mut BTreeMap<String, String>,
+    state: &'state mut State,
 ) -> Result<Scope<'state>> {
     let mut files = BTreeSet::new();
     for token in tokens {
@@ -204,7 +223,7 @@ fn file_scope<'a, 'state>(
     Ok(Scope::new(
         files.into_iter().map(str::to_owned).collect(),
         cwd,
-        tags,
+        state,
     ))
 }
 pub(super) fn named_route_body(
@@ -214,9 +233,9 @@ pub(super) fn named_route_body(
     counter: &mut Counter,
     cwd: &Path,
     invokes: &mut Invokes,
-    tags: &mut BTreeMap<String, String>,
+    state: &mut State,
 ) -> Result<Vec<Route>> {
-    let scope = file_scope(tokens.iter(), budget, cwd, tags)?;
+    let scope = file_scope(tokens.iter(), budget, cwd, state)?;
     block_routes(
         tokens,
         Block::Ordered,
@@ -293,10 +312,32 @@ fn parse_segments(
                 first.line
             );
         }
+        if name == "log" {
+            let entry = {
+                let mut state = scope.state.borrow_mut();
+                super::log_config::parse(seg, None, &mut state.log_counter, budget, options)?
+            };
+            if let Some(piles) = piles.as_deref_mut() {
+                budget.materialize(std::mem::size_of::<super::log_config::Entry>() as u64)?;
+                piles.logs.push(entry);
+            } else {
+                budget.materialize(
+                    first.file.len() as u64 + std::mem::size_of::<RouteValue>() as u64 + 16,
+                )?;
+                result.push(RouteValue {
+                    directive: name.into(),
+                    value: RouteKind::Log {
+                        file: first.file.clone(),
+                        line: first.line,
+                    },
+                });
+            }
+            continue;
+        }
         if name == "tls" {
             let directive = {
-                let mut tags = scope.tags.borrow_mut();
-                super::tls_directive::parse(seg, &mut tags, options, &scope.cwd, budget)?
+                let mut state = scope.state.borrow_mut();
+                super::tls_directive::parse(seg, &mut state.tags, options, &scope.cwd, budget)?
             };
             if let Some(piles) = piles.as_deref_mut() {
                 piles.tls.push(directive, budget)?;
@@ -377,6 +418,38 @@ fn parse_segments(
                 },
                 budget,
             )?;
+            continue;
+        }
+        if name == "acme_server" {
+            scope.pre_extract(seg, budget)?;
+            let r = reserve_helper(seg, budget)?;
+            let (matcher, tokens) = named_matchers::extract(seg, &scope.defs)?;
+            let (handler, ca) = super::handler_acmeserver::parse(&tokens, budget)?;
+            budget.finish_value(r, &Value::Null)?;
+            record_route(
+                &mut result,
+                name,
+                Route {
+                    matchers: matcher.into_iter().collect(),
+                    handlers: vec![handler],
+                    ..Default::default()
+                },
+                budget,
+            )?;
+            if let Some(ca) = ca {
+                budget.materialize(ca.len() as u64 + first.file.len() as u64 + 128)?;
+                if let Some(piles) = piles.as_deref_mut() {
+                    piles.ca_names.push(ca);
+                } else {
+                    result.push(RouteValue {
+                        directive: name.into(),
+                        value: RouteKind::Pki {
+                            file: first.file.clone(),
+                            line: first.line,
+                        },
+                    });
+                }
+            }
             continue;
         }
         if name == "try_files" {
@@ -603,6 +676,8 @@ fn block_routes(
                     }
                     RouteKind::Binding { file, line } => Some((file, *line, "bind")),
                     RouteKind::Tls { file, line } => Some((file, *line, "tls")),
+                    RouteKind::Log { file, line } => Some((file, *line, "custom_log")),
+                    RouteKind::Pki { file, line } => Some((file, *line, "pki.ca")),
                     RouteKind::Route(_) | RouteKind::Subroute(_) => None,
                 };
                 if let Some((file, line, class)) = invalid {

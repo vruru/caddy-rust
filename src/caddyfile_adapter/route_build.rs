@@ -62,14 +62,20 @@ pub(super) fn build(
             RouteKind::Subroute(_)
             | RouteKind::ErrorRoute(_)
             | RouteKind::Binding { .. }
-            | RouteKind::Tls { .. } => {}
+            | RouteKind::Tls { .. }
+            | RouteKind::Log { .. }
+            | RouteKind::Pki { .. } => {}
         }
         match v.value {
             RouteKind::Route(r) => routes.push(r),
             RouteKind::Subroute(children) => routes.extend(children),
             // Original buildSubroute does not match *Subroute pointer values;
             // the existing order check above still rejects them by default.
-            RouteKind::ErrorRoute(_) | RouteKind::Binding { .. } | RouteKind::Tls { .. } => {}
+            RouteKind::ErrorRoute(_)
+            | RouteKind::Binding { .. }
+            | RouteKind::Tls { .. }
+            | RouteKind::Log { .. }
+            | RouteKind::Pki { .. } => {}
         }
     }
     Ok(consolidate(routes))

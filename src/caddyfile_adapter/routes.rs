@@ -81,6 +81,8 @@ pub(super) enum RouteKind {
     ErrorRoute(ErrorRoute),
     Binding { file: String, line: usize },
     Tls { file: String, line: usize },
+    Log { file: String, line: usize },
+    Pki { file: String, line: usize },
 }
 impl RouteValue {
     pub(super) fn route(&self) -> Option<&Route> {
@@ -89,7 +91,9 @@ impl RouteValue {
             RouteKind::Subroute(_)
             | RouteKind::ErrorRoute(_)
             | RouteKind::Binding { .. }
-            | RouteKind::Tls { .. } => None,
+            | RouteKind::Tls { .. }
+            | RouteKind::Log { .. }
+            | RouteKind::Pki { .. } => None,
         }
     }
 }

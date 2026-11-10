@@ -15,7 +15,7 @@ struct Parsed {
     host: String,
     port: String,
 }
-fn join_host(host: &str, port: &str) -> String {
+pub(super) fn join_host(host: &str, port: &str) -> String {
     if host.contains(':') {
         format!("[{host}]:{port}")
     } else {

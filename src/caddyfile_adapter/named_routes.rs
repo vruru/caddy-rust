@@ -70,7 +70,7 @@ pub(super) fn extract(
     let mut regular = Vec::with_capacity(blocks.len());
     let mut named = NamedRoutes::default();
     let mut counter = Counter::default();
-    let mut tags = BTreeMap::new();
+    let mut state = super::site::State::default();
     for mut block in blocks {
         if !block.is_named_route {
             regular.push(block);
@@ -108,7 +108,7 @@ pub(super) fn extract(
             &mut counter,
             cwd,
             &mut invokes,
-            &mut tags,
+            &mut state,
         )?;
         let route = simplify(routes, budget)?;
         let key = block

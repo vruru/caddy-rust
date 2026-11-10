@@ -47,7 +47,7 @@ pub(super) fn setup(
     let (blocks, named) = super::named_routes::extract(blocks, &options, budget, cwd)?;
     let mut sites = Vec::new();
     let mut counter = Counter::default();
-    let mut certificate_tags = BTreeMap::new();
+    let mut state = site::State::default();
     for mut block in blocks {
         if block.keys.is_empty() {
             bail!("global configuration must be the first block");
@@ -71,7 +71,7 @@ pub(super) fn setup(
             budget,
             &mut counter,
             cwd,
-            &mut certificate_tags,
+            &mut state,
         )?);
     }
     let mut pairings = listeners::pairings(&sites, &options, budget)?;
@@ -99,6 +99,7 @@ pub(super) fn setup(
         }
         servers.insert(format!("srv{i}"), Value::Object(server));
     }
+    let server_metrics = super::global_servers::apply(&mut servers, &options.servers, budget)?;
     // No parsed option may disappear simply because the next adapter family
     // is still pending. This gate is removed only with its physical assembly.
     for name in options.atoms.keys() {
@@ -138,6 +139,11 @@ pub(super) fn setup(
     }
     let mut config = Map::new();
     options.top(&mut config, budget)?;
+    if let Some(logging) = super::log_assembly::top(&pairings, &sites, &options, budget)? {
+        config.insert("logging".into(), logging);
+    } else {
+        config.remove("logging");
+    }
     let mut apps = Map::new();
     if let Some(events) = &options.events {
         let cost = budget.measure(events)?;
@@ -149,13 +155,28 @@ pub(super) fn setup(
             let cost = budget.measure(metrics)?;
             budget.copies(cost, 1, 2)?;
         }
-        apps.insert("http".into(), Value::Object(options.http(servers)));
+        let mut http = options.http(servers);
+        if let Some(mut metric) = server_metrics {
+            if http
+                .get("metrics")
+                .and_then(|m| m.get("per_host"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                metric
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("per_host".into(), true.into());
+            }
+            http.insert("metrics".into(), metric);
+        }
+        apps.insert("http".into(), Value::Object(http));
     }
     let tls = super::tls_defaults::build(&sites, &pairings, &options, budget)?;
     if let Some(tls) = super::tls_settings::apply(tls, &options, budget)? {
         apps.insert("tls".into(), tls);
     }
-    if let Some(pki) = options.pki_app(budget)? {
+    if let Some(pki) = options.pki_app(budget, &pairings, &sites)? {
         apps.insert("pki".into(), pki);
     }
     if !apps.is_empty() {
@@ -277,6 +298,9 @@ fn server(
         a.2 > b.2
     });
     pair.sites = ranked.into_iter().map(|(entry, _)| entry).collect();
+    if let Some(logging) = super::log_assembly::server(pair, sites, budget)? {
+        server.insert("logs".into(), logging);
+    }
     let tls = super::tls_server::build(pair, sites, options, budget)?;
     if !tls.skip.is_empty() {
         let auto = server.entry("automatic_https").or_insert_with(|| json!({}));

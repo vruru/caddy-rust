@@ -68,6 +68,9 @@ pub(super) struct Options {
     pub storage: Option<Value>,
     pub metrics: Option<Value>,
     pub events: Option<Value>,
+    pub logs: Vec<super::log_config::Entry>,
+    pub servers: Vec<super::global_servers::Settings>,
+    log_names: std::collections::BTreeSet<String>,
     pub diagnostics: std::cell::RefCell<Vec<super::Warning>>,
 }
 impl Options {
@@ -89,6 +92,9 @@ impl Options {
             storage: None,
             metrics: None,
             events: None,
+            logs: Vec::new(),
+            servers: Vec::new(),
+            log_names: Default::default(),
             diagnostics: Default::default(),
         }
     }
@@ -152,6 +158,14 @@ impl Options {
             }
             (|| -> Result<()> {
             match name {
+                "servers"=>{self.servers.push(super::global_servers::parse(seg,budget)?);}
+                "log"=>{
+                    // Pass names separately because parsing diagnostics borrow Options.
+                    let mut names=std::mem::take(&mut self.log_names);
+                    let result=super::log_config::parse(seg,Some(&mut names),&mut 0,budget,self);
+                    self.log_names=names;
+                    self.logs.push(result?);
+                }
                 "events" => {
                     self.events=Some(super::global_auxiliary::events(seg)?);
                 }
@@ -372,11 +386,27 @@ impl Options {
 }
 
 impl Options {
-    pub fn pki_app(&self, budget: &mut Budget) -> Result<Option<Value>> {
+    pub fn pki_app(
+        &self,
+        budget: &mut Budget,
+        pairings: &[super::listeners::Pairing],
+        sites: &[super::site::Site],
+    ) -> Result<Option<Value>> {
         let cost = budget.measure_map(&self.pki)?;
         budget.copies(cost, 1, 3)?;
         let mut cas = self.pki.clone();
         let skip = self.atoms.contains_key("skip_install_trust");
+        for p in pairings {
+            for s in &p.sites {
+                for id in &sites[s.site].ca_names {
+                    budget.work(id.len() as u64 + 1)?;
+                    if !cas.contains_key(id) {
+                        budget.materialize(id.len() as u64 + 192)?;
+                        cas.insert(id.clone(), Value::Object(Map::new()));
+                    }
+                }
+            }
+        }
         if skip {
             for ca in cas.values_mut() {
                 ca.as_object_mut()
@@ -385,6 +415,30 @@ impl Options {
             }
             if cas.is_empty() && !self.strings("auto_https").iter().any(|s| s == "off") {
                 cas.insert("local".into(), json!({"install_trust":false}));
+            }
+        }
+        if skip {
+            for p in pairings {
+                for s in &p.sites {
+                    for issuer in &sites[s.site].tls.issuers {
+                        budget.work(1)?;
+                        let issuer = issuer.borrow();
+                        if issuer.module() != "internal" {
+                            continue;
+                        }
+                        let id = issuer
+                            .fields()
+                            .get("ca")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("local");
+                        budget.work(id.len() as u64 + 1)?;
+                        if !cas.contains_key(id) {
+                            budget.materialize(id.len() as u64 + 192)?;
+                            cas.insert(id.into(), json!({"install_trust":false}));
+                        }
+                    }
+                }
             }
         }
         if cas.is_empty() {

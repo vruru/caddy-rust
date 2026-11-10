@@ -301,3 +301,12 @@ metadata-only OCSP updates preserve valid ownership. Cache eviction does not
 create a global revocation fact, and accepted TLS streams retain their owned
 keys. On-demand permission, renewal and HTTP request integration remain separate
 compatibility gates.
+
+The configuration adapter now translates global/site logging, access-log host
+association, built-in log writers/encoders/filters, per-listener server settings
+and metrics options, and the ACME-server directive with its explicit PKI CA
+configuration. Server selection preserves the original Go unstable sorting
+behavior for overlapping listener settings. These are configuration conversion
+capabilities; the corresponding runtime modules remain separate implementation
+and acceptance gates. Logging output, ACME-server signing, server protocols and
+metrics must not be advertised as operational from adaptation success alone.

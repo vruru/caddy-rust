@@ -196,3 +196,27 @@ mod proxy_sources;
 
 #[path = "caddyfile_adapter/proxy_shortcuts.rs"]
 mod proxy_shortcuts;
+
+#[path = "caddyfile_adapter/log_writers.rs"]
+mod log_writers;
+
+#[path = "caddyfile_adapter/log_filters.rs"]
+mod log_filters;
+
+#[path = "caddyfile_adapter/log_encoders.rs"]
+mod log_encoders;
+
+#[path = "caddyfile_adapter/log_config.rs"]
+mod log_config;
+
+#[path = "caddyfile_adapter/log_assembly.rs"]
+mod log_assembly;
+
+#[path = "caddyfile_adapter/global_servers.rs"]
+mod global_servers;
+
+#[path = "caddyfile_adapter/pdqsort.rs"]
+mod pdqsort;
+
+#[path = "caddyfile_adapter/handler_acmeserver.rs"]
+mod handler_acmeserver;
