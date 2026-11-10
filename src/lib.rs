@@ -9,3 +9,5 @@ pub mod certstore;
 pub mod http_config;
 pub mod http_runtime;
 pub mod admin;
+pub mod acme_wire;
+pub mod cert_automation;

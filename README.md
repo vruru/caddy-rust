@@ -92,6 +92,14 @@ Unsupported modules and transport options fail validation instead of being
 silently ignored. The vendored HTTP crates contain opt-in compatibility changes;
 see vendor/VENDOR.md and THIRD-PARTY-NOTICES.
 
+ACME library work now includes bounded signed protocol requests, persistent
+account/order checkpoints, isolated issuer fallback, scoped recovery and renewal
+scheduling. Cached certificate publication emits a discovery hint as well as
+new issuance; consumers must rescan after a missed hint or a full replacement.
+The automatic-HTTPS product lifecycle, certificate-policy integration and the
+remaining issuer/module behaviors are still migration work. Library checks and
+isolated CA interoperability do not make the inspector a production server.
+
 Build with the current official stable Rust, pinned to 1.99.1 for this phase.
 Keep all QA, fixtures, private configuration, keys, logs, and build output in the
 current LocalOps task. Do not create GitHub Actions. The authorized source
