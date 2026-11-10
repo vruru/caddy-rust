@@ -46,24 +46,25 @@ impl OcspManager {
             !certificate.chain_der.is_empty(),
             "OCSP certificate chain empty"
         );
-        let leaf = verify::certificate(&certificate.chain_der[0])?;
-        let quiet = leaf.validity().not_after.timestamp() - leaf.validity().not_before.timestamp()
-            < 7 * 86400
-            && !verify::must_staple(&leaf).unwrap_or(true);
-        if verify::endpoints(&certificate.chain_der[0])?.0.is_none() {
-            if verify::must_staple(&leaf)? {
+        let chain=certificate.chain_der.clone();
+        let (inspection,slot)=tokio::task::spawn_blocking(move || {
+            let inspection=inspect_certificate(&chain)?;
+            Ok::<_,anyhow::Error>((inspection,slot))
+        }).await??;
+        ensure!(!cancel.is_cancelled(),"OCSP cache probe cancelled");
+        let quiet=inspection.quiet;
+        if inspection.responder.is_none() {
+            if inspection.must_staple {
                 self.emit(&certificate, "ocsp_must_staple_unavailable", None, false);
             }
-            self.inner
-                .resolver
-                .set_ocsp(&certificate.identity, certificate.generation, None)?;
-            self.record(&certificate, None, None)?;
+            self.inner.resolver.set_ocsp(&certificate.identity,certificate.generation,None)?;
+            self.record(&certificate,None,None)?;
             return Ok(CacheRestore::NotApplicable);
         }
         if certificate.chain_der.len() < 2 {
             return Ok(CacheRestore::NeedsIssuer);
         }
-        let key = cache_key(&certificate.names, &certificate.chain_der);
+        let key = inspection.cache_key;
         let Some(raw) = self.inner.store.load(&key).await? else {
             self.reconcile_known_negative(&certificate, quiet).await?;
             return Ok(CacheRestore::Missing);
@@ -81,6 +82,7 @@ impl OcspManager {
             certificate.chain_der[1].clone(),
             config.no_next_update_max_age,
             Some(slot),
+            None,
         )
         .await;
         let status = match verified {

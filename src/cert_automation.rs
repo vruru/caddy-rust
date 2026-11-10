@@ -205,6 +205,7 @@ pub struct AutomationResources {
     max_per_ca: usize,
 }
 impl AutomationResources {
+    pub(crate) fn cpu_slots(&self) -> Arc<Semaphore> { self.local.clone() }
     pub fn limits(&self) -> (usize, usize) { (self.max_concurrent, self.max_per_ca) }
     pub fn new(max_concurrent: usize, max_per_ca: usize) -> Result<Self> {
         ensure!((1..=128).contains(&max_concurrent) && (1..=32).contains(&max_per_ca), "ACME concurrency outside bounds");
@@ -379,11 +380,21 @@ impl CertificateManager {
         };
         Ok(NetworkPermit { _global: global, _issuer: issuer })
     }
-    async fn local_permit(&self, cancel: &CancellationToken) -> Result<tokio::sync::SemaphorePermit<'_>> {
-        tokio::select! { biased;
-            _ = cancel.cancelled() => bail!("ACME local work cancelled"),
-            permit = self.inner.local.acquire() => permit.map_err(|_| anyhow!("ACME manager closed")),
-        }
+    async fn cpu<T: Send + 'static>(&self, cancel: &CancellationToken, operation: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+        crate::cert_cpu::run(self.inner.local.clone(), cancel.clone(), operation).await
+    }
+    async fn inspect_material(&self, bundle: &CertificateBundle, names: &[String], cancel: &CancellationToken) -> Result<MaterialInfo> {
+        let bundle = CertificateBundle { chain_pem:bundle.chain_pem.clone(), private_key_pem:bundle.private_key_pem.clone(), metadata:Value::Null };
+        let names = names.to_vec();
+        self.cpu(cancel, move || material_info(&bundle, &names)).await
+    }
+    async fn certificate_id(&self, pem: &[u8], cancel: &CancellationToken) -> Result<Option<String>> {
+        let pem = pem.to_vec();
+        self.cpu(cancel, move || ari_certificate_id(&pem)).await
+    }
+    async fn account_signer(&self, pem: &[u8], cancel: &CancellationToken) -> Result<Arc<AccountSigner>> {
+        let pem = Zeroizing::new(pem.to_vec());
+        self.cpu(cancel, move || Ok(Arc::new(AccountSigner::from_pem(&pem)?))).await
     }
     pub fn new(
         store: FsStore,
@@ -585,10 +596,10 @@ impl CertificateManager {
                     );
                     let wire = issuer
                         .wire
-                        .get_or_try_init(|| AcmeWire::connect(issuer.config.wire.clone(), &cancel))
+                        .get_or_try_init(|| AcmeWire::connect_with_cpu(issuer.config.wire.clone(), self.inner.local.clone(), &cancel))
                         .await?;
                     let session = wire.restore(
-                        Arc::new(AccountSigner::from_pem(&account.private_key_pem)?),
+                        self.account_signer(&account.private_key_pem, &cancel).await?,
                         &job.account_location,
                     )?;
                     let resource = session.order(&order_url, &cancel).await?;
@@ -776,7 +787,7 @@ impl CertificateManager {
             }
             let wire = match issuer
                 .wire
-                .get_or_try_init(|| AcmeWire::connect(issuer.config.wire.clone(), &cancel))
+                .get_or_try_init(|| AcmeWire::connect_with_cpu(issuer.config.wire.clone(), self.inner.local.clone(), &cancel))
                 .await
             {
                 Ok(wire) => wire,
@@ -968,7 +979,6 @@ impl CertificateManager {
         lease: &StorageLease,
         cancel: &CancellationToken,
     ) -> Result<Option<Reservation>> {
-        let _local = self.local_permit(cancel).await?;
         let Some(value) = self
             .inner
             .store
@@ -1022,7 +1032,7 @@ impl CertificateManager {
         // Finish an already validated candidate without depending on CA/account
         // connectivity. A prior commit may have succeeded before its checkpoint.
         if let Some(current) = self.inner.store.load_certificate(&issuer, &key).await? {
-            let info = material_info(&current, names)?;
+            let info = self.inspect_material(&current, names, cancel).await?;
             if job.stored_leaf_sha256.as_deref() == Some(&info.leaf_sha256) {
                 job.phase = "stored".to_owned();
                 job.private_key_pem.zeroize();
@@ -1053,7 +1063,7 @@ impl CertificateManager {
                 private_key_pem: Zeroizing::new(job.private_key_pem.as_bytes().to_vec()),
                 metadata: json!({"sans":names,"issuer_data":{"url":job.certificate_url,"ca":job.directory,"account":job.account_location}}),
             };
-            let info = material_info(&bundle, names)?;
+            let info = self.inspect_material(&bundle, names, cancel).await?;
             if info.not_after <= now() {
                 job.phase = "prepared".to_owned();
                 job.order_url = None;
@@ -1108,7 +1118,6 @@ impl CertificateManager {
     ) -> Result<(Option<ManagedCertificate>, Option<Replacement>, Option<CertificateBundle>)> {
         let key = names_key(names)?;
         let selection = {
-        let _local = self.local_permit(cancel).await?;
         let active_attempt = self.load_attempt(names).await?;
         let selected = active_attempt.as_ref().and_then(|a| {
             a.winner
@@ -1137,7 +1146,7 @@ impl CertificateManager {
                 else {
                     return Ok(None);
                 };
-                let info = material_info(&bundle, names)?;
+                let info = self.inspect_material(&bundle, names, cancel).await?;
                 Ok::<_, anyhow::Error>(Some((bundle, info)))
             }
             .await;
@@ -1201,12 +1210,10 @@ impl CertificateManager {
                 return Err(FutureCertificate(info.not_before).into());
             }
             if mode == LoadMode::Online && info.not_before <= now && info.not_after > now {
-                let _local = self.local_permit(cancel).await?;
-                self.publish(names, &bundle, cancel).await?;
+                        self.publish(names, &bundle, cancel).await?;
             }
             let certificate_id = {
-                let _local = self.local_permit(cancel).await?;
-                ari_certificate_id(&bundle.chain_pem)?
+                        self.certificate_id(&bundle.chain_pem,cancel).await?
             };
             let mut ari = parse_ari(&bundle.metadata);
             if mode == LoadMode::Online
@@ -1221,7 +1228,7 @@ impl CertificateManager {
                     if issuer.ca.next_allowed_unix.load(Ordering::Acquire) > now { return Ok(None); }
                     let wire = issuer
                         .wire
-                        .get_or_try_init(|| AcmeWire::connect(issuer.config.wire.clone(), cancel))
+                        .get_or_try_init(|| AcmeWire::connect_with_cpu(issuer.config.wire.clone(), self.inner.local.clone(), cancel))
                         .await?;
                     if let Some(cert_id) = certificate_id.as_deref() {
                         return wire.renewal_info(cert_id, cancel).await;
@@ -1232,8 +1239,7 @@ impl CertificateManager {
                 ensure!(!cancel.is_cancelled(), "ACME operation cancelled");
                 match update {
                     Ok(Some(updated)) => {
-                        let _local = self.local_permit(cancel).await?;
-                        // Caddy may have persisted an equivalent SAN set in a
+                                        // Caddy may have persisted an equivalent SAN set in a
                         // different order. Native leases use normalized first SAN.
                         bundle.metadata["sans"] = json!(names);
                         write_ari(
@@ -1387,7 +1393,7 @@ impl CertificateManager {
                     );
                     return wire
                         .restore(
-                            Arc::new(AccountSigner::from_pem(&account.private_key_pem)?),
+                            self.account_signer(&account.private_key_pem, cancel).await?,
                             location,
                         )
                         .map(Some);
@@ -1424,7 +1430,7 @@ impl CertificateManager {
             let existing=self.inner.store.load_account(&issuer_name,&email).await?;
             if let Some(account)=existing {
                 ensure!(account_lock_name(&account.metadata)?==registration,"account contact changed while acquiring registration lock");
-                let signer=Arc::new(AccountSigner::from_pem(&account.private_key_pem)?);
+                let signer=self.account_signer(&account.private_key_pem, cancel).await?;
                 if let Some(location)=account.metadata["location"].as_str().filter(|v|!v.is_empty()){
                     ensure!(account.metadata["status"]=="valid"&&expected_location.is_none_or(|v|v==location),"stored ACME account identity changed");
                     return Ok::<_,anyhow::Error>((Some(wire.restore(signer,location)?),None));
@@ -1448,12 +1454,12 @@ impl CertificateManager {
                 ensure!(pending.version==1&&pending.directory==wire.directory_url(),"account checkpoint identity changed");pending
             }else{
                 let kind=issuer.config.account_key_type;
-                let(_,key)=tokio::task::spawn_blocking(move||AccountSigner::generate(kind)).await.map_err(|_|anyhow!("account key generation failed"))??;
+                let(_,key)=self.cpu(cancel, move||AccountSigner::generate(kind)).await?;
                 let pending=PendingAccount{version:1,directory:wire.directory_url().to_owned(),phase:"key_prepared".to_owned(),private_key_pem:std::str::from_utf8(&key)?.to_owned(),eab:None,storage_email:None,metadata:Some(if email.is_empty(){json!({"contact":[]})}else{json!({"contact":[format!("mailto:{email}")]})})};
                 self.store_checkpoint(&pending_id,serde_json::to_value(&pending)?,&lease).await?;pending
             };
             if pending.phase=="account_received"{return Ok((None,Some(pending)))}
-            let signer=Arc::new(AccountSigner::from_pem(pending.private_key_pem.as_bytes())?);
+            let signer=self.account_signer(pending.private_key_pem.as_bytes(), cancel).await?;
             let recovered=if pending.phase!="key_prepared" {
                 match wire.account(signer.clone(),&email,issuer.config.terms_of_service_agreed,true,None,&registration_cancel).await {
                     Ok(result)=>Some(result),
@@ -1537,7 +1543,7 @@ impl CertificateManager {
             metadata["status"] == "valid" && expected_location.is_none_or(|v| v == location),
             "account publication identity changed"
         );
-        let signer = Arc::new(AccountSigner::from_pem(pending.private_key_pem.as_bytes())?);
+        let signer = self.account_signer(pending.private_key_pem.as_bytes(), cancel).await?;
         let session = wire.restore(signer.clone(), &location)?;
         let destination_lock = account_lock_name(metadata)?;
         let lease = self
@@ -1553,7 +1559,7 @@ impl CertificateManager {
             let mut stored = metadata.clone();
             if let Some(existing) = self.inner.store.load_account(issuer_name, &actual).await? {
                 ensure!(
-                    AccountSigner::from_pem(&existing.private_key_pem)?.public_spki()?
+                    self.account_signer(&existing.private_key_pem, cancel).await?.public_spki()?
                         == signer.public_spki()?
                         && existing.metadata["location"]
                             .as_str()
@@ -1626,7 +1632,7 @@ impl CertificateManager {
         let (replacement, reservation, attempt_id) = cycle;
         let wire = issuer
             .wire
-            .get_or_try_init(|| AcmeWire::connect(issuer.config.wire.clone(), cancel))
+            .get_or_try_init(|| AcmeWire::connect_with_cpu(issuer.config.wire.clone(), self.inner.local.clone(), cancel))
             .await?;
         let issuer_name = issuer_key(wire.directory_url())?;
         let replaces = replacement
@@ -1666,9 +1672,7 @@ impl CertificateManager {
         } else {
             let csr_names = names.to_vec();
             let kind = issuer.config.leaf_key_type;
-            let (csr, key) = tokio::task::spawn_blocking(move || generate_csr(&csr_names, kind))
-                .await
-                .map_err(|_| anyhow!("certificate key generation failed"))??;
+            let (csr, key) = self.cpu(cancel, move || generate_csr(&csr_names, kind)).await?;
             let job = Job {
                 version: 1,
                 names: names.to_vec(),
@@ -1704,7 +1708,7 @@ impl CertificateManager {
                 .load_certificate(&issuer_name, &names_key(names)?)
                 .await?;
             if let Some(bundle) = current {
-                let info = material_info(&bundle, names)?;
+                let info = self.inspect_material(&bundle, names, cancel).await?;
                 let renew_at = renewal_time(
                     info.not_before,
                     info.not_after,
@@ -1737,9 +1741,7 @@ impl CertificateManager {
             // externally replaced or now-due certificate starts a fresh cycle.
             let csr_names = names.to_vec();
             let kind = issuer.config.leaf_key_type;
-            let (csr, key) = tokio::task::spawn_blocking(move || generate_csr(&csr_names, kind))
-                .await
-                .map_err(|_| anyhow!("certificate key generation failed"))??;
+            let (csr, key) = self.cpu(cancel, move || generate_csr(&csr_names, kind)).await?;
             job.csr_der = csr;
             job.private_key_pem = std::str::from_utf8(&key)
                 .map_err(|_| anyhow!("invalid generated certificate key"))?
@@ -1913,9 +1915,9 @@ impl CertificateManager {
                 job.phase="downloaded".to_owned();self.save_job(&id,&job,lease).await?;
             }
             let mut bundle=CertificateBundle {chain_pem:job.downloaded_pem.as_ref().ok_or_else(||anyhow!("ACME certificate missing"))?.as_bytes().to_vec(),private_key_pem:Zeroizing::new(job.private_key_pem.as_bytes().to_vec()),metadata:json!({"sans":names,"issuer_data":{"url":job.certificate_url,"ca":wire.directory_url(),"account":account.location()}})};
-            let info=material_info(&bundle,names)?;
+            let info=self.inspect_material(&bundle,names,cancel).await?;
             ensure!(info.not_before<=now() && info.not_after>now(),"issued certificate is not currently valid");
-            if let Some(cert_id)=ari_certificate_id(&bundle.chain_pem)? && let Ok(Some(ari))=wire.renewal_info(&cert_id,cancel).await {write_ari(&mut bundle.metadata,&ari,&info,self.inner.options.renewal_window_ratio)?;}
+            if let Some(cert_id)=self.certificate_id(&bundle.chain_pem,cancel).await? && let Ok(Some(ari))=wire.renewal_info(&cert_id,cancel).await {write_ari(&mut bundle.metadata,&ari,&info,self.inner.options.renewal_window_ratio)?;}
             job.stored_leaf_sha256=Some(info.leaf_sha256.clone());job.phase="store_intent".to_owned();self.save_job(&id,&job,lease).await?;
             lease.check().await?;self.inner.store.save_certificate(&issuer_name,&names_key(names)?,&bundle,lease).await?;
             job.phase="stored".to_owned();job.private_key_pem.zeroize();job.downloaded_pem=None;job.csr_der.clear();self.save_job(&id,&job,lease).await?;
@@ -2092,11 +2094,13 @@ impl CertificateManager {
         cancel: &CancellationToken,
     ) -> Result<()> {
         for attempt in 0..8 {
-            match self.inner.resolver.upsert(&CertificateInput {
-                names,
-                certificate_pem: &bundle.chain_pem,
-                private_key_pem: &bundle.private_key_pem,
-            }) {
+            let names_owned = names.to_vec();
+            let chain = bundle.chain_pem.clone();
+            let key = bundle.private_key_pem.clone();
+            let resolver = self.inner.resolver.clone();
+            match self.cpu(cancel, move || Ok(resolver.upsert(&CertificateInput {
+                names: &names_owned, certificate_pem: &chain, private_key_pem: &key,
+            }))).await? {
                 Ok(()) => {
                     // Cached material is also a new resolver instance. Observers
                     // must discover it even when no ACME order was necessary.

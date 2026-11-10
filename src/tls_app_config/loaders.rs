@@ -82,23 +82,15 @@ pub(super) async fn blocking<T: Send + 'static>(
     cancel: CancellationToken,
     operation: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
+    crate::cert_cpu::run(slots,cancel,operation).await
+}
+
+async fn loading<T: Send + 'static>(io: Arc<Semaphore>, cpu: Arc<Semaphore>, cancel: CancellationToken, operation: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
     let permit = tokio::select! { biased;
-        _ = cancel.cancelled() => return Err(anyhow!("certificate file operation cancelled")),
-        permit = slots.acquire_owned() => permit.map_err(|_| anyhow!("certificate file operations stopped"))?,
+        _ = cancel.cancelled() => return Err(anyhow!("certificate loading cancelled")),
+        permit = cpu.acquire_owned() => permit.map_err(|_| anyhow!("certificate CPU operations stopped"))?,
     };
-    let worker_cancel = cancel.clone();
-    let mut worker = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        ensure!(
-            !worker_cancel.is_cancelled(),
-            "certificate file operation cancelled"
-        );
-        operation()
-    });
-    tokio::select! { biased;
-        _ = cancel.cancelled() => { let _ = worker.await; Err(anyhow!("certificate file operation cancelled")) }
-        result = &mut worker => result.map_err(|_| anyhow!("certificate file worker failed"))?,
-    }
+    blocking(io,cancel,move || { let _permit=permit; operation() }).await
 }
 
 pub(super) async fn load_manual(
@@ -127,6 +119,7 @@ pub(super) async fn load_manual(
             let store = store.clone();
             let cwd = context.paths.cwd.clone();
             let io = context.resources.io.clone();
+            let cpu = context.resources.cpu.clone();
             let token = work.clone();
             let budget = budget.clone();
             let operation = async move {
@@ -137,7 +130,7 @@ pub(super) async fn load_manual(
                         key,
                         tags,
                     } => {
-                        blocking(io, token, move || {
+                        loading(io, cpu, token, move || {
                             Ok(vec![material(certificate, key, tags, &budget)?])
                         })
                         .await
@@ -147,7 +140,7 @@ pub(super) async fn load_manual(
                         key,
                         tags,
                     } => {
-                        blocking(io, token, move || {
+                        loading(io, cpu, token, move || {
                             Ok(vec![material(
                                 read(&absolute(&cwd, &certificate))?,
                                 Zeroizing::new(read(&absolute(&cwd, &key))?),
@@ -174,14 +167,14 @@ pub(super) async fn load_manual(
                             .load(&key)
                             .await?
                             .ok_or_else(|| anyhow!("configured storage private key missing"))?;
-                        blocking(io, token, move || {
+                        loading(io, cpu, token, move || {
                             Ok(vec![material(certificate.to_vec(), key, tags, &budget)?])
                         })
                         .await
                     }
                     ManualSource::Folder(path) => {
                         let walking = token.clone();
-                        blocking(io, token, move || {
+                        loading(io, cpu, token, move || {
                             let path = absolute(&cwd, &path);
                             let mut files = Vec::new();
                             collect(&path, 0, &mut files, &walking, &budget)?;

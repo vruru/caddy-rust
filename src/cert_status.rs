@@ -342,15 +342,7 @@ impl OcspManager {
     ) -> Result<()> {
         if !(self.inner.inventory)(&certificate) { return Ok(()); }
         let _work = self.inner.resources.work_slots.try_acquire().map_err(|_| anyhow!("OCSP queued work capacity exhausted"))?;
-        let quiet = certificate
-            .chain_der
-            .first()
-            .and_then(|der| verify::certificate(der).ok())
-            .is_some_and(|leaf| {
-                leaf.validity().not_after.timestamp() - leaf.validity().not_before.timestamp()
-                    < 7 * 86400
-                    && !verify::must_staple(&leaf).unwrap_or(true)
-            });
+        let quiet = self.inspect(&certificate,cancel.clone()).await.map(|value|value.quiet).unwrap_or(false);
         let leaf_sha256 = leaf_hash(&certificate);
         let summary = OcspCertificate {
             identity: certificate.identity,
@@ -464,6 +456,10 @@ impl OcspManager {
             }
         })
     }
+    async fn inspect(&self, certificate: &OcspCertificate, cancel: CancellationToken) -> Result<CertificateInspection> {
+        let chain = certificate.chain_der.clone();
+        crate::cert_cpu::run(self.inner.restore_slots.clone(),cancel,move || inspect_certificate(&chain)).await
+    }
     fn configuration(&self, certificate: &OcspCertificate) -> Result<OcspConfig> {
         let mut config = (self.inner.policy)(certificate)?;
         if config.no_next_update_max_age.is_zero() {
@@ -504,13 +500,11 @@ impl OcspManager {
             !certificate.chain_der.is_empty(),
             "OCSP certificate chain empty"
         );
-        let leaf = verify::certificate(&certificate.chain_der[0])?;
-        let quiet = leaf.validity().not_after.timestamp() - leaf.validity().not_before.timestamp()
-            < 7 * 86400
-            && !verify::must_staple(&leaf).unwrap_or(true);
-        let (responder, aia) = verify::endpoints(&certificate.chain_der[0])?;
+        let inspection = self.inspect(&certificate,cancel.clone()).await?;
+        let quiet = inspection.quiet;
+        let (responder,aia) = (inspection.responder,inspection.aia);
         let Some(original) = responder else {
-            if verify::must_staple(&leaf)? {
+            if inspection.must_staple {
                 self.emit(&certificate, "ocsp_must_staple_unavailable", None, false);
             }
             self.inner
@@ -547,15 +541,16 @@ impl OcspManager {
         } else {
             None
         };
-        let _responder_permit = if let Some(limiter) = &limiter {
+        let responder_permit = if let Some(limiter) = &limiter {
             Some(
-                tokio::select! {_ =cancel.cancelled()=>return Err(anyhow!("OCSP refresh cancelled")),permit=limiter.acquire()=>permit?},
+                tokio::select! {_ =cancel.cancelled()=>return Err(anyhow!("OCSP refresh cancelled")),permit=limiter.clone().acquire_owned()=>permit?},
             )
         } else {
             None
         };
-        let _permit = tokio::select! {_ =cancel.cancelled()=>return Err(anyhow!("OCSP refresh cancelled")),permit=self.inner.global.acquire()=>permit?};
-        let cache_key = cache_key(&certificate.names, &certificate.chain_der);
+        let global_permit = tokio::select! {_ =cancel.cancelled()=>return Err(anyhow!("OCSP refresh cancelled")),permit=self.inner.global.clone().acquire_owned()=>permit?};
+        let budget=Arc::new(OcspNetworkBudget { _global:global_permit,_responder:responder_permit });
+        let cache_key = inspection.cache_key;
         let scope = format!("ocsp_{}", hex(&Sha256::digest(cache_key.as_bytes())));
         let lock_cancel = cancel.child_token();
         let lease_result = tokio::time::timeout(
@@ -595,7 +590,9 @@ impl OcspManager {
             let leaf_der = certificate.chain_der[0].clone();
             let issuer_for_check = issuer.clone();
             let checked_at = now()?;
+            let issuer_budget=budget.clone();
             tokio::task::spawn_blocking(move || {
+                let _budget=issuer_budget;
                 verify::validate_issuer(&leaf_der, &issuer_for_check, checked_at)
             })
             .await??;
@@ -636,6 +633,7 @@ impl OcspManager {
                     issuer.clone(),
                     config.no_next_update_max_age,
                     None,
+                    Some(budget.clone()),
                 )
                 .await
                 {
@@ -748,6 +746,7 @@ impl OcspManager {
                     issuer,
                     config.no_next_update_max_age,
                     None,
+                    Some(budget.clone()),
                 )
                 .await?;
                 // Authentication establishes a leaf fact independently of
@@ -1229,16 +1228,41 @@ fn record_leaf(certificate: &OcspCertificate, status: &VerifiedStatus) -> Result
     })
 }
 
+struct CertificateInspection {
+    quiet: bool,
+    must_staple: bool,
+    responder: Option<String>,
+    aia: Option<String>,
+    cache_key: String,
+}
+fn inspect_certificate(chain: &[Vec<u8>]) -> Result<CertificateInspection> {
+    ensure!(!chain.is_empty(),"OCSP certificate chain empty");
+    let leaf = verify::certificate(&chain[0])?;
+    let parsed_staple = verify::must_staple(&leaf);
+    let quiet = leaf.validity().not_after.timestamp() - leaf.validity().not_before.timestamp() < 7*86400 && !parsed_staple.as_ref().copied().unwrap_or(true);
+    let (responder,aia)=verify::endpoints(&chain[0])?;
+    // Preserve the existing error boundary: a malformed TLS feature matters
+    // here only when there is no responder; online verification is unchanged.
+    let must_staple = if responder.is_none() { parsed_staple? } else { parsed_staple.unwrap_or(true) };
+    Ok(CertificateInspection { quiet,must_staple,responder,aia,cache_key:cache_key(&[],chain) })
+}
+
+struct OcspNetworkBudget {
+    _global: tokio::sync::OwnedSemaphorePermit,
+    _responder: Option<tokio::sync::OwnedSemaphorePermit>,
+}
 async fn verify_owned(
     raw: Vec<u8>,
     leaf: Vec<u8>,
     issuer: Vec<u8>,
     max_age: Duration,
     admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    budget: Option<Arc<OcspNetworkBudget>>,
 ) -> Result<VerifiedStatus> {
     let now = now()?;
     tokio::task::spawn_blocking(move || {
         let _admission = admission;
+        let _budget = budget;
         verify_response_with_max_age(&raw, &leaf, &issuer, now, max_age)
     })
     .await?

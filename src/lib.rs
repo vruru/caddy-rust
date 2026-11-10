@@ -24,3 +24,5 @@ pub mod local_pki;
 pub mod caddyfile_adapter;
 
 pub mod tls_app_config;
+
+pub(crate) mod cert_cpu;

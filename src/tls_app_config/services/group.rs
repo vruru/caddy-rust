@@ -366,7 +366,7 @@ impl CertificateServices {
             });
             return Ok(());
         };
-        let mut material = Material::from_pem(bundle.chain_pem, bundle.private_key_pem)?;
+        let mut material = self.parse_material(bundle.chain_pem, bundle.private_key_pem, cancel.clone()).await?;
         material.names = group.names.clone();
         let (begin, end) = material.times()?;
         let leaf = self.context.leaf_guard.intern(material.leaf_id, end)?;
@@ -384,7 +384,7 @@ impl CertificateServices {
             return Ok(());
         }
         material.validate_at(at, false)?;
-        material.publish(&group.resolver)?;
+        self.publish_material(Arc::new(material.clone()),group.resolver.clone(),cancel.clone()).await?;
         self.remember_material(&group, material).await
     }
 
@@ -413,7 +413,7 @@ impl CertificateServices {
                     .ok_or_else(|| anyhow!("published managed certificate is missing"))?;
                 Ok((
                     info.renew_at_unix,
-                    Material::from_pem(bundle.chain_pem, bundle.private_key_pem)?,
+                    self.parse_material(bundle.chain_pem, bundle.private_key_pem, cancel.clone()).await?,
                 ))
             }
             GroupIssuer::Internal { pki, ca, options } => {
@@ -431,7 +431,7 @@ impl CertificateServices {
                         .await?;
                     if let Some(bundle) = group.store.fs.load_certificate(ca, &key).await? {
                         let mut material =
-                            Material::from_pem(bundle.chain_pem, bundle.private_key_pem)?;
+                            self.parse_material(bundle.chain_pem, bundle.private_key_pem, cancel.clone()).await?;
                         material.names = group.names.clone();
                         let (begin, end) = material.times()?;
                         if begin > now()? {
@@ -448,7 +448,7 @@ impl CertificateServices {
                             && reject_revoked(&material, &self.context.leaf_guard).is_ok()
                             && (cached_first || due > now()?)
                         {
-                            material.publish(&group.resolver)?;
+                            self.publish_material(Arc::new(material.clone()),group.resolver.clone(),cancel.clone()).await?;
                             return Ok((due, material));
                         }
                     }
@@ -465,7 +465,7 @@ impl CertificateServices {
                     .await?;
                     let chain_pem = pki.issue(ca, csr, options.clone(), cancel.clone()).await?;
                     let mut material =
-                        Material::from_pem(chain_pem.clone(), private_key_pem.clone())?;
+                        self.parse_material(chain_pem.clone(), private_key_pem.clone(), cancel.clone()).await?;
                     material.names = group.names.clone();
                     material.validate_at(now()?, false)?;
                     let bundle = CertificateBundle {
@@ -480,7 +480,7 @@ impl CertificateServices {
                         .save_certificate(ca, &key, &bundle, &lease)
                         .await?;
                     lease.check().await?;
-                    material.publish(&group.resolver)?;
+                    self.publish_material(Arc::new(material.clone()),group.resolver.clone(),cancel.clone()).await?;
                     let (begin, end) = material.times()?;
                     Ok((
                         cert_automation::renewal_time(

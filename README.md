@@ -255,3 +255,12 @@ budget. Adapter JSON equivalence does not establish execution of every emitted
 module: named routes, tracing, URLPattern and remaining server/module options
 still have explicit runtime gates. The remaining proxy/directive families and
 complete runtime behavior continue to block production replacement.
+
+Certificate preparation, material publication, ACME signing and OCSP certificate
+inspection now dispatch their CPU work through owned bounded blocking admission.
+The actual worker retains its permit through caller cancellation. Immutable
+material caches validated keys, certificate times, purposes and issuer names;
+current time and shared revocation policy still apply at use. This removes those
+CPU operations from async request workers without starting business issuance
+before activation. TLS handshake CPU isolation and remaining lifecycle/module
+compatibility are separate integration gates; the CLI remains an inspector.

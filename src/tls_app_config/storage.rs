@@ -33,6 +33,7 @@ pub struct CertificateResources {
     pub(super) ocsp: Arc<OcspResources>,
     pub(super) pki: Arc<crate::local_pki::LocalPkiResources>,
     pub(super) io: Arc<Semaphore>,
+    pub(super) cpu: Arc<Semaphore>,
     pub(super) revoked: Notify,
 }
 impl CertificateResources {
@@ -48,6 +49,7 @@ impl CertificateResources {
     ) -> Result<Self> {
         Ok(Self {
             stores: Mutex::new(HashMap::new()),
+            cpu: issuance.cpu_slots(),
             issuance,
             ocsp,
             pki: Arc::new(crate::local_pki::LocalPkiResources::new(

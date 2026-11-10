@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
@@ -147,6 +147,7 @@ pub struct AcmeWire {
     inner: Arc<WireInner>,
 }
 struct WireInner {
+    cpu: Arc<Semaphore>,
     client: reqwest::Client,
     directory_url: Url,
     directory: Directory,
@@ -179,6 +180,11 @@ struct WireResponse {
 
 impl AcmeWire {
     pub async fn connect(options: WireOptions, cancel: &CancellationToken) -> Result<Self> {
+        static CPU: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+        let cpu = CPU.get_or_init(|| Arc::new(Semaphore::new(std::thread::available_parallelism().map_or(1,usize::from).min(4)))).clone();
+        Self::connect_with_cpu(options,cpu,cancel).await
+    }
+    pub(crate) async fn connect_with_cpu(options: WireOptions, cpu: Arc<Semaphore>, cancel: &CancellationToken) -> Result<Self> {
         ensure!(
             !options.request_timeout.is_zero()
                 && options.request_timeout <= Duration::from_secs(3600),
@@ -205,6 +211,7 @@ impl AcmeWire {
             trusted.insert(url.origin().ascii_serialization());
         }
         validate_url(&directory_url, &trusted, options.allow_insecure_loopback)?;
+        let client = crate::cert_cpu::run(cpu.clone(),cancel.clone(),move || {
         let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
@@ -217,13 +224,15 @@ impl AcmeWire {
                     .map_err(|_| anyhow!("invalid ACME trust root"))?,
             );
         }
-        let client = builder
+        builder
             .build()
-            .map_err(|_| anyhow!("ACME client construction failed"))?;
+            .map_err(|_| anyhow!("ACME client construction failed"))
+        }).await?;
         let response = send(&client, Method::GET, directory_url.clone(), None, cancel).await?;
         check_status(&response)?;
-        let directory: Directory = serde_json::from_slice(&response.body)
-            .map_err(|_| anyhow!("invalid ACME directory response"))?;
+        let body=response.body;
+        let directory: Directory = crate::cert_cpu::run(cpu.clone(),cancel.clone(),move || serde_json::from_slice(&body)
+            .map_err(|_| anyhow!("invalid ACME directory response"))).await?;
         for endpoint in [
             &directory.new_nonce,
             &directory.new_account,
@@ -242,6 +251,7 @@ impl AcmeWire {
         Ok(Self {
             inner: Arc::new(WireInner {
                 client,
+                cpu,
                 directory_url,
                 directory,
                 trusted,
@@ -424,7 +434,7 @@ impl AcmeWire {
 
     async fn signed(
         &self,
-        signer: &AccountSigner,
+        signer: &Arc<AccountSigner>,
         kid: Option<&str>,
         raw: &str,
         payload: Option<&Value>,
@@ -447,7 +457,12 @@ impl AcmeWire {
                 Some(value) => URL_SAFE_NO_PAD.encode(serde_json::to_vec(value)?),
                 None => String::new(),
             };
-            let signature = signer.sign(format!("{protected}.{payload}").as_bytes())?;
+            let signer = signer.clone();
+            let signed_bytes = format!("{protected}.{payload}");
+            let signature = match crate::cert_cpu::run(self.inner.cpu.clone(),cancel.clone(),move || signer.sign(signed_bytes.as_bytes())).await {
+                Err(_) if cancel.is_cancelled() => return Err(ProtocolError { status:0,kind:"cancelledBeforeSend".into(),uncertain:false,retry_after:None }.into()),
+                result => result?,
+            };
             let body = serde_json::to_vec(
                 &json!({"protected":protected,"payload":payload,"signature":URL_SAFE_NO_PAD.encode(signature)}),
             )?;

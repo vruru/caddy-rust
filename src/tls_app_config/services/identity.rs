@@ -150,12 +150,7 @@ impl CertificateServices {
         for item in material {
             let key = item.material.client_key(now()?)?;
             let (begin, end) = item.material.times()?;
-            let mut issuer_names = Vec::new();
-            for certificate in &key.cert {
-                let (_, certificate) = x509_parser::parse_x509_certificate(certificate.as_ref())
-                    .map_err(|_| anyhow!("invalid administrative identity certificate"))?;
-                issuer_names.push(certificate.issuer().as_raw().to_vec());
-            }
+            let issuer_names = item.material.issuer_names.clone();
             let leaf = key
                 .cert
                 .first()

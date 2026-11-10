@@ -347,10 +347,10 @@ impl CertificateServices {
                     } else {
                         &self.context.resolver
                     };
-                    item.material.publish(resolver)?;
+                    self.publish_material(item.material.clone(), resolver.clone(), cancel.clone()).await?;
                 }
             }
-            self.install_manual(&manual)?;
+            self.install_manual(&manual,cancel.clone()).await?;
             self.state.lock().await.material = retained.material.clone();
             if let Some(identity) = &self.plan.identity {
                 let names = identity
@@ -373,7 +373,7 @@ impl CertificateServices {
             super::loaders::load_manual(&self.plan.manual, storage, &self.context, cancel.clone())
                 .await?;
         let materials = materials.into_iter().map(Arc::new).collect::<Vec<_>>();
-        self.install_manual(&materials)?;
+        self.install_manual(&materials,cancel.clone()).await?;
         self.state.lock().await.material = materials
             .into_iter()
             .map(|material| RetainedMaterial {
@@ -385,7 +385,17 @@ impl CertificateServices {
         self.manual_ocsp(cancel).await?;
         Ok(())
     }
-    fn install_manual(&self, material: &[Arc<Material>]) -> Result<()> {
+    async fn parse_material(&self, certificate: Vec<u8>, key: zeroize::Zeroizing<Vec<u8>>, cancel: CancellationToken) -> Result<Material> {
+        super::loaders::blocking(self.context.resources.cpu.clone(),cancel,move || Material::from_pem(certificate,key)).await
+    }
+    async fn publish_material(&self, material: Arc<Material>, resolver: Arc<HotCertificateResolver>, cancel: CancellationToken) -> Result<()> {
+        super::loaders::blocking(self.context.resources.cpu.clone(),cancel,move || material.publish(&resolver)).await
+    }
+    async fn install_manual(&self, material: &[Arc<Material>], cancel: CancellationToken) -> Result<()> {
+        let material = material.to_vec();
+        let resolver = self.manual_resolver.clone();
+        let certificates = super::loaders::blocking(self.context.resources.cpu.clone(),cancel,move || {
+
         let inputs = material
             .iter()
             .map(|material| CertificateInput {
@@ -394,7 +404,7 @@ impl CertificateServices {
                 private_key_pem: &material.key,
             })
             .collect::<Vec<_>>();
-        self.manual_resolver.replace(&inputs)?;
+        resolver.replace(&inputs)?;
         let certificates = material
             .iter()
             .map(|material| ManualCertificateInfo {
@@ -403,6 +413,8 @@ impl CertificateServices {
                 tags: material.tags.clone(),
             })
             .collect();
+        Ok(certificates)
+        }).await?;
         self.manual_inventory.store(Arc::new(ManualCertificates {
             resolver: self.manual_resolver.clone(),
             certificates: Arc::new(certificates),
