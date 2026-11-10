@@ -273,7 +273,10 @@ async fn prepare_servers(
     let mut redirects = HashMap::<SocketAddr, Vec<Route>>::new();
     let mut output = HashMap::new();
     for server in &config.servers {
-        let local = Arc::new(HotCertificateResolver::new(inner.registry.clone()));
+        let local = Arc::new(HotCertificateResolver::with_leaf_guard(
+            inner.registry.clone(),
+            inner.managed.leaf_guard(),
+        ));
         let mut materials = Vec::new();
         if server.tls {
             for file in &config.certificates {

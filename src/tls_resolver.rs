@@ -4,6 +4,7 @@
 //! those policies. Successful replacement affects future handshakes only.
 
 use crate::challenge::{ACME_ALPN, ChallengeRegistry, normalize_domain};
+use crate::leaf_guard::{LeafGuard, LeafState, leaf_id};
 use anyhow::{Result, anyhow, ensure};
 use rustls::{
     SignatureScheme,
@@ -86,6 +87,7 @@ struct Staple {
 #[derive(Clone)]
 struct LoadedCertificate {
     key: Arc<CertifiedKey>,
+    leaf_state: Arc<LeafState>,
     identity: [u8; 32],
     instance_generation: u64,
     staple: Option<Staple>,
@@ -105,6 +107,7 @@ struct Snapshot {
 /// Arc keeps old signing material alive for handshakes/connections using it.
 pub struct HotCertificateResolver {
     challenges: ChallengeRegistry,
+    leaf_guard: Arc<LeafGuard>,
     certificates: RwLock<Arc<Snapshot>>,
     next_instance: AtomicU64,
 }
@@ -117,12 +120,19 @@ impl fmt::Debug for HotCertificateResolver {
 }
 
 impl HotCertificateResolver {
-    pub fn new(challenges: ChallengeRegistry) -> Self {
+    /// Every candidate and retiring resolver in one process must share this
+    /// guard. Repackaging a leaf in another chain must not forget its status.
+    pub fn with_leaf_guard(challenges: ChallengeRegistry, leaf_guard: Arc<LeafGuard>) -> Self {
         Self {
             challenges,
+            leaf_guard,
             certificates: RwLock::new(Arc::new(Snapshot::default())),
             next_instance: AtomicU64::new(1),
         }
+    }
+
+    pub fn leaf_guard(&self) -> Arc<LeafGuard> {
+        self.leaf_guard.clone()
     }
 
     fn instance_generation(&self) -> Result<u64> {
@@ -155,7 +165,7 @@ impl HotCertificateResolver {
                 .and_then(|n| n.checked_add(input.private_key_pem.len()))
                 .ok_or_else(|| anyhow!("certificate data limit exceeded"))?;
             ensure!(bytes <= MAX_TOTAL_BYTES, "certificate data limit exceeded");
-            let (names, mut cert) = load_certificate(input)?;
+            let (names, mut cert) = load_certificate(input, &self.leaf_guard)?;
             cert.instance_generation = self.instance_generation()?;
             inherit_staple(&mut cert, &base.names, now);
             let cert = Arc::new(cert);
@@ -199,7 +209,7 @@ impl HotCertificateResolver {
     /// candidate cannot replace the current key. This does not remove aliases
     /// omitted by the caller: full configuration reload must use replace().
     pub fn upsert(&self, input: &CertificateInput<'_>) -> Result<()> {
-        let (names, mut cert) = load_certificate(input)?;
+        let (names, mut cert) = load_certificate(input, &self.leaf_guard)?;
         cert.instance_generation = self.instance_generation()?;
         for _ in 0..MAX_UPSERT_ATTEMPTS {
             let base = self
@@ -399,20 +409,23 @@ impl HotCertificateResolver {
         let now =
             i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs()).ok()?;
         let select = |candidates: &Vec<Arc<LoadedCertificate>>| {
-            candidates
-                .iter()
-                .find(|entry| {
-                    now >= entry.not_before
-                        && now < entry.not_after
-                        && entry.key.key.choose_scheme(signature_schemes).is_some()
-                })
-                .map(|entry| {
+            candidates.iter().find_map(|entry| {
+                let admission = entry.leaf_state.admission();
+                if !admission.allow_certificate
+                    || now < entry.not_before
+                    || now >= entry.not_after
+                    || entry.key.key.choose_scheme(signature_schemes).is_none()
+                {
+                    return None;
+                }
+                Some(
                     entry
                         .staple
                         .as_ref()
-                        .filter(|staple| now < staple.valid_until)
-                        .map_or_else(|| entry.key.clone(), |staple| staple.key.clone())
-                })
+                        .filter(|staple| admission.allow_staple && now < staple.valid_until)
+                        .map_or_else(|| entry.key.clone(), |staple| staple.key.clone()),
+                )
+            })
         };
         if let Some(key) = snapshot.names.get(&sni).and_then(select) {
             return Some(key);
@@ -443,7 +456,10 @@ fn staple_size(key: &CertifiedKey) -> Result<usize> {
         })
 }
 
-fn load_certificate(input: &CertificateInput<'_>) -> Result<(Vec<String>, LoadedCertificate)> {
+fn load_certificate(
+    input: &CertificateInput<'_>,
+    leaf_guard: &LeafGuard,
+) -> Result<(Vec<String>, LoadedCertificate)> {
     ensure!(
         !input.names.is_empty() && input.names.len() <= MAX_NAMES,
         "certificate aliases outside bounds"
@@ -539,6 +555,8 @@ fn load_certificate(input: &CertificateInput<'_>) -> Result<(Vec<String>, Loaded
         names,
         LoadedCertificate {
             key: Arc::new(certified),
+            leaf_state: leaf_guard
+                .intern(leaf_id(&blocks[0].1), leaf.validity().not_after.timestamp())?,
             identity,
             instance_generation: 0,
             staple: None,
