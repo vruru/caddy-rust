@@ -1,8 +1,8 @@
 # Native compatibility implementation
 
 Standalone Rust implementation in progress for the existing Caddy deployment.
-This is a separate project from GoEdge. The current build is a **read-only
-migration inspector**, not a traffic-serving replacement. Existing production
+This is a separate project from GoEdge. The current build provides **configuration utilities and read-only migration
+inspection**, not a traffic-serving replacement. Existing production
 Caddy remains unchanged until the replacement passes the applicable contracts.
 
 The user requires original functionality and module behavior to remain available,
@@ -12,11 +12,14 @@ success are not evidence that a proxy, plugin, or certificate issuer is complete
 
 Current commands:
 
+- `fmt [FLAGS] [FILE]`: format, preview differences or overwrite a Caddyfile.
+- `adapt [FLAGS]`: adapt implemented Caddyfile directives, with compatible env-file
+  and flag behavior; `--validate` remains an explicit provisioning integration gate.
 - `inspect-config FILE`: extract a privacy-safe configuration feature inventory.
 - `inspect-storage ROOT`: inspect CertMagic certificate/account layout and validate
   supported certificate/key pairs without writing or registering an ACME account.
 
-Neither command serves traffic, renews a certificate, reloads a running process,
+These commands do not serve traffic, renew a certificate, reload a running process,
 or replaces existing state. Reports must not contain private keys, account email,
 account URLs, domain names, or credential values. Schema pointers use documented
 redaction for dynamic map keys; they are not Admin API mutation paths.
@@ -272,3 +275,11 @@ Range expansion and recursive source/fallback trees share the adapter's prepaid
 resource ledger. `formatting_difference` exposes the original formatter comparison
 for command-line use. These are adaptation contracts; executing every emitted
 transport, policy and handler remains a separate production gate.
+
+CLI environment files are applied at single-threaded executable startup before
+crypto/runtime construction. Existing process variables are preserved, repeated
+files use the original CSV semantics, and a file named `-` remains an ordinary
+environment file even when configuration is read from stdin. Formatting supports
+original overwrite/diff precedence and preserves existing file modes and symlinks.
+The diff implementation has explicit work/output budgets. Serving, validation
+provisioning and the remaining lifecycle commands are still migration gates.

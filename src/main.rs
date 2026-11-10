@@ -1,3 +1,4 @@
+mod cli;
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     io::{Read, Write},
@@ -5,6 +6,17 @@ use std::{
 };
 
 fn main() {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    // SAFETY: this entry has not initialized crypto libraries, workers, runtimes
+    // or other threads. Env files are applied only inside this startup boundary.
+    match unsafe { cli::dispatch_early(&args) } {
+        Ok(Some(code)) => std::process::exit(code),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            std::process::exit(1);
+        }
+    }
     if run().is_err() {
         eprintln!(
             "native compatibility inspection failed; configuration and private material are not printed"
@@ -19,7 +31,7 @@ fn run() -> Result<()> {
     let report = match args.as_slice() {
         [flag] if flag == "--help" => {
             println!(
-                "caddy-compat-native inspect-config FILE | inspect-storage CERTMAGIC_ROOT\nRead-only migration inspection. This build does not serve traffic or replace Caddy."
+                "caddy-compat-native fmt [FLAGS] [FILE] | adapt [FLAGS] | inspect-config FILE | inspect-storage CERTMAGIC_ROOT\nNative compatibility development. This build does not serve traffic or replace Caddy."
             );
             return Ok(());
         }

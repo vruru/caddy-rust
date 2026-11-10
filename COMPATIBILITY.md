@@ -5,7 +5,8 @@ production binaries expose the same 135 standard modules and no additional
 third-party modules. The live configuration uses a subset; that observation does
 not authorize removing capabilities from the requested replacement.
 
-Current CLI stage: read-only feature/storage inspection only. The library adds
+Current CLI stage: Caddyfile formatting/adaptation and read-only feature/storage
+inspection. Full provisioning validation and serving commands remain incomplete. The library adds
 bounded in-memory challenge leases and validated certificate snapshot selection;
 these primitives are not connected to a production listener or ACME issuer.
 All traffic serving,
