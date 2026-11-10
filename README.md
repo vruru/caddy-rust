@@ -124,3 +124,9 @@ Keep all QA, fixtures, private configuration, keys, logs, and build output in th
 current LocalOps task. Do not create GitHub Actions. The authorized source
 repository is the private `vruru/caddy-rust` repository; do not publish this
 standalone project into another repository.
+
+HTTP upstream TLS now loads explicit trust material during preparation, validates
+client identities, derives supported dynamic server names per request, and bounds
+connect/handshake/read/write waits. HTTP-only ALPN follows the original absence
+of an ALPN extension. Static and managed leaves share revocation policy. This
+is isolated transport support; transactional listener integration remains work.

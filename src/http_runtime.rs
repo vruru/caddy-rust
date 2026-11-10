@@ -15,10 +15,12 @@ mod rewrite_uri;
 #[allow(dead_code)] // Used by the following encode middleware stage, not file_server.
 mod sniff;
 #[path = "http_runtime/timeout_io.rs"]
-#[allow(dead_code)] // Provisioned by the next upstream transport stage.
 mod timeout_io;
 #[path = "http_runtime/trailer_policy.rs"]
 mod trailer_policy;
+#[path = "http_runtime/upstream_tls.rs"]
+mod upstream_tls;
+pub use upstream_tls::NativeTrustDiagnostics;
 
 use crate::{
     challenge::{ACME_ALPN, ChallengeRegistry},
@@ -53,6 +55,10 @@ pub struct HttpRuntime {
     control: Mutex<Control>,
 }
 impl HttpRuntime {
+    /// Process-level native CA load and skipped-root counts, without material.
+    pub fn native_upstream_trust_diagnostics(&self) -> NativeTrustDiagnostics {
+        upstream_tls::diagnostics()
+    }
     /// Process-wide count of trailer values excluded by the proxy policy.
     /// Header values and per-user labels are never retained in this counter.
     pub fn filtered_trailer_values(&self) -> u64 {

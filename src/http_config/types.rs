@@ -76,7 +76,7 @@ pub(crate) enum Handler {
         index_names: Vec<String>,
         pass_thru: bool,
     },
-    ReverseProxy(ProxyConfig),
+    ReverseProxy(Box<ProxyConfig>),
 }
 
 #[derive(Clone)]
@@ -101,6 +101,8 @@ pub(crate) struct ProxyConfig {
     pub(crate) compression: bool,
     pub(crate) dial_timeout: std::time::Duration,
     pub(crate) response_header_timeout: Option<std::time::Duration>,
+    pub(crate) read_timeout: Option<std::time::Duration>,
+    pub(crate) write_timeout: Option<std::time::Duration>,
     pub(crate) request_headers: HeaderOps,
     pub(crate) response_headers: HeaderOps,
     pub(crate) flush_interval: i64,
@@ -112,4 +114,8 @@ pub(crate) struct ProxyTls {
     pub(crate) server_name: Option<String>,
     pub(crate) insecure_skip_verify: bool,
     pub(crate) root_ca_pem_files: Vec<String>,
+    pub(crate) root_ca_pool: Vec<String>,
+    pub(crate) client_certificate_file: Option<String>,
+    pub(crate) client_certificate_key_file: Option<String>,
+    pub(crate) handshake_timeout: Option<std::time::Duration>,
 }

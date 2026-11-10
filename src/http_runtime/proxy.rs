@@ -1,32 +1,13 @@
 use super::request::{Context, apply_headers};
+use super::upstream_tls::{FixedDialConnector, PreparedTransport};
 use super::*;
 use http::{HeaderMap, HeaderName, HeaderValue, Uri, Version};
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
-
+use hyper_util::client::legacy::Client;
+use rustls::pki_types::ServerName;
 type HyperClient = Client<FixedDialConnector, Body>;
-#[derive(Clone)]
-struct FixedDialConnector {
-    inner: HttpsConnector<HttpConnector>,
-    dial: Uri,
-}
-impl tower_service::Service<Uri> for FixedDialConnector {
-    type Response = <HttpsConnector<HttpConnector> as tower_service::Service<Uri>>::Response;
-    type Error = <HttpsConnector<HttpConnector> as tower_service::Service<Uri>>::Error;
-    type Future = <HttpsConnector<HttpConnector> as tower_service::Service<Uri>>::Future;
-    fn poll_ready(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
-        tower_service::Service::poll_ready(&mut self.inner, cx)
-    }
-    fn call(&mut self, _uri: Uri) -> Self::Future {
-        tower_service::Service::call(&mut self.inner, self.dial.clone())
-    }
-}
 pub(super) struct ProxyClient {
-    connector: HttpsConnector<HttpConnector>,
-    http1_connector: HttpsConnector<HttpConnector>,
+    connector: PreparedTransport,
+    http1_connector: PreparedTransport,
     http2_only: bool,
     cache: std::sync::Mutex<ClientCache>,
 }
@@ -35,8 +16,13 @@ struct ClientCache {
     clients: HashMap<String, (HyperClient, u64)>,
 }
 impl ProxyClient {
-    fn client_for(&self, dial: &str, force_http1: bool) -> Result<HyperClient> {
-        let cache_key = format!("{dial}|{force_http1}");
+    fn client_for(
+        &self,
+        dial: &str,
+        force_http1: bool,
+        server_name: Option<ServerName<'static>>,
+    ) -> Result<HyperClient> {
+        let cache_key = format!("{dial}|{force_http1}|{server_name:?}");
         let mut cache = self
             .cache
             .lock()
@@ -59,14 +45,12 @@ impl ProxyClient {
         builder.pool_max_idle_per_host(32);
         builder.pool_idle_timeout(Duration::from_secs(120));
         builder.pool_timer(TokioTimer::new());
-        let client = builder.build(FixedDialConnector {
-            inner: if force_http1 {
-                self.http1_connector.clone()
-            } else {
-                self.connector.clone()
-            },
-            dial: uri,
-        });
+        let transport = if force_http1 {
+            &self.http1_connector
+        } else {
+            &self.connector
+        };
+        let client = builder.build(transport.connector(uri, server_name));
         // Building a pool must not hold the shared cache lock. Another request
         // may have populated the same key meanwhile; keep that existing pool.
         let mut cache = self
@@ -111,28 +95,9 @@ pub(super) fn prepare_clients(
                     super::mime::initialize();
                 }
                 Handler::ReverseProxy(config) => {
-                    let mut http = HttpConnector::new();
-                    http.enforce_http(false);
-                    http.set_connect_timeout(Some(config.dial_timeout));
-                    http.set_nodelay(true);
-                    let http1_connector = HttpsConnectorBuilder::new()
-                        .with_provider_and_native_roots(Arc::new(
-                            rustls::crypto::ring::default_provider(),
-                        ))?
-                        .https_or_http()
-                        .enable_http1()
-                        .wrap_connector(http.clone());
-                    let connector = HttpsConnectorBuilder::new()
-                        .with_provider_and_native_roots(Arc::new(
-                            rustls::crypto::ring::default_provider(),
-                        ))?
-                        .https_or_http()
-                        .enable_http1();
-                    let connector = if config.enable_http2 {
-                        connector.enable_http2().wrap_connector(http)
-                    } else {
-                        connector.wrap_connector(http)
-                    };
+                    let config = config.as_ref();
+                    let connector = PreparedTransport::prepare(config)?;
+                    let http1_connector = connector.http1();
                     output.insert(
                         config as *const ProxyConfig as usize,
                         ProxyClient {
@@ -198,7 +163,32 @@ pub(super) async fn serve(
         !dial.contains(['@', '#', '?', '/', '\r', '\n']),
         "invalid expanded upstream dial"
     );
-    let connection_uri = format!("{scheme}://{dial}");
+    let parsed: Uri = format!("{scheme}://{dial}").parse()?;
+    let authority = parsed
+        .authority()
+        .ok_or_else(|| anyhow::anyhow!("upstream authority required"))?;
+    let host = authority
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let port = authority.port_u16().unwrap_or(0).to_string();
+    let hostport = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    for (key, value) in [
+        ("address", format!("tcp/{hostport}")),
+        ("hostport", hostport.clone()),
+        ("host", host.to_owned()),
+        ("port", port),
+    ] {
+        ctx.values
+            .insert(format!("http.reverse_proxy.upstream.{key}"), value);
+    }
+    // Caddy network addresses without an explicit port use port zero, not the
+    // URL scheme's implicit 80/443. The adapter supplies normal HTTP defaults.
+    let connection_uri = format!("{scheme}://{hostport}");
     let downstream_version = ctx.req().version();
     let is_upgrade = ctx.req().version() == Version::HTTP_11
         && header_has_token(ctx.req().headers(), http::header::CONNECTION, "upgrade")
@@ -208,7 +198,37 @@ pub(super) async fn serve(
             .get(http::header::UPGRADE)
             .is_some_and(|v| !v.is_empty());
     let expected_upgrade = ctx.req().headers().get(http::header::UPGRADE).cloned();
-    let client = state.client_for(&connection_uri, is_upgrade)?;
+    let server_name = if let Some(tls) = config.tls.as_ref() {
+        match tls.server_name.as_ref() {
+            Some(template) => {
+                let name = ctx.expand(template)?;
+                if name.is_empty() && template.contains('{') {
+                    // Caddy's dynamic DialTLS path passes the expanded config
+                    // directly to tls.Client; unlike the static net/http path
+                    // an empty name is not replaced with the dial host.
+                    ensure!(
+                        tls.insecure_skip_verify,
+                        "empty dynamic upstream TLS server name"
+                    );
+                    // IP names omit the SNI extension. Chain/name checks are
+                    // explicitly disabled here, but handshake signatures remain.
+                    Some(ServerName::from(std::net::IpAddr::V4(
+                        std::net::Ipv4Addr::UNSPECIFIED,
+                    )))
+                } else if name.is_empty() {
+                    None
+                } else {
+                    Some(ServerName::try_from(name).map_err(|_| {
+                        anyhow::anyhow!("invalid expanded upstream TLS server name")
+                    })?)
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let client = state.client_for(&connection_uri, is_upgrade, server_name)?;
     let downstream_upgrade = if is_upgrade {
         Some(hyper::upgrade::on(ctx.req_mut()))
     } else {

@@ -673,6 +673,15 @@ fn handlers<'a>(
                             .map_err(|error| {
                                 if error.is::<HttpError>() {
                                     error
+                                } else if error.chain().any(|source| {
+                                    source
+                                        .downcast_ref::<std::io::Error>()
+                                        .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
+                                        || source
+                                            .downcast_ref::<hyper::Error>()
+                                            .is_some_and(hyper::Error::is_timeout)
+                                }) {
+                                    failure(StatusCode::GATEWAY_TIMEOUT)
                                 } else {
                                     failure(StatusCode::BAD_GATEWAY)
                                 }

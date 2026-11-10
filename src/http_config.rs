@@ -874,7 +874,7 @@ fn parse_handler(value: &Value, depth: usize) -> Result<Handler> {
                 pass_thru: boolean(m.get("pass_thru"), false, path)?,
             }
         }
-        "reverse_proxy" => Handler::ReverseProxy(parse_proxy(m, path)?),
+        "reverse_proxy" => Handler::ReverseProxy(Box::new(parse_proxy(m, path)?)),
         _ => return Err(unsupported(path)),
     })
 }
@@ -959,6 +959,8 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
     let mut compression = true;
     let mut dial_timeout = Duration::from_secs(3);
     let mut response_header_timeout = None;
+    let mut read_timeout = None;
+    let mut write_timeout = None;
     if let Some(t) = m.get("transport") {
         let t = object(t, path)?;
         deny_unknown(
@@ -975,35 +977,56 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
             ],
             path,
         )?;
-        ensure!(
-            t.get("protocol")
-                .and_then(Value::as_str)
-                .is_none_or(|s| s == "http"),
-            "unsupported reverse proxy transport"
-        );
+        if let Some(protocol) = t.get("protocol") {
+            ensure!(
+                string(protocol, path)? == "http",
+                "unsupported reverse proxy transport"
+            );
+        }
         if let Some(v) = t.get("tls") {
             let t = object(v, path)?;
             deny_unknown(
                 t,
-                &["server_name", "insecure_skip_verify", "root_ca_pem_files"],
+                &[
+                    "server_name",
+                    "insecure_skip_verify",
+                    "root_ca_pem_files",
+                    "root_ca_pool",
+                    "client_certificate_file",
+                    "client_certificate_key_file",
+                    "handshake_timeout",
+                ],
                 path,
             )?;
             tls = Some(ProxyTls {
                 server_name: t.get("server_name").map(|v| string(v, path)).transpose()?,
                 insecure_skip_verify: boolean(t.get("insecure_skip_verify"), false, path)?,
+                root_ca_pool: t
+                    .get("root_ca_pool")
+                    .map(|v| strings(v, path))
+                    .transpose()?
+                    .unwrap_or_default(),
+                client_certificate_file: t
+                    .get("client_certificate_file")
+                    .map(|v| string(v, path))
+                    .transpose()?
+                    .filter(|v| !v.is_empty()),
+                client_certificate_key_file: t
+                    .get("client_certificate_key_file")
+                    .map(|v| string(v, path))
+                    .transpose()?
+                    .filter(|v| !v.is_empty()),
+                handshake_timeout: t
+                    .get("handshake_timeout")
+                    .map(|v| duration(v, path))
+                    .transpose()?
+                    .filter(|d| !d.is_zero()),
                 root_ca_pem_files: t
                     .get("root_ca_pem_files")
                     .map(|v| strings(v, path))
                     .transpose()?
                     .unwrap_or_default(),
             });
-            if tls.as_ref().is_some_and(|t| {
-                t.insecure_skip_verify || !t.root_ca_pem_files.is_empty() || t.server_name.is_some()
-            }) {
-                return Err(unsupported(
-                    "/reverse_proxy/transport/tls/custom_validation",
-                ));
-            }
         }
         if let Some(v) = t.get("versions") {
             let versions = strings(v, path)?;
@@ -1034,15 +1057,16 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
             }
             response_header_timeout = Some(timeout);
         }
-        for pending in ["read_timeout", "write_timeout"] {
-            if t.get(pending)
-                .map(|v| duration(v, path))
-                .transpose()?
-                .is_some_and(|v| !v.is_zero())
-            {
-                return Err(unsupported("/reverse_proxy/transport/stream_timeout"));
-            }
-        }
+        read_timeout = t
+            .get("read_timeout")
+            .map(|v| duration(v, path))
+            .transpose()?
+            .filter(|d| !d.is_zero());
+        write_timeout = t
+            .get("write_timeout")
+            .map(|v| duration(v, path))
+            .transpose()?
+            .filter(|d| !d.is_zero());
     }
     if m.get("flush_interval")
         .map(|v| signed_duration(v, path))
@@ -1071,6 +1095,8 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
         compression,
         dial_timeout,
         response_header_timeout,
+        read_timeout,
+        write_timeout,
         request_headers,
         response_headers,
         flush_interval: m
@@ -1105,7 +1131,17 @@ fn pending_placeholders_depth(value: &Value, depth: usize) -> Result<()> {
                     && let Some(end) = close
                 {
                     let key = &s[i + 1..end];
-                    if key.starts_with("file.") || key.starts_with("http.request.tls.") {
+                    if key.starts_with("file.")
+                        || key.starts_with("http.request.tls.")
+                        || (key.starts_with("http.reverse_proxy.")
+                            && !matches!(
+                                key,
+                                "http.reverse_proxy.upstream.address"
+                                    | "http.reverse_proxy.upstream.hostport"
+                                    | "http.reverse_proxy.upstream.host"
+                                    | "http.reverse_proxy.upstream.port"
+                            ))
+                    {
                         return Err(helpers::unsupported("/placeholder/provider"));
                     }
                 }
