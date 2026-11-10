@@ -1219,8 +1219,15 @@ async fn dispatch(
                 super::AdaptedConfig {
                     result: inner
                         .offload(move || {
-                            crate::admin_json::decoded(&bytes)
-                                .map_err(|e| AdminError::new(400, e.category))
+                            crate::admin_json::decoded(&bytes).map_err(|e| {
+                                let status = if e.category == "configuration_materialization_limit"
+                                {
+                                    413
+                                } else {
+                                    400
+                                };
+                                AdminError::new(status, e.category)
+                            })
                         })
                         .await?,
                     warnings: Vec::new(),
@@ -1290,6 +1297,8 @@ async fn dispatch(
                                 AdminError::new(
                                     if e.category == "configuration_depth_limit" {
                                         400
+                                    } else if e.category == "configuration_materialization_limit" {
+                                        413
                                     } else {
                                         500
                                     },

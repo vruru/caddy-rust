@@ -40,3 +40,10 @@ Current production inputs and all authentication material remain exclusively in
 LocalOps. The live service names, ports, certificate storage, domain routing and
 other applications' loopback backends must be preserved during eventual rollout.
 No new official installation/self-upgrade workflow is introduced.
+
+The Rust JSON configuration decoder rejects more than 400,000 opening
+brackets, opening braces, commas and colons outside JSON strings before
+allocating the configuration tree. Unlike upstream, HTTP writes that hit
+this safety limit return `413 configuration_materialization_limit`. The
+existing configuration stays active. The raw JSON `/adapt` endpoint does
+not construct a tree and retains its separate input and output limits.

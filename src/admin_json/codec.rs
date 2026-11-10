@@ -1,5 +1,11 @@
 use super::ConfigError;
 
+// Punctuation outside quoted strings bounds the number of allocated tree
+// entries before the DOM parser allocates. The existing Admin index has a
+// 100,000-entry cap; allow up to four tokens per entry for structure and
+// duplicate keys. Raw /adapt validation intentionally does not build a DOM.
+const MAX_SHAPE_TOKENS: usize = 400_000;
+
 /// Pure O(n) iterative byte-scan sanitizer for JSON body bytes.
 /// - Inside strings: validates UTF-8 in ≤4-byte windows (rejects overlong,
 ///   surrogates, >U+10FFFF via `std::str::from_utf8`), emits one U+FFFD per
@@ -11,7 +17,8 @@ use super::ConfigError;
 ///   rejects depth > max_depth.  All other bytes passed unchanged.
 /// - No unsafe, no unwrap, no panic, no allocation beyond the output Vec.
 pub(super) fn sanitize(input: &[u8], max_depth: usize) -> Result<Vec<u8>, ConfigError> {
-    let mut out: Vec<u8> = Vec::with_capacity(input.len());
+    let mut out: Vec<u8> = Vec::with_capacity(input.len().min(1024 * 1024));
+    let mut shape = 0usize;
     let mut depth: usize = 0usize;
     let mut in_string = false;
     let mut i: usize = 0;
@@ -113,7 +120,18 @@ pub(super) fn sanitize(input: &[u8], max_depth: usize) -> Result<Vec<u8>, Config
                 }
             }
         } else {
-            // Outside a JSON string.
+            // Outside a JSON string. Colons count object values, commas
+            // count array continuation, and delimiters count containers.
+            // No byte within a string or escape advances this budget.
+            if matches!(b, b'[' | b'{' | b',' | b':') {
+                shape += 1;
+                if shape > MAX_SHAPE_TOKENS {
+                    return Err(ConfigError {
+                        status: 413,
+                        category: "configuration_materialization_limit",
+                    });
+                }
+            }
             match b {
                 b'"' => {
                     in_string = true;
