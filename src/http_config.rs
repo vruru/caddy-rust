@@ -1107,8 +1107,7 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
         stream_close_delay: m
             .get("stream_close_delay")
             .map(|v| duration(v, path))
-            .transpose()?
-            .unwrap_or(Duration::ZERO),
+            .transpose()?,
     })
 }
 use std::str::FromStr;

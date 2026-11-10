@@ -392,7 +392,13 @@ pub(super) async fn serve(
         let hold_client = client.clone();
         upgrades.spawn(async move {
             let _hold_client=hold_client;
-            if let (Ok(downstream),Ok(upstream))=tokio::join!(downstream_upgrade,upstream_upgrade){let mut downstream=TokioIo::new(downstream);let mut upstream=TokioIo::new(upstream);let copy=tokio::io::copy_bidirectional(&mut downstream,&mut upstream);tokio::pin!(copy);tokio::select!{_=&mut copy=>{},_=drain.cancelled()=>{let _=tokio::time::timeout(delay,copy).await;}}}
+            if let (Ok(downstream),Ok(upstream))=tokio::join!(downstream_upgrade,upstream_upgrade){
+                let mut downstream=TokioIo::new(downstream);let mut upstream=TokioIo::new(upstream);
+                let copy=tokio::io::copy_bidirectional(&mut downstream,&mut upstream);tokio::pin!(copy);
+                if let Some(delay)=delay {
+                    tokio::select!{_=&mut copy=>{},_=drain.cancelled()=>{let _=tokio::time::timeout(delay,copy).await;}}
+                } else { let _=copy.await; }
+            }
         });
     }
     let upgrade = response.status() == StatusCode::SWITCHING_PROTOCOLS;

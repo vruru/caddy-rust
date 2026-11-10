@@ -152,3 +152,11 @@ Configuration-adapter primitives now include source formatting, directive order,
 route sorting, named matchers and a subset of global options and handlers. They
 are not yet exposed through a complete adapter entry point. Aggregate resource
 budgeting, remaining directives and runtime integration remain explicit gaps.
+
+HTTP listener staging now reserves a non-cloneable publication ticket; graceful
+stop waits for its owner and forced stop discards late publication. Compatible
+TLS connections can reuse current routes after reload; rotated or withdrawn
+identities receive a complete response and graceful connection drain. Existing
+streams retain their accepted lifetime unless an explicit close delay applies.
+Session resumption checks the actual stored leaf and current ClientHello policy.
+These HTTP lifecycle components do not complete the root backend or module set.

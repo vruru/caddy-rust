@@ -106,7 +106,7 @@ pub(crate) struct ProxyConfig {
     pub(crate) request_headers: HeaderOps,
     pub(crate) response_headers: HeaderOps,
     pub(crate) flush_interval: i64,
-    pub(crate) stream_close_delay: std::time::Duration,
+    pub(crate) stream_close_delay: Option<std::time::Duration>,
 }
 
 #[derive(Clone)]

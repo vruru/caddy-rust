@@ -170,15 +170,7 @@ impl Context {
         })
     }
 }
-pub(super) async fn handle(
-    inner: Arc<Inner>,
-    server: Arc<ActiveServer>,
-    request: Request<Incoming>,
-    peer: SocketAddr,
-    local: SocketAddr,
-    tls: bool,
-    drain: CancellationToken,
-) -> Response<Body> {
+fn request_authority<B>(request: &Request<B>) -> Result<String, ()> {
     let authority = request
         .uri()
         .authority()
@@ -194,16 +186,30 @@ pub(super) async fn handle(
     if (request.version() != Version::HTTP_10 && authority.is_empty())
         || authority.contains(['@', '/', '\r', '\n', ' ', '\t'])
     {
-        return simple(StatusCode::BAD_REQUEST, "Bad Request\n");
+        return Err(());
     }
     if request.headers().get_all(http::header::HOST).iter().count() > 1 {
-        return simple(StatusCode::BAD_REQUEST, "Bad Request\n");
+        return Err(());
     }
+    Ok(authority)
+}
+pub(super) fn proof_response<B>(
+    registry: &ChallengeRegistry,
+    request: &Request<B>,
+) -> Result<Option<Response<Body>>, ()> {
+    let authority = request_authority(request)?;
+    Ok(proof_for_authority(registry, request, &authority))
+}
+fn proof_for_authority<B>(
+    registry: &ChallengeRegistry,
+    request: &Request<B>,
+    authority: &str,
+) -> Option<Response<Body>> {
     if let Some(token) = request
         .uri()
         .path()
         .strip_prefix("/.well-known/acme-challenge/")
-        && let Some(proof) = inner.registry.lookup_http(&authority, token)
+        && let Some(proof) = registry.lookup_http(authority, token)
     {
         let mut response = simple(StatusCode::OK, proof);
         response
@@ -213,6 +219,24 @@ pub(super) async fn handle(
             http::header::CONTENT_TYPE,
             HeaderValue::from_static("text/plain"),
         );
+        return Some(response);
+    }
+    None
+}
+pub(super) async fn handle(
+    inner: Arc<Inner>,
+    server: Arc<ActiveServer>,
+    request: Request<Incoming>,
+    peer: SocketAddr,
+    local: SocketAddr,
+    tls: bool,
+    drain: CancellationToken,
+) -> Response<Body> {
+    let authority = match request_authority(&request) {
+        Ok(authority) => authority,
+        Err(()) => return simple(StatusCode::BAD_REQUEST, "Bad Request\n"),
+    };
+    if let Some(response) = proof_for_authority(&inner.registry, &request, &authority) {
         return response;
     }
     let trusted = server

@@ -1,8 +1,16 @@
 //! Native HTTP listeners with request-scoped configuration snapshots. Preparation is
 //! isolated from publication; failed binds and certificate loads preserve the
 //! active generation. This module never starts a Go process.
+#[path = "http_runtime/connection_identity.rs"]
+mod connection_identity;
+#[path = "http_runtime/connection_sessions.rs"]
+mod connection_sessions;
 #[path = "http_runtime/files.rs"]
 mod files;
+use connection_identity::{TlsIdentity, TlsVerdict};
+#[path = "http_runtime/lifecycle.rs"]
+mod lifecycle;
+pub use lifecycle::{CommitOutcome, HttpStage, StagedAddress};
 #[path = "http_runtime/mime.rs"]
 mod mime;
 #[path = "http_runtime/proxy.rs"]
@@ -44,7 +52,7 @@ use rustls::{
 use std::{
     collections::HashMap, convert::Infallible, fmt, net::SocketAddr, sync::Arc, time::Duration,
 };
-use tokio::{net::TcpListener, sync::Mutex};
+use tokio::net::TcpListener;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -52,7 +60,7 @@ pub(crate) type Body = UnsyncBoxBody<Bytes, BoxError>;
 
 pub struct HttpRuntime {
     inner: Arc<Inner>,
-    control: Mutex<Control>,
+    control: Arc<lifecycle::Lifecycle>,
 }
 impl HttpRuntime {
     /// Process-level native CA load and skipped-root counts, without material.
@@ -78,15 +86,6 @@ struct Inner {
     upgrades: TaskTracker,
     stopped: CancellationToken,
 }
-struct Control {
-    listeners: HashMap<SocketAddr, ListenerControl>,
-    generation: u64,
-    stopped: bool,
-}
-struct ListenerControl {
-    cancel: CancellationToken,
-    actual: SocketAddr,
-}
 struct Generation {
     id: u64,
     servers: HashMap<SocketAddr, Arc<ActiveServer>>,
@@ -97,9 +96,9 @@ struct Generation {
 struct ActiveServer {
     plan: Arc<ServerConfig>,
     tls: Option<Arc<rustls::ServerConfig>>,
+    resolver: Option<Arc<CandidateResolver>>,
+    sessions: Arc<connection_sessions::SharedSessions>,
     clients: Arc<HashMap<usize, proxy::ProxyClient>>,
-    policy_key: Vec<u8>,
-    connection_cancel: CancellationToken,
 }
 struct CandidateResolver {
     static_certificates: Arc<HotCertificateResolver>,
@@ -117,24 +116,29 @@ impl ResolvesServerCert for CandidateResolver {
             .alpn()
             .map(|x| x.collect::<Vec<_>>())
             .unwrap_or_default();
-        let sni = hello.server_name()?;
+        self.select(hello.server_name(), &alpn, hello.signature_schemes())
+    }
+}
+impl CandidateResolver {
+    fn select(
+        &self,
+        sni: Option<&str>,
+        alpn: &[&[u8]],
+        schemes: &[rustls::SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        let sni = sni?;
         if alpn.contains(&ACME_ALPN) {
             // The same challenge registry backs both resolvers. Only the
             // managed resolver needs to answer validation certificates.
-            return self
-                .managed
-                .select(Some(sni), &alpn, hello.signature_schemes());
+            return self.managed.select(Some(sni), alpn, schemes);
         }
         self.static_certificates
-            .select(Some(sni), &alpn, hello.signature_schemes())
+            .select(Some(sni), alpn, schemes)
             .or_else(|| {
                 self.allowed_managed
                     .iter()
                     .any(|name| dns_covers(name, sni))
-                    .then(|| {
-                        self.managed
-                            .select(Some(sni), &alpn, hello.signature_schemes())
-                    })
+                    .then(|| self.managed.select(Some(sni), alpn, schemes))
                     .flatten()
             })
     }
@@ -156,78 +160,8 @@ impl HttpRuntime {
                 upgrades: TaskTracker::new(),
                 stopped: CancellationToken::new(),
             }),
-            control: Mutex::new(Control {
-                listeners: HashMap::new(),
-                generation: 0,
-                stopped: false,
-            }),
+            control: Arc::new(lifecycle::Lifecycle::new()),
         }
-    }
-    pub async fn validate_prepared(&self, config: &PreparedConfig) -> Result<()> {
-        let _ = prepare_servers(config, &self.inner).await?;
-        Ok(())
-    }
-    pub async fn apply(&self, config: PreparedConfig) -> Result<()> {
-        // Serializing apply does not serialize request handling or certificate
-        // renewal. The lock is never held by a request or TLS resolver.
-        let mut control = self.control.lock().await;
-        ensure!(!control.stopped, "HTTP runtime is stopped");
-        let generation = control
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("HTTP generation exhausted"))?;
-        let (servers, managed_names) = prepare_servers(&config, &self.inner).await?;
-        let mut new_listeners = Vec::new();
-        for addr in servers.keys() {
-            if !control.listeners.contains_key(addr) {
-                let socket = bind_listener(*addr)
-                    .map_err(|_| anyhow::anyhow!("candidate HTTP listener bind failed"))?;
-                let actual = socket.local_addr()?;
-                new_listeners.push((*addr, actual, socket, CancellationToken::new()));
-            }
-        }
-        let next = Arc::new(Generation {
-            id: generation,
-            servers,
-            drain: CancellationToken::new(),
-            managed_names,
-        });
-        // From here publication is infallible: all parsing, provision, roots,
-        // certificates and socket binds completed without touching old state.
-        let previous = self.inner.current.swap(next.clone());
-        control.generation = generation;
-        for (addr, actual, socket, cancel) in new_listeners {
-            control.listeners.insert(
-                addr,
-                ListenerControl {
-                    cancel: cancel.clone(),
-                    actual,
-                },
-            );
-            let inner = self.inner.clone();
-            self.inner.tasks.spawn(async move {
-                accept_loop(inner, socket, addr, cancel).await;
-            });
-        }
-        control.listeners.retain(|addr, listener| {
-            if next.servers.contains_key(addr) {
-                true
-            } else {
-                listener.cancel.cancel();
-                false
-            }
-        });
-        for (address, old) in &previous.servers {
-            if next
-                .servers
-                .get(address)
-                .is_none_or(|new| new.policy_key != old.policy_key)
-            {
-                old.connection_cancel.cancel();
-            }
-        }
-        previous.drain.cancel();
-        Ok(())
     }
     pub fn generation(&self) -> u64 {
         self.inner.current.load().id
@@ -235,53 +169,20 @@ impl HttpRuntime {
     pub fn active_managed_names(&self) -> Vec<Vec<String>> {
         self.inner.current.load().managed_names.clone()
     }
-    pub async fn bound_addresses(&self) -> Vec<SocketAddr> {
-        self.control
-            .lock()
-            .await
-            .listeners
-            .values()
-            .map(|l| l.actual)
-            .collect()
-    }
-    /// Stops accepting first, requests protocol-level graceful drain, and waits.
-    /// A deadline does not abort active upgrades; timeout is reported and the
-    /// runtime stays stopped. Calling shutdown again can await their completion.
-    pub async fn shutdown(&self, deadline: Duration) -> Result<()> {
-        {
-            let mut control = self.control.lock().await;
-            control.stopped = true;
-            for listener in control.listeners.values() {
-                listener.cancel.cancel();
-            }
-            self.inner.current.load().drain.cancel();
-            for server in self.inner.current.load().servers.values() {
-                server.connection_cancel.cancel();
-            }
-            self.inner.stopped.cancel();
-            self.inner.tasks.close();
-            self.inner.upgrades.close();
-        }
-        tokio::time::timeout(deadline, async {
-            self.inner.tasks.wait().await;
-            self.inner.upgrades.wait().await;
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("HTTP shutdown deadline elapsed with active connections"))?;
-        Ok(())
-    }
 }
+
 async fn prepare_servers(
     config: &PreparedConfig,
-    inner: &Arc<Inner>,
+    registry: &ChallengeRegistry,
+    managed: &Arc<HotCertificateResolver>,
 ) -> Result<(HashMap<SocketAddr, Arc<ActiveServer>>, Vec<Vec<String>>)> {
     let mut actual_managed = std::collections::BTreeSet::new();
     let mut redirects = HashMap::<SocketAddr, Vec<Route>>::new();
     let mut output = HashMap::new();
     for server in &config.servers {
         let local = Arc::new(HotCertificateResolver::with_leaf_guard(
-            inner.registry.clone(),
-            inner.managed.leaf_guard(),
+            registry.clone(),
+            managed.leaf_guard(),
         ));
         let mut materials = Vec::new();
         if server.tls {
@@ -385,19 +286,20 @@ async fn prepare_servers(
                 }
             }
         }
-        let tls = if server.tls {
+        let (tls, resolver) = if server.tls {
+            let resolver = Arc::new(CandidateResolver {
+                static_certificates: local,
+                managed: managed.clone(),
+                allowed_managed: if server.certificate_tags.is_empty() {
+                    managed_names.clone()
+                } else {
+                    Vec::new()
+                },
+            });
             let mut tls = rustls::ServerConfig::builder_with_provider(crate::crypto::provider())
                 .with_safe_default_protocol_versions()?
                 .with_no_client_auth()
-                .with_cert_resolver(Arc::new(CandidateResolver {
-                    static_certificates: local,
-                    managed: inner.managed.clone(),
-                    allowed_managed: if server.certificate_tags.is_empty() {
-                        managed_names.clone()
-                    } else {
-                        Vec::new()
-                    },
-                }));
+                .with_cert_resolver(resolver.clone());
             if server.protocols.iter().any(|p| p == "h2") {
                 tls.alpn_protocols.push(b"h2".to_vec());
             }
@@ -405,9 +307,13 @@ async fn prepare_servers(
                 tls.alpn_protocols.push(b"http/1.1".to_vec());
             }
             tls.alpn_protocols.push(ACME_ALPN.to_vec());
-            Some(Arc::new(tls))
+            ensure!(
+                !tls.ticketer.enabled() && tls.max_early_data_size == 0,
+                "unsupported TLS session policy"
+            );
+            (Some(Arc::new(tls)), Some(resolver))
         } else {
-            None
+            (None, None)
         };
         let client_plan = server.clone();
         let clients = tokio::task::spawn_blocking(move || {
@@ -418,23 +324,15 @@ async fn prepare_servers(
         })
         .await
         .map_err(|_| anyhow::anyhow!("candidate proxy provisioning task failed"))??;
-        let policy_key = policy_key(server, !materials.is_empty());
         let active = ActiveServer {
             plan: server.clone(),
             tls,
+            resolver,
+            sessions: Arc::new(connection_sessions::SharedSessions::new()),
             clients: Arc::new(clients),
-            policy_key,
-            connection_cancel: CancellationToken::new(),
         };
-        let previous = inner.current.load_full();
         for addr in &server.listen {
-            let mut active = active.clone();
-            if let Some(old) = previous.servers.get(addr)
-                && old.policy_key == active.policy_key
-            {
-                active.connection_cancel = old.connection_cancel.clone();
-            }
-            output.insert(*addr, Arc::new(active));
+            output.insert(*addr, Arc::new(active.clone()));
         }
     }
     for (address, routes) in redirects {
@@ -466,23 +364,14 @@ async fn prepare_servers(
             })
             .await
             .map_err(|_| anyhow::anyhow!("candidate proxy provisioning task failed"))??;
-            let policy_key = policy_key(&plan, false);
-            let connection_cancel = inner
-                .current
-                .load()
-                .servers
-                .get(&address)
-                .filter(|old| old.policy_key == policy_key)
-                .map(|old| old.connection_cancel.clone())
-                .unwrap_or_default();
             output.insert(
                 address,
                 Arc::new(ActiveServer {
                     plan,
                     tls: None,
+                    resolver: None,
+                    sessions: Arc::new(connection_sessions::SharedSessions::new()),
                     clients: Arc::new(clients),
-                    policy_key,
-                    connection_cancel,
                 }),
             );
         } else {
@@ -504,23 +393,14 @@ async fn prepare_servers(
                 skip_redirect: vec![],
                 ignore_loaded_certificates: false,
             };
-            let policy_key = policy_key(&plan, false);
-            let connection_cancel = inner
-                .current
-                .load()
-                .servers
-                .get(&address)
-                .filter(|old| old.policy_key == policy_key)
-                .map(|old| old.connection_cancel.clone())
-                .unwrap_or_default();
             output.insert(
                 address,
                 Arc::new(ActiveServer {
                     plan: Arc::new(plan),
                     tls: None,
+                    resolver: None,
+                    sessions: Arc::new(connection_sessions::SharedSessions::new()),
                     clients: Arc::new(HashMap::new()),
-                    policy_key,
-                    connection_cancel,
                 }),
             );
         }
@@ -529,6 +409,12 @@ async fn prepare_servers(
         output,
         actual_managed.into_iter().map(|n| vec![n]).collect(),
     ))
+}
+fn plain_transport_compatible(old: &ServerConfig, next: &ServerConfig) -> bool {
+    !old.tls
+        && !next.tls
+        && old.protocols == next.protocols
+        && old.read_header_timeout == next.read_header_timeout
 }
 fn dns_covers(pattern: &str, name: &str) -> bool {
     if pattern.eq_ignore_ascii_case(name) {
@@ -600,14 +486,53 @@ fn certificate_names(chain: &[u8]) -> Result<Vec<String>> {
     ensure!(!names.is_empty(), "DNS TLS certificate has no DNS SAN");
     Ok(names)
 }
+/// A newly bound candidate socket can prove ownership before publication, but
+/// never exposes the candidate routes. Mode is fixed when a connection accepts.
+#[derive(Clone)]
+struct ProofListener {
+    tls: Option<Arc<rustls::ServerConfig>>,
+    cancel: CancellationToken,
+}
+struct ProofResolver(Arc<HotCertificateResolver>);
+impl fmt::Debug for ProofResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProofResolver").finish_non_exhaustive()
+    }
+}
+impl ResolvesServerCert for ProofResolver {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let protocols = hello.alpn()?.collect::<Vec<_>>();
+        if protocols != [ACME_ALPN] {
+            return None;
+        }
+        self.0
+            .select(hello.server_name(), &protocols, hello.signature_schemes())
+    }
+}
+fn proof_tls_config(managed: Arc<HotCertificateResolver>) -> Result<Arc<rustls::ServerConfig>> {
+    let mut tls = rustls::ServerConfig::builder_with_provider(crate::crypto::provider())
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(ProofResolver(managed)));
+    tls.alpn_protocols = vec![ACME_ALPN.to_vec()];
+    tls.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    tls.send_tls13_tickets = 0;
+    Ok(Arc::new(tls))
+}
 async fn accept_loop(
     inner: Arc<Inner>,
     socket: TcpListener,
     key: SocketAddr,
     cancel: CancellationToken,
+    fallback: Option<ProofListener>,
 ) {
     loop {
-        let accepted = tokio::select! {biased;_ = cancel.cancelled()=>break,_=inner.stopped.cancelled()=>break,result=socket.accept()=>result};
+        let accepted = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = inner.stopped.cancelled() => break,
+            result = socket.accept() => result,
+        };
         let Ok((stream, peer)) = accepted else {
             if cancel.is_cancelled() {
                 break;
@@ -615,53 +540,162 @@ async fn accept_loop(
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
-        let snapshot = inner.current.load_full();
-        let Some(server) = snapshot.servers.get(&key).cloned() else {
-            continue;
+        // Proof/business mode is fixed at accept. A TLS ClientHello selects
+        // from one current identity view; each HTTP operation later checks its
+        // actual handshake identity against the current published policy.
+        let snapshot = loop {
+            let snapshot = inner.current.load_full();
+            if !snapshot.drain.is_cancelled() || inner.stopped.is_cancelled() {
+                break snapshot;
+            }
         };
+        let server = snapshot.servers.get(&key).cloned();
         let canonical =
             |address: SocketAddr| SocketAddr::new(address.ip().to_canonical(), address.port());
         let peer = canonical(peer);
         let local = canonical(stream.local_addr().unwrap_or(key));
         let _ = stream.set_nodelay(true);
-        let inner_clone = inner.clone();
-        inner.tasks.spawn(async move {
-            if let Some(tls)=server.tls.clone() {
-                let handshake=tokio_rustls::TlsAcceptor::from(tls).accept(stream);
-                let tls=tokio::select!{_ = server.connection_cancel.cancelled()=>return,result=tokio::time::timeout(Duration::from_secs(30),handshake)=>match result{Ok(Ok(tls))=>tls,_=>return}};
-                if tls.get_ref().1.alpn_protocol()==Some(ACME_ALPN){return;}
-                let negotiated_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
-                serve_connection(inner_clone,TokioIo::new(tls),peer,local,key,server,Some(negotiated_h2)).await;
-            }else{serve_connection(inner_clone,TokioIo::new(stream),peer,local,key,server,None).await;}
-        });
+        let task_inner = inner.clone();
+        if let Some(server) = server {
+            inner.tasks.spawn(async move {
+                if server.tls.is_some() {
+                    let handshake = connection_identity::accept(&task_inner, stream, key);
+                    let accepted = tokio::select! {
+                        biased;
+                        _ = task_inner.stopped.cancelled() => return,
+                        result = tokio::time::timeout(Duration::from_secs(30), handshake) => match result {
+                            Ok(Ok(accepted)) => accepted,
+                            _ => return,
+                        },
+                    };
+                    let negotiated_h2 = accepted.stream.get_ref().1.alpn_protocol() == Some(b"h2");
+                    serve_connection(task_inner, TokioIo::new(accepted.stream), peer, local, ConnectionView {
+                        key, server: accepted.server,
+                        negotiated_tls_h2: Some(negotiated_h2), identity: Some(accepted.identity),
+                    }).await;
+                } else {
+                    serve_connection(task_inner, TokioIo::new(stream), peer, local, ConnectionView { key, server, negotiated_tls_h2: None, identity: None }).await;
+                }
+            });
+        } else if let Some(proof) = fallback.clone() {
+            // A proof connection accepted before commit cannot turn into a
+            // business connection after commit, even if it delays its headers.
+            inner.tasks.spawn(async move {
+                if proof.cancel.is_cancelled() {
+                    return;
+                }
+                if let Some(tls) = proof.tls {
+                    let handshake = tokio_rustls::TlsAcceptor::from(tls).accept(stream);
+                    tokio::select! {
+                        biased;
+                        _ = proof.cancel.cancelled() => {},
+                        _ = task_inner.stopped.cancelled() => {},
+                        _ = tokio::time::timeout(Duration::from_secs(30), handshake) => {},
+                    }
+                    // ACME ALPN never speaks HTTP after its handshake.
+                } else {
+                    serve_proof_connection(task_inner, TokioIo::new(stream), proof.cancel).await;
+                }
+            });
+        }
     }
 }
-fn policy_key(server: &ServerConfig, has_static: bool) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(serde_json::to_vec(&serde_json::json!({"tls":server.tls,"protocols":server.protocols,"certificate_tags":server.certificate_tags,"static_resolver":has_static,"header_read_timeout_ns":server.read_header_timeout.as_nanos()})).expect("known policy JSON serializes")).to_vec()
+async fn serve_proof_connection<I>(inner: Arc<Inner>, io: I, cancel: CancellationToken)
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    let registry = inner.registry.clone();
+    let service = service_fn(move |request: Request<Incoming>| {
+        let response = match request::proof_response(&registry, &request) {
+            Ok(Some(response)) => response,
+            Ok(None) => simple(StatusCode::NOT_FOUND, "Not Found\n"),
+            Err(()) => simple(StatusCode::BAD_REQUEST, "Bad Request\n"),
+        };
+        async { Ok::<_, Infallible>(response) }
+    });
+    let mut builder = Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(60));
+    let connection = builder.serve_connection_with_upgrades(io, service);
+    tokio::pin!(connection);
+    tokio::select! {
+        _ = &mut connection => {},
+        _ = cancel.cancelled() => {},
+        _ = inner.stopped.cancelled() => {},
+    }
+}
+struct ConnectionView {
+    key: SocketAddr,
+    server: Arc<ActiveServer>,
+    negotiated_tls_h2: Option<bool>,
+    identity: Option<Arc<TlsIdentity>>,
 }
 async fn serve_connection<I>(
     inner: Arc<Inner>,
     io: I,
     peer: SocketAddr,
     local: SocketAddr,
-    key: SocketAddr,
-    server: Arc<ActiveServer>,
-    negotiated_tls_h2: Option<bool>,
+    view: ConnectionView,
 ) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
+    let ConnectionView {
+        key,
+        server,
+        negotiated_tls_h2,
+        identity,
+    } = view;
     let tls = negotiated_tls_h2.is_some();
     let svc_inner = inner.clone();
-    let accepted_policy = server.policy_key.clone();
-    let policy_cancel = server.connection_cancel.clone();
+    let svc_server = server.clone();
     let requested_drain = CancellationToken::new();
     let service_drain = requested_drain.clone();
     let service = service_fn(move |mut request: Request<Incoming>| {
         let inner = svc_inner.clone();
-        let accepted_policy = accepted_policy.clone();
+        let accepted_server = svc_server.clone();
+        let identity = identity.clone();
         let requested_drain = service_drain.clone();
         async move {
+            let snapshot = inner.current.load_full();
+            let current = snapshot.servers.get(&key).cloned();
+            let verdict = match (identity.as_ref(), current.as_ref()) {
+                (Some(identity), Some(current)) => {
+                    identity.verdict(current, negotiated_tls_h2 == Some(true))
+                }
+                (None, Some(current))
+                    if plain_transport_compatible(&accepted_server.plan, &current.plan) =>
+                {
+                    TlsVerdict::Serve
+                }
+                _ => TlsVerdict::Reject,
+            };
+            if verdict == TlsVerdict::Reject {
+                let mut response = simple(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable\n");
+                response.headers_mut().insert(
+                    http::header::RETRY_AFTER,
+                    http::HeaderValue::from_static("0"),
+                );
+                if request.version() != http::Version::HTTP_2 {
+                    response.headers_mut().insert(
+                        http::header::CONNECTION,
+                        http::HeaderValue::from_static("close"),
+                    );
+                } else {
+                    requested_drain.cancel();
+                }
+                return Ok(response);
+            }
+            let Some(current) = current else {
+                return Ok(simple(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Service Unavailable\n",
+                ));
+            };
+            let close_after = verdict == TlsVerdict::ServeThenClose
+                || current.plan.read_header_timeout != accepted_server.plan.read_header_timeout;
+            let request_h2 = request.version() == http::Version::HTTP_2;
             let metadata = match trailer_policy::prepare_request(&mut request) {
                 Ok(metadata) => metadata,
                 Err(()) => {
@@ -677,31 +711,8 @@ async fn serve_connection<I>(
             if !metadata.is_empty() {
                 request.extensions_mut().insert(metadata);
             }
-            let snapshot = inner.current.load_full();
-            let Some(current) = snapshot.servers.get(&key).cloned() else {
-                requested_drain.cancel();
-                let mut r = simple(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable\n");
-                if request.version() != http::Version::HTTP_2 {
-                    r.headers_mut().insert(
-                        http::header::CONNECTION,
-                        http::HeaderValue::from_static("close"),
-                    );
-                }
-                return Ok::<_, h2::Error>(r);
-            };
-            if current.policy_key != accepted_policy {
-                requested_drain.cancel();
-                let mut r = simple(StatusCode::MISDIRECTED_REQUEST, "Misdirected Request\n");
-                if request.version() != http::Version::HTTP_2 {
-                    r.headers_mut().insert(
-                        http::header::CONNECTION,
-                        http::HeaderValue::from_static("close"),
-                    );
-                }
-                return Ok(r);
-            }
             let keep = current.clone();
-            let response = request::handle(
+            let mut response = request::handle(
                 inner,
                 current,
                 request,
@@ -711,6 +722,16 @@ async fn serve_connection<I>(
                 snapshot.drain.clone(),
             )
             .await;
+            if close_after {
+                if request_h2 {
+                    requested_drain.cancel();
+                } else {
+                    response.headers_mut().insert(
+                        http::header::CONNECTION,
+                        http::HeaderValue::from_static("close"),
+                    );
+                }
+            }
             if fault.as_ref().is_some_and(CancellationToken::is_cancelled) {
                 return Err(h2::Error::from(h2::Reason::PROTOCOL_ERROR));
             }
@@ -733,8 +754,6 @@ async fn serve_connection<I>(
         .iter()
         .any(|p| p == if tls { "h2" } else { "h2c" });
     if let Some(negotiated_h2) = negotiated_tls_h2 {
-        // TLS chooses the HTTP protocol during ALPN, not by sniffing a
-        // mismatched client preface after the handshake.
         builder = if negotiated_h2 {
             builder.http2_only()
         } else {
@@ -743,14 +762,12 @@ async fn serve_connection<I>(
     } else if !allow_h2 {
         builder = builder.http1_only();
     }
-    drop(server);
     let connection = builder.serve_connection_with_upgrades(io, service);
     tokio::pin!(connection);
     tokio::select! {
-        result=&mut connection=>{let _=result;},
-        _=policy_cancel.cancelled()=>{connection.as_mut().graceful_shutdown();let _=connection.await;},
-        _=requested_drain.cancelled()=>{connection.as_mut().graceful_shutdown();let _=connection.await;},
-        _=inner.stopped.cancelled()=>{connection.as_mut().graceful_shutdown();let _=connection.await;}
+        _ = &mut connection => {},
+        _ = requested_drain.cancelled() => { connection.as_mut().graceful_shutdown(); let _ = connection.await; },
+        _ = inner.stopped.cancelled() => { connection.as_mut().graceful_shutdown(); let _ = connection.await; },
     }
 }
 struct RetainedBody {
@@ -787,7 +804,6 @@ pub(crate) fn simple(status: StatusCode, body: impl Into<Bytes>) -> Response<Bod
 
 impl Drop for HttpRuntime {
     fn drop(&mut self) {
-        self.inner.stopped.cancel();
-        self.inner.current.load().drain.cancel();
+        self.force_shutdown();
     }
 }

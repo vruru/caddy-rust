@@ -45,9 +45,8 @@ pub(crate) fn duration(value: &Value, path: &str) -> Result<Duration> {
 }
 pub(crate) fn signed_duration(value: &Value, path: &str) -> Result<i64> {
     if value.is_number() {
-        return value
-            .as_i64()
-            .ok_or_else(|| anyhow::anyhow!("integer nanoseconds required at {path}"));
+        return crate::duration::parse_value(value)
+            .map_err(|_| anyhow::anyhow!("integer nanoseconds required at {path}"));
     }
     let raw = value
         .as_str()
@@ -56,88 +55,7 @@ pub(crate) fn signed_duration(value: &Value, path: &str) -> Result<i64> {
         !raw.is_empty() && raw.len() <= 1024,
         "invalid duration at {path}"
     );
-    let (negative, s) = if let Some(x) = raw.strip_prefix('-') {
-        (true, x)
-    } else {
-        (false, raw.strip_prefix('+').unwrap_or(raw))
-    };
-    if s == "0" {
-        return Ok(0);
-    }
-    let mut rest = s;
-    let mut total = 0u128;
-    while !rest.is_empty() {
-        let number_end = rest
-            .bytes()
-            .position(|b| !(b.is_ascii_digit() || b == b'.'))
-            .unwrap_or(rest.len());
-        ensure!(
-            number_end > 0 && number_end < rest.len(),
-            "invalid duration at {path}"
-        );
-        let number = &rest[..number_end];
-        let suffix = &rest[number_end..];
-        let (unit, scale) = [
-            ("ns", 1u128),
-            ("us", 1000),
-            ("µs", 1000),
-            ("μs", 1000),
-            ("ms", 1_000_000),
-            ("s", 1_000_000_000),
-            ("m", 60_000_000_000),
-            ("h", 3_600_000_000_000),
-            ("d", 86_400_000_000_000),
-        ]
-        .into_iter()
-        .find(|(unit, _)| suffix.starts_with(unit))
-        .ok_or_else(|| anyhow::anyhow!("invalid duration unit at {path}"))?;
-        let parts: Vec<_> = number.split('.').collect();
-        ensure!(
-            parts.len() <= 2
-                && parts.iter().any(|p| !p.is_empty())
-                && parts.iter().all(|p| p.bytes().all(|b| b.is_ascii_digit())),
-            "invalid duration at {path}"
-        );
-        let whole = if parts[0].is_empty() {
-            0
-        } else {
-            parts[0]
-                .parse::<u128>()
-                .map_err(|_| anyhow::anyhow!("duration overflow at {path}"))?
-        };
-        let mut nanos = whole
-            .checked_mul(scale)
-            .ok_or_else(|| anyhow::anyhow!("duration overflow at {path}"))?;
-        if let Some(fraction) = parts.get(1) {
-            // Only the first 18 digits can contribute to an int64 nanosecond duration.
-            let digits = &fraction[..fraction.len().min(18)];
-            if !digits.is_empty() {
-                let f = digits
-                    .parse::<u128>()
-                    .map_err(|_| anyhow::anyhow!("invalid duration at {path}"))?;
-                nanos = nanos
-                    .checked_add(f * scale / 10u128.pow(digits.len() as u32))
-                    .ok_or_else(|| anyhow::anyhow!("duration overflow at {path}"))?;
-            }
-        }
-        total = total
-            .checked_add(nanos)
-            .ok_or_else(|| anyhow::anyhow!("duration overflow at {path}"))?;
-        ensure!(
-            total <= i64::MAX as u128 + u128::from(negative),
-            "duration overflow at {path}"
-        );
-        rest = &suffix[unit.len()..];
-    }
-    if negative && total == i64::MAX as u128 + 1 {
-        Ok(i64::MIN)
-    } else {
-        Ok(if negative {
-            -(total as i64)
-        } else {
-            total as i64
-        })
-    }
+    crate::duration::parse_str(raw).map_err(|_| anyhow::anyhow!("invalid duration at {path}"))
 }
 
 /// Caddy ReplaceAll (unknown -> empty) and ReplaceKnown (unknown preserved).
