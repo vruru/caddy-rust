@@ -13,10 +13,14 @@ pub(crate) mod auth_cache;
 #[path = "http_runtime/certificate_provider.rs"]
 mod certificate_provider;
 pub use certificate_provider::ScopedCertificateProvider;
+#[path = "http_runtime/browse.rs"]
+pub(crate) mod browse;
 #[path = "http_runtime/connection_identity.rs"]
 mod connection_identity;
 #[path = "http_runtime/connection_sessions.rs"]
 mod connection_sessions;
+#[path = "http_runtime/file_match.rs"]
+mod file_match;
 #[path = "http_runtime/file_preconditions.rs"]
 mod file_preconditions;
 #[path = "http_runtime/file_sidecars.rs"]
@@ -79,6 +83,8 @@ mod request;
 mod request_regex;
 #[path = "http_runtime/response_matcher.rs"]
 mod response_matcher;
+#[path = "http_runtime/url_pattern.rs"]
+pub(crate) mod url_pattern;
 pub use encode_body::CompressionDiagnostics;
 #[path = "http_runtime/encode_response.rs"]
 pub(crate) mod encode_response;
@@ -837,6 +843,9 @@ fn dns_covers(pattern: &str, name: &str) -> bool {
     if pattern.eq_ignore_ascii_case(name) {
         return true;
     }
+    if name.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
     pattern.strip_prefix("*.").is_some_and(|suffix| {
         name.split_once('.')
             .is_some_and(|(_, rest)| rest.eq_ignore_ascii_case(suffix))
@@ -864,22 +873,11 @@ fn certificate_names(chain: &[u8]) -> Result<Vec<String>> {
         .map_err(|_| anyhow::anyhow!("invalid TLS certificate PEM"))?;
     let (_, cert) = x509_parser::parse_x509_certificate(&pem.contents)
         .map_err(|_| anyhow::anyhow!("invalid TLS certificate DER"))?;
-    let san = cert
-        .subject_alternative_name()?
-        .ok_or_else(|| anyhow::anyhow!("TLS certificate lacks SAN"))?;
-    let names = san
-        .value
-        .general_names
-        .iter()
-        .filter_map(|name| {
-            if let x509_parser::extensions::GeneralName::DNSName(name) = name {
-                Some(name.to_ascii_lowercase())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    ensure!(!names.is_empty(), "DNS TLS certificate has no DNS SAN");
+    let names = crate::tls_resolver::certificate_san_names(&cert)?;
+    ensure!(
+        !names.is_empty(),
+        "TLS certificate has no usable DNS or IP SAN"
+    );
     Ok(names)
 }
 /// A newly bound candidate socket can prove ownership before publication, but
@@ -1012,7 +1010,10 @@ async fn accept_loop(
                     };
                     let negotiated_h2 = accepted.stream.get_ref().1.alpn_protocol() == Some(b"h2");
                     let tls_details = fastcgi::TlsDetails::of(accepted.stream.get_ref().1);
-                    let tls_log = Some(Arc::new(access_log::Tls::of(accepted.stream.get_ref().1)));
+                    let tls_log = Some(Arc::new(access_log::Tls::of(
+                        accepted.stream.get_ref().1,
+                        accepted.identity.server_name(),
+                    )));
 
                     let Some(deadline) =
                         tokio::time::Instant::now().checked_add(server.plan.read_header_timeout)

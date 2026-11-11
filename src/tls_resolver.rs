@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{
         Arc, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -955,8 +956,9 @@ impl HotCertificateResolver {
         {
             return None;
         }
-        let sni = normalize_domain(sni?).ok()?;
+        let raw_name = sni?;
         if offered_alpn.contains(&ACME_ALPN) {
+            let sni = normalize_domain(raw_name).ok()?;
             if allowed_identities.is_some() {
                 return None;
             }
@@ -976,6 +978,7 @@ impl HotCertificateResolver {
                 leaf_state: None,
             });
         }
+        let sni = normalize_certificate_name(raw_name).ok()?;
         let snapshot = self.certificates.read().ok()?.clone();
         let now =
             i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs()).ok()?;
@@ -1017,6 +1020,9 @@ impl HotCertificateResolver {
         };
         if let Some(key) = snapshot.names.get(&sni).and_then(select) {
             return Some(key);
+        }
+        if sni.parse::<IpAddr>().is_ok() || sni.starts_with("*.") {
+            return None;
         }
         let (_, suffix) = sni.split_once('.')?;
         snapshot.names.get(&format!("*.{suffix}")).and_then(select)
@@ -1139,33 +1145,15 @@ fn load_certificate(
             .any(|e| e.oid.to_id_string() == "1.3.6.1.5.5.7.1.31"),
         "ACME challenge certificate cannot be a normal certificate"
     );
-    let san = leaf
-        .subject_alternative_name()
-        .map_err(|_| anyhow!("invalid certificate SAN"))?
-        .ok_or_else(|| anyhow!("certificate has no SAN"))?;
-    let dns_names = san
-        .value
-        .general_names
-        .iter()
-        .filter_map(|name| {
-            if let GeneralName::DNSName(name) = name {
-                Some(*name)
-            } else {
-                None
-            }
-        })
-        // Extra SANs unsupported by this DNS-only selector (e.g. underscore
-        // labels) do not invalidate another valid, explicitly requested alias.
-        .filter_map(|name| normalize_pattern(name).ok())
-        .collect::<Vec<_>>();
+    let san_names = certificate_san_names(&leaf)?;
     let names = input
         .names
         .iter()
-        .map(|s| normalize_pattern(s))
+        .map(|s| normalize_certificate_name(s))
         .collect::<Result<Vec<_>>>()?;
     for name in &names {
         ensure!(
-            dns_names.iter().any(|san| covers(san, name)),
+            san_names.iter().any(|san| covers(san, name)),
             "certificate SAN does not cover alias"
         );
     }
@@ -1349,7 +1337,51 @@ fn validate_snapshot_size_with_limit(
     Ok(())
 }
 
-fn normalize_pattern(raw: &str) -> Result<String> {
+pub(crate) fn canonical_certificate_ip(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V6(value) => value
+            .to_ipv4_mapped()
+            .map_or_else(|| value.to_string(), |mapped| mapped.to_string()),
+        IpAddr::V4(value) => value.to_string(),
+    }
+}
+
+pub(crate) fn certificate_san_names(
+    leaf: &x509_parser::certificate::X509Certificate<'_>,
+) -> Result<Vec<String>> {
+    let san = leaf
+        .subject_alternative_name()
+        .map_err(|_| anyhow!("invalid certificate SAN"))?
+        .ok_or_else(|| anyhow!("certificate has no SAN"))?;
+    let names = san
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            GeneralName::DNSName(name) if name.parse::<IpAddr>().is_err() => {
+                normalize_certificate_name(name).ok()
+            }
+            GeneralName::IPAddress(octets) => {
+                let ip = match *octets {
+                    bytes if bytes.len() == 4 => {
+                        IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(bytes).ok()?))
+                    }
+                    bytes if bytes.len() == 16 => {
+                        IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(bytes).ok()?))
+                    }
+                    _ => return None,
+                };
+                Some(canonical_certificate_ip(ip))
+            }
+            _ => None,
+        });
+    Ok(names.collect())
+}
+
+pub(crate) fn normalize_certificate_name(raw: &str) -> Result<String> {
+    if let Ok(ip) = raw.parse::<IpAddr>() {
+        return Ok(canonical_certificate_ip(ip));
+    }
     if let Some(suffix) = raw.strip_prefix("*.") {
         let suffix = normalize_domain(suffix)?;
         ensure!(
@@ -1366,7 +1398,7 @@ fn covers(pattern: &str, name: &str) -> bool {
     if pattern == name {
         return true;
     }
-    if name.starts_with("*.") {
+    if name.starts_with("*.") || name.parse::<IpAddr>().is_ok() {
         return false;
     }
     pattern.strip_prefix("*.").is_some_and(|suffix| {

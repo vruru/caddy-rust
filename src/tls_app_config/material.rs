@@ -5,7 +5,6 @@ use crate::{
 use anyhow::{Result, anyhow, ensure};
 use rustls::{pki_types::CertificateDer, sign::CertifiedKey};
 use std::sync::Arc;
-use x509_parser::extensions::GeneralName;
 use zeroize::Zeroizing;
 
 #[derive(Clone, Copy)]
@@ -45,24 +44,12 @@ impl Material {
         }
         let (_, leaf) = x509_parser::parse_x509_certificate(&blocks[0].1)
             .map_err(|_| anyhow!("invalid configured leaf certificate"))?;
-        let san = leaf
-            .subject_alternative_name()
-            .map_err(|_| anyhow!("invalid configured certificate SAN"))?
-            .ok_or_else(|| anyhow!("configured certificate SAN missing"))?;
-        let mut names = san
-            .value
-            .general_names
-            .iter()
-            .filter_map(|name| match name {
-                GeneralName::DNSName(name) => Some(name.to_ascii_lowercase()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let mut names = crate::tls_resolver::certificate_san_names(&leaf)?;
         names.sort();
         names.dedup();
         ensure!(
             !names.is_empty(),
-            "IP-only certificate requires IP selection support"
+            "configured certificate has no usable DNS or IP SAN"
         );
         let not_before = leaf.validity().not_before.timestamp();
         let not_after = leaf.validity().not_after.timestamp();

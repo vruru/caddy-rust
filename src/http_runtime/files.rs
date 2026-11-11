@@ -17,6 +17,7 @@ pub(super) async fn serve(
     indices: &[String],
     canonical_uris: bool,
     sidecars: &SidecarPlan,
+    browse: Option<&super::browse::BrowsePlan>,
 ) -> Result<Option<Response<Body>>> {
     let root = ctx.expand(root.unwrap_or("{http.vars.root}"))?;
     let decoded = decoded_path(ctx.req().uri().path())?;
@@ -36,14 +37,15 @@ pub(super) async fn serve(
         }
         Err(error) => return Err(super::request::file_io_failure(ctx, &error)),
     };
-    if hidden(ctx, &path, hide)? {
+    let hidden = HiddenPaths::prepare(ctx, hide)?;
+    if hidden.matches(&path) {
         return Ok(None);
     }
     let mut implicit_index = false;
     if metadata.is_dir() {
         for index in indices {
             let candidate = path.join(ctx.expand(index)?);
-            if hidden(ctx, &candidate, hide)? {
+            if hidden.matches(&candidate) {
                 continue;
             }
             let stat_path = candidate.clone();
@@ -68,6 +70,27 @@ pub(super) async fn serve(
             }
         }
         if !implicit_index {
+            if let Some(browse) = browse {
+                let base = |path: &str| {
+                    path.trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                let original = decoded_path(ctx.original_uri.path())?;
+                if (decoded.is_empty() || base(&original) == base(&decoded))
+                    && !original.ends_with('/')
+                {
+                    return Ok(Some(redirect(
+                        ctx,
+                        &format!("{}/", ctx.original_uri.path()),
+                    )?));
+                }
+                return super::browse::serve(ctx, path, metadata, browse, hidden)
+                    .await
+                    .map(Some);
+            }
             return Ok(None);
         }
     }
@@ -492,53 +515,68 @@ fn part_header(boundary: &str, mime: &str, range: &RangeInclusive<u64>, size: u6
         range.end()
     )
 }
-fn hidden(ctx: &Context, path: &std::path::Path, patterns: &[String]) -> Result<bool> {
-    for pattern in patterns {
-        let mut pattern = ctx.expand(pattern)?;
-        if pattern.contains(std::path::MAIN_SEPARATOR) {
-            let candidate = std::path::Path::new(&pattern);
-            let absolute = if candidate.is_absolute() {
-                candidate.to_path_buf()
-            } else {
-                std::env::current_dir()?.join(candidate)
-            };
-            let mut cleaned = std::path::PathBuf::new();
-            for component in absolute.components() {
-                if component == std::path::Component::ParentDir {
-                    cleaned.pop();
-                } else if component != std::path::Component::CurDir {
-                    cleaned.push(component);
+pub(super) struct HiddenPaths {
+    patterns: Vec<String>,
+    cwd: Option<std::path::PathBuf>,
+}
+impl HiddenPaths {
+    fn prepare(ctx: &Context, patterns: &[String]) -> Result<Self> {
+        let mut cwd = None;
+        let mut resolved = Vec::with_capacity(patterns.len());
+        for pattern in patterns {
+            let mut pattern = ctx.expand(pattern)?;
+            if pattern.contains(std::path::MAIN_SEPARATOR) {
+                let candidate = std::path::Path::new(&pattern);
+                let absolute = if candidate.is_absolute() {
+                    candidate.to_path_buf()
+                } else {
+                    if cwd.is_none() {
+                        cwd = Some(std::env::current_dir()?);
+                    }
+                    cwd.as_ref().expect("loaded").join(candidate)
+                };
+                let mut cleaned = std::path::PathBuf::new();
+                for component in absolute.components() {
+                    if component == std::path::Component::ParentDir {
+                        cleaned.pop();
+                    } else if component != std::path::Component::CurDir {
+                        cleaned.push(component);
+                    }
                 }
+                pattern = cleaned.to_string_lossy().into_owned();
             }
-            pattern = cleaned.to_string_lossy().into_owned();
-        }
-        if pattern.is_empty() {
-            continue;
-        }
-        if !pattern.contains(std::path::MAIN_SEPARATOR) {
-            if path
-                .components()
-                .any(|part| go_path_glob(&pattern, &part.as_os_str().to_string_lossy()))
-            {
-                return Ok(true);
-            }
-        } else {
-            let absolute = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                std::env::current_dir()?.join(path)
-            };
-            if absolute.to_string_lossy() == pattern
-                || absolute
-                    .to_string_lossy()
-                    .starts_with(&(pattern.clone() + "/"))
-                || go_path_glob(&pattern, &absolute.to_string_lossy())
-            {
-                return Ok(true);
+            if !pattern.is_empty() {
+                resolved.push(pattern);
             }
         }
+        if cwd.is_none()
+            && resolved
+                .iter()
+                .any(|p| p.contains(std::path::MAIN_SEPARATOR))
+        {
+            cwd = Some(std::env::current_dir()?);
+        }
+        Ok(Self {
+            patterns: resolved,
+            cwd,
+        })
     }
-    Ok(false)
+    pub(super) fn matches(&self, path: &std::path::Path) -> bool {
+        let absolute = self.cwd.as_ref().map(|cwd| cwd.join(path));
+        let absolute = absolute.as_deref().unwrap_or(path).to_string_lossy();
+        self.patterns.iter().any(|pattern| {
+            if !pattern.contains(std::path::MAIN_SEPARATOR) {
+                path.components()
+                    .any(|part| go_path_glob(pattern, &part.as_os_str().to_string_lossy()))
+            } else {
+                absolute == *pattern
+                    || absolute
+                        .strip_prefix(pattern)
+                        .is_some_and(|s| s.starts_with(std::path::MAIN_SEPARATOR))
+                    || go_path_glob(pattern, &absolute)
+            }
+        })
+    }
 }
 fn redirect(ctx: &Context, path: &str) -> Result<Response<Body>> {
     let path = format!("/{}", path.trim_start_matches('/'));

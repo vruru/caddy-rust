@@ -29,6 +29,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt", "io"] }
 time = { version = "0.3", features = ["formatting", "parsing", "serde-human-readable"] }
 url = "2"
+urlpattern = "=0.6.0"
 base64 = "0.22"
 http = "1"
 h2 = "=0.4.20"
@@ -85,6 +86,7 @@ p224={version="0.13.2",features=["ecdsa"]}
 openssl = { version = "=0.10.82", features = ["vendored"] }
 
 [patch.crates-io]
+urlpattern = { path = "vendor/urlpattern-0.6.0" }
 h2 = { path = "vendor/h2-0.4.20" }
 http = { path = "vendor/http-1.5.0" }
 reqwest = { path = "vendor/reqwest-0.12.28" }

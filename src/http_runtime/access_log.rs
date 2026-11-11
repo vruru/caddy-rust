@@ -92,7 +92,7 @@ pub(super) struct Tls {
     server_name: String,
 }
 impl Tls {
-    pub(super) fn of(connection: &rustls::ServerConnection) -> Self {
+    pub(super) fn of(connection: &rustls::ServerConnection, offered_name: &str) -> Self {
         Self {
             version: connection.protocol_version().map_or(0, u16::from),
             suite: connection
@@ -100,7 +100,7 @@ impl Tls {
                 .map_or(0, |s| u16::from(s.suite())),
             resumed: connection.handshake_kind() == Some(rustls::HandshakeKind::Resumed),
             protocol: connection.alpn_protocol().unwrap_or_default().to_vec(),
-            server_name: connection.server_name().unwrap_or_default().to_owned(),
+            server_name: offered_name.to_owned(),
         }
     }
     fn fields(&self) -> Vec<Field> {

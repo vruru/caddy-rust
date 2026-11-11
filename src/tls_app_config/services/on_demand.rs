@@ -306,6 +306,12 @@ impl ScopedCertificateProvider for Provider {
             service.policy_index(name).is_some_and(|index| service.plan.policies[index].on_demand)
         })
     }
+    fn should_probe_before_fallback(&self, name: &str) -> bool {
+        self.service.upgrade().is_none_or(|service| {
+            service.policy(name).on_demand
+                || self.state.almost_full(service.plan.cache_capacity)
+        })
+    }
     fn cached_name(&self, name: &str) -> bool {
         self.state.cached(name)
     }

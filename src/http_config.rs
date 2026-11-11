@@ -805,6 +805,27 @@ fn parse_matcher_sets(
                         Matcher::Vars(rules)
                     }
                 }
+                "url_pattern" => {
+                    let fields = object(v, "URLPattern matcher")?;
+                    deny_unknown(
+                        fields,
+                        &["pattern", "base_url", "ignore_case"],
+                        "URLPattern matcher",
+                    )?;
+                    let pattern = optional_handler_string(fields, "pattern", "URLPattern pattern")?;
+                    let base = optional_handler_string(fields, "base_url", "URLPattern base URL")?;
+                    let ignore_case = boolean(
+                        fields.get("ignore_case").filter(|v| !v.is_null()),
+                        false,
+                        "URLPattern ignore_case",
+                    )?;
+                    Matcher::UrlPattern(crate::http_runtime::url_pattern::Plan::prepare(
+                        &pattern,
+                        &base,
+                        ignore_case,
+                        regex_remaining,
+                    )?)
+                }
                 "tls" => {
                     let fields = object(v, "tls matcher")?;
                     deny_unknown(fields, &["handshake_complete"], "tls matcher")?;
@@ -859,10 +880,14 @@ fn parse_matcher_sets(
                         .map(|v| string(v, "try_policy"))
                         .transpose()?
                         .unwrap_or_default();
-                    ensure!(
-                        matches!(policy.as_str(), "" | "first_exist" | "first_exist_fallback"),
-                        "unsupported file try policy"
-                    );
+                    let policy = match policy.as_str() {
+                        "" | "first_exist" => FileMatchPolicy::First,
+                        "first_exist_fallback" => FileMatchPolicy::Fallback,
+                        "largest_size" => FileMatchPolicy::Largest,
+                        "smallest_size" => FileMatchPolicy::Smallest,
+                        "most_recently_modified" => FileMatchPolicy::Newest,
+                        _ => return Err(unsupported("/match/file/try_policy")),
+                    };
                     Matcher::File {
                         root: m.get("root").map(|v| string(v, "file root")).transpose()?,
                         try_files: m
@@ -875,7 +900,7 @@ fn parse_matcher_sets(
                             .map(|v| strings(v, "file split_path"))
                             .transpose()?
                             .unwrap_or_default(),
-                        fallback: policy == "first_exist_fallback",
+                        policy,
                     }
                 }
                 _ => return Err(unsupported("/apps/http/servers/*/routes/*/match/module")),
@@ -1243,6 +1268,7 @@ fn parse_handler(
                     "precompressed",
                     "precompressed_order",
                     "etag_file_extensions",
+                    "browse",
                 ],
                 path,
             )?;
@@ -1265,11 +1291,143 @@ fn parse_handler(
                     path,
                 )?,
                 sidecars: parse_file_sidecars(m, path)?,
+                browse: m
+                    .get("browse")
+                    .filter(|v| !v.is_null())
+                    .map(|value| {
+                        let fields = object(value, "file_server browse")?;
+                        deny_unknown(
+                            fields,
+                            &["template_file", "reveal_symlinks", "sort", "file_limit"],
+                            "browse",
+                        )?;
+                        let template = optional_handler_string(
+                            fields,
+                            "template_file",
+                            "browse template file",
+                        )?;
+                        ensure!(
+                            template.is_empty(),
+                            "custom browse templates require the template runtime"
+                        );
+                        let limit = fields
+                            .get("file_limit")
+                            .filter(|v| !v.is_null())
+                            .map(|v| {
+                                v.as_number().and_then(|n| n.as_go_i64()).ok_or_else(|| {
+                                    anyhow::anyhow!("browse file_limit must be an integer")
+                                })
+                            })
+                            .transpose()?
+                            .unwrap_or_default();
+                        ensure!(
+                            limit <= 100_000,
+                            "browse file_limit exceeds the native maximum"
+                        );
+                        Ok::<_, anyhow::Error>(crate::http_runtime::browse::BrowsePlan {
+                            file_limit: limit,
+                            reveal_symlinks: boolean(
+                                fields.get("reveal_symlinks").filter(|v| !v.is_null()),
+                                false,
+                                "browse reveal_symlinks",
+                            )?,
+                            sort: fields
+                                .get("sort")
+                                .filter(|v| !v.is_null())
+                                .map(|v| strings(v, "browse sort"))
+                                .transpose()?
+                                .unwrap_or_default(),
+                        })
+                    })
+                    .transpose()?,
             }
         }
-        "reverse_proxy" => Handler::ReverseProxy(Box::new(parse_proxy(m, path)?)),
+        "intercept" => {
+            deny_unknown(m, &["handler", "handle_response"], path)?;
+            Handler::Intercept(parse_response_routes(m.get("handle_response"), depth, regex_remaining)?)
+        }
+        "copy_response" => {
+            deny_unknown(m, &["handler", "status_code"], path)?;
+            Handler::CopyResponse(
+                m.get("status_code")
+                    .map(crate::module_json::weak_string)
+                    .transpose()?
+                    .unwrap_or_default(),
+            )
+        }
+        "copy_response_headers" => {
+            deny_unknown(m, &["handler", "include", "exclude"], path)?;
+            let include = parse_response_header_filter(m.get("include"), path)?;
+            let exclude = parse_response_header_filter(m.get("exclude"), path)?;
+            ensure!(include.is_empty() || exclude.is_empty(), "cannot define both include and exclude");
+            Handler::CopyResponseHeaders(ResponseHeaderFilter { include, exclude })
+        }
+        "reverse_proxy" => Handler::ReverseProxy(Box::new(parse_proxy(m, path, depth, regex_remaining)?)),
         _ => return Err(unsupported(path)),
     })
+}
+
+fn parse_response_header_filter(
+    value: Option<&Value>,
+    path: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Ok(Default::default());
+    };
+    value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("{path}: expected header filter list"))?
+        .iter()
+        .map(|entry| {
+            if entry.is_null() {
+                Ok(String::new())
+            } else {
+                Ok(string(entry, path)?.to_ascii_lowercase())
+            }
+        })
+        .collect()
+}
+
+fn parse_response_routes(
+    value: Option<&Value>,
+    depth: usize,
+    regex_remaining: &mut usize,
+) -> Result<Vec<ResponseRoute>> {
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let path = "/apps/http/servers/*/routes/*/handle/*/handle_response";
+    let entries = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("{path}: expected response route list"))?;
+    ensure!(entries.len() <= 65536, "response route count limit exceeded");
+    entries
+        .iter()
+        .map(|entry| {
+            if entry.is_null() {
+                return Ok(ResponseRoute::default());
+            }
+            let obj = object(entry, path)?;
+            deny_unknown(obj, &["match", "status_code", "routes"], path)?;
+            Ok(ResponseRoute {
+                matcher: obj
+                    .get("match")
+                    .filter(|v| !v.is_null())
+                    .map(|v| parse_response_matcher(v, path))
+                    .transpose()?,
+                status: obj
+                    .get("status_code")
+                    .map(crate::module_json::weak_string)
+                    .transpose()?
+                    .unwrap_or_default(),
+                routes: obj
+                    .get("routes")
+                    .filter(|v| !v.is_null())
+                    .map(|v| parse_routes(Some(v), depth + 1, true, regex_remaining))
+                    .transpose()?,
+            })
+        })
+        .collect()
 }
 fn parse_header_values(value: &Value, path: &str) -> Result<Vec<(String, Vec<String>)>> {
     let mut values = Vec::new();
@@ -1396,7 +1554,12 @@ fn parse_header_ops(value: &Value, path: &str, response: bool) -> Result<HeaderO
             .transpose()?,
     })
 }
-fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyConfig> {
+fn parse_proxy(
+    m: &serde_json::Map<String, Value>,
+    path: &str,
+    depth: usize,
+    regex_remaining: &mut usize,
+) -> Result<ProxyConfig> {
     let transport = m.get("transport").map(|v| object(v, path)).transpose()?;
     let is_fastcgi = transport
         .and_then(|t| t.get("protocol"))
@@ -1413,6 +1576,7 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
             "stream_close_delay",
             "request_buffers",
             "load_balancing",
+            "handle_response",
         ],
         path,
     )?;
@@ -1690,7 +1854,8 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
         read_timeout,
         write_timeout,
         request_headers,
-        response_headers,
+        response_headers: std::sync::Arc::new(response_headers),
+        response_routes: parse_response_routes(m.get("handle_response"), depth, regex_remaining)?,
         flush_interval: m
             .get("flush_interval")
             .map(|v| signed_duration(v, path))
@@ -1734,7 +1899,10 @@ fn pending_placeholders_depth(value: &Value, depth: usize) -> Result<()> {
                                     | "http.reverse_proxy.upstream.requests"
                                     | "http.reverse_proxy.upstream.max_requests"
                                     | "http.reverse_proxy.upstream.fails"
-                            ))
+                                    | "http.reverse_proxy.status_code"
+                                    | "http.reverse_proxy.status_text"
+                            )
+                            && !key.starts_with("http.reverse_proxy.header."))
                     {
                         return Err(helpers::unsupported("/placeholder/provider"));
                     }

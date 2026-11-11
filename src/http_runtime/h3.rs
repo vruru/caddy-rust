@@ -201,7 +201,8 @@ fn udp_socket(address: SocketAddr) -> std::io::Result<UdpSocket> {
 /// A handshake records exactly the selected leaf, never the best matching
 /// candidate at a later instant. QUIC does not consult the TCP proof resolver.
 struct SeenCert {
-    resolver: Arc<CandidateResolver>,
+    selected_policy: Arc<tls_policies::PreparedPolicy>,
+    local_ip: String,
     selection: Arc<sessions::SelectionSlot>,
     inspected_name: Option<String>,
     policy: PolicyScope,
@@ -213,8 +214,16 @@ impl fmt::Debug for SeenCert {
 }
 impl ResolvesServerCert for SeenCert {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let wire_name = hello.server_name()?;
-        let name = crate::challenge::normalize_domain(wire_name).ok()?;
+        let wire_name = hello.offered_server_name().unwrap_or_default();
+        let name = crate::tls_policy::normalized_offered_name(wire_name).ok()?;
+        let is_ip = name.parse::<std::net::IpAddr>().is_ok();
+        let dns_sni = hello.server_name();
+        if (name.is_empty() || is_ip) != dns_sni.is_none()
+            || dns_sni.is_some_and(|value| !value.eq_ignore_ascii_case(&name))
+        {
+            self.selection.poison();
+            return None;
+        }
         let protocols = hello.alpn()?.collect::<Vec<_>>();
         let version = hello.negotiated_version()?;
         if self
@@ -228,14 +237,38 @@ impl ResolvesServerCert for SeenCert {
             self.selection.poison();
             return None;
         }
-        let selected = self.selection.select(&name, self.policy.digest, || {
-            self.resolver.select_for_version(
-                Some(&name),
-                &protocols,
-                hello.signature_schemes(),
-                version,
-            )
-        })?;
+        let session_name = if name.is_empty() {
+            format!("no-sni:{}", self.local_ip)
+        } else if is_ip {
+            format!("ip-sni:{name}")
+        } else {
+            name.clone()
+        };
+        let resolver = &self.selected_policy.resolver;
+        let primary_only = (name.is_empty() || is_ip)
+            && resolver
+                .provider
+                .as_ref()
+                .is_some_and(|provider| provider.should_probe_before_fallback(&name));
+        let selected =
+            self.selection
+                .select(&session_name, wire_name, self.policy.digest, || {
+                    self.selected_policy
+                        .definition
+                        .certificate_names(&name, &self.local_ip)
+                        .into_iter()
+                        .take(if primary_only { 1 } else { 3 })
+                        .flatten()
+                        .filter(|name| !name.is_empty())
+                        .find_map(|name| {
+                            resolver.select_for_version(
+                                Some(name),
+                                &protocols,
+                                hello.signature_schemes(),
+                                version,
+                            )
+                        })
+                })?;
         let key = &selected.certificate.key;
         if key.key.choose_scheme(hello.signature_schemes()).is_none() {
             self.selection.poison();
@@ -338,7 +371,7 @@ enum Prepared {
 
 async fn prepare_certificate(
     incoming: &quinn::Incoming,
-    resolver: &CandidateResolver,
+    policy: &tls_policies::PreparedPolicy,
     hello: &hello::Hello,
     provider: &dyn ScopedCertificateProvider,
     name: &str,
@@ -350,16 +383,33 @@ async fn prepare_certificate(
         .iter()
         .map(Vec::as_slice)
         .collect::<Vec<_>>();
+    let resolver = &policy.resolver;
     let selected = resolver.select_for_version_with_origin(
         Some(name),
         &protocols,
         &hello.signatures,
         rustls::ProtocolVersion::TLSv1_3,
     );
+    let has_fallback = policy
+        .definition
+        .fallback_sni
+        .as_deref()
+        .is_some_and(|fallback| {
+            resolver
+                .select_for_version(
+                    Some(fallback),
+                    &protocols,
+                    &hello.signatures,
+                    rustls::ProtocolVersion::TLSv1_3,
+                )
+                .is_some()
+        });
+    let probe_fallback = has_fallback && provider.should_probe_before_fallback(name);
     if selected
         .as_ref()
         .is_some_and(|(_, origin)| *origin == CertificateOrigin::Manual)
-        || !provider.can_acquire_quic_name(name)
+        || (has_fallback && !probe_fallback)
+        || (!probe_fallback && !provider.can_acquire_quic_name(name))
     {
         return Some(Prepared::Ready);
     }
@@ -468,8 +518,8 @@ async fn accept_loop(
                     Some(Preflight::Retry) => { let _ = incoming.retry(); return; }
                     None => return,
                 };
-                let Some(wire_name) = hello.server_name.as_deref() else { return; };
-                let Ok(name) = crate::challenge::normalize_domain(wire_name) else { return; };
+                let wire_name = hello.server_name.as_deref().unwrap_or_default();
+                let Ok(name) = crate::tls_policy::normalized_offered_name(wire_name) else { return; };
                 if !hello.protocols.iter().any(|p| p == b"h3") || hello.protocols.iter().any(|p| p == ACME_ALPN) {
                     return;
                 }
@@ -492,14 +542,17 @@ async fn accept_loop(
                 if policy.definition.drop || policy.definition.protocol_max == Some(crate::tls_policy::ProtocolVersion::Tls12) {
                     return;
                 }
-                let resolver = &policy.resolver;
-                if let Some(provider) = resolver.provider.as_deref().filter(|p| p.needs_quic_preflight()) {
+                if !name.is_empty() && name.parse::<std::net::IpAddr>().is_err()
+                    && let Some(provider) = policy.resolver.provider.as_deref().filter(|p| {
+                        p.needs_quic_preflight() || policy.definition.fallback_sni.is_some()
+                    })
+                {
                     let prepared = tokio::select! {
                         biased;
                         _=activity.superseded.cancelled()=>return,
                         _=activity.admission_closed.cancelled()=>return,
                         _=activity.hard_stop.cancelled()=>return,
-                        value=tokio::time::timeout_at(deadline, prepare_certificate(&incoming, resolver, &hello, provider, &name, (&binding.preflight, &runtime.quic_limits.preflight)))=>value.ok().flatten(),
+                        value=tokio::time::timeout_at(deadline, prepare_certificate(&incoming, &policy, &hello, provider, &name, (&binding.preflight, &runtime.quic_limits.preflight)))=>value.ok().flatten(),
                     };
                     match prepared {
                         Some(Prepared::Ready) => {}
@@ -515,7 +568,9 @@ async fn accept_loop(
                 return;
             }
             let seen = Arc::new(SeenCert {
-                resolver: policy.resolver.clone(),
+                selected_policy: policy.clone(),
+                local_ip: if local.ip().is_unspecified() { String::new() }
+                    else { crate::tls_resolver::canonical_certificate_ip(local.ip()) },
                 selection: Arc::new(sessions::SelectionSlot::default()),
                 inspected_name,
                 policy: PolicyScope::new(&server, index, &policy),
@@ -538,11 +593,11 @@ async fn accept_loop(
                 value=tokio::time::timeout_at(deadline,connecting)=>match value {Ok(Ok(value))=>value,_=>return},
             };
             drop((handshake_slot,process_handshake));
-            let leaf = seen.selection.current().map(|selected| selected.leaf().clone());
-            let Some(leaf)=leaf else {return;};
+            let Some(selected) = seen.selection.current() else { return; };
+            let identity = QuicIdentity { leaf: selected.leaf().clone(), sni: selected.raw_sni.clone() };
             let peer = Peer {key,peer,local,scope:config.scope};
             if !peer.permits(&connection) { return; }
-            serve_connection(runtime,connection,peer,server,activity,leaf).await;
+            serve_connection(runtime,connection,peer,server,activity,identity).await;
             drop(binding);
         });
     }
@@ -591,21 +646,21 @@ fn canonical(address: SocketAddr) -> SocketAddr {
     SocketAddr::new(address.ip().to_canonical(), address.port())
 }
 
+struct QuicIdentity {
+    leaf: Arc<LeafState>,
+    sni: Arc<str>,
+}
+
 async fn serve_connection(
     inner: Arc<Inner>,
     quic: quinn::Connection,
     peer: Peer,
     server: Arc<ActiveServer>,
     activity: Arc<BusinessGeneration>,
-    leaf: Arc<LeafState>,
+    identity: QuicIdentity,
 ) {
-    let sni: Option<Arc<str>> = if server.plan.strict_sni_host {
-        quic.handshake_data()
-            .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
-            .and_then(|data| data.server_name.map(Arc::from))
-    } else {
-        None
-    };
+    let QuicIdentity { leaf, sni } = identity;
+    let sni = server.plan.strict_sni_host.then_some(sni);
     let mut builder = ::h3::server::builder();
     builder.max_field_section_size(16 * 1024);
     let mut connection = tokio::select! {

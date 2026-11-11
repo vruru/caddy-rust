@@ -50,6 +50,7 @@ fn now() -> Option<i64> {
 
 pub(super) struct Selected {
     pub(super) certificate: CertificateSelection,
+    pub(super) raw_sni: Arc<str>,
     identity: Arc<Identity>,
 }
 impl Selected {
@@ -79,6 +80,7 @@ impl SelectionSlot {
     pub(super) fn select(
         &self,
         sni: &str,
+        raw_sni: &str,
         policy: [u8; 32],
         resolve: impl FnOnce() -> Option<CertificateSelection>,
     ) -> Option<&Selected> {
@@ -86,7 +88,7 @@ impl SelectionSlot {
             return None;
         }
         if let Some(known) = self.selected.get() {
-            if known.identity.sni.as_ref() != sni {
+            if known.identity.sni.as_ref() != sni || known.raw_sni.as_ref() != raw_sni {
                 self.poison();
                 return None;
             }
@@ -102,6 +104,7 @@ impl SelectionSlot {
                 .selected
                 .set(Selected {
                     certificate,
+                    raw_sni: Arc::from(raw_sni),
                     identity,
                 })
                 .is_err()

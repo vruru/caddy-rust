@@ -192,7 +192,41 @@ impl fmt::Debug for ConnectionPolicy {
     }
 }
 
+/// Normalize the read-only wire name for certificate lookup only. Use the
+/// original offered name separately for policy matching and HTTP identity.
+pub fn normalized_offered_name(raw: &str) -> Result<String> {
+    if raw.is_empty() {
+        return Ok(String::new());
+    }
+    if raw.ends_with('.') {
+        bail!("trailing dot in TLS server name");
+    }
+    if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
+        return Ok(crate::tls_resolver::canonical_certificate_ip(ip));
+    }
+    crate::challenge::normalize_domain(raw)
+}
+
 impl ConnectionPolicy {
+    /// Ordered certificate lookups after matching the unchanged ClientHello.
+    /// The caller passes a normalized offered DNS SNI (or an empty string)
+    /// and the canonical IP of this socket's local endpoint.
+    pub fn certificate_names<'a>(
+        &'a self,
+        offered_sni: &'a str,
+        local_ip: &'a str,
+    ) -> [Option<&'a str>; 3] {
+        if offered_sni.is_empty() {
+            [
+                Some(local_ip),
+                self.default_sni.as_deref(),
+                self.fallback_sni.as_deref(),
+            ]
+        } else {
+            [Some(offered_sni), None, self.fallback_sni.as_deref()]
+        }
+    }
+
     fn default_empty() -> Self {
         Self {
             identity: <sha2::Sha256 as sha2::Digest>::digest(b"{}").into(),
@@ -315,8 +349,18 @@ fn parse_one_policy(v: &Value) -> Result<ConnectionPolicy> {
 
     let client_auth = parse_client_auth(obj.get("client_authentication"))?;
 
-    let default_sni = parse_opt_string(obj.get("default_sni"), "default_sni")?;
-    let fallback_sni = parse_opt_string(obj.get("fallback_sni"), "fallback_sni")?;
+    let certificate_name = |field| -> Result<Option<String>> {
+        let configured = parse_opt_string(obj.get(field), field)?;
+        configured
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(crate::tls_resolver::normalize_certificate_name)
+            .transpose()
+            .with_context(|| format!("invalid {field} certificate name"))
+    };
+    let default_sni = certificate_name("default_sni")?;
+    let fallback_sni = certificate_name("fallback_sni")?;
 
     let insecure_secrets_log =
         parse_opt_string(obj.get("insecure_secrets_log"), "insecure_secrets_log")?;

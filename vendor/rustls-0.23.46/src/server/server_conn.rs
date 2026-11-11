@@ -139,6 +139,7 @@ pub trait ResolvesServerCert: Debug + Send + Sync {
 pub struct ClientHello<'a> {
     pub(super) negotiated_version: Option<ProtocolVersion>,
     pub(super) server_name: &'a Option<DnsName<'a>>,
+    pub(super) offered_server_name: Option<&'a str>,
     pub(super) signature_schemes: &'a [SignatureScheme],
     pub(super) alpn: Option<&'a Vec<ProtocolName>>,
     pub(super) server_cert_types: Option<&'a [CertificateType]>,
@@ -168,6 +169,13 @@ impl<'a> ClientHello<'a> {
         self.server_name
             .as_ref()
             .map(<DnsName<'_> as AsRef<str>>::as_ref)
+    }
+
+    /// The case-preserving SNI hostname sent by the client, including an IP
+    /// literal if a non-conforming client sent one. This does not turn an IP
+    /// into a DNS name or change Rustls's default SNI or resumption behavior.
+    pub fn offered_server_name(&self) -> Option<&str> {
+        self.offered_server_name
     }
 
     /// Get the compatible signature schemes.
@@ -1043,6 +1051,10 @@ impl Accepted {
         let ch = ClientHello {
             negotiated_version: None,
             server_name: &self.connection.core.data.sni,
+            offered_server_name: payload
+                .server_name
+                .as_ref()
+                .and_then(crate::msgs::handshake::ServerNamePayload::offered_name),
             signature_schemes: &self.sig_schemes,
             alpn: payload.protocols.as_ref(),
             server_cert_types: payload

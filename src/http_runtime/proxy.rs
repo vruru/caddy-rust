@@ -4,6 +4,7 @@ use super::upstream_tls::{FixedDialConnector, PreparedTransport};
 use super::*;
 use http::{HeaderMap, HeaderName, HeaderValue, Uri, Version};
 use hyper_util::client::legacy::Client;
+use http_body_util::BodyStream;
 use rustls::pki_types::ServerName;
 use std::{
     collections::VecDeque,
@@ -103,11 +104,15 @@ pub(super) fn prepare_clients(
                     prepare_clients(routes, output, hosts, logging_available)?;
                     prepare_clients(errors, output, hosts, logging_available)?;
                 }
+                Handler::Intercept(response) => {
+                    prepare_response_clients(response, output, hosts, logging_available)?;
+                }
                 Handler::FileServer { .. } => {
                     super::mime::initialize();
                 }
                 Handler::ReverseProxy(config) => {
                     let config = config.as_ref();
+                    prepare_response_clients(&config.response_routes, output, hosts, logging_available)?;
                     if let Some(fastcgi) = &config.fastcgi {
                         ensure!(
                             !fastcgi.capture_stderr || logging_available,
@@ -141,12 +146,144 @@ pub(super) fn prepare_clients(
     }
     Ok(())
 }
+fn prepare_response_clients(
+    entries: &[crate::http_config::types::ResponseRoute],
+    output: &mut HashMap<usize, ProxyClient>,
+    hosts: &HostRegistry,
+    logging_available: bool,
+) -> Result<()> {
+    for entry in entries {
+        if let Some(routes) = &entry.routes {
+            prepare_clients(routes, output, hosts, logging_available)?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) struct PreparedResponse {
+    pub(super) response: Response<Body>,
+    pub(super) status_text: String,
+    headers: Arc<crate::http_config::types::HeaderOps>,
+    protocol: Option<Version>,
+    sniff: bool,
+    upgrade: Option<Upgrade>,
+    lease: Option<Arc<super::proxy_policy::RequestLease>>,
+}
+
+struct Upgrade {
+    upstream: hyper::upgrade::OnUpgrade,
+    downstream: Option<hyper::upgrade::OnUpgrade>,
+    expected: Option<HeaderValue>,
+    client: HyperClient,
+    close_delay: Option<Duration>,
+}
+
+impl PreparedResponse {
+    pub(super) fn fastcgi(
+        response: Response<Body>,
+        headers: Arc<crate::http_config::types::HeaderOps>,
+        sniff: bool,
+    ) -> Self {
+        let status_text = response.headers().get("status")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|text| text.split_once(' ').map(|(_, phrase)| phrase))
+            .unwrap_or_default().to_owned();
+        Self {
+            response,
+            status_text,
+            headers,
+            protocol: None,
+            sniff,
+            upgrade: None,
+            lease: None,
+        }
+    }
+
+    pub(super) async fn finish(mut self, ctx: &mut Context, inner: &Arc<Inner>) -> Result<Response<Body>> {
+        let upgrade = self.response.status() == StatusCode::SWITCHING_PROTOCOLS;
+        if upgrade {
+            let setup = self.upgrade.take().ok_or_else(|| anyhow::anyhow!("unsolicited upstream upgrade"))?;
+            ensure!(
+                header_has_token(self.response.headers(), http::header::CONNECTION, "upgrade"),
+                "upstream upgrade connection token missing"
+            );
+            ensure!(
+                self.response.headers().get(http::header::UPGRADE)
+                    .zip(setup.expected.as_ref())
+                    .is_some_and(|(received, expected)| received.as_bytes().eq_ignore_ascii_case(expected.as_bytes())),
+                "upstream upgrade protocol mismatch"
+            );
+            let downstream = setup.downstream.ok_or_else(|| anyhow::anyhow!("missing downstream upgrade"))?;
+            let drain = ctx.drain.clone();
+            let business = ctx.business.clone();
+            let hard_stop = business.generation().hard_stop.clone();
+            let admission = self.lease.take().expect("HTTP upgrade lease");
+            inner.upgrades.spawn(async move {
+                let _admission = admission;
+                let _hold_client = setup.client;
+                let _business = business;
+                let tunnel = async {
+                    if let (Ok(downstream), Ok(upstream)) = tokio::join!(downstream, setup.upstream) {
+                        let mut downstream = TokioIo::new(downstream);
+                        let mut upstream = TokioIo::new(upstream);
+                        let copy = tokio::io::copy_bidirectional(&mut downstream, &mut upstream);
+                        tokio::pin!(copy);
+                        if let Some(delay) = setup.close_delay {
+                            tokio::select! { _ = &mut copy => {}, _ = drain.cancelled() => {
+                                let _ = tokio::time::timeout(delay, copy).await;
+                            } }
+                        } else {
+                            let _ = copy.await;
+                        }
+                    }
+                };
+                tokio::select! { biased; _ = hard_stop.cancelled() => {}, _ = tunnel => {} }
+            });
+        }
+
+        if self.sniff {
+            let mut body = std::mem::replace(self.response.body_mut(), full(Bytes::new()));
+            if let Some(first) = body.frame().await {
+                if let Some(bytes) = first.as_ref().ok().and_then(hyper::body::Frame::data_ref) {
+                    self.response.headers_mut().insert(
+                        http::header::CONTENT_TYPE,
+                        HeaderValue::from_static(super::sniff::detect_content_type(bytes)),
+                    );
+                }
+                let stream = futures_util::stream::once(async move { first });
+                *self.response.body_mut() = http_body_util::StreamBody::new(
+                    futures_util::StreamExt::chain(stream, BodyStream::new(body))
+                ).boxed_unsync();
+            }
+        }
+        remove_hop_headers(self.response.headers_mut(), upgrade, false);
+        if !upgrade {
+            ctx.immediate.remove(http::header::SERVER);
+            let via = match self.protocol {
+                Some(Version::HTTP_10) => "1.0 Caddy",
+                Some(Version::HTTP_2) => "2.0 Caddy",
+                Some(_) => "1.1 Caddy",
+                None => "0.0 Caddy",
+            };
+            ctx.immediate.append(http::header::VIA, HeaderValue::from_static(via));
+            let status = self.response.status().as_u16();
+            apply_response_headers(self.response.headers_mut(), status, &self.headers, ctx)?;
+        }
+        *self.response.version_mut() = ctx.req().version();
+        // A copied or intercepted response may move just its body. Keep
+        // upstream admission with the stream rather than the header object.
+        if let Some(lease) = self.lease.take() {
+            return Ok(self.response.map(|body| super::proxy_policy::with_lease(body, lease)));
+        }
+        Ok(self.response)
+    }
+}
+
 pub(super) async fn serve(
     ctx: &mut Context,
     config: &ProxyConfig,
     server: &Arc<ActiveServer>,
-    inner: &Arc<Inner>,
-) -> Result<Response<Body>> {
+) -> Result<PreparedResponse> {
     ensure!(
         !ctx.fastcgi_body_claimed,
         "FastCGI request body cannot be replayed"
@@ -206,7 +343,7 @@ pub(super) async fn serve(
         }
     }
     .ok_or_else(|| super::request::failure(StatusCode::SERVICE_UNAVAILABLE))?;
-    let mut lease = Some(selection.lease);
+    let lease = selection.lease;
     for value in selection.cookies {
         ctx.immediate.append(http::header::SET_COOKIE, value);
     }
@@ -395,7 +532,7 @@ pub(super) async fn serve(
     request = request.map(|body| {
         super::proxy_policy::with_lease(
             super::request_body::outgoing_body(body, replacement),
-            lease.as_ref().expect("attempt lease").clone(),
+            lease.clone(),
         )
     });
     // Keep the bounded upstream-event waiter out of the outer route
@@ -407,49 +544,23 @@ pub(super) async fn serve(
         config.response_header_timeout,
     ))
     .await?;
-    if response.status() == StatusCode::SWITCHING_PROTOCOLS {
-        ensure!(is_upgrade, "unsolicited upstream upgrade");
-        ensure!(
-            header_has_token(response.headers(), http::header::CONNECTION, "upgrade"),
-            "upstream upgrade connection token missing"
-        );
-        ensure!(
-            response
-                .headers()
-                .get(http::header::UPGRADE)
-                .zip(expected_upgrade.as_ref())
-                .is_some_and(|(received, expected)| received
-                    .as_bytes()
-                    .eq_ignore_ascii_case(expected.as_bytes())),
-            "upstream upgrade protocol mismatch"
-        );
-        let upstream_upgrade = hyper::upgrade::on(&mut response);
-        let downstream_upgrade =
-            downstream_upgrade.ok_or_else(|| anyhow::anyhow!("missing downstream upgrade"))?;
-        let upgrades = inner.upgrades.clone();
-        let drain = ctx.drain.clone();
-        let delay = config.stream_close_delay;
-        let hold_client = client.clone();
-        let business = ctx.business.clone();
-        let hard_stop = business.generation().hard_stop.clone();
-        let admission = lease.take().expect("upgrade attempt lease");
-        upgrades.spawn(async move {
-            let _admission = admission;
-            let _hold_client=hold_client;
-            let _business=business;
-            let tunnel=async {
-            if let (Ok(downstream),Ok(upstream))=tokio::join!(downstream_upgrade,upstream_upgrade){
-                let mut downstream=TokioIo::new(downstream);let mut upstream=TokioIo::new(upstream);
-                let copy=tokio::io::copy_bidirectional(&mut downstream,&mut upstream);tokio::pin!(copy);
-                if let Some(delay)=delay {
-                    tokio::select!{_=&mut copy=>{},_=drain.cancelled()=>{let _=tokio::time::timeout(delay,copy).await;}}
-                } else { let _=copy.await; }
-            }
-            };
-            tokio::select! {biased; _=hard_stop.cancelled()=>{},_=tunnel=>{}}
-        });
-    }
-    let upgrade = response.status() == StatusCode::SWITCHING_PROTOCOLS;
+    let reason = response.extensions_mut().remove::<hyper::ext::ReasonPhrase>();
+    let status = response.status();
+    let status_text = format!(
+        "{} {}",
+        status.as_str(),
+        reason.as_ref()
+            .map(|reason| String::from_utf8_lossy(reason.as_bytes()))
+            .unwrap_or_else(|| status.canonical_reason().unwrap_or_default().into()),
+    );
+    let protocol = response.version();
+    let upgrade = (status == StatusCode::SWITCHING_PROTOCOLS).then(|| Upgrade {
+        upstream: hyper::upgrade::on(&mut response),
+        downstream: downstream_upgrade,
+        expected: expected_upgrade,
+        client: client.clone(),
+        close_delay: config.stream_close_delay,
+    });
     let has_body = !hyper::body::Body::is_end_stream(response.body())
         && response.status() != StatusCode::NO_CONTENT
         && response.status() != StatusCode::NOT_MODIFIED
@@ -469,31 +580,7 @@ pub(super) async fn serve(
             .remove(http::header::CONTENT_ENCODING);
         response.headers_mut().remove(http::header::CONTENT_LENGTH);
     }
-    remove_hop_headers(response.headers_mut(), upgrade, false);
-    if !upgrade {
-        // Go finalizes normal responses before copying upstream fields. Via
-        // belongs to the downstream writer, outside the require matcher input.
-        ctx.immediate.remove(http::header::SERVER);
-        let via = match response.version() {
-            Version::HTTP_10 => "1.0 Caddy",
-            Version::HTTP_2 => "2.0 Caddy",
-            _ => "1.1 Caddy",
-        };
-        ctx.immediate
-            .append(http::header::VIA, HeaderValue::from_static(via));
-        let status = response.status().as_u16();
-        apply_response_headers(
-            response.headers_mut(),
-            status,
-            &config.response_headers,
-            ctx,
-        )?;
-    }
-    *response.version_mut() = downstream_version;
-    if let Some(lease) = lease {
-        response.extensions_mut().insert(lease);
-    }
-    Ok(response.map(|body| {
+    let response = response.map(|body| {
         let body = ProxyBody { body, client };
         let body = if decompress {
             gzip_decode(body)
@@ -501,7 +588,16 @@ pub(super) async fn serve(
             body.map_err(|e| -> BoxError { e.into() }).boxed_unsync()
         };
         super::trailer_policy::policy(body, false)
-    }))
+    });
+    Ok(PreparedResponse {
+        response,
+        status_text,
+        headers: config.response_headers.clone(),
+        protocol: Some(protocol),
+        sniff: false,
+        upgrade,
+        lease: Some(lease),
+    })
 }
 async fn fetch_with_informational(
     ctx: &mut Context,

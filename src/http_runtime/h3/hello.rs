@@ -109,7 +109,7 @@ impl rustls::server::ResolvesServerCert for Observe {
             && !hello.signature_schemes().is_empty()
         {
             *self.0.lock().ok()? = Some(Hello {
-                server_name: hello.server_name().map(str::to_owned),
+                server_name: hello.offered_server_name().map(str::to_owned),
                 protocols: hello
                     .alpn()
                     .map(|p| p.map(<[u8]>::to_vec).collect())

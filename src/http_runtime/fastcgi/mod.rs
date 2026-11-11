@@ -9,7 +9,7 @@ mod wire;
 
 use super::{
     Body, BoxError, Bytes, Response, StatusCode, full, proxy,
-    request::{Context, apply_headers, budget_failure, failure},
+    request::{Context, budget_failure, failure},
     resource_budget::BudgetError,
 };
 use crate::http_config::types::{FastCgiConfig, ProxyConfig};
@@ -481,7 +481,7 @@ pub(super) async fn serve(
     transport: &FastCgiConfig,
     dial: String,
     logging: Option<&std::sync::Arc<crate::logging::Logging>>,
-) -> Result<Response<Body>> {
+) -> Result<proxy::PreparedResponse> {
     let target = Target::parse(&dial)?;
     target.set_placeholders(ctx);
     let path = percent_encoding::percent_decode_str(ctx.req().uri().path()).collect::<Vec<_>>();
@@ -649,35 +649,15 @@ pub(super) async fn serve(
     let reply = reply::Reader::new(wire::Responses::new(socket, read_limit), stderr)
         .headers()
         .await?;
-    let mut response_headers = reply.headers;
+    let response_headers = reply.headers;
     let no_body = ctx.req().method() == Method::HEAD
-        || matches!(
-            reply.status,
-            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
-        )
-        || response_headers
-            .get(header::CONTENT_LENGTH)
-            .is_some_and(|value| value == "0");
-    let mut reply_body = reply.body;
+        || matches!(reply.status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED)
+        || response_headers.get(header::CONTENT_LENGTH).is_some_and(|value| value == "0");
+    let reply_body = reply.body;
     let sniff = !no_body
         && !response_headers.contains_key(header::CONTENT_TYPE)
         && !response_headers.contains_key(header::CONTENT_ENCODING)
         && !response_headers.contains_key(header::CONTENT_RANGE);
-    let first = if sniff {
-        reply_body.next().await.transpose()
-    } else {
-        None
-    };
-    if let Some(Ok(bytes)) = &first {
-        response_headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static(super::sniff::detect_content_type(bytes)),
-        );
-    }
-    proxy::remove_hop_headers(&mut response_headers, false, false);
-    ctx.immediate.remove(header::SERVER);
-    response_headers.append(header::VIA, HeaderValue::from_static("0.0 Caddy"));
-    apply_headers(&mut response_headers, &config.response_headers, ctx)?;
     let diagnostic_owner = capture.then(|| (ctx.resources.clone(), ctx.business.clone()));
     let body = if no_body {
         if let Some(owner) = diagnostic_owner {
@@ -686,15 +666,12 @@ pub(super) async fn serve(
         full(Bytes::new())
     } else {
         let frames = stream::try_unfold(
-            (first, Some(reply_body), diagnostic_owner),
-            |(first, body, owner)| async move {
+            (Some(reply_body), diagnostic_owner),
+            |(body, owner)| async move {
                 let Some(mut body) = body else {
                     return Ok(None);
                 };
-                let result = match first {
-                    Some(value) => value.map(Some),
-                    None => body.next().await,
-                };
+                let result = body.next().await;
                 if result.is_err() {
                     // Give Hyper one flush opportunity before closing an already
                     // started HTTP/1 response on an upstream framing failure.
@@ -709,7 +686,7 @@ pub(super) async fn serve(
                 } else {
                     Some(body)
                 };
-                Ok::<_, BoxError>(bytes.map(|bytes| (Frame::data(bytes), (None, body, owner))))
+                Ok::<_, BoxError>(bytes.map(|bytes| (Frame::data(bytes), (body, owner))))
             },
         );
         StreamBody::new(frames).boxed_unsync()
@@ -718,7 +695,7 @@ pub(super) async fn serve(
     *response.status_mut() = reply.status;
     *response.version_mut() = ctx.req().version();
     *response.headers_mut() = response_headers;
-    Ok(response)
+    Ok(proxy::PreparedResponse::fastcgi(response, config.response_headers.clone(), sniff))
 }
 
 // A completed response does not wait for the FastCGI diagnostic tail. The

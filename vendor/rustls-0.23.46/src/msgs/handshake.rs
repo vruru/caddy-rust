@@ -268,8 +268,8 @@ pub(crate) enum ServerNamePayload<'a> {
     /// A successfully decoded value:
     SingleDnsName(DnsName<'a>),
 
-    /// A DNS name which was actually an IP address
-    IpAddress,
+    /// An IP literal presented as SNI. Kept only for read-only inspection.
+    IpAddress(PayloadU16<NonEmpty>),
 
     /// A successfully decoded, but syntactically-invalid value.
     Invalid,
@@ -279,8 +279,16 @@ impl ServerNamePayload<'_> {
     fn into_owned(self) -> ServerNamePayload<'static> {
         match self {
             Self::SingleDnsName(d) => ServerNamePayload::SingleDnsName(d.to_owned()),
-            Self::IpAddress => ServerNamePayload::IpAddress,
+            Self::IpAddress(value) => ServerNamePayload::IpAddress(value),
             Self::Invalid => ServerNamePayload::Invalid,
+        }
+    }
+
+    pub(crate) fn offered_name(&self) -> Option<&str> {
+        match self {
+            Self::SingleDnsName(value) => Some(value.as_ref()),
+            Self::IpAddress(value) => core::str::from_utf8(value.0.as_slice()).ok(),
+            Self::Invalid => None,
         }
     }
 
@@ -344,11 +352,11 @@ impl<'a> Codec<'a> for ServerNamePayload<'a> {
                     Some(Self::SingleDnsName(dns_name.to_owned()))
                 }
 
-                HostNamePayload::IpAddress(_invalid) => {
+                HostNamePayload::IpAddress(address) => {
                     warn!(
-                        "Illegal SNI extension: ignoring IP address presented as hostname ({_invalid:?})"
+                        "Illegal SNI extension: ignoring IP address presented as hostname ({address:?})"
                     );
-                    Some(Self::IpAddress)
+                    Some(Self::IpAddress(address))
                 }
 
                 HostNamePayload::Invalid(_invalid) => {

@@ -203,6 +203,7 @@ pub struct ResourceDiagnostics {
     pub compression: super::CompressionDiagnostics,
     pub proxy_selection: BudgetSnapshot,
     pub request_regexp: BudgetSnapshot,
+    pub directory_listing: BudgetSnapshot,
     pub access_capture_rejected: u64,
     pub access_capture_reduced: u64,
     pub access_response_headers_omitted: u64,
@@ -227,6 +228,8 @@ pub(crate) struct Resources {
     pub(super) proxy_hosts: Arc<super::proxy_policy::HostRegistry>,
     pub proxy_selection: BlockingBudget,
     pub request_regexp: BlockingBudget,
+    pub directory_listing: BlockingBudget,
+    pub directory_listing_bytes: Arc<Semaphore>,
     pub(super) fastcgi_admission: super::fastcgi::admission::Admission,
     pub fastcgi_dns: BlockingBudget,
     pub fastcgi_spool_io: BlockingBudget,
@@ -321,6 +324,14 @@ impl Resources {
             cpu.saturating_mul(16).clamp(32, 256),
             Duration::from_secs(2),
         )?;
+        let listing_running = cpu
+            .clamp(1, 8)
+            .min((spare.saturating_sub(selection_running + regex_running) / 2).max(1));
+        let directory_listing = BlockingBudget::new(
+            listing_running,
+            cpu.saturating_mul(4).clamp(8, 64),
+            Duration::from_secs(2),
+        )?;
         Ok(Self {
             request_body_bytes: Arc::new(Semaphore::new(super::request_body::REPLACEMENT_UNITS)),
             auth,
@@ -337,11 +348,15 @@ impl Resources {
             fastcgi,
             compression: super::encode_body::CompressionBudget::new(
                 cpu,
-                established + selection_running + regex_running,
+                established + selection_running + regex_running + listing_running,
             )?,
             proxy_hosts: Arc::new(super::proxy_policy::HostRegistry::default()),
             proxy_selection,
             request_regexp,
+            directory_listing,
+            directory_listing_bytes: Arc::new(Semaphore::new(
+                super::browse::LISTING_BYTES_UNITS as usize,
+            )),
             fastcgi_admission: super::fastcgi::admission::Admission::new(capacity),
             fastcgi_dns,
             fastcgi_spool_io,
@@ -361,6 +376,7 @@ impl Resources {
         self.compression.close();
         self.proxy_selection.tasks.close();
         self.request_regexp.tasks.close();
+        self.directory_listing.tasks.close();
         self.fastcgi_dns.tasks.close();
         self.fastcgi_spool_io.tasks.close();
         self.fastcgi_admission.diagnostics.close();
@@ -377,6 +393,7 @@ impl Resources {
         self.compression.wait().await;
         self.proxy_selection.tasks.wait().await;
         self.request_regexp.tasks.wait().await;
+        self.directory_listing.tasks.wait().await;
         self.fastcgi_dns.tasks.wait().await;
         self.fastcgi_spool_io.tasks.wait().await;
         self.fastcgi_admission.diagnostics.wait().await;
@@ -401,6 +418,7 @@ impl Resources {
             compression: self.compression.snapshot(),
             proxy_selection: self.proxy_selection.snapshot(),
             request_regexp: self.request_regexp.snapshot(),
+            directory_listing: self.directory_listing.snapshot(),
         }
     }
 }

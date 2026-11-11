@@ -10,6 +10,10 @@ use std::sync::OnceLock;
 
 pub(super) struct TlsIdentity {
     sni: String,
+    wire_sni: String,
+    local_ip: String,
+    primary_certificate_only: bool,
+    session_name: Arc<str>,
     offered_alpn: Vec<Vec<u8>>,
     schemes: Vec<SignatureScheme>,
     chain_hash: [u8; 32],
@@ -37,7 +41,10 @@ pub(super) enum TlsVerdict {
 }
 impl TlsIdentity {
     pub(super) fn server_name(&self) -> &str {
-        &self.sni
+        &self.wire_sni
+    }
+    pub(super) fn session_name(&self) -> &str {
+        &self.session_name
     }
     pub(super) fn resumable_for(&self, chain_hash: &[u8; 32]) -> bool {
         self.chain_hash == *chain_hash && self.leaf.admission().allow_certificate
@@ -61,12 +68,23 @@ impl TlsIdentity {
         if current.policy_identity != self.policy_identity {
             return TlsVerdict::Reject;
         }
-        let current_resolver = current
-            .tls_policies
-            .get(self.policy_index)
-            .map(|policy| &policy.resolver);
-        let Some(key) = current_resolver.and_then(|r| {
-            r.select_for_version(Some(&self.sni), &alpn, &self.schemes, self.version)
+        let policy = current.tls_policies.get(self.policy_index);
+        let current_resolver = policy.map(|policy| &policy.resolver);
+        let Some(key) = policy.and_then(|policy| {
+            policy
+                .definition
+                .certificate_names(&self.sni, &self.local_ip)
+                .into_iter()
+                .take(if self.primary_certificate_only { 1 } else { 3 })
+                .flatten()
+                .find_map(|name| {
+                    policy.resolver.select_for_version(
+                        Some(name),
+                        &alpn,
+                        &self.schemes,
+                        self.version,
+                    )
+                })
         }) else {
             // On-demand permission/storage errors can evict a managed cache
             // entry while an accepted connection still owns its valid identity.
@@ -109,11 +127,13 @@ struct FixedSelection {
     leaf: Arc<LeafState>,
 }
 struct FixedResolver {
-    resolver: Arc<CandidateResolver>,
+    policy: Arc<tls_policies::PreparedPolicy>,
     state: Arc<connection_sessions::HandshakeState>,
     selection: OnceLock<FixedSelection>,
     tickets: Option<Arc<ConnectionTickets>>,
     sni: String,
+    local_ip: String,
+    primary_certificate_only: bool,
     acme: bool,
     offered_alpn: Vec<Vec<u8>>,
 }
@@ -124,11 +144,11 @@ impl fmt::Debug for FixedResolver {
 }
 impl ResolvesServerCert for FixedResolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        if crate::challenge::normalize_domain(hello.server_name()?)
-            .ok()?
-            .as_str()
-            != self.sni
-        {
+        let offered_name = crate::tls_policy::normalized_offered_name(
+            hello.offered_server_name().unwrap_or_default(),
+        )
+        .ok()?;
+        if offered_name != self.sni {
             return None;
         }
         let protocols = hello
@@ -151,12 +171,21 @@ impl ResolvesServerCert for FixedResolver {
         }
         let version = hello.negotiated_version()?;
         if self.selection.get().is_none() {
-            let (selection, origin) = self.resolver.select_for_version_with_origin(
-                Some(&self.sni),
-                &protocols,
-                hello.signature_schemes(),
-                version,
-            )?;
+            let (selection, origin) = self
+                .policy
+                .definition
+                .certificate_names(&self.sni, &self.local_ip)
+                .into_iter()
+                .take(if self.primary_certificate_only { 1 } else { 3 })
+                .flatten()
+                .find_map(|name| {
+                    self.policy.resolver.select_for_version_with_origin(
+                        Some(name),
+                        &protocols,
+                        hello.signature_schemes(),
+                        version,
+                    )
+                })?;
             if !selection.signature_compatibility.allows(version) {
                 return None;
             }
@@ -168,6 +197,7 @@ impl ResolvesServerCert for FixedResolver {
                 x509_parser::parse_x509_certificate(leaf_certificate.as_ref()).ok()?;
             let not_after = parsed.validity().not_after.timestamp();
             let leaf = self
+                .policy
                 .resolver
                 .managed
                 .leaf_guard()
@@ -210,7 +240,7 @@ impl ResolvesServerCert for FixedResolver {
         }
         if let Some(tickets) = &self.tickets
             && !tickets.select(
-                &self.sni,
+                &self.state.session_name,
                 version,
                 selection.chain_hash,
                 selection.leaf.clone(),
@@ -278,13 +308,28 @@ async fn server_for_hello(
             "TLS connection policy dropped the connection"
         );
         let resolver = &policy.resolver;
-        // A loaded manual candidate does not ask permission or acquire another
-        // certificate. Actual negotiated-version selection remains authoritative.
-        let manual = resolver
-            .static_certificates
-            .select_candidate_filtered(Some(sni), alpn, schemes, &resolver.allowed_static)
-            .is_some();
-        if !manual && let Some(provider) = &resolver.provider {
+        // Never rewrite the actual Hello or its automation permission
+        // target to the name of a resident fallback certificate.
+        let manual = !sni.is_empty()
+            && resolver
+                .static_certificates
+                .select_candidate_filtered(Some(sni), alpn, schemes, &resolver.allowed_static)
+                .is_some();
+        let fallback = policy
+            .definition
+            .fallback_sni
+            .as_deref()
+            .is_some_and(|name| {
+                resolver
+                    .select_candidate(Some(name), alpn, schemes)
+                    .is_some()
+            });
+        if !sni.is_empty()
+            && sni.parse::<std::net::IpAddr>().is_err()
+            && !manual
+            && let Some(provider) = &resolver.provider
+            && (!fallback || provider.should_probe_before_fallback(sni))
+        {
             let cancel = CancellationToken::new();
             let _cancel_on_drop = cancel.clone().drop_guard();
             let acquiring = provider.ensure(sni.to_owned(), cancel);
@@ -362,12 +407,10 @@ where
     })
     .await?;
     let hello = start.client_hello();
-    let raw_sni = hello
-        .server_name()
-        .ok_or_else(|| anyhow::anyhow!("TLS DNS identity required"))?
-        .to_owned();
-    let sni = crate::challenge::normalize_domain(&raw_sni)
-        .map_err(|_| anyhow::anyhow!("invalid TLS identity name"))?;
+    let raw_sni = hello.offered_server_name().unwrap_or_default().to_owned();
+    let sni = crate::tls_policy::normalized_offered_name(&raw_sni)?;
+    let ip_sni = sni.parse::<std::net::IpAddr>().is_ok();
+    let local_ip = crate::tls_resolver::canonical_certificate_ip(local.ip());
     let offered_protocols = hello
         .alpn()
         .map(|a| a.map(<[u8]>::to_vec).collect::<Vec<_>>())
@@ -385,6 +428,10 @@ where
     // disappeared while ClientHello was paused. A separate legitimate proof
     // owner still has the right to use the runtime registry on the same socket.
     if protocols == [ACME_ALPN] {
+        ensure!(
+            !sni.is_empty() && !ip_sni,
+            "ACME proof requires an explicit DNS SNI"
+        );
         connection_budget::classify_proof(&admission, deadline).await?;
         let config = if let Some((business, _)) = inner.current.load_full().business(&address) {
             let matching = business.clone();
@@ -432,11 +479,34 @@ where
     )
     .await?;
     let resolver = &policy.resolver;
+    // A primary typed IP SAN hit can serve without a permission round trip.
+    // Go tries dynamic acquisition before serving any defaulted candidate.
+    // Until typed no-SNI and IP admission are wired, fail closed on those
+    // dynamic-policy misses; never reinterpret the candidate as a DNS request.
+    let primary_certificate_only = (sni.is_empty() || ip_sni)
+        && resolver
+            .provider
+            .as_ref()
+            .is_some_and(|provider| provider.should_probe_before_fallback(&sni));
     // Availability is not authorization; final protocol-bound selection still
     // runs in the real resolver callback before session lookup.
-    resolver
-        .select_candidate(Some(&sni), &protocols, &schemes)
-        .ok_or_else(|| anyhow::anyhow!("TLS identity unavailable"))?;
+    ensure!(
+        policy
+            .definition
+            .certificate_names(&sni, &local_ip)
+            .into_iter()
+            .take(if primary_certificate_only { 1 } else { 3 })
+            .flatten()
+            .any(|name| resolver
+                .select_candidate(Some(name), &protocols, &schemes)
+                .is_some()),
+        "{}",
+        if primary_certificate_only {
+            "typed no-SNI or IP certificate admission unavailable"
+        } else {
+            "TLS identity unavailable"
+        }
+    );
     let mut config = (*policy.tls).clone();
     // Go permits an h1-only client to reach a server which only advertised h2
     // without negotiating ALPN. This exception never applies to QUIC or proof.
@@ -451,7 +521,18 @@ where
     {
         config.alpn_protocols.clear();
     }
-    let state = Arc::new(connection_sessions::HandshakeState::new());
+    // An omitted SNI uses a distinct session namespace bound to the actual
+    // local address. It cannot borrow a ticket from a DNS-named handshake.
+    let session_name: Arc<str> = if sni.is_empty() {
+        format!("no-sni:{local_ip}").into()
+    } else if ip_sni {
+        format!("ip-sni:{sni}").into()
+    } else {
+        sni.as_str().into()
+    };
+    let state = Arc::new(connection_sessions::HandshakeState::new(
+        session_name.clone(),
+    ));
     let tickets = connection_sessions::configure(
         &mut config,
         &server.tickets,
@@ -461,11 +542,13 @@ where
         policy.identity,
     );
     let fixed = Arc::new(FixedResolver {
-        resolver: resolver.clone(),
+        policy: policy.clone(),
         state: state.clone(),
         selection: OnceLock::new(),
         tickets: tickets.clone(),
         sni: sni.clone(),
+        local_ip: local_ip.clone(),
+        primary_certificate_only,
         acme: false,
         offered_alpn: protocols.iter().map(|p| p.to_vec()).collect(),
     });
@@ -487,7 +570,11 @@ where
             "TLS selection identity changed"
         );
         let identity = Arc::new(TlsIdentity {
-            sni: sni.clone(),
+            sni,
+            wire_sni: raw_sni,
+            local_ip,
+            primary_certificate_only,
+            session_name,
             offered_alpn,
             schemes,
             chain_hash: selection.chain_hash,
@@ -509,7 +596,8 @@ where
                 // ALPN and signature capabilities belong to the current
                 // hello, including a resumed hello.
                 ensure!(
-                    resumed.chain_hash == identity.chain_hash && resumed.sni == sni,
+                    resumed.chain_hash == identity.chain_hash
+                        && resumed.session_name == identity.session_name,
                     "TLS resumption identity mismatch"
                 );
             }

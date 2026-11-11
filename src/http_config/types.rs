@@ -20,6 +20,7 @@ pub(crate) enum Matcher {
     Query(Vec<(String, Vec<String>)>),
     Vars(Vec<(String, Vec<String>)>),
     Tls(Option<bool>),
+    UrlPattern(crate::http_runtime::url_pattern::Plan),
     Not(Vec<MatcherSet>),
     RemoteIp(Vec<ipnet::IpNet>),
     ClientIp(Vec<ipnet::IpNet>),
@@ -28,8 +29,17 @@ pub(crate) enum Matcher {
         root: Option<String>,
         try_files: Vec<String>,
         split_path: Vec<String>,
-        fallback: bool,
+        policy: FileMatchPolicy,
     },
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum FileMatchPolicy {
+    First,
+    Fallback,
+    Largest,
+    Smallest,
+    Newest,
 }
 
 #[derive(Clone)]
@@ -42,6 +52,19 @@ pub(crate) struct RequestRegex {
 pub(crate) struct ResponseMatcher {
     pub(crate) status_codes: Option<Vec<i64>>,
     pub(crate) headers: Vec<(String, Option<Vec<String>>)>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ResponseRoute {
+    pub(crate) matcher: Option<ResponseMatcher>,
+    pub(crate) status: String,
+    pub(crate) routes: Option<Vec<Route>>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ResponseHeaderFilter {
+    pub(crate) include: std::collections::HashSet<String>,
+    pub(crate) exclude: std::collections::HashSet<String>,
 }
 
 #[derive(Clone, Default)]
@@ -101,9 +124,13 @@ pub(crate) enum Handler {
         pass_thru: bool,
         canonical_uris: bool,
         sidecars: crate::http_runtime::file_sidecars::SidecarPlan,
+        browse: Option<crate::http_runtime::browse::BrowsePlan>,
     },
     Encode(std::sync::Arc<crate::http_runtime::encode_response::EncodePlan>),
     RequestBody(RequestBodyConfig),
+    Intercept(Vec<ResponseRoute>),
+    CopyResponse(String),
+    CopyResponseHeaders(ResponseHeaderFilter),
     ReverseProxy(Box<ProxyConfig>),
 }
 
@@ -147,7 +174,8 @@ pub(crate) struct ProxyConfig {
     pub(crate) read_timeout: Option<std::time::Duration>,
     pub(crate) write_timeout: Option<std::time::Duration>,
     pub(crate) request_headers: HeaderOps,
-    pub(crate) response_headers: HeaderOps,
+    pub(crate) response_headers: std::sync::Arc<HeaderOps>,
+    pub(crate) response_routes: Vec<ResponseRoute>,
     pub(crate) flush_interval: i64,
     pub(crate) stream_close_delay: Option<std::time::Duration>,
 }

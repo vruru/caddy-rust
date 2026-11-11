@@ -15,6 +15,18 @@ const MAX_SEARCH_MEMORY: usize = 8 << 20;
 const MAX_SINGLE_SEARCH_WORK: usize = 64 << 20;
 const HYBRID_CACHE: usize = 64 << 10;
 
+/// Reuse Go's syntax normalization for native consumers with their own
+/// bounded matching engine. The declared capture count includes group zero.
+pub(crate) fn translate_native_pattern(
+    pattern: &str,
+    memory_limit: usize,
+) -> Result<(String, usize)> {
+    let limit = memory_limit.min(MAX_PATTERN_MEMORY);
+    ensure!(limit >= 1024, "regexp compile memory limit too small");
+    let translated = syntax::translate(pattern, limit)?;
+    Ok((translated.pattern, translated.names.len()))
+}
+
 #[derive(Debug)]
 pub(crate) enum OperationError {
     ByteLimit,

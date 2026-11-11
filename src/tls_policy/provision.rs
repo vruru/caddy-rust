@@ -24,16 +24,6 @@ impl ConnectionPolicy {
         resolver: Arc<dyn ResolvesServerCert>,
         default_alpn: &[Vec<u8>],
     ) -> Result<(ServerConfig, [u8; 32], usize)> {
-        ensure!(
-            self.default_sni
-                .as_ref()
-                .is_none_or(|value| value.is_empty())
-                && self
-                    .fallback_sni
-                    .as_ref()
-                    .is_none_or(|value| value.is_empty()),
-            "default/fallback SNI integration is pending"
-        );
         let mut provider = (*crate::crypto::provider()).clone();
         if let Some(names) = &self.cipher_suites
             && !names.is_empty()

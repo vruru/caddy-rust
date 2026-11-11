@@ -253,3 +253,11 @@ original Apache-2.0 and MIT license texts.
 The vendored Quinn extension provides opt-in, read-only cancellation observation
 for established server request streams. The application enables that extension;
 its original SendStream ownership and transport event handling remain intact.
+
+
+urlpattern 0.6.0
+----------------
+Copyright 2018-2021 the Deno authors and contributors. MIT license.
+Source: https://github.com/denoland/rust-urlpattern
+Runtime source and license are retained in vendor/urlpattern-0.6.0.
+The local ignore-case matcher correction is described in its VENDOR.md.

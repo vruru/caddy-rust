@@ -557,9 +557,12 @@ FastCGI cancellation timing also differs from the original.
 TLS connection policies support ordered SNI, regexp and IP matching, manual
 certificate tags, TLS 1.2 and 1.3, explicit key exchange groups including
 P-521, and supported file/inline/combined or pinned client trust. A TLS 1.2
-only policy still serves TCP and will not accept QUIC. Custom TLS providers,
-additional trust loaders, default and fallback SNI, and certificates selected
-without a DNS SNI are separate compatibility items.
+only policy still serves TCP and will not accept QUIC. Cached default/fallback
+server names, IP-literal SNI and no-SNI manual lookup preserve the original
+offered name for connection-policy matching and distinguish DNS SANs from IP
+SANs. Cold IP/no-SNI certificate acquisition and its permission/lifecycle
+integration, custom certificate selectors and additional trust loaders remain
+separate compatibility work.
 
 
 The HTTP upstream response header timeout starts after the request's final
@@ -575,3 +578,38 @@ version ranges. Regex work has its own bounded queue and request capture
 budget. Request-body placeholders in variable matchers require further
 integration. The early-data matcher does not match any request while QUIC
 early data is disabled.
+
+
+Native request matching includes URLPattern with Go-compatible path escaping,
+case folding, Perl character classes and captured placeholders. Empty default
+components do not publish a capture, while unmatched optional groups within a
+nonempty component publish an empty value. File matching supports first-existing,
+last-candidate fallback, largest, smallest and newest policies with sorted glob
+expansion and split-path placeholders. Placeholder values are escaped before
+file globs are evaluated. These features do not provide CEL expression matching.
+
+Matcher preparation shares a 64 MiB compiled-program allowance. URLPattern
+conservatively charges 4 MiB per plan for two possible 256 KiB programs in each
+of eight components. DFA caches have a separate 256 KiB limit per cache, and
+execution uses a bounded worker pool; the compiled-program allowance is not a
+process RSS guarantee. URLPattern inputs are limited to 64 KiB, file-glob scans
+to 100,000 entries and glob results to 10,000 paths.
+
+Response routes implement reverse-proxy handle_response, intercept,
+copy_response and copy_response_headers. Replacement routes have an independent
+end and run once; empty replacements retain the original body. A replacement
+entity does not inherit the original entity's Content-Length. Likewise,
+copy_response_headers excludes Content-Length and Transfer-Encoding even when
+explicitly listed in include; copy_response itself retains source-body framing,
+and a separate explicit header operation remains available. This intentionally
+repairs invalid framing produced by the original server in these configurations.
+Other copied metadata keeps the original Add behavior, including duplicate
+values. Body-forbidden status changes remove their corresponding entity and
+framing headers. Streaming bodies and trailers remain streaming.
+
+Directory listings provide JSON, plain text and native HTML with sorting,
+query/cookie order selection and pagination, while existing index files retain
+priority. Names and links are escaped in the native HTML view. Hidden-file
+filtering is stricter than the original listing implementation. Custom browse
+templates and the remaining default-view presentation behavior are still gated
+on the complete shared template implementation.

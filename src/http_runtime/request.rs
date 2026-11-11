@@ -49,8 +49,13 @@ pub(super) struct Context {
     deferred: Vec<DeferredResponse>,
     groups: HashSet<String>,
     invoke_depth: u8,
+    response_route_depth: u8,
+    proxy_response: Option<Box<super::proxy::PreparedResponse>>,
     maps: Vec<LazyMap>,
 }
+#[path = "response_routes.rs"]
+mod response_routes;
+
 enum DeferredResponse {
     Headers(HeaderOps),
     Encode(super::encode_response::ResponseEncoding),
@@ -391,6 +396,8 @@ where
         deferred: Vec::new(),
         groups: HashSet::new(),
         invoke_depth: 0,
+        response_route_depth: 0,
+        proxy_response: None,
         maps: Vec::new(),
     };
     let result = if tls
@@ -435,24 +442,13 @@ where
             }
         }
     };
-    // Non-deferred writer headers exist before a terminal handler copies its
-    // headers; terminal headers append, matching Caddy's shared writer model.
-    let mut headers = std::mem::take(&mut ctx.immediate);
-    if headers.is_empty() {
-        // Static handlers already own the complete header map. Keep that
-        // allocation instead of cloning every entry back into an empty map.
-        headers = std::mem::take(response.headers_mut());
-    } else {
-        for (name, value) in response.headers().iter() {
-            headers.append(name, value.clone());
-        }
-    }
+    let mut headers = take_writer_headers(&mut response, &mut ctx);
     let any_transform = ctx
         .deferred
         .iter()
         .any(|step| !matches!(step, DeferredResponse::Headers(_)));
     if any_transform {
-        if finalize_transforms(&mut headers, &mut response, explicit_headers, &mut ctx)
+        if finalize_transforms(&mut headers, &mut response, explicit_headers, 0, &mut ctx)
             .await
             .is_err()
         {
@@ -508,13 +504,6 @@ where
         }
         *response.body_mut() = full(Bytes::new());
     }
-    if let Some(lease) = response
-        .extensions_mut()
-        .remove::<Arc<super::proxy_policy::RequestLease>>()
-    {
-        let body = std::mem::replace(response.body_mut(), full(Bytes::new()));
-        *response.body_mut() = super::proxy_policy::with_lease(body, lease);
-    }
     response = super::request_body::mark_response(response, ctx.await_h2_response_head);
     if let Some(access) = access.filter(|_| !ctx.skip_access) {
         return (*access).attach(
@@ -536,6 +525,18 @@ enum Flow {
     // The underlying server finishes an untouched 200 without calling an
     // application writer's WriteHeader; deferred wrappers do not run again.
     ImplicitResponse(Response<Body>),
+}
+
+fn take_writer_headers(response: &mut Response<Body>, ctx: &mut Context) -> HeaderMap {
+    // Terminal headers append to the shared writer's existing fields.
+    let mut headers = std::mem::take(&mut ctx.immediate);
+    if headers.is_empty() {
+        return std::mem::take(response.headers_mut());
+    }
+    for (name, value) in response.headers().iter() {
+        headers.append(name, value.clone());
+    }
+    headers
 }
 
 #[derive(Clone, Copy)]
@@ -700,14 +701,61 @@ fn populate_error(ctx: &mut Context, error: &anyhow::Error) -> StatusCode {
     error.status
 }
 type ResponseFuture<'a> = Pin<Box<dyn Future<Output = Result<Flow>> + Send + 'a>>;
+
+// Borrowed tails preserve middleware's next handler without allocating a
+// future or stack frame for each ordinary handler in a flat route.
+#[derive(Clone, Copy)]
+enum Next<'a> {
+    End,
+    Stop,
+    Routes(&'a [Route], &'a Next<'a>),
+    Handlers(&'a [Handler], &'a Next<'a>),
+}
+
 fn routes<'a>(
     list: &'a [Route],
     ctx: &'a mut Context,
     inner: &'a Arc<Inner>,
     server: &'a Arc<ActiveServer>,
 ) -> ResponseFuture<'a> {
+    chained_routes(list, ctx, inner, server, &Next::End)
+}
+
+fn continue_chain<'a>(
+    mut step: Next<'a>,
+    ctx: &'a mut Context,
+    inner: &'a Arc<Inner>,
+    server: &'a Arc<ActiveServer>,
+) -> ResponseFuture<'a> {
     Box::pin(async move {
-        for route in list {
+        loop {
+            let (flow, after) = match step {
+                Next::End => return Ok(Flow::Continue),
+                Next::Stop => return Ok(Flow::Stop),
+                Next::Routes(list, after) => {
+                    (chained_routes(list, ctx, inner, server, after).await?, after)
+                }
+                Next::Handlers(list, after) => {
+                    (handlers(list, ctx, inner, server, after).await?, after)
+                }
+            };
+            if !matches!(flow, Flow::Continue) {
+                return Ok(flow);
+            }
+            step = *after;
+        }
+    })
+}
+
+fn chained_routes<'a>(
+    list: &'a [Route],
+    ctx: &'a mut Context,
+    inner: &'a Arc<Inner>,
+    server: &'a Arc<ActiveServer>,
+    next: &'a Next<'a>,
+) -> ResponseFuture<'a> {
+    Box::pin(async move {
+        for (index, route) in list.iter().enumerate() {
             if route.group.as_ref().is_some_and(|g| ctx.groups.contains(g)) {
                 continue;
             }
@@ -717,7 +765,12 @@ fn routes<'a>(
             if let Some(group) = &route.group {
                 ctx.groups.insert(group.clone());
             }
-            match handlers(&route.handlers, ctx, inner, server).await? {
+            let after = if route.terminal {
+                Next::Stop
+            } else {
+                Next::Routes(&list[index + 1..], next)
+            };
+            match handlers(&route.handlers, ctx, inner, server, &after).await? {
                 Flow::Continue if route.terminal => return Ok(Flow::Stop),
                 Flow::Continue => {}
                 flow => return Ok(flow),
@@ -731,9 +784,10 @@ fn handlers<'a>(
     ctx: &'a mut Context,
     inner: &'a Arc<Inner>,
     server: &'a Arc<ActiveServer>,
+    next: &'a Next<'a>,
 ) -> ResponseFuture<'a> {
     Box::pin(async move {
-        for handler in list {
+        for (index, handler) in list.iter().enumerate() {
             match handler {
                 Handler::StaticError { status, message } => {
                     let code = if status.is_empty() {
@@ -770,7 +824,8 @@ fn handlers<'a>(
                         return Err(failure(StatusCode::INTERNAL_SERVER_ERROR));
                     }
                     ctx.invoke_depth += 1;
-                    let result = routes(std::slice::from_ref(route), ctx, inner, server).await;
+                    let after = Next::Handlers(&list[index + 1..], next);
+                    let result = chained_routes(std::slice::from_ref(route), ctx, inner, server, &after).await;
                     ctx.invoke_depth -= 1;
                     match result? {
                         Flow::Continue => {}
@@ -865,13 +920,14 @@ fn handlers<'a>(
                     }
                 }
                 Handler::Subroute {
-                    routes: list,
+                    routes: nested,
                     errors,
                     errors_configured,
                 } => {
                     let pending_headers = ctx.deferred.len();
                     let pending_logs = log_append::mark(ctx);
-                    let result = routes(list, ctx, inner, server).await;
+                    let after = Next::Handlers(&list[index + 1..], next);
+                    let result = chained_routes(nested, ctx, inner, server, &after).await;
                     match result {
                         Ok(Flow::Continue) => {}
                         Ok(flow) => return Ok(flow),
@@ -881,7 +937,7 @@ fn handlers<'a>(
                             log_append::unwind(ctx, pending_logs, None).await;
                             ctx.deferred.truncate(pending_headers);
                             populate_error(ctx, &error);
-                            match routes(errors, ctx, inner, server).await? {
+                            match chained_routes(errors, ctx, inner, server, &after).await? {
                                 Flow::Continue => {}
                                 flow => return Ok(flow),
                             }
@@ -1098,6 +1154,7 @@ fn handlers<'a>(
                     pass_thru,
                     canonical_uris,
                     sidecars,
+                    browse,
                 } => match super::files::serve(
                     ctx,
                     root.as_deref(),
@@ -1105,6 +1162,7 @@ fn handlers<'a>(
                     index_names,
                     *canonical_uris,
                     sidecars,
+                    browse.as_ref(),
                 )
                 .await?
                 {
@@ -1112,10 +1170,28 @@ fn handlers<'a>(
                     None if *pass_thru => {}
                     None => return Err(failure(StatusCode::NOT_FOUND)),
                 },
+                Handler::Intercept(rules) => {
+                    if !rules.is_empty() {
+                        return response_routes::intercept(
+                            rules,
+                            Next::Handlers(&list[index + 1..], next),
+                            ctx,
+                            inner,
+                            server,
+                        )
+                        .await;
+                    }
+                }
+                Handler::CopyResponse(status) => {
+                    return response_routes::copy_response(ctx, status, inner).await;
+                }
+                Handler::CopyResponseHeaders(filter) => {
+                    response_routes::copy_headers(ctx, filter)?;
+                }
                 Handler::ReverseProxy(config) => {
                     let body_limit = ctx.body_limit.clone();
-                    return Ok(Flow::Response(
-                        super::proxy::serve(ctx, config, server, inner)
+                    let response =
+                        super::proxy::serve(ctx, config, server)
                             .await
                             .map_err(|error| {
                                 if error.is::<HttpError>() {
@@ -1136,8 +1212,16 @@ fn handlers<'a>(
                                 } else {
                                     failure(StatusCode::BAD_GATEWAY)
                                 }
-                            })?,
-                    ));
+                            })?;
+                    return response_routes::reverse_proxy(
+                        response,
+                        &config.response_routes,
+                        Next::Handlers(&list[index + 1..], next),
+                        ctx,
+                        inner,
+                        server,
+                    )
+                    .await;
                 }
             }
         }
@@ -1311,6 +1395,7 @@ fn matches<'a>(
             }
             // All currently admitted TLS requests have completed a handshake.
             Matcher::Tls(complete) => ctx.tls && *complete != Some(false),
+            Matcher::UrlPattern(plan) => plan.matches(ctx).await?,
             Matcher::Not(sets) => !match_sets(sets, ctx).await?,
             Matcher::RemoteIp(ranges) => ranges.iter().any(|r| r.contains(&ctx.peer.ip())),
             Matcher::ClientIp(ranges) => ranges.iter().any(|r| r.contains(&ctx.client_ip)),
@@ -1341,71 +1426,10 @@ fn matches<'a>(
                 root,
                 try_files,
                 split_path,
-                fallback,
+                policy,
             } => {
-                let base = ctx.expand(root.as_deref().unwrap_or("{http.vars.root}"))?;
-                let mut found = false;
-                for (index, pattern) in try_files.iter().enumerate() {
-                    if let Some(status) = pattern
-                        .strip_prefix('=')
-                        .and_then(|s| s.parse::<u16>().ok())
-                        && let Ok(status) = StatusCode::from_u16(status)
-                    {
-                        return Err(failure(status));
-                    }
-                    let candidate = ctx.expand(pattern)?;
-                    let candidate = clean_path(&candidate, true);
-                    let (relative, remainder) =
-                        file_split(candidate.trim_end_matches('/'), split_path);
-                    let mut relative = if relative.starts_with('/') {
-                        relative.to_owned()
-                    } else {
-                        format!("/{relative}")
-                    };
-                    let directory = pattern.ends_with('/');
-                    if directory && !relative.ends_with('/') {
-                        relative.push('/');
-                    }
-                    let path = safe_join(Path::new(&base), &relative)?;
-                    let fallback = *fallback && index + 1 == try_files.len();
-                    if !fallback {
-                        let lookup_path = path.clone();
-                        let lookup = ctx
-                            .resources
-                            .metadata
-                            .run(move || std::fs::metadata(lookup_path))
-                            .await
-                            .map_err(|error| budget_failure(ctx, error))?;
-                        if let Err(error) = &lookup
-                            && descriptor_exhausted(error)
-                        {
-                            return Err(file_io_failure(ctx, error));
-                        }
-                        if !lookup.is_ok_and(|metadata| metadata.is_dir() == directory) {
-                            continue;
-                        }
-                    }
-                    ctx.values
-                        .insert("http.matchers.file.relative".into(), relative);
-                    ctx.values.insert(
-                        "http.matchers.file.absolute".into(),
-                        path.to_string_lossy().into_owned(),
-                    );
-                    ctx.values
-                        .insert("http.matchers.file.remainder".into(), remainder.to_owned());
-                    ctx.values.insert(
-                        "http.matchers.file.type".into(),
-                        if directory && !fallback {
-                            "directory"
-                        } else {
-                            "file"
-                        }
-                        .into(),
-                    );
-                    found = true;
-                    break;
-                }
-                found
+                super::file_match::matches(ctx, root.as_deref(), try_files, split_path, *policy)
+                    .await?
             }
         })
     })
@@ -1609,7 +1633,7 @@ pub(super) fn apply_response_headers(
     }
     Ok(())
 }
-fn file_split<'a>(path: &'a str, extensions: &[String]) -> (&'a str, &'a str) {
+pub(super) fn file_split<'a>(path: &'a str, extensions: &[String]) -> (&'a str, &'a str) {
     for extension in extensions.iter().filter(|value| !value.is_empty()) {
         let Some(at) = path
             .as_bytes()
@@ -1885,6 +1909,7 @@ fn finalize_transforms<'a>(
     headers: &'a mut HeaderMap,
     response: &'a mut Response<Body>,
     explicit: bool,
+    start: usize,
     ctx: &'a mut Context,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
@@ -1894,7 +1919,11 @@ fn finalize_transforms<'a>(
             .get::<StaticInterimStatus>()
             .map(|code| code.0);
         let mut body = std::mem::replace(response.body_mut(), full(Bytes::new()));
-        let deferred = std::mem::take(&mut ctx.deferred);
+        let deferred = if start == 0 {
+            std::mem::take(&mut ctx.deferred)
+        } else {
+            ctx.deferred.split_off(start)
+        };
         for entry in deferred.iter().rev() {
             match entry {
                 DeferredResponse::Headers(ops) if explicit => {

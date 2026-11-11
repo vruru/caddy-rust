@@ -70,14 +70,16 @@ pub(super) fn configure(
 }
 
 pub(super) struct HandshakeState {
+    pub session_name: Arc<str>,
     pub identity: OnceLock<Arc<TlsIdentity>>,
     pub selected_chain: OnceLock<[u8; 32]>,
     resumed: Mutex<Option<Arc<TlsIdentity>>>,
 }
 
 impl HandshakeState {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(session_name: Arc<str>) -> Self {
         Self {
+            session_name,
             identity: OnceLock::new(),
             selected_chain: OnceLock::new(),
             resumed: Mutex::new(None),
@@ -271,7 +273,9 @@ impl PerConnectionSessions {
                 .lookup(key, consume, |owner| match owner.identity.get() {
                     None => OwnerCheck::Pending,
                     Some(identity) => {
-                        if identity.resumable_for(current_chain) {
+                        if identity.session_name() == self.handshake.session_name.as_ref()
+                            && identity.resumable_for(current_chain)
+                        {
                             OwnerCheck::Accept(identity.clone())
                         } else {
                             OwnerCheck::Reject

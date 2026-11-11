@@ -15,11 +15,22 @@ pub trait ScopedCertificateProvider: Send + Sync {
 
     /// Whether QUIC needs to read the client name before accepting the handshake.
     /// No network or storage access may run here.
-    fn needs_quic_preflight(&self) -> bool { true }
+    fn needs_quic_preflight(&self) -> bool {
+        true
+    }
 
     /// Whether the selected policy permits attempting acquisition for this name.
     /// The real permission endpoint still decides at acquisition time.
-    fn can_acquire_quic_name(&self, _normalized_name: &str) -> bool { true }
+    fn can_acquire_quic_name(&self, _normalized_name: &str) -> bool {
+        true
+    }
+
+    /// Whether this generation would try the original name before using an
+    /// already-resident fallback. A conservative implementation must return
+    /// true: issuance permission failures cannot become a fallback bypass.
+    fn should_probe_before_fallback(&self, _normalized_name: &str) -> bool {
+        true
+    }
 
     /// Called before the synchronous TLS resolver for an ordinary, non-tagged
     /// handshake. A valid resident hit is an immediate path; bounded maintenance
