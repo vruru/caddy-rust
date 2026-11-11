@@ -30,6 +30,7 @@ impl PreparedConfig {
 }
 #[derive(Clone)]
 pub(crate) struct ServerConfig {
+    pub(crate) access_logs: Option<AccessLogConfig>,
     pub(crate) listen: Vec<SocketAddr>,
     pub(crate) routes: Vec<Route>,
     pub(crate) errors: Vec<Route>,
@@ -47,6 +48,42 @@ pub(crate) struct ServerConfig {
     pub(crate) skip_redirect: Vec<String>,
     pub(crate) ignore_loaded_certificates: bool,
 }
+#[derive(Clone)]
+pub(crate) struct AccessLogConfig {
+    pub(crate) default_name: String,
+    pub(crate) names: std::collections::BTreeMap<String, Vec<String>>,
+    pub(crate) skip_hosts: Vec<String>,
+    pub(crate) skip_unmapped: bool,
+    pub(crate) credentials: bool,
+}
+
+fn access_logs(value: &Value, path: &str) -> Result<AccessLogConfig> {
+    let map = object(value, path)?;
+    deny_unknown(map,&["default_logger_name","logger_names","skip_hosts","skip_unmapped_hosts","should_log_credentials","trace"],path)?;
+    ensure!(!boolean(map.get("trace"),false,path)?, "HTTP handler trace logging is not implemented");
+    let mut names=std::collections::BTreeMap::new();
+    if let Some(value)=map.get("logger_names").filter(|value|!value.is_null()) {
+        let map=object(value,path)?;
+        ensure!(map.len()<=8192, "too many access logger hosts");
+        for (host,value) in map {
+            let mapped=if let Some(value)=value.as_str() {vec![value.to_owned()]} else {strings(value,path)?};
+            ensure!(mapped.len()<=16 && mapped.iter().all(|name|name.len()<=128),"too many or oversized access logger destinations");
+            let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+            ensure!(!names.contains_key(&normalized), "ambiguous access logger host");
+            names.insert(normalized,mapped);
+        }
+    }
+    let default_name=map.get("default_logger_name").filter(|value|!value.is_null()).map(|value|string(value,path)).transpose()?.unwrap_or_default();
+    ensure!(default_name.len()<=128,"oversized default access logger name");
+    Ok(AccessLogConfig{
+        default_name,
+        names,
+        skip_hosts:map.get("skip_hosts").filter(|value|!value.is_null()).map(|value|strings(value,path)).transpose()?.unwrap_or_default().into_iter().map(|host|host.trim_end_matches('.').to_ascii_lowercase()).collect(),
+        skip_unmapped:boolean(map.get("skip_unmapped_hosts"),false,path)?,
+        credentials:boolean(map.get("should_log_credentials"),false,path)?,
+    })
+}
+
 #[derive(Clone)]
 pub(crate) struct FileCertificate {
     pub(crate) certificate: String,
@@ -254,9 +291,8 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
     if m.contains_key("idle_timeout") {
         return Err(unsupported("/apps/http/servers/*/idle_timeout"));
     }
-    if m.contains_key("logs") {
-        return Err(unsupported("/apps/http/servers/*/logs"));
-    }
+    let access_logs = m.get("logs").filter(|value|!value.is_null())
+        .map(|value| access_logs(value,path)).transpose()?;
     let mut listen = Vec::new();
     for raw in strings(required(m, "listen")?, path)? {
         let raw = helpers::replace(&raw, true, helpers::global_lookup)?;
@@ -428,6 +464,7 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
         .transpose()?
         .unwrap_or(false);
     Ok(ServerConfig {
+        access_logs,
         listen,
         routes,
         errors: if let Some(v) = m.get("errors") {
@@ -1090,10 +1127,6 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
             "FastCGI transport has not been validated on this platform"
         );
         ensure!(request_buffer >= -1, "invalid FastCGI request_buffers");
-        ensure!(
-            !boolean(t.get("capture_stderr"), false, path)?,
-            "FastCGI capture_stderr requires the logging runtime"
-        );
         Some(FastCgiConfig {
             root: t
                 .get("root")
@@ -1109,6 +1142,7 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
                 size => Some(size as u64),
             },
             explicit_request_buffer: request_buffer != 0,
+            capture_stderr: boolean(t.get("capture_stderr"), false, path)?,
         })
     } else {
         ensure!(

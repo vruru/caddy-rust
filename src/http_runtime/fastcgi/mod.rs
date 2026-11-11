@@ -24,6 +24,7 @@ use std::{
     net::{SocketAddr, ToSocketAddrs},
     path::PathBuf,
     pin::Pin,
+    sync::Arc,
     task::{Context as PollContext, Poll},
     time::Duration,
 };
@@ -512,6 +513,7 @@ pub(super) async fn serve(
     config: &ProxyConfig,
     transport: &FastCgiConfig,
     dial: String,
+    logging: Option<&std::sync::Arc<crate::logging::Logging>>,
 ) -> Result<Response<Body>> {
     let target = Target::parse(&dial)?;
     target.set_placeholders(ctx);
@@ -638,7 +640,42 @@ pub(super) async fn serve(
         }
     }
     wire::finish_stdin(&mut socket.io, write_limit).await?;
-    let reply = reply::Reader::new(wire::Responses::new(socket, read_limit), None)
+    let capture = transport.capture_stderr;
+    let stderr: Option<reply::StderrSink> = if capture {
+        let logging = logging
+            .cloned()
+            .ok_or_else(|| failure(StatusCode::BAD_GATEWAY))?;
+        Some(Box::new(move |status, body, truncated| {
+            use crate::logging::{Event, Field, FieldValue, Level, Origin};
+            let module = "http.reverse_proxy.transport.fastcgi";
+            let level = if status.as_u16() >= 400 {
+                Level::Error
+            } else {
+                Level::Warn
+            };
+            if let Ok(mut event) = Event::new(
+                Origin::Module {
+                    module_id: module.into(),
+                },
+                module,
+                level,
+                "stderr",
+            ) {
+                event
+                    .fields
+                    .push(Field::new("body", FieldValue::ByteString(body.to_vec())));
+                if truncated {
+                    event
+                        .fields
+                        .push(Field::new("stderr_truncated", FieldValue::Bool(true)));
+                }
+                let _ = logging.try_emit(event);
+            }
+        }))
+    } else {
+        None
+    };
+    let reply = reply::Reader::new(wire::Responses::new(socket, read_limit), stderr)
         .headers()
         .await?;
     let mut response_headers = reply.headers;
@@ -646,7 +683,10 @@ pub(super) async fn serve(
         || matches!(
             reply.status,
             StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
-        );
+        )
+        || response_headers
+            .get(header::CONTENT_LENGTH)
+            .is_some_and(|value| value == "0");
     let mut reply_body = reply.body;
     let sniff = !no_body
         && !response_headers.contains_key(header::CONTENT_TYPE)
@@ -667,21 +707,40 @@ pub(super) async fn serve(
     ctx.immediate.remove(header::SERVER);
     response_headers.append(header::VIA, HeaderValue::from_static("0.0 Caddy"));
     apply_headers(&mut response_headers, &config.response_headers, ctx)?;
+    let diagnostic_owner = capture.then(|| (ctx.resources.clone(), ctx.business.clone()));
     let body = if no_body {
+        if let Some(owner) = diagnostic_owner {
+            handoff_diagnostics(reply_body, &owner);
+        }
         full(Bytes::new())
     } else {
-        let frames = stream::try_unfold((first, reply_body), |(first, mut body)| async move {
-            let result = match first {
-                Some(value) => value.map(Some),
-                None => body.next().await,
-            };
-            if result.is_err() {
-                // Give Hyper one flush opportunity before closing an already
-                // started HTTP/1 response on an upstream framing failure.
-                tokio::task::yield_now().await;
-            }
-            Ok::<_, BoxError>(result?.map(|bytes| (Frame::data(bytes), (None, body))))
-        });
+        let frames = stream::try_unfold(
+            (first, Some(reply_body), diagnostic_owner),
+            |(first, body, owner)| async move {
+                let Some(mut body) = body else {
+                    return Ok(None);
+                };
+                let result = match first {
+                    Some(value) => value.map(Some),
+                    None => body.next().await,
+                };
+                if result.is_err() {
+                    // Give Hyper one flush opportunity before closing an already
+                    // started HTTP/1 response on an upstream framing failure.
+                    tokio::task::yield_now().await;
+                }
+                let bytes = result?;
+                let body = if let Some(ref owner) = owner
+                    && body.diagnostics_ready()
+                {
+                    handoff_diagnostics(body, owner);
+                    None
+                } else {
+                    Some(body)
+                };
+                Ok::<_, BoxError>(bytes.map(|bytes| (Frame::data(bytes), (None, body, owner))))
+            },
+        );
         StreamBody::new(frames).boxed_unsync()
     };
     let mut response = Response::new(body);
@@ -689,6 +748,36 @@ pub(super) async fn serve(
     *response.version_mut() = ctx.req().version();
     *response.headers_mut() = response_headers;
     Ok(response)
+}
+
+// A completed response does not wait for the FastCGI diagnostic tail. The
+// exact socket (and its admission) moves to a bounded owned task; no retry
+// or second request occurs. The generation remains live only for this budget.
+fn handoff_diagnostics(
+    mut body: reply::ReplyBody<Socket>,
+    owner: &(
+        Arc<super::resource_budget::Resources>,
+        Arc<super::BusinessGuard>,
+    ),
+) {
+    let (resources, business) = owner;
+    let lane = &resources.fastcgi_admission;
+    let Ok(permit) = lane.diagnostic_slots.clone().try_acquire_owned() else {
+        body.mark_diagnostic_limit();
+        return;
+    };
+    let business = business.clone();
+    lane.diagnostics.spawn(async move {
+        if tokio::time::timeout(Duration::from_millis(250), body.drain_diagnostics())
+            .await
+            .is_err()
+        {
+            body.mark_diagnostic_limit();
+        }
+        drop(body);
+        drop(business);
+        drop(permit);
+    });
 }
 
 async fn send_checked(

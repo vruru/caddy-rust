@@ -255,6 +255,36 @@ fn normalized_length(headers: &HeaderMap) -> io::Result<Option<u64>> {
 }
 
 impl<R: AsyncRead + Unpin> ReplyBody<R> {
+    pub(super) fn diagnostics_ready(&self) -> bool {
+        self.reader.report_stderr.is_some()
+            && (self.finished || matches!(self.mode, Mode::Raw(Some(0))))
+    }
+
+    pub(super) fn mark_diagnostic_limit(&mut self) {
+        self.reader.stderr_truncated = true;
+    }
+
+    pub(super) async fn drain_diagnostics(&mut self) {
+        let mut extra = 0usize;
+        loop {
+            match self.reader.available().await {
+                Ok(true) => {
+                    extra = extra.saturating_add(self.reader.buffered.len());
+                    self.reader.buffered = Bytes::new();
+                    if extra > 64 * 1024 || self.reader.stderr_truncated {
+                        self.mark_diagnostic_limit();
+                        return;
+                    }
+                }
+                Ok(false) => return,
+                Err(_) => {
+                    self.mark_diagnostic_limit();
+                    return;
+                }
+            }
+        }
+    }
+
     pub async fn next(&mut self) -> io::Result<Option<Bytes>> {
         if self.finished {
             return Ok(None);

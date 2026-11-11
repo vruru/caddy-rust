@@ -82,21 +82,24 @@ impl ProxyClient {
 pub(super) fn prepare_clients(
     routes: &[Route],
     output: &mut HashMap<usize, ProxyClient>,
+    logging_available: bool,
 ) -> Result<()> {
     crate::http_config::helpers::initialize_globals();
     for route in routes {
         for handler in &route.handlers {
             match handler {
                 Handler::Subroute { routes, errors, .. } => {
-                    prepare_clients(routes, output)?;
-                    prepare_clients(errors, output)?;
+                    prepare_clients(routes, output, logging_available)?;
+                    prepare_clients(errors, output, logging_available)?;
                 }
                 Handler::FileServer { .. } => {
                     super::mime::initialize();
                 }
                 Handler::ReverseProxy(config) => {
                     let config = config.as_ref();
-                    if config.fastcgi.is_some() {
+                    if let Some(fastcgi) = &config.fastcgi {
+                        ensure!(!fastcgi.capture_stderr || logging_available,
+                            "FastCGI capture_stderr requires generation logging");
                         continue;
                     }
                     let connector = PreparedTransport::prepare(config)?;
@@ -158,7 +161,7 @@ pub(super) async fn serve(
     let index = (u64::from_le_bytes(random) % config.upstreams.len() as u64) as usize;
     let dial = ctx.expand(&config.upstreams[index])?;
     if let Some(transport) = &config.fastcgi {
-        return super::fastcgi::serve(ctx, config, transport, dial).await;
+        return super::fastcgi::serve(ctx, config, transport, dial, server.logging.as_ref()).await;
     }
     let state = server
         .clients

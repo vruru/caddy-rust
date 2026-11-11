@@ -350,8 +350,7 @@ impl HttpRuntime {
             &self.inner.registry,
             &self.inner.managed,
             &self.inner.challenge_resolver,
-            None,
-            None,
+            ServingMaterial{manual:None,provider:None,logging:None,validate_only:true},
             &self.inner.resources,
         );
         tokio::select! {
@@ -389,8 +388,7 @@ impl HttpRuntime {
             &self.inner.registry,
             managed,
             &self.inner.challenge_resolver,
-            Some(manual),
-            None,
+            ServingMaterial{manual:Some(manual),provider:None,logging:None,validate_only:true},
             &self.inner.resources,
         );
         tokio::select! {
@@ -416,7 +414,7 @@ impl HttpRuntime {
         config: PreparedConfig,
         managed: Arc<HotCertificateResolver>,
     ) -> Result<HttpStage> {
-        self.stage_inner(config, managed, None, None).await
+        self.stage_inner(config, managed, None, None, None).await
     }
     /// The supplied inventory is already provisioned by the TLS app. Raw
     /// load_files must have been consumed there, not silently ignored here.
@@ -429,7 +427,7 @@ impl HttpRuntime {
         managed: Arc<HotCertificateResolver>,
         manual: ManualCertificates,
     ) -> Result<HttpStage> {
-        self.stage_inner(config, managed, Some(manual), None).await
+        self.stage_inner(config, managed, Some(manual), None, None).await
     }
     /// Attach this generation's immutable automation-policy capability. It is
     /// never consulted by tagged manual selection or ACME proof handshakes.
@@ -440,8 +438,18 @@ impl HttpRuntime {
         manual: ManualCertificates,
         provider: Arc<dyn ScopedCertificateProvider>,
     ) -> Result<HttpStage> {
-        self.stage_inner(config, managed, Some(manual), Some(provider))
+        self.stage_inner(config, managed, Some(manual), Some(provider), None)
             .await
+    }
+    pub async fn stage_with_generation_resources(
+        &self,
+        config: PreparedConfig,
+        managed: Arc<HotCertificateResolver>,
+        manual: ManualCertificates,
+        provider: Arc<dyn ScopedCertificateProvider>,
+        logging: Arc<crate::logging::Logging>,
+    ) -> Result<HttpStage> {
+        self.stage_inner(config,managed,Some(manual),Some(provider),Some(logging)).await
     }
     async fn stage_inner(
         &self,
@@ -449,6 +457,7 @@ impl HttpRuntime {
         managed: Arc<HotCertificateResolver>,
         manual: Option<ManualCertificates>,
         provider: Option<Arc<dyn ScopedCertificateProvider>>,
+        logging: Option<Arc<crate::logging::Logging>>,
     ) -> Result<HttpStage> {
         ensure!(
             Arc::ptr_eq(&self.inner.managed.leaf_guard(), &managed.leaf_guard()),
@@ -495,8 +504,7 @@ impl HttpRuntime {
             &self.inner.registry,
             &managed,
             &self.inner.challenge_resolver,
-            manual.as_ref(),
-            provider.as_ref(),
+            ServingMaterial { manual: manual.as_ref(), provider: provider.as_ref(), logging: logging.as_ref(), validate_only:false },
             &self.inner.resources,
         );
         let (servers, managed_names) = tokio::select! {

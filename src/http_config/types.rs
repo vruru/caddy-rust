@@ -132,4 +132,5 @@ pub(crate) struct FastCgiConfig {
     pub(crate) env: std::collections::BTreeMap<String, String>,
     pub(crate) request_buffer: Option<u64>,
     pub(crate) explicit_request_buffer: bool,
+    pub(crate) capture_stderr: bool,
 }

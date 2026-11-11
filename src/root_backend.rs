@@ -10,6 +10,7 @@ use crate::{
     http_runtime::{CommitOutcome, HttpRuntime},
     leaf_guard::LeafGuard,
     local_pki::TrustInstaller,
+    logging::{self, Event, Field, FieldValue, Level, Logging, LoggingRegistry, Origin},
     tls_app_config::{
         CertificatePaths, CertificatePlan, CertificateResources, CertificateServices,
         CertificateViews, PrepareContext, PrepareMode, RetainedCertificates,
@@ -51,6 +52,7 @@ struct Root {
     guard: Arc<LeafGuard>,
     resources: Arc<CertificateResources>,
     http: Arc<HttpRuntime>,
+    logging_registry: Arc<LoggingRegistry>,
     serial: AsyncMutex<()>,
     active: ArcSwapOption<Active>,
     retained: Mutex<Option<Predecessor>>,
@@ -67,6 +69,7 @@ struct Active {
     digest: [u8; 32],
     services: Arc<CertificateServices>,
     client: Option<ClientIdentity>,
+    logging: Arc<Logging>,
 }
 #[derive(Clone)]
 struct Predecessor {
@@ -79,6 +82,7 @@ struct Prepared {
     http: http_config::PreparedConfig,
     needs_client: bool,
     effective_tls_app: bool,
+    logging: Option<Value>,
 }
 fn failed(category: &'static str) -> AdminError {
     AdminError::new(400, category)
@@ -103,6 +107,8 @@ impl NativeBackend {
             guard.clone(),
         ));
         let http = Arc::new(HttpRuntime::new(challenges.clone(), resolver));
+        let logging_registry = LoggingRegistry::new(Default::default())
+            .map_err(|_| failed("logging_registry_initialization_failed"))?;
         let resources = Arc::new(
             CertificateResources::new()
                 .map_err(|_| failed("root_certificate_resources_invalid"))?,
@@ -114,6 +120,7 @@ impl NativeBackend {
                 guard,
                 resources,
                 http,
+                logging_registry,
                 serial: AsyncMutex::new(()),
                 active: ArcSwapOption::empty(),
                 retained: Mutex::new(None),
@@ -169,10 +176,18 @@ impl NativeBackend {
         let result = async {
             services.set_effective_tls_app(prepared.effective_tls_app)
                 .map_err(|_| failed("certificate_scope_preparation_failed"))?;
-            services
-                .prepare(root.candidates.child_token())
-                .await
-                .map_err(|_| failed("certificate_storage_preparation_failed"))?;
+            let (certificates, logging) = tokio::join!(
+                async {
+                    services.prepare(root.candidates.child_token()).await
+                        .map_err(|_| failed("certificate_storage_preparation_failed"))
+                },
+                async {
+                    logging::prepare(prepared.logging, root.logging_registry.clone(), root.candidates.child_token()).await
+                        .map_err(|_| failed("logging_candidate_preparation_failed"))
+                }
+            );
+            certificates?;
+            drop(logging?);
             let manual = services
                 .manual_certificates()
                 .map_err(|_| failed("manual_certificate_inventory_failed"))?;
@@ -312,20 +327,29 @@ impl Root {
         let result = async {
             services.set_effective_tls_app(prepared.effective_tls_app)
                 .map_err(|_| failed("certificate_scope_preparation_failed"))?;
-            services
-                .prepare(self.candidates.child_token())
-                .await
-                .map_err(|_| failed("certificate_storage_preparation_failed"))?;
+            let (certificates, logging) = tokio::join!(
+                async {
+                    services.prepare(self.candidates.child_token()).await
+                        .map_err(|_| failed("certificate_storage_preparation_failed"))
+                },
+                async {
+                    logging::prepare(prepared.logging, self.logging_registry.clone(), self.candidates.child_token()).await
+                        .map_err(|_| failed("logging_candidate_preparation_failed"))
+                }
+            );
+            certificates?;
+            let logging = logging?;
             let manual = services
                 .manual_certificates()
                 .map_err(|_| failed("manual_certificate_inventory_failed"))?;
             let stage = self
                 .http
-                .stage_with_certificates_and_provider(
+                .stage_with_generation_resources(
                     prepared.http,
                     services.business_resolver(),
                     manual,
                     services.certificate_provider(),
+                    logging.clone(),
                 )
                 .await
                 .map_err(|_| failed("http_candidate_staging_failed"))?;
@@ -370,6 +394,7 @@ impl Root {
                 digest: prepared.digest,
                 services: services.clone(),
                 client: client.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                logging: logging.clone(),
             });
             if self.phase.load(Ordering::Acquire) != RUNNING || self.cancel.is_cancelled() {
                 return Err(stopping());
@@ -383,10 +408,15 @@ impl Root {
             if next.generation != generation {
                 return Err(AdminError::new(500, "root_generation_mismatch"));
             }
+            let logging = next.logging.clone();
             let retired = self.active.swap(Some(next));
             *self.retained.lock().unwrap_or_else(|e| e.into_inner()) = retained;
             services.activate();
             cleanup.armed = false;
+            if let Ok(mut event) = Event::new(Origin::Core, "", Level::Info, "serving configuration") {
+                event.fields.push(Field::new("generation", FieldValue::U64(generation)));
+                let _ = logging.try_emit(event);
+            }
             if let Some(retired) = retired {
                 let slot = cleanup.slot.take();
                 let root = Arc::downgrade(&self);
@@ -582,6 +612,7 @@ impl Root {
             .begin_shutdown()
             .map_err(|_| AdminError::new(503, "http_shutdown_start_failed"))?;
         let active = self.active.swap(None);
+        let active_logging = active.as_ref().map(|active| active.logging.clone());
         self.retained
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -608,8 +639,20 @@ impl Root {
             result
         };
         let (http, certificates) = tokio::join!(http, certificates);
+        // The stopped HTTP snapshot still retains the server plan. All of
+        // its request tasks are joined now, so close exact-generation log
+        // admission before waiting for the registry's actual writers.
+        if let Some(active_logging) = active_logging {
+            active_logging.retire();
+        }
+        let deadline = std::time::Instant::now() + JOIN_BOUND;
+        let logging = self.logging_registry.shutdown(deadline).await;
         http.map_err(|_| AdminError::new(503, "http_shutdown_incomplete"))?;
-        certificates
+        certificates?;
+        if !logging.complete {
+            return Err(AdminError::new(503,"logging_shutdown_incomplete"));
+        }
+        Ok(())
     }
 }
 
@@ -698,9 +741,6 @@ fn prepare(raw: Value) -> Result<Prepared, AdminError> {
         return Err(failed("unknown_root_configuration_field"));
     }
     admin::validate(root)?;
-    if root.get("logging").is_some_and(|v| !v.is_null()) {
-        return Err(failed("logging_app_integration_pending"));
-    }
     let apps = root.get("apps").filter(|v| !v.is_null());
     if apps.is_some_and(|v| {
         v.as_object().is_none_or(|o| {
@@ -744,5 +784,6 @@ fn prepare(raw: Value) -> Result<Prepared, AdminError> {
         http,
         needs_client: admin::client_identity_required(root)?,
         effective_tls_app,
+        logging: root.get("logging").filter(|value| !value.is_null()).cloned(),
     })
 }

@@ -23,6 +23,8 @@ pub(super) struct Context {
     pub peer: SocketAddr,
     pub local: SocketAddr,
     pub tls: bool,
+    access_names: Option<Vec<String>>,
+    skip_access: bool,
     pub authority: String,
     pub client_ip: IpAddr,
     pub trusted: bool,
@@ -256,6 +258,23 @@ pub(super) async fn handle_business(
         .iter()
         .any(|range| range.contains(&peer.ip()));
     let client_ip = client_ip(request.headers(), peer.ip(), trusted, &server.plan);
+    let access = server
+        .plan
+        .access_logs
+        .as_ref()
+        .zip(server.logging.as_ref())
+        .and_then(|(config, logging)| {
+            super::access_log::Access::start(
+                logging.clone(),
+                config,
+                &request,
+                &authority,
+                peer,
+                client_ip,
+                &inner.resources.access_capture,
+            )
+        })
+        .map(Box::new);
     let original_uri = request.uri().clone();
     let trailer_metadata = request
         .extensions()
@@ -264,7 +283,16 @@ pub(super) async fn handle_business(
         .unwrap_or_default();
     let (parts, body) = request.into_parts();
     let body = super::trailer_policy::validate_incoming(body, &trailer_metadata);
-    let body = IdleBody::new(body, server.plan.read_idle_timeout).boxed_unsync();
+    let body = IdleBody::new(body, server.plan.read_idle_timeout);
+    let body = if let Some(access) = &access {
+        super::access_log::ReadCount {
+            body,
+            bytes: access.read.clone(),
+        }
+        .boxed_unsync()
+    } else {
+        body.boxed_unsync()
+    };
     let mut ctx = Context {
         request: Some(Request::from_parts(parts, body)),
         fastcgi_body_claimed: false,
@@ -272,6 +300,8 @@ pub(super) async fn handle_business(
         peer,
         local,
         tls,
+        access_names: None,
+        skip_access: false,
         authority,
         client_ip,
         trusted,
@@ -322,6 +352,13 @@ pub(super) async fn handle_business(
         .is_some_and(|r| r.method() == Method::HEAD)
     {
         *response.body_mut() = full(Bytes::new());
+    }
+    if let Some(access) = access.filter(|_| !ctx.skip_access) {
+        return (*access).attach(
+            response,
+            ctx.access_names,
+            ctx.values.remove("http.auth.user.id").unwrap_or_default(),
+        );
     }
     response
 }
@@ -665,6 +702,19 @@ fn handlers<'a>(
                 }
                 Handler::Vars(vars) => {
                     for (name, value) in vars {
+                        if name == "log_skip" {
+                            ctx.skip_access = value.as_bool() == Some(true);
+                        } else if name == "access_logger_names" {
+                            ctx.access_names = value
+                                .as_array()
+                                .filter(|names| names.len() <= 16)
+                                .and_then(|names| {
+                                    names
+                                        .iter()
+                                        .map(|value| value.as_str().filter(|name| name.len()<=128).map(str::to_owned))
+                                        .collect()
+                                });
+                        }
                         let value = match value {
                             serde_json::Value::String(s) => ctx.expand(s)?,
                             serde_json::Value::Null => String::new(),

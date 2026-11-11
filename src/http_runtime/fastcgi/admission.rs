@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::task::TaskTracker;
 
 const MAX_TARGETS: usize = 1024;
 pub(super) const MEMORY_UNIT: u64 = 4096;
@@ -13,6 +14,8 @@ pub(in crate::http_runtime) struct Admission {
     limit_per_target: usize,
     targets: Mutex<HashMap<String, Weak<Semaphore>>>,
     pub(super) prefix_memory: Arc<Semaphore>,
+    pub(super) diagnostic_slots: Arc<Semaphore>,
+    pub(in crate::http_runtime) diagnostics: TaskTracker,
 }
 
 impl Admission {
@@ -22,6 +25,8 @@ impl Admission {
             targets: Mutex::new(HashMap::new()),
             // 16 MiB of process-wide logical prefix allocation.
             prefix_memory: Arc::new(Semaphore::new(4096)),
+            diagnostic_slots: Arc::new(Semaphore::new((capacity / 4).clamp(1, 16))),
+            diagnostics: TaskTracker::new(),
         }
     }
 

@@ -427,5 +427,15 @@ file and disk budgets. Per-target socket admission leaves capacity for
 unrelated upstreams. An interrupted upstream response is not reported as
 complete; conflicting Content-Length fields are rejected. An already
 consumed request is not replayed as an empty request through error routes.
-Capture of upstream stderr still requires the logging integration, and
-general proxy retry, response buffering and HTTP/3 remain separate gates.
+General proxy retry, response buffering and HTTP/3 remain separate gates.
+
+The native root stages a logging generation with its server configuration.
+An already admitted request retains that generation through body delivery;
+a failed candidate does not retire existing log writers. The logging registry
+drains accepted work during owned shutdown. HTTP access logging supports
+host selection and omits credentials by default. Captured FastCGI stderr
+uses the same generation's nonblocking logger. Bounded tail processing
+does not delay a completed response. The capture marks truncated data and
+limits stderr to 16 KiB. Under pressure the separate reduced access-log
+budget retains status and a shortened request without its headers. Regular-expression filters, handler tracing, and complete
+module-level log integration remain separate compatibility work.

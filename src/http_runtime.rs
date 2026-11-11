@@ -22,6 +22,9 @@ mod files;
 
 #[path = "http_runtime/fastcgi/mod.rs"]
 mod fastcgi;
+
+#[path = "http_runtime/access_log.rs"]
+mod access_log;
 #[path = "http_runtime/tls_executor.rs"]
 mod tls_executor;
 pub use tls_executor::TlsHandshakeDiagnostics;
@@ -150,6 +153,7 @@ impl Generation {
 }
 #[derive(Clone)]
 struct ActiveServer {
+    logging: Option<Arc<crate::logging::Logging>>,
     plan: Arc<ServerConfig>,
     tls: Option<Arc<rustls::ServerConfig>>,
     resolver: Option<Arc<CandidateResolver>>,
@@ -438,15 +442,23 @@ fn tls_initialization_failure_name(code: u8) -> Option<&'static str> {
     }
 }
 
+struct ServingMaterial<'a> {
+    manual: Option<&'a ManualCertificates>,
+    provider: Option<&'a Arc<dyn ScopedCertificateProvider>>,
+    logging: Option<&'a Arc<crate::logging::Logging>>,
+    validate_only: bool,
+}
+
 async fn prepare_servers(
     config: &PreparedConfig,
     registry: &ChallengeRegistry,
     managed: &Arc<HotCertificateResolver>,
     challenges: &Arc<HotCertificateResolver>,
-    manual: Option<&ManualCertificates>,
-    provider: Option<&Arc<dyn ScopedCertificateProvider>>,
+    material: ServingMaterial<'_>,
     resources: &Arc<resource_budget::Resources>,
 ) -> Result<(HashMap<SocketAddr, Arc<ActiveServer>>, Vec<Vec<String>>)> {
+    let ServingMaterial { manual, provider, logging, validate_only } = material;
+    let logging_available = logging.is_some() || validate_only;
     let standalone;
     let manual = if let Some(manual) = manual {
         ensure!(
@@ -590,13 +602,14 @@ async fn prepare_servers(
         let client_plan = server.clone();
         let clients = tokio::task::spawn_blocking(move || {
             let mut clients = HashMap::new();
-            proxy::prepare_clients(&client_plan.routes, &mut clients)?;
-            proxy::prepare_clients(&client_plan.errors, &mut clients)?;
+            proxy::prepare_clients(&client_plan.routes, &mut clients, logging_available)?;
+            proxy::prepare_clients(&client_plan.errors, &mut clients, logging_available)?;
             Ok::<_, anyhow::Error>(clients)
         })
         .await
         .map_err(|_| anyhow::anyhow!("candidate proxy provisioning task failed"))??;
         let active = ActiveServer {
+            logging: logging.cloned(),
             plan: server.clone(),
             tls,
             resolver,
@@ -630,8 +643,8 @@ async fn prepare_servers(
             let client_plan = plan.clone();
             let clients = tokio::task::spawn_blocking(move || {
                 let mut clients = HashMap::new();
-                proxy::prepare_clients(&client_plan.routes, &mut clients)?;
-                proxy::prepare_clients(&client_plan.errors, &mut clients)?;
+                proxy::prepare_clients(&client_plan.routes, &mut clients, logging_available)?;
+                proxy::prepare_clients(&client_plan.errors, &mut clients, logging_available)?;
                 Ok::<_, anyhow::Error>(clients)
             })
             .await
@@ -639,6 +652,7 @@ async fn prepare_servers(
             output.insert(
                 address,
                 Arc::new(ActiveServer {
+                    logging: logging.cloned(),
                     plan,
                     tls: None,
                     resolver: None,
@@ -648,6 +662,7 @@ async fn prepare_servers(
             );
         } else {
             let plan = ServerConfig {
+                access_logs: None,
                 listen: vec![address],
                 routes,
                 errors: Vec::new(),
@@ -668,6 +683,7 @@ async fn prepare_servers(
             output.insert(
                 address,
                 Arc::new(ActiveServer {
+                    logging: logging.cloned(),
                     plan: Arc::new(plan),
                     tls: None,
                     resolver: None,
@@ -840,13 +856,14 @@ async fn accept_loop(
                     };
                     let negotiated_h2 = accepted.stream.get_ref().1.alpn_protocol() == Some(b"h2");
                     let tls_details = fastcgi::TlsDetails::of(accepted.stream.get_ref().1);
+                    let tls_log = Some(Arc::new(access_log::Tls::of(accepted.stream.get_ref().1)));
 
                     serve_connection(task_inner, TokioIo::new(accepted.stream), peer, local, ConnectionView {
                         key, server: accepted.server, admission,
-                        negotiated_tls_h2: Some(negotiated_h2), identity: Some(accepted.identity), tls_details: Some(tls_details),
+                        negotiated_tls_h2: Some(negotiated_h2), identity: Some(accepted.identity), tls_log, tls_details: Some(tls_details),
                     }).await;
                 } else {
-                    serve_connection(task_inner, TokioIo::new(stream), peer, local, ConnectionView { key, server, admission, negotiated_tls_h2: None, identity: None, tls_details: None }).await;
+                    serve_connection(task_inner, TokioIo::new(stream), peer, local, ConnectionView { key, server, admission, negotiated_tls_h2: None, identity: None, tls_log: None, tls_details: None }).await;
                 }
             });
         } else {
@@ -913,6 +930,7 @@ struct ConnectionView {
     key: SocketAddr,
     server: Arc<ActiveServer>,
     negotiated_tls_h2: Option<bool>,
+    tls_log: Option<Arc<access_log::Tls>>,
     tls_details: Option<fastcgi::TlsDetails>,
     identity: Option<Arc<TlsIdentity>>,
 }
@@ -929,6 +947,7 @@ async fn serve_connection<I>(
         key,
         server,
         negotiated_tls_h2,
+        tls_log,
         tls_details,
         identity,
         admission,
@@ -943,6 +962,7 @@ async fn serve_connection<I>(
         let accepted_server = svc_server.clone();
         let identity = identity.clone();
         let requested_drain = service_drain.clone();
+        let tls_log = tls_log.clone();
         let admission=admission.clone();
         async move {
             // Count admission before confirming that this exact view is still
@@ -1041,7 +1061,10 @@ async fn serve_connection<I>(
                     return Ok(response);
                 }
             };
-            if let Some(details) = tls_details {
+            if let Some(tls_log) = tls_log.filter(|_| current.plan.access_logs.is_some()) {
+                request.extensions_mut().insert(tls_log);
+            }
+            if let Some(details)=tls_details {
                 request.extensions_mut().insert(details);
             }
             let fault = metadata.fault.clone();

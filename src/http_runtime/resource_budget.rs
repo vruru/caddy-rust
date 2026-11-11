@@ -200,6 +200,9 @@ pub struct ResourceDiagnostics {
     pub metadata: BudgetSnapshot,
     pub file_streams: BudgetSnapshot,
     pub file_reads: BudgetSnapshot,
+    pub access_capture_rejected: u64,
+    pub access_capture_reduced: u64,
+    pub access_response_headers_omitted: u64,
 }
 
 pub(crate) struct Resources {
@@ -214,6 +217,7 @@ pub(crate) struct Resources {
     pub metadata: BlockingBudget,
     pub streams: BlockingBudget,
     pub reads: BlockingBudget,
+    pub(super) access_capture: Arc<super::access_log::CaptureBudget>,
     pub fastcgi: BlockingBudget,
     pub(super) fastcgi_admission: super::fastcgi::admission::Admission,
     pub fastcgi_dns: BlockingBudget,
@@ -310,6 +314,7 @@ impl Resources {
             fastcgi_spool_io,
             fastcgi_spool_fds,
             fastcgi_spool_bytes,
+            access_capture: super::access_log::CaptureBudget::new(),
             read_timeout: limits.file_read_timeout.unwrap_or(Duration::ZERO),
         })
     }
@@ -322,6 +327,7 @@ impl Resources {
         self.fastcgi.tasks.close();
         self.fastcgi_dns.tasks.close();
         self.fastcgi_spool_io.tasks.close();
+        self.fastcgi_admission.diagnostics.close();
     }
     pub(crate) async fn wait(&self) {
         // Parents complete before children: a cache leader may still submit a
@@ -334,9 +340,15 @@ impl Resources {
         self.fastcgi.tasks.wait().await;
         self.fastcgi_dns.tasks.wait().await;
         self.fastcgi_spool_io.tasks.wait().await;
+        self.fastcgi_admission.diagnostics.wait().await;
     }
     pub(crate) fn snapshot(&self) -> ResourceDiagnostics {
+        let (access_capture_rejected, access_capture_reduced, access_response_headers_omitted) =
+            self.access_capture.stats();
         ResourceDiagnostics {
+            access_capture_rejected,
+            access_capture_reduced,
+            access_response_headers_omitted,
             auth: self.auth.snapshot(),
             auth_comparisons: self.auth_comparisons.load(Ordering::Relaxed),
             auth_cache_rejected: self.auth_cache_rejected.load(Ordering::Relaxed),
