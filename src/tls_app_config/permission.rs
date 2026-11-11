@@ -15,6 +15,8 @@ use url::Url;
 mod proxy;
 #[path = "permission/query.rs"]
 mod query;
+#[path = "permission/target.rs"]
+mod target;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,34 +103,39 @@ impl HttpPermission {
     async fn check_inner(&self, name: String, cancel: CancellationToken) -> Result<()> {
         let endpoint = self.endpoint.clone();
         let cache = self.client.clone();
-        let url = cert_cpu::run(self.resources.cpu_slots(), cancel.clone(), move || {
-            let mut url =
-                Url::parse(&strict_replace(&endpoint)?).map_err(|_| PermissionFailure::Endpoint)?;
-            ensure!(
-                matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
-                PermissionFailure::Endpoint
-            );
-            url.set_query(Some(&query::query_with_domain(
-                url.query().unwrap_or(""),
-                &name,
-            )));
-            Ok(url)
+        let target = cert_cpu::run(self.resources.cpu_slots(), cancel.clone(), move || {
+            target::Target::parse(&strict_replace(&endpoint)?, &name)
         })
         .await?;
         let _network = self
             .resources
-            .admit_permission(url.origin().ascii_serialization(), &cancel)
+            .admit_permission(target.origin.origin().ascii_serialization(), &cancel)
             .await
             .map_err(|_| PermissionFailure::Capacity)?;
         // Root-store I/O and TLS construction are admitted only after the
-        // per-permission-origin permit. A flood from one endpoint cannot fill
-        // the shared certificate CPU queue with redundant root reloads.
-        let target=url.clone();
-        let client=crate::cert_cpu::run(self.resources.cpu_slots(),cancel.clone(),move||permission_client(&cache,&target)).await?;
+        // per-permission-origin permit. A slow endpoint cannot consume the
+        // independent CA network budget while merely waiting.
+        let origin = target.origin.clone();
+        let client = cert_cpu::run(self.resources.cpu_slots(), cancel.clone(), move || {
+            permission_client(&cache, &origin)
+        })
+        .await?;
+        let mut request = client
+            .get(target.origin)
+            .header(http::header::USER_AGENT, "Go-http-client/1.1")
+            .header(http::header::ACCEPT_ENCODING, "gzip")
+            .header(http::header::HOST, target.host)
+            .build()
+            .map_err(|_| PermissionFailure::Endpoint)?;
+        if let Some(auth) = target.auth {
+            request
+                .headers_mut()
+                .insert(http::header::AUTHORIZATION, auth);
+        }
         let response = tokio::select! { biased;
             _ = cancel.cancelled() => return Err(PermissionFailure::Cancelled.into()),
-            response = client.get(url).header(http::header::USER_AGENT,"Go-http-client/1.1")
-                .header(http::header::ACCEPT_ENCODING,"gzip").send() => response.map_err(|_| PermissionFailure::Transport)?,
+            response = client.execute_with_raw_target(request, target.target) =>
+                response.map_err(|_| PermissionFailure::Transport)?,
         };
         let status = response.status().as_u16();
         let would_redirect = matches!(status, 301 | 302 | 303 | 307 | 308)
@@ -160,7 +167,8 @@ fn strict_replace(input: &str) -> Result<String> {
             failed.set(true);
         }
         value
-    }).map_err(|_|PermissionFailure::Endpoint)?;
+    })
+    .map_err(|_| PermissionFailure::Endpoint)?;
     ensure!(!failed.get(), PermissionFailure::Endpoint);
     Ok(output)
 }
@@ -203,11 +211,15 @@ fn permission_client(cache: &Mutex<Option<CachedClient>>, url: &Url) -> Result<r
     }
     let mut trust = rustls::RootCertStore::empty();
     let _ = trust.add_parsable_certificates(roots);
-    let tls = rustls::ClientConfig::builder_with_provider(crate::crypto::provider())
+    let mut tls = rustls::ClientConfig::builder_with_provider(crate::crypto::provider())
         .with_safe_default_protocol_versions()
         .map_err(|_| PermissionFailure::Transport)?
         .with_root_certificates(trust)
         .with_no_client_auth();
+    // Reqwest does not set ALPN on a preconfigured Rustls ClientConfig.
+    // Go's default HTTP transport negotiates h2 and has no TLS session cache.
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    tls.resumption = rustls::client::Resumption::disabled();
     let mut builder = reqwest::Client::builder()
         .no_proxy()
         .no_gzip()

@@ -72,3 +72,8 @@ float values, equality, hashing, serialization and unsigned decoding retain
 their existing behavior. The application selects this parser only after its
 own Unicode and depth checks. The alternate arbitrary-precision Number
 representation is not enabled or supported in this patched copy.
+
+## On-demand HTTP permission targets
+
+The opt-in permission transport uses patched http 1.5.0 and reqwest 0.12.28.
+See their VENDOR.md files for exact release hashes, scope, and licenses.

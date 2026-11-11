@@ -20,12 +20,27 @@ pub(super) fn selected(url: &Url) -> Result<Option<Url>> {
     if bypass(url, &env("NO_PROXY").unwrap_or_default()) {
         Ok(None)
     } else {
-        // Go's HTTP transport sends the hostname in both SOCKS5 variants.
-        // reqwest's socks5 URL requests local DNS unless the `h` form is used.
-        if proxy.scheme() == "socks5" {
-            proxy
-                .set_scheme("socks5h")
-                .map_err(|_| PermissionFailure::Transport)?;
+        match proxy.scheme() {
+            "socks5" => {
+                // Both Go variants send the unresolved DNS name to the proxy.
+                proxy
+                    .set_scheme("socks5h")
+                    .map_err(|_| PermissionFailure::Transport)?;
+            }
+            "socks5h" | "http" | "https" => {}
+            _ => {
+                // Go's transport uses an HTTP proxy for other schemes with an
+                // explicit port, rather than using reqwest's SOCKS4 semantics.
+                if proxy.port().is_none() {
+                    return Err(PermissionFailure::Transport.into());
+                }
+                let (_, authority_and_path) = proxy
+                    .as_str()
+                    .split_once("://")
+                    .ok_or(PermissionFailure::Transport)?;
+                proxy = Url::parse(&format!("http://{authority_and_path}"))
+                    .map_err(|_| PermissionFailure::Transport)?;
+            }
         }
         Ok(Some(proxy))
     }

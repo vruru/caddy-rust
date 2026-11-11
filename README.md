@@ -421,8 +421,11 @@ miss uses that generation's permission policy. Concurrent requests for the
 same name share an acquisition, and an already verified compatible certificate
 can remain usable across a reload without another permission lookup. Storage
 imports, renewal and eviction remain fenced to their owning generation.
-Original cache capacity, unusual permission request targets, and full
-production automatic-HTTPS acceptance remain separate gates.
+The permission client preserves the escaped request path and Go query
+normalization on HTTP/1 and HTTP/2; it leaves the configured origin, proxy,
+certificate verification, and ordinary inbound URI limits unchanged. Long
+targets still require a permission server whose own limit permits them.
+Full production automatic-HTTPS acceptance remains a separate gate.
 
 Native FastCGI supports dedicated TCP and Unix socket exchanges, request
 streaming, and the standard PHP front-controller route. Large configured
