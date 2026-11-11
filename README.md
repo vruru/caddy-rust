@@ -445,3 +445,11 @@ spellings by default. Per-server exact and prefix allowlists preserve the
 chosen spelling, remove competing hyphenated variants, and reject repeated
 values for an allowed alias. Mixed underscore/dot spellings require an exact
 entry. This applies before proxying to HTTP or FastCGI backends.
+
+The native TLS cache honors the default 10,000-entry capacity and explicit
+positive capacities up to 16,384. Eager loads, exact shared imports, and
+on-demand acquisitions use the same generation-owned capacity. Manual
+certificate entries are never eviction targets; a full manual inventory
+can still serve one managed certificate. Count limits do not replace the
+separate certificate-material byte limits. Exact rollback history includes
+only displaced, configured entries from the retained generation.

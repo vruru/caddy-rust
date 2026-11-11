@@ -203,20 +203,23 @@ impl CertificateServices {
             .started
             .lock()
             .map_err(|_| anyhow!("certificate scope admission unavailable"))?;
-        if self.context.cancel.is_cancelled() || group.cancel.is_cancelled() || *started {
+        if self.context.cancel.is_cancelled()
+            || group.cancel.is_cancelled()
+            || *started
+            || group
+                .residency
+                .lock()
+                .is_ok_and(|binding| binding.as_ref().is_some_and(|binding| !binding.slot.live()))
+        {
             return Ok(());
         }
         *started = true;
         let this = self.clone();
         let worker = group.clone();
-        group.tasks.spawn(async move {
+        group.tasks.spawn(self.tasks.track_future(async move {
             this.run_group(worker).await;
-        });
+        }));
         group.tasks.close();
-        let tasks = group.tasks.clone();
-        self.tasks.spawn(async move {
-            tasks.wait().await;
-        });
         Ok(())
     }
     pub(super) async fn stop_group(&self, group: Arc<Group>) -> Result<()> {
@@ -249,7 +252,9 @@ impl CertificateServices {
             let refreshed = if group.renew_at.load(Ordering::Acquire) > 0
                 && group.ari_after.load(Ordering::Acquire) <= now().unwrap_or(i64::MAX)
             {
-                match self.refresh_cached_schedule(&group, cancel.clone()).await {
+                // Most scopes sleep until their scheduled check. Allocate
+                // the larger acquisition/ARI state only while it is needed.
+                match Box::pin(self.refresh_cached_schedule(&group, cancel.clone())).await {
                     Err(error) if error.is::<cert_automation::PendingPromotion>() => {
                         // Explicit non-on-demand groups can resume their
                         // interrupted attempt through the normal lease path.
@@ -272,11 +277,11 @@ impl CertificateServices {
             } else if cached_deadline > now().unwrap_or(i64::MAX) && !pending {
                 Ok(cached_deadline)
             } else {
-                std::panic::AssertUnwindSafe(self.ensure_group(
+                std::panic::AssertUnwindSafe(Box::pin(self.ensure_group(
                     group.clone(),
                     false,
                     cancel.clone(),
-                ))
+                )))
                 .catch_unwind()
                 .await
                 .unwrap_or_else(|_| Err(anyhow!("certificate maintenance worker panicked")))

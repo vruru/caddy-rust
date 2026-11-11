@@ -638,9 +638,12 @@ impl CertificateManager {
     /// The calling generation owns certificate purpose checks and scoped
     /// publication. Keep using its LeafGuard, but never insert an unowned key.
     pub(crate) fn storage_only(mut self) -> Result<Self> {
-        Arc::get_mut(&mut self.inner)
-            .ok_or_else(|| anyhow!("certificate manager already shared"))?
-            .publish_to_resolver = false;
+        let inner = Arc::get_mut(&mut self.inner)
+            .ok_or_else(|| anyhow!("certificate manager already shared"))?;
+        inner.publish_to_resolver = false;
+        // A service-owned single-group manager forwards results through its
+        // owning Group; it doesn't need the standalone manager's large ring.
+        inner.events = broadcast::channel(8).0;
         Ok(self)
     }
     async fn startup_recovery(&self, cancel: CancellationToken) -> Result<&RecoveryReport> {

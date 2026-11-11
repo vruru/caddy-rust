@@ -24,7 +24,7 @@ use std::{
 };
 use x509_parser::extensions::GeneralName;
 
-const MAX_CERTIFICATES: usize = 4096;
+pub(crate) const MAX_CERTIFICATES: usize = 16_384;
 const MAX_NAMES: usize = 65536;
 const MAX_CERT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_KEY_BYTES: usize = 128 * 1024;
@@ -41,6 +41,15 @@ impl std::fmt::Display for CertificatePublicationConflict {
     }
 }
 impl std::error::Error for CertificatePublicationConflict {}
+
+#[derive(Debug)]
+pub(crate) struct CertificateResidencyRetired;
+impl std::fmt::Display for CertificateResidencyRetired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("certificate cache slot retired")
+    }
+}
+impl std::error::Error for CertificateResidencyRetired {}
 
 #[derive(Debug)]
 pub struct OcspPublishConflict;
@@ -126,6 +135,12 @@ impl CertificateScope {
 #[derive(Clone, Default)]
 pub(crate) struct CertificateResidency(tokio_util::sync::CancellationToken);
 impl CertificateResidency {
+    /// Retiring one generation's projection does not affect its source or
+    /// other generations. Retiring the source also retires every projection.
+    pub(crate) fn projection(&self) -> Self {
+        Self(self.0.child_token())
+    }
+
     pub(crate) fn live(&self) -> bool {
         !self.0.is_cancelled()
     }
@@ -455,11 +470,18 @@ impl HotCertificateResolver {
         cancel: Option<&tokio_util::sync::CancellationToken>,
         commit: impl FnOnce() -> Result<()>,
     ) -> Result<Option<ScopedCertificate>> {
-        let active = || {
-            residency.as_ref().is_none_or(|slot| slot.live())
-                && cancel.is_none_or(|token| !token.is_cancelled())
+        let check_active = || {
+            ensure!(
+                cancel.is_none_or(|token| !token.is_cancelled()),
+                "certificate publication cancelled"
+            );
+            ensure!(
+                residency.as_ref().is_none_or(|slot| slot.live()),
+                CertificateResidencyRetired
+            );
+            Ok(())
         };
-        ensure!(active(), "certificate cache slot retired");
+        check_active()?;
         let (names, mut cert) = load_certificate(input, &self.leaf_guard)?;
         cert.instance_generation = self.instance_generation()?;
         cert.owner = owner.clone();
@@ -522,7 +544,12 @@ impl HotCertificateResolver {
                 candidates.push(cert.clone());
             }
             prune_staples(&mut next, now, true)?;
-            validate_snapshot_size(&next)?;
+            // A scoped insertion can retire its victim in the final commit
+            // hook. Allow that one transient instance in the candidate only.
+            validate_snapshot_size_with_limit(
+                &next,
+                MAX_CERTIFICATES + usize::from(residency.is_some()),
+            )?;
             let generation = base
                 .generation
                 .checked_add(1)
@@ -540,7 +567,7 @@ impl HotCertificateResolver {
                 drop(guard);
                 continue;
             }
-            ensure!(active(), "certificate cache slot retired");
+            check_active()?;
             // The cache admission hook only commits short in-memory state;
             // all key validation and snapshot construction already succeeded.
             // Nothing fallible follows the hook in this publication.
@@ -1246,6 +1273,9 @@ fn prune_staples(
     now: i64,
     evict: bool,
 ) -> Result<()> {
+    if !names.values().flatten().any(|cert| cert.staple.is_some()) {
+        return Ok(());
+    }
     let mut instances: HashMap<u64, Arc<LoadedCertificate>> = names
         .values()
         .flatten()
@@ -1286,15 +1316,19 @@ fn prune_staples(
 }
 
 fn validate_snapshot_size(names: &HashMap<String, Vec<Arc<LoadedCertificate>>>) -> Result<()> {
+    validate_snapshot_size_with_limit(names, MAX_CERTIFICATES)
+}
+
+fn validate_snapshot_size_with_limit(
+    names: &HashMap<String, Vec<Arc<LoadedCertificate>>>,
+    limit: usize,
+) -> Result<()> {
     let mut unique = HashSet::new();
     let mut size = 0usize;
     let mut staple_bytes = 0usize;
     for cert in names.values().flatten() {
         if unique.insert(Arc::as_ptr(cert)) {
-            ensure!(
-                unique.len() <= MAX_CERTIFICATES,
-                "certificate count limit exceeded"
-            );
+            ensure!(unique.len() <= limit, "certificate count limit exceeded");
             size = size
                 .checked_add(cert.size)
                 .ok_or_else(|| anyhow!("certificate data limit exceeded"))?;

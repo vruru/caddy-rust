@@ -69,6 +69,9 @@ pub(super) fn parse(views: CertificateViews<'_>) -> Result<CertificatePlan> {
         if value > 0 {
             plan.cache_capacity =
                 usize::try_from(value).map_err(|_| ConfigError::invalid(cache.at("capacity")))?;
+            if plan.cache_capacity > crate::tls_resolver::MAX_CERTIFICATES {
+                return Err(ConfigError::invalid(cache.at("capacity")));
+            }
         }
     }
     let certificates = Object::new(
@@ -246,7 +249,7 @@ pub(super) fn parse(views: CertificateViews<'_>) -> Result<CertificatePlan> {
     }
     if plan.policies.len() > 1024
         || plan.authorities.len() > 256
-        || plan.manual.len() > 4096
+        || plan.manual.len() > crate::tls_resolver::MAX_CERTIFICATES
         || plan.automate.len() > 65536
     {
         return Err(ConfigError::invalid("/apps/tls".into()));

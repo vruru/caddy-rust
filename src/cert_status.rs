@@ -370,6 +370,9 @@ impl OcspManager {
         let inner =
             Arc::get_mut(&mut self.inner).ok_or_else(|| anyhow!("OCSP scope already shared"))?;
         inner.names_scope = Some(Arc::new(names.into_iter().collect()));
+        // One managed group is one certificate. Its internal watcher uses
+        // the authenticated LeafGuard after lag, not an unbounded event log.
+        inner.events = broadcast::channel(8).0;
         Ok(self)
     }
     pub fn subscribe(&self) -> broadcast::Receiver<OcspEvent> {
@@ -1019,14 +1022,17 @@ impl OcspManager {
         {
             return Ok(false);
         }
-        if !observations.contains_key(identity) && observations.len() >= 4096 {
+        if !observations.contains_key(identity)
+            && observations.len() >= crate::tls_resolver::MAX_CERTIFICATES
+        {
             // Retired identities are also pruned here for explicit refresh_one
             // callers which do not run the inventory maintenance loop.
             let current = self.inner.resolver.ocsp_identities()?;
             observations.retain(|identity, _| current.contains(identity));
         }
         ensure!(
-            observations.contains_key(identity) || observations.len() < 4096,
+            observations.contains_key(identity)
+                || observations.len() < crate::tls_resolver::MAX_CERTIFICATES,
             "OCSP observation capacity exhausted"
         );
         observations.insert(
@@ -1269,7 +1275,7 @@ impl OcspManager {
                 let names=self.inner.names_scope.clone();
                 let certificates=crate::cert_cpu::run(self.inner.cpu_slots.clone(),cancel.clone(),move||match names {Some(names)=>resolver.ocsp_certificates_for_names(&names),None=>resolver.ocsp_certificates()}).await?;
                 let certificates=certificates.into_iter().filter(|certificate|(self.inner.inventory)(certificate)).collect::<Vec<_>>();
-                ensure!(certificates.len()<=4096,"OCSP inventory exceeds resolver certificate limit");
+                ensure!(certificates.len()<=crate::tls_resolver::MAX_CERTIFICATES,"OCSP inventory exceeds resolver certificate limit");
                 let current:HashSet<_>=certificates.iter().map(|c|(c.identity,c.generation)).collect();
                 for (key,token) in &active{if !current.contains(key){token.cancel();}}
                 self.inner.entries.lock().map_err(|_|anyhow!("OCSP maintenance state unavailable"))?.retain(|key,_|current.contains(key));

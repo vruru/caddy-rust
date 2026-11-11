@@ -99,10 +99,7 @@ impl CertificateServices {
                         .lock()
                         .map_err(|_| anyhow!("certificate residency unavailable"))?;
                     if binding.is_none() {
-                        *binding = Some(ResidencyBinding {
-                            slot: seed.slot.clone(),
-                            shared: true,
-                        });
+                        *binding = Some(ResidencyBinding::shared(&seed.slot));
                     }
                     let mut leaf = group
                         .leaf_state
@@ -276,10 +273,9 @@ impl CertificateServices {
             .iter()
             .find(|item| item.identity == identity && item.managed_names.as_ref() == Some(&names))
             .map(|item| item.material.clone());
-        let seed_binding = seed.as_ref().map(|entry| ResidencyBinding {
-            slot: entry.slot.clone(),
-            shared: true,
-        });
+        let seed_binding = seed
+            .as_ref()
+            .map(|entry| ResidencyBinding::shared(&entry.slot));
         let leaf_state = seed
             .map(|entry| entry.material.clone())
             .or(retained)
@@ -327,7 +323,7 @@ impl CertificateServices {
         });
         let mut state = self.state.lock().await;
         ensure!(
-            state.groups.len() < 4096,
+            state.groups.len() < super::capacity::GROUP_LIMIT,
             "certificate group capacity exceeded"
         );
         let candidate = group;
@@ -1024,74 +1020,101 @@ impl CertificateServices {
         identity_scope: bool,
         cancel: CancellationToken,
     ) -> Result<()> {
-        let groups = self
-            .state
-            .lock()
-            .await
-            .groups
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for group in groups
-            .into_iter()
-            .filter(|group| group.identity == identity_scope)
-        {
-            self.ocsp_manager(&group).await?;
+        if self.plan.disable_ocsp {
+            return Ok(());
         }
-        for (identity, resolver) in [
-            (false, &self.context.resolver),
-            (true, &self.identity_resolver),
-        ] {
-            if identity != identity_scope {
-                continue;
-            }
-            for certificate in resolver.ocsp_certificates()? {
-                let key = group_key(certificate.names(), identity);
-                let manager = {
-                    let state = self.state.lock().await;
+        let groups =
+            self.state
+                .lock()
+                .await
+                .groups
+                .values()
+                .filter(|group| group.identity == identity_scope)
+                .filter(|group| {
+                    group.residency.lock().is_ok_and(|binding| {
+                        binding.as_ref().is_none_or(|binding| binding.slot.live())
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+        let managers = stream::iter(groups)
+            .map(|group| async move { self.ocsp_manager(&group).await })
+            .buffer_unordered(8)
+            .collect::<Vec<_>>()
+            .await;
+        for manager in managers {
+            manager?;
+        }
+        let resolver = if identity_scope {
+            self.identity_resolver.clone()
+        } else {
+            self.context.resolver.clone()
+        };
+        let manual_resolver = self.manual_resolver.clone();
+        let (managed, manual) = loaders::blocking(
+            self.context.resources.cpu.clone(),
+            cancel.clone(),
+            move || {
+                let managed = resolver
+                    .ocsp_certificates()?
+                    .into_iter()
+                    .map(|certificate| {
+                        (group_key(certificate.names(), identity_scope), certificate)
+                    })
+                    .collect::<Vec<_>>();
+                let manual = if identity_scope {
+                    Vec::new()
+                } else {
+                    manual_resolver.ocsp_certificates()?
+                };
+                Ok((managed, manual))
+            },
+        )
+        .await?;
+        let jobs = {
+            let state = self.state.lock().await;
+            let mut jobs = managed
+                .into_iter()
+                .filter_map(|(key, certificate)| {
                     state
                         .ocsp
                         .get(&key)
-                        .or_else(|| {
-                            if !identity {
-                                state.ocsp.get("manual:false")
-                            } else {
-                                None
-                            }
-                        })
                         .cloned()
-                };
-                if let Some(manager) = manager {
-                    let status = manager
-                        .probe_cached_one(certificate, cancel.clone())
-                        .await?;
-                    if matches!(status, crate::cert_status::CacheRestore::Restored { status } if status.state == OcspState::Revoked)
-                    {
-                        self.context.resources.revoked.notify_waiters();
-                    }
-                }
+                        .map(|manager| (manager, certificate))
+                })
+                .collect::<Vec<_>>();
+            if let Some(manager) = state.ocsp.get("manual:false") {
+                jobs.extend(
+                    manual
+                        .into_iter()
+                        .map(|certificate| (manager.clone(), certificate)),
+                );
             }
-        }
-        let manual = if identity_scope {
-            None
-        } else {
-            self.state.lock().await.ocsp.get("manual:false").cloned()
+            jobs
         };
-        if let Some(manager) = manual {
-            for certificate in self.manual_resolver.ocsp_certificates()? {
-                let status = manager
-                    .probe_cached_one(certificate, cancel.clone())
-                    .await?;
-                if matches!(status, crate::cert_status::CacheRestore::Restored { status } if status.state == OcspState::Revoked)
-                {
-                    self.context.resources.revoked.notify_waiters();
-                }
+        // Drain the admitted operations even if another certificate failed.
+        // The separate restore admission budget remains shared across scopes.
+        let outcomes = stream::iter(jobs)
+            .map(|(manager, certificate)| {
+                let cancel = cancel.clone();
+                async move { manager.probe_cached_one(certificate, cancel).await }
+            })
+            .buffer_unordered(8)
+            .collect::<Vec<_>>()
+            .await;
+        for status in outcomes {
+            if matches!(status?, crate::cert_status::CacheRestore::Restored { status } if status.state == OcspState::Revoked)
+            {
+                self.context.resources.revoked.notify_waiters();
             }
         }
         Ok(())
     }
 
     pub(super) async fn manual_ocsp(&self, cancel: CancellationToken) -> Result<()> {
+        if self.plan.disable_ocsp {
+            return Ok(());
+        }
         let resolver = self.manual_resolver.clone();
         let inventory = super::super::loaders::blocking(
             self.context.resources.cpu.clone(),
@@ -1117,7 +1140,6 @@ impl CertificateServices {
             .resources
             .store(storage, &self.context.paths, cancel)
             .await?;
-        let disable = self.plan.disable_ocsp;
         let (max_concurrent, max_concurrent_per_responder) = self.context.resources.ocsp.limits();
         let manager = OcspManager::with_resources_and_inventory_cpu(
             store.fs.clone(),
@@ -1128,12 +1150,7 @@ impl CertificateServices {
                 max_concurrent_per_responder,
                 ..OcspOptions::default()
             },
-            Arc::new(move |_| {
-                Ok(OcspConfig {
-                    disable_stapling: disable,
-                    ..OcspConfig::default()
-                })
-            }),
+            Arc::new(move |_| Ok(OcspConfig::default())),
             Arc::new(move |certificate| identities.contains(&certificate.identity())),
             self.context.resources.ocsp.clone(),
             self.context.resources.cpu.clone(),
@@ -1189,7 +1206,13 @@ impl CertificateServices {
         Ok(())
     }
 
-    pub(super) async fn ocsp_manager(&self, group: &Group) -> Result<OcspScope> {
+    pub(super) async fn ocsp_manager(&self, group: &Group) -> Result<Option<OcspScope>> {
+        // No certificate status work or per-group event ring is necessary
+        // when this policy disables OCSP. A shared authenticated LeafGuard
+        // fact still applies independently of the stapling policy.
+        if self.plan.disable_ocsp || group.policy.disable_ocsp {
+            return Ok(None);
+        }
         let key = group_key(&group.names, group.identity);
         {
             let state = self.state.lock().await;
@@ -1202,15 +1225,13 @@ impl CertificateServices {
                 "certificate status scope retired"
             );
             if let Some(manager) = state.ocsp.get(&key).cloned() {
-                return Ok(manager);
+                return Ok(Some(manager));
             }
         }
-        let disable = self.plan.disable_ocsp || group.policy.disable_ocsp;
         let overrides: std::collections::HashMap<String, String> =
             group.policy.ocsp_overrides.clone().into_iter().collect();
         let policy = Arc::new(move |_: &crate::tls_resolver::OcspCertificate| {
             Ok(OcspConfig {
-                disable_stapling: disable,
                 responder_overrides: overrides.clone(),
                 ..OcspConfig::default()
             })
@@ -1253,7 +1274,7 @@ impl CertificateServices {
         let manager = state.ocsp.entry(key).or_insert(scope).clone();
         drop(state);
         self.maintenance_changed.notify_one();
-        Ok(manager)
+        Ok(Some(manager))
     }
 }
 

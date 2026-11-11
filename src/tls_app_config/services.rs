@@ -29,6 +29,8 @@ use std::{
 };
 use tokio::sync::{Mutex as AsyncMutex, OnceCell, broadcast, oneshot};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+#[path = "services/capacity.rs"]
+mod capacity;
 #[path = "services/group.rs"]
 mod group;
 #[path = "services/identity.rs"]
@@ -64,6 +66,7 @@ pub struct RetainedCertificates {
     permission: Option<PermissionSetting>,
     business_names: Vec<Vec<String>>,
     on_demand_names: Vec<Vec<String>>,
+    capacity_displaced: std::collections::HashSet<Vec<String>>,
 }
 #[derive(Clone)]
 struct RetainedMaterial {
@@ -116,7 +119,26 @@ struct Group {
 #[derive(Clone)]
 struct ResidencyBinding {
     slot: Arc<CertificateResidency>,
-    shared: bool,
+    source: Option<Arc<CertificateResidency>>,
+}
+impl ResidencyBinding {
+    fn local() -> Self {
+        Self {
+            slot: Arc::new(CertificateResidency::default()),
+            source: None,
+        }
+    }
+    fn shared(source: &Arc<CertificateResidency>) -> Self {
+        Self {
+            slot: Arc::new(source.projection()),
+            source: Some(source.clone()),
+        }
+    }
+    fn projects(&self, source: &Arc<CertificateResidency>) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(|actual| Arc::ptr_eq(actual, source))
+    }
 }
 struct State {
     material: Vec<RetainedMaterial>,
@@ -139,6 +161,7 @@ pub struct CertificateServices {
     identity_ready: OnceCell<()>,
     prepared: OnceCell<()>,
     ensure_gate: AsyncMutex<()>,
+    staged_publication: AsyncMutex<()>,
     state: AsyncMutex<State>,
     tasks: TaskTracker,
     admission: Mutex<()>,
@@ -208,6 +231,7 @@ impl CertificateServices {
             identity_ready: OnceCell::new(),
             prepared: OnceCell::new(),
             ensure_gate: AsyncMutex::new(()),
+            staged_publication: AsyncMutex::new(()),
             state: AsyncMutex::new(State {
                 material: Vec::new(),
                 groups: HashMap::new(),
@@ -224,7 +248,9 @@ impl CertificateServices {
             maintenance_changed: tokio::sync::Notify::new(),
             on_demand: Arc::new(on_demand::OnDemand::new(cache_receiver)),
             permission: OnceCell::new(),
-            group_slots: Arc::new(tokio::sync::Semaphore::new(4096)),
+            // Inventory capacity and the admission headroom needed to replace
+            // a resident certificate are distinct from running job limits.
+            group_slots: Arc::new(tokio::sync::Semaphore::new(capacity::GROUP_LIMIT)),
             cache_epoch: OnceCell::new(),
             effective_tls: AtomicBool::new(true),
         });
@@ -364,6 +390,7 @@ impl CertificateServices {
                 .filter(|names| self.policy(&names[0]).on_demand)
                 .cloned()
                 .collect(),
+            capacity_displaced: self.on_demand.displaced_groups()?,
         })
     }
 
@@ -419,7 +446,10 @@ impl CertificateServices {
     async fn prepare_inner(&self, cancel: CancellationToken) -> Result<()> {
         self.prepare_permission(cancel.clone()).await?;
         if let Some(retained) = &self.restore {
+            self.on_demand
+                .set_configured_groups(&retained.business_names, &retained.capacity_displaced)?;
             let mut manual = Vec::new();
+            let mut managed = Vec::new();
             for item in &retained.material {
                 ensure!(!cancel.is_cancelled(), "certificate preparation cancelled");
                 item.material.validate_at(now()?, false)?;
@@ -435,12 +465,14 @@ impl CertificateServices {
                         )
                         .await?;
                     } else {
-                        self.publish_restored_resident(item.clone(), cancel.clone())
-                            .await?;
+                        managed.push(item.clone());
                     }
                 }
             }
             self.install_manual(&manual, cancel.clone()).await?;
+            for item in managed {
+                self.publish_restored_resident(item, cancel.clone()).await?;
+            }
             self.state.lock().await.material = retained.material.clone();
             if let Some(identity) = &self.plan.identity {
                 let names = identity
@@ -537,10 +569,7 @@ impl CertificateServices {
         super::loaders::blocking(
             self.context.resources.cpu.clone(),
             cancel.clone(),
-            move || {
-                state.install_manual(&materials);
-                Ok(())
-            },
+            move || state.install_manual(&materials),
         )
         .await?;
         self.manual_inventory.store(Arc::new(ManualCertificates {
@@ -629,11 +658,25 @@ impl CertificateServices {
                 .into_iter()
                 .flatten()
                 .collect::<Vec<_>>();
-            let results = stream::iter(groups)
-                .map(|group| self.probe_group(group, cancel.clone()))
-                .buffer_unordered(10)
-                .collect::<Vec<_>>()
-                .await;
+            let results =
+                stream::iter(groups)
+                    .map(|group| {
+                        let cancel = cancel.clone();
+                        async move {
+                            let result = self.probe_group(group.clone(), cancel).await;
+                            if result.as_ref().is_err_and(|error| {
+                                error.is::<super::resident_cache::CacheChanged>()
+                            }) && group.residency.lock().is_ok_and(|binding| {
+                                binding.as_ref().is_some_and(|binding| !binding.slot.live())
+                            }) {
+                                return Ok(());
+                            }
+                            result
+                        }
+                    })
+                    .buffer_unordered(10)
+                    .collect::<Vec<_>>()
+                    .await;
             for result in results {
                 result?;
             }
@@ -644,8 +687,13 @@ impl CertificateServices {
         Ok(())
     }
     fn preflight(&self, names: Vec<Vec<String>>) -> Result<Vec<Vec<String>>> {
-        ensure!(names.len() <= 4096, "certificate group capacity exceeded");
+        ensure!(
+            names.len() <= crate::tls_resolver::MAX_CERTIFICATES,
+            "certificate group capacity exceeded"
+        );
         let mut result = Vec::new();
+        let mut groups = std::collections::HashSet::new();
+        let mut aliases = std::collections::HashSet::new();
         for group in names {
             let normalized = cert_automation::normalize_names(&group)?;
             let first = self.policy_index(&normalized[0]);
@@ -655,14 +703,11 @@ impl CertificateServices {
                     .all(|name| self.policy_index(name) == first),
                 "SAN group crosses automation policies"
             );
-            ensure!(
-                result
-                    .iter()
-                    .all(|existing: &Vec<String>| existing == &normalized
-                        || existing.iter().all(|name| !normalized.contains(name))),
-                "overlapping SAN groups require explicit separate aliases"
-            );
-            if !result.contains(&normalized) {
+            if groups.insert(normalized.clone()) {
+                ensure!(
+                    normalized.iter().all(|name| aliases.insert(name.clone())),
+                    "overlapping SAN groups require explicit separate aliases"
+                );
                 result.push(normalized);
             }
         }
@@ -692,11 +737,11 @@ impl CertificateServices {
                 // The opaque, digest-bound snapshot records which subjects
                 // really were registered under its old on-demand policy.
                 if !identity
-                    && self.policy(&names[0]).on_demand
-                    && self
-                        .restore
-                        .as_ref()
-                        .is_some_and(|retained| retained.on_demand_names.contains(names))
+                    && self.restore.as_ref().is_some_and(|retained| {
+                        retained.capacity_displaced.contains(names)
+                            || (self.policy(&names[0]).on_demand
+                                && retained.on_demand_names.contains(names))
+                    })
                 {
                     continue;
                 }

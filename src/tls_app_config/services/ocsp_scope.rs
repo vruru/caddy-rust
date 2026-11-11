@@ -44,19 +44,19 @@ impl OcspScope {
         let mut receiver = self.0.manager.subscribe();
         let resources = service.context.resources.clone();
         let cancel = self.0.cancel.clone();
-        self.0.tasks.spawn(async move {loop {tokio::select! {biased;
+        self.0.tasks.spawn(service.tasks.track_future(async move {loop {tokio::select! {biased;
             _=cancel.cancelled()=>break,
             event=receiver.recv()=>match event {
                 Ok(event)=>if event.status.is_some_and(|status|status.state==OcspState::Revoked){resources.revoked.notify_waiters();},
                 Err(broadcast::error::RecvError::Lagged(_))=>resources.revoked.notify_waiters(),
                 Err(broadcast::error::RecvError::Closed)=>break,
             }
-        }}});
+        }}}));
         let manager = self.0.manager.clone();
         let cancel = self.0.cancel.clone();
         let events = service.events.clone();
         let names = self.0.names.clone();
-        self.0.tasks.spawn(async move {
+        self.0.tasks.spawn(service.tasks.track_future(async move {
             let result = std::panic::AssertUnwindSafe(manager.run(cancel.clone()))
                 .catch_unwind()
                 .await;
@@ -67,12 +67,8 @@ impl OcspScope {
                     names,
                 });
             }
-        });
+        }));
         self.0.tasks.close();
-        let tasks = self.0.tasks.clone();
-        service.tasks.spawn(async move {
-            tasks.wait().await;
-        });
         Ok(())
     }
     pub(super) async fn stop(&self) -> Result<()> {

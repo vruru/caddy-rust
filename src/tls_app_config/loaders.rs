@@ -30,7 +30,9 @@ impl MaterialBudget {
             .ok_or_else(|| anyhow!("configured certificate size overflow"))?;
         self.count
             .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                count.checked_add(1).filter(|next| *next <= 4096)
+                count
+                    .checked_add(1)
+                    .filter(|next| *next <= crate::tls_resolver::MAX_CERTIFICATES)
             })
             .map_err(|_| anyhow!("configured certificate capacity exceeded"))?;
         self.bytes
@@ -82,15 +84,24 @@ pub(super) async fn blocking<T: Send + 'static>(
     cancel: CancellationToken,
     operation: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    crate::cert_cpu::run(slots,cancel,operation).await
+    crate::cert_cpu::run(slots, cancel, operation).await
 }
 
-async fn loading<T: Send + 'static>(io: Arc<Semaphore>, cpu: Arc<Semaphore>, cancel: CancellationToken, operation: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+async fn loading<T: Send + 'static>(
+    io: Arc<Semaphore>,
+    cpu: Arc<Semaphore>,
+    cancel: CancellationToken,
+    operation: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
     let permit = tokio::select! { biased;
         _ = cancel.cancelled() => return Err(anyhow!("certificate loading cancelled")),
         permit = cpu.acquire_owned() => permit.map_err(|_| anyhow!("certificate CPU operations stopped"))?,
     };
-    blocking(io,cancel,move || { let _permit=permit; operation() }).await
+    blocking(io, cancel, move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
 }
 
 pub(super) async fn load_manual(
@@ -313,7 +324,7 @@ fn collect(
             .is_some_and(|extension| extension.eq_ignore_ascii_case("pem"))
         {
             ensure!(
-                output.len() < 4096,
+                output.len() < crate::tls_resolver::MAX_CERTIFICATES,
                 "configured certificate folder capacity exceeded"
             );
             output.push(entry.path());

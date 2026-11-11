@@ -231,6 +231,14 @@ impl ResidentCache {
     /// Runs only after the resolver has validated its candidate snapshot.
     /// No I/O or acquisition of a resolver lock is permitted here.
     pub(super) fn commit(&self, plan: Publication) -> Result<()> {
+        self.commit_replacing(plan, None)
+    }
+
+    pub(super) fn commit_replacing(
+        &self,
+        plan: Publication,
+        victim: Option<(&[String], &Arc<CertificateResidency>)>,
+    ) -> Result<()> {
         let mut st = self
             .state
             .lock()
@@ -251,11 +259,27 @@ impl ResidentCache {
             .and_then(|size| size.checked_add(bytes(&plan.entry)))
             .ok_or_else(|| anyhow::anyhow!("resident cache accounting failed"))?;
         let mut victims = Vec::new();
+        if let Some((names, source)) = victim
+            && names != key
+            && let Some(entry) = st.entries.get(names)
+            && Arc::ptr_eq(&entry.slot, source)
+        {
+            count -= 1;
+            size = size
+                .checked_sub(bytes(entry))
+                .ok_or_else(|| anyhow::anyhow!("resident cache accounting failed"))?;
+            victims.push(entry.clone());
+        }
         if count > plan.capacity || size > BYTE_CAPACITY {
             let (mut ineligible, mut eligible): (Vec<_>, Vec<_>) = st
                 .entries
                 .iter()
-                .filter(|(names, _)| *names != key)
+                .filter(|(names, entry)| {
+                    *names != key
+                        && victims
+                            .first()
+                            .is_none_or(|victim| !Arc::ptr_eq(victim, entry))
+                })
                 .map(|(_, entry)| entry)
                 .partition(|entry| !is_eligible(&plan.epoch, entry));
             while count > plan.capacity || size > BYTE_CAPACITY {
@@ -297,7 +321,18 @@ impl ResidentCache {
     }
 
     pub(super) fn valid_import(&self, epoch: &Arc<Epoch>, entry: &Arc<CacheEntry>) -> Result<()> {
-        let st = self
+        self.commit_import(epoch, entry, None)
+    }
+
+    /// Verify the exact imported source. Only the actual active epoch may
+    /// retire an exact shared victim; a candidate changes its own projection.
+    pub(super) fn commit_import(
+        &self,
+        epoch: &Arc<Epoch>,
+        entry: &Arc<CacheEntry>,
+        victim: Option<(&[String], &Arc<CertificateResidency>)>,
+    ) -> Result<()> {
+        let mut st = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("resident cache state unavailable"))?;
@@ -309,6 +344,38 @@ impl ResidentCache {
                 .is_some_and(|actual| Arc::ptr_eq(actual, entry))
         {
             return Err(CacheChanged.into());
+        }
+        let removed = if Arc::ptr_eq(&st.active, epoch) {
+            remove_projection_source(&mut st, victim)?
+        } else {
+            None
+        };
+        drop(st);
+        if let Some(id) = removed {
+            let _ = self.events.send(id);
+        }
+        Ok(())
+    }
+
+    pub(super) fn retire_projection(
+        &self,
+        epoch: &Arc<Epoch>,
+        victim: Option<(&[String], &Arc<CertificateResidency>)>,
+    ) -> Result<()> {
+        if victim.is_none() {
+            return Ok(());
+        }
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resident cache state unavailable"))?;
+        if !Arc::ptr_eq(&st.active, epoch) {
+            return Ok(());
+        }
+        let removed = remove_projection_source(&mut st, victim)?;
+        drop(st);
+        if let Some(id) = removed {
+            let _ = self.events.send(id);
         }
         Ok(())
     }
@@ -417,6 +484,31 @@ impl ResidentCache {
         }
         Ok(())
     }
+}
+
+fn remove_projection_source(
+    state: &mut State,
+    victim: Option<(&[String], &Arc<CertificateResidency>)>,
+) -> Result<Option<u64>> {
+    let Some((names, source)) = victim else {
+        return Ok(None);
+    };
+    let Some(entry) = state
+        .entries
+        .get(names)
+        .filter(|entry| Arc::ptr_eq(&entry.slot, source))
+    else {
+        return Ok(None);
+    };
+    let remaining = state
+        .bytes
+        .checked_sub(bytes(entry))
+        .ok_or_else(|| anyhow::anyhow!("resident cache accounting failed"))?;
+    let id = entry.id;
+    entry.slot.retire();
+    state.bytes = remaining;
+    state.entries.remove(names);
+    Ok(Some(id))
 }
 
 /// Uniform selection with bounded rejection, using the already configured OS

@@ -2,8 +2,9 @@
 //! CPU budgets, so queued handshakes cannot consume a permit needed by proofs.
 use super::*;
 use crate::http_runtime::ScopedCertificateProvider;
+use crate::tls_resolver::{CertificatePublicationConflict, CertificateResidencyRetired};
 use futures_util::{FutureExt, future::BoxFuture};
-use std::sync::{Weak, atomic::AtomicUsize};
+use std::sync::{RwLock, Weak, atomic::AtomicUsize};
 
 type Outcome = std::result::Result<(), Arc<str>>;
 #[derive(Clone, Copy)]
@@ -53,14 +54,14 @@ pub(super) struct OnDemand {
     pub(super) active: AtomicBool,
     pending: Mutex<HashMap<[u8; 32], PendingRestore>>,
     pending_changed: tokio::sync::Notify,
-    resident: arc_swap::ArcSwap<HashMap<String, Vec<Arc<Resident>>>>,
+    resident: RwLock<HashMap<String, Vec<Arc<Resident>>>>,
     manual: arc_swap::ArcSwap<HashMap<String, Vec<Arc<Material>>>>,
     flights: Mutex<HashMap<String, Arc<Flight>>>,
     flight_slots: Arc<tokio::sync::Semaphore>,
     waiters: Arc<tokio::sync::Semaphore>,
     cleanup_changed: tokio::sync::Notify,
     cache_receiver: AsyncMutex<Option<broadcast::Receiver<u64>>>,
-    local_slots: Mutex<HashMap<Vec<String>, Arc<CertificateResidency>>>,
+    capacity: super::capacity::Ledger,
     attach_changed: tokio::sync::Notify,
 }
 impl OnDemand {
@@ -71,9 +72,9 @@ impl OnDemand {
             pending_changed: tokio::sync::Notify::new(),
             cleanup_changed: tokio::sync::Notify::new(),
             cache_receiver: AsyncMutex::new(Some(receiver)),
-            local_slots: Mutex::new(HashMap::new()),
+            capacity: super::capacity::Ledger::default(),
             attach_changed: tokio::sync::Notify::new(),
-            resident: arc_swap::ArcSwap::from_pointee(HashMap::new()),
+            resident: RwLock::new(HashMap::new()),
             manual: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             flights: Mutex::new(HashMap::new()),
             flight_slots: Arc::new(tokio::sync::Semaphore::new(256)),
@@ -88,7 +89,7 @@ impl OnDemand {
         name: &str,
         predicate: impl Fn(&Resident) -> bool,
     ) -> Option<Arc<Resident>> {
-        let entries = self.resident.load();
+        let entries = self.resident.read().ok()?;
         let select = |name: &str| {
             entries.get(name).and_then(|residents| {
                 residents
@@ -104,40 +105,42 @@ impl OnDemand {
         })
     }
     fn index(&self, resident: &Arc<Resident>) {
-        self.resident.rcu(|previous| {
-            let mut next = previous.as_ref().clone();
-            for name in &resident.material.names {
-                let candidates = next.entry(name.clone()).or_default();
-                candidates
-                    .retain(|prior| !Arc::ptr_eq(&prior.binding.slot, &resident.binding.slot));
-                candidates.push(resident.clone());
-            }
-            Arc::new(next)
-        });
+        // All aliases become visible together; no certificate parsing, IO,
+        // callbacks or resolver acquisition under the small index lock.
+        let mut entries = self
+            .resident
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        for name in &resident.material.names {
+            let candidates = entries.entry(name.clone()).or_default();
+            candidates.retain(|prior| !Arc::ptr_eq(&prior.binding.slot, &resident.binding.slot));
+            candidates.push(resident.clone());
+        }
     }
     fn unindex(&self, resident: &Arc<Resident>) {
-        self.resident.rcu(|previous| {
-            let mut next = previous.as_ref().clone();
-            for name in &resident.material.names {
-                if let Some(candidates) = next.get_mut(name) {
-                    candidates.retain(|current| !Arc::ptr_eq(current, resident));
-                    if candidates.is_empty() {
-                        next.remove(name);
-                    }
+        let mut entries = self
+            .resident
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        for name in &resident.material.names {
+            if let Some(candidates) = entries.get_mut(name) {
+                candidates.retain(|current| !Arc::ptr_eq(current, resident));
+                if candidates.is_empty() {
+                    entries.remove(name);
                 }
             }
-            Arc::new(next)
-        });
+        }
     }
     fn indexed(&self, resident: &Arc<Resident>) -> bool {
-        self.resident
-            .load()
-            .get(&resident.material.names[0])
-            .is_some_and(|candidates| {
-                candidates
-                    .iter()
-                    .any(|current| Arc::ptr_eq(current, resident))
-            })
+        self.resident.read().is_ok_and(|entries| {
+            entries
+                .get(&resident.material.names[0])
+                .is_some_and(|candidates| {
+                    candidates
+                        .iter()
+                        .any(|current| Arc::ptr_eq(current, resident))
+                })
+        })
     }
     fn manual(&self, name: &str, at: i64) -> bool {
         let entries = self.manual.load();
@@ -154,11 +157,13 @@ impl OnDemand {
                 .is_some_and(|(_, rest)| valid(entries.get(&format!("*.{rest}"))))
     }
     pub(super) fn references_group(&self, group: &Arc<Group>) -> bool {
-        self.resident.load().values().flatten().any(|resident| {
-            resident
-                .group
-                .get()
-                .is_some_and(|actual| Arc::ptr_eq(actual, group))
+        self.resident.read().is_ok_and(|entries| {
+            entries.values().flatten().any(|resident| {
+                resident
+                    .group
+                    .get()
+                    .is_some_and(|actual| Arc::ptr_eq(actual, group))
+            })
         })
     }
     pub(super) fn bound_material(
@@ -178,60 +183,18 @@ impl OnDemand {
                 .resident_if(name, |resident| resident.usable(at))
                 .is_some()
     }
-    fn admit_local(
-        &self,
-        names: &[String],
-        slot: &Arc<CertificateResidency>,
-        capacity: usize,
-    ) -> Result<()> {
-        let mut slots = self
-            .local_slots
-            .lock()
-            .map_err(|_| anyhow!("local certificate cache unavailable"))?;
-        ensure!(
-            slot.live() && capacity > 0,
-            "invalid local certificate admission"
-        );
-        slots.retain(|_, old| old.live());
-        if let Some(previous) = slots.get(names) {
-            ensure!(
-                Arc::ptr_eq(previous, slot),
-                "local certificate cache slot changed"
-            );
-            return Ok(());
-        }
-        if slots.len() >= capacity {
-            let mut keys = slots.keys().cloned().collect::<Vec<_>>();
-            let at = super::super::resident_cache::random_index(keys.len())?;
-            if let Some(victim) = slots.remove(&keys.swap_remove(at)) {
-                victim.retire();
-            }
-        }
-        slots.insert(names.to_vec(), slot.clone());
-        self.cleanup_changed.notify_one();
-        Ok(())
-    }
     fn almost_full(&self, capacity: usize) -> bool {
-        let target = capacity.saturating_sub(1);
-        if target == 0 {
-            return true;
-        }
-        let entries = self.resident.load();
-        let managed = entries
-            .values()
-            .flatten()
-            .filter(|entry| entry.binding.slot.live())
-            .map(|entry| Arc::as_ptr(entry) as usize)
-            .collect::<std::collections::HashSet<_>>()
-            .len();
-        let manual = self.manual.load();
-        let manual = manual
-            .values()
-            .flatten()
-            .map(|material| Arc::as_ptr(material) as usize)
-            .collect::<std::collections::HashSet<_>>()
-            .len();
-        managed.saturating_add(manual) >= target
+        self.capacity.almost_full(capacity)
+    }
+    pub(super) fn set_configured_groups(
+        &self,
+        groups: &[Vec<String>],
+        retained: &std::collections::HashSet<Vec<String>>,
+    ) -> Result<()> {
+        self.capacity.set_configured(groups, retained)
+    }
+    pub(super) fn displaced_groups(&self) -> Result<std::collections::HashSet<Vec<String>>> {
+        self.capacity.displaced()
     }
     pub(super) fn imported_binding(
         &self,
@@ -254,7 +217,7 @@ impl OnDemand {
             resident.binding.clone(),
         ))
     }
-    pub(super) fn install_manual(&self, material: &[Arc<Material>]) {
+    pub(super) fn install_manual(&self, material: &[Arc<Material>]) -> Result<()> {
         let mut entries: HashMap<String, Vec<Arc<Material>>> = HashMap::new();
         for material in material {
             for name in &material.names {
@@ -264,7 +227,13 @@ impl OnDemand {
                     .push(material.clone());
             }
         }
+        let identities = material
+            .iter()
+            .map(|item| item.identity)
+            .collect::<std::collections::HashSet<_>>();
+        self.capacity.set_manual(identities.len())?;
         self.manual.store(Arc::new(entries));
+        Ok(())
     }
     fn restore_resident(
         &self,
@@ -378,7 +347,7 @@ impl CertificateServices {
         let guard = self.context.leaf_guard.clone();
         let state = self.on_demand.clone();
         let publication_cancel = cancel.clone();
-        let capacity = self.plan.cache_capacity.min(4096);
+        let capacity = self.plan.cache_capacity;
         super::super::loaders::blocking(self.context.resources.cpu.clone(), cancel, move || {
             let material = retained.material;
             material.validate_at(now()?, false)?;
@@ -388,7 +357,7 @@ impl CertificateServices {
                 "retained certificate is revoked"
             );
             let scope = CertificateScope::new();
-            let slot = Arc::new(CertificateResidency::default());
+            let binding = ResidencyBinding::local();
             let receipt = resolver.upsert_resident(
                 &CertificateInput {
                     names: &material.names,
@@ -396,16 +365,21 @@ impl CertificateServices {
                     private_key_pem: &material.key,
                 },
                 &scope,
-                &slot,
+                &binding.slot,
                 &publication_cancel,
-                || state.admit_local(&material.names, &slot, capacity),
+                || {
+                    if state
+                        .capacity
+                        .admit(&material.names, &binding, capacity, |_| Ok(()))?
+                    {
+                        state.cleanup_changed.notify_one();
+                    }
+                    Ok(())
+                },
             )?;
             state.restore_resident(
                 material,
-                ResidencyBinding {
-                    slot,
-                    shared: false,
-                },
+                binding,
                 leaf,
                 scope,
                 receipt,
@@ -434,6 +408,10 @@ impl CertificateServices {
     ) -> Result<()> {
         self.cache_epoch
             .get_or_try_init(|| async {
+                if self.restore.is_none() {
+                    self.on_demand
+                        .set_configured_groups(names, &Default::default())?;
+                }
                 let registered = names
                     .iter()
                     .flat_map(|names| names.iter())
@@ -522,6 +500,7 @@ impl CertificateServices {
         let retain = material.clone();
         let pending_entry = entry.clone();
         let publication_cancel = cancel.clone();
+        let capacity = self.plan.cache_capacity;
         let imported = super::super::loaders::blocking(
             self.context.resources.cpu.clone(),
             cancel.clone(),
@@ -548,6 +527,15 @@ impl CertificateServices {
                     Validity::Current => {}
                 }
                 let scope = CertificateScope::new();
+                let binding = state
+                    .resident_if(&material.names[0], |resident| {
+                        resident.material.names == material.names
+                            && resident.binding.projects(&entry.slot)
+                    })
+                    .map_or_else(
+                        || ResidencyBinding::shared(&entry.slot),
+                        |resident| resident.binding.clone(),
+                    );
                 let receipt = match resolver.upsert_resident(
                     &CertificateInput {
                         names: &material.names,
@@ -555,14 +543,24 @@ impl CertificateServices {
                         private_key_pem: &material.key,
                     },
                     &scope,
-                    &entry.slot,
+                    &binding.slot,
                     &publication_cancel,
-                    || cache.valid_import(&epoch, &entry),
+                    || {
+                        if state
+                            .capacity
+                            .admit(&material.names, &binding, capacity, |victim| {
+                                cache.commit_import(&epoch, &entry, shared_victim(victim))
+                            })?
+                        {
+                            state.cleanup_changed.notify_one();
+                        }
+                        Ok(())
+                    },
                 ) {
                     Ok(receipt) => receipt,
                     Err(error)
                         if error.is::<super::super::resident_cache::CacheChanged>()
-                            || !entry.slot.live() =>
+                            || publication_displaced(&error, &binding.slot) =>
                     {
                         return Ok(SharedImport::Superseded);
                     }
@@ -570,10 +568,7 @@ impl CertificateServices {
                 };
                 let resident = Arc::new(Resident {
                     material: material.clone(),
-                    binding: ResidencyBinding {
-                        slot: entry.slot.clone(),
-                        shared: true,
-                    },
+                    binding: binding.clone(),
                     leaf,
                     group: std::sync::OnceLock::new(),
                     receipt,
@@ -584,7 +579,7 @@ impl CertificateServices {
                     next_check: AtomicI64::new(entry.renew_at.min(entry.ari_after)),
                 });
                 state.index(&resident);
-                if !entry.slot.live() {
+                if !binding.slot.live() {
                     // The retirement event can arrive before the resident
                     // index sees this import; make the recheck explicit.
                     state.cleanup_changed.notify_one();
@@ -629,7 +624,8 @@ impl CertificateServices {
                         .lock()
                         .map_err(|_| anyhow!("certificate pending restoration unavailable"))?;
                     ensure!(
-                        queue.len() < 4096 || queue.contains_key(&retain.identity),
+                        queue.len() < crate::tls_resolver::MAX_CERTIFICATES
+                            || queue.contains_key(&retain.identity),
                         "certificate pending restoration capacity exceeded"
                     );
                     queue.insert(
@@ -670,7 +666,11 @@ impl CertificateServices {
             tokio::pin!(changed);
             changed.as_mut().enable();
             {
-                let entries = self.on_demand.resident.load();
+                let entries = self
+                    .on_demand
+                    .resident
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner());
                 for resident in entries.values().flatten() {
                     if jobs.len() >= 8 {
                         break;
@@ -714,13 +714,17 @@ impl CertificateServices {
             tokio::pin!(changed);
             changed.as_mut().enable();
             let pending = {
-                let entries = self.on_demand.resident.load();
+                let entries = self
+                    .on_demand
+                    .resident
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner());
                 let mut seen = std::collections::HashSet::new();
                 entries
                     .values()
                     .flatten()
                     .filter(|resident| {
-                        resident.binding.shared
+                        resident.binding.source.is_some()
                             && resident.binding.slot.live()
                             && resident.group.get().is_none()
                             && seen.insert(Arc::as_ptr(resident) as usize)
@@ -1228,9 +1232,7 @@ impl CertificateServices {
         if !policy.on_demand {
             ensure!(
                 matches!(action, Action::Miss)
-                    && self
-                        .on_demand
-                        .almost_full(self.plan.cache_capacity.min(4096)),
+                    && self.on_demand.almost_full(self.plan.cache_capacity),
                 "certificate is not resident and on-demand acquisition is not enabled"
             );
             let bound = self
@@ -1419,8 +1421,11 @@ impl CertificateServices {
                     } else {
                         false
                     };
-                if removed && !evicted.binding.shared {
+                if removed {
                     evicted.binding.slot.retire();
+                    state
+                        .capacity
+                        .remove(&evicted.material.names, &evicted.binding.slot);
                 }
                 // The old exact receipt is now absent even if another scope
                 // already replaced it. Retire only this local index entry; a
@@ -1551,6 +1556,9 @@ impl CertificateServices {
         })
         .await?;
         self.on_demand.unindex(&resident);
+        self.on_demand
+            .capacity
+            .remove(&resident.material.names, &resident.binding.slot);
         Ok(())
     }
     pub(super) async fn publish_group(
@@ -1565,22 +1573,34 @@ impl CertificateServices {
         if let Some(lease) = lease {
             lease.check().await?;
         }
+        // Candidate groups perform storage and crypto work in parallel. The
+        // eventual snapshot write is one per resolver; avoiding speculative
+        // duplicate whole-inventory copies here keeps large cold loads bounded.
+        let _candidate_write = if self.on_demand.active.load(Ordering::Acquire) {
+            None
+        } else {
+            Some(tokio::select! {biased;
+                _=cancel.cancelled()=>return Err(anyhow!("candidate certificate publication cancelled")),
+                lock=self.staged_publication.lock()=>lock,
+            })
+        };
         let lost = lease.map(crate::certstore::StorageLease::lost);
         let mut last = None;
         for attempt in 0..4 {
-            let group = group.clone();
+            let work_group = group.clone();
             let material = material.clone();
             let lost = lost.clone();
             let state = self.on_demand.clone();
             let cache = self.context.resources.resident_cache.clone();
             let epoch = self.cache_epoch.get().cloned();
-            let capacity = self.plan.cache_capacity.min(4096);
+            let capacity = self.plan.cache_capacity;
             let leaf_guard = self.context.leaf_guard.clone();
             let publication_cancel = cancel.clone();
             let result = crate::cert_cpu::run_committed(
                 self.context.resources.cpu.clone(),
                 cancel.clone(),
                 move || {
+                    let group = work_group;
                     material.validate_at(now()?, false)?;
                     let leaf = leaf_guard.intern(material.leaf_id, material.times()?.1)?;
                     ensure!(
@@ -1613,10 +1633,12 @@ impl CertificateServices {
                         .clone();
                     ensure!(
                         previous.as_ref().is_none_or(|binding| binding.slot.live()),
-                        "certificate cache slot retired"
+                        super::super::resident_cache::CacheChanged
                     );
                     let plan = if let Some(epoch) = &epoch
-                        && previous.as_ref().is_none_or(|binding| binding.shared)
+                        && previous
+                            .as_ref()
+                            .is_none_or(|binding| binding.source.is_some())
                     {
                         cache.plan(
                             epoch,
@@ -1626,8 +1648,10 @@ impl CertificateServices {
                                 renew_at,
                                 ari_after,
                             },
-                            capacity,
-                            previous.as_ref().map(|binding| &binding.slot),
+                            crate::tls_resolver::MAX_CERTIFICATES,
+                            previous
+                                .as_ref()
+                                .and_then(|binding| binding.source.as_ref()),
                         )?
                     } else {
                         None
@@ -1635,30 +1659,54 @@ impl CertificateServices {
                     let cached = plan.as_ref().map(|plan| plan.entry.clone());
                     let binding = cached
                         .as_ref()
-                        .map(|entry| ResidencyBinding {
-                            slot: entry.slot.clone(),
-                            shared: true,
+                        .map(|entry| {
+                            previous
+                                .as_ref()
+                                .filter(|binding| binding.projects(&entry.slot))
+                                .cloned()
+                                .unwrap_or_else(|| ResidencyBinding::shared(&entry.slot))
                         })
                         .or(previous)
-                        .unwrap_or_else(|| ResidencyBinding {
-                            slot: Arc::new(CertificateResidency::default()),
-                            shared: false,
-                        });
-                    let receipt = group.resolver.upsert_resident(
-                        &input,
-                        &group.scope,
-                        &binding.slot,
-                        &publication_cancel,
-                        || {
-                            ensure!(active(), "certificate acquisition cancelled");
-                            if let Some(plan) = plan {
-                                cache.commit(plan)?;
-                            } else if !binding.shared {
-                                state.admit_local(&material.names, &binding.slot, capacity)?;
+                        .unwrap_or_else(ResidencyBinding::local);
+                    let receipt = group
+                        .resolver
+                        .upsert_resident(
+                            &input,
+                            &group.scope,
+                            &binding.slot,
+                            &publication_cancel,
+                            || {
+                                ensure!(active(), "certificate acquisition cancelled");
+                                if state.capacity.admit(
+                                    &material.names,
+                                    &binding,
+                                    capacity,
+                                    |victim| {
+                                        let victim = shared_victim(victim);
+                                        if let Some(plan) = plan {
+                                            if victim.is_some() {
+                                                cache.commit_replacing(plan, victim)?;
+                                            } else {
+                                                cache.commit(plan)?;
+                                            }
+                                        } else if let Some(epoch) = &epoch {
+                                            cache.retire_projection(epoch, victim)?;
+                                        }
+                                        Ok(())
+                                    },
+                                )? {
+                                    state.cleanup_changed.notify_one();
+                                }
+                                Ok(())
+                            },
+                        )
+                        .map_err(|error| {
+                            if active() && publication_displaced(&error, &binding.slot) {
+                                super::super::resident_cache::CacheChanged.into()
+                            } else {
+                                error
                             }
-                            Ok(())
-                        },
-                    )?;
+                        })?;
                     *group
                         .residency
                         .lock()
@@ -1687,7 +1735,17 @@ impl CertificateServices {
             .await;
             match result {
                 Err(error)
-                    if error.is::<crate::tls_resolver::CertificatePublicationConflict>()
+                    if error.is::<super::super::resident_cache::CacheChanged>()
+                        && group.residency.lock().is_ok_and(|binding| {
+                            binding.as_ref().is_some_and(|binding| !binding.slot.live())
+                        }) =>
+                {
+                    // A retired projection cannot win a retry. Preserve the
+                    // typed displacement for precommit/maintenance callers.
+                    return Err(error);
+                }
+                Err(error)
+                    if error.is::<CertificatePublicationConflict>()
                         || error.is::<super::super::resident_cache::CacheChanged>() =>
                 {
                     last = Some(error);
@@ -1703,6 +1761,16 @@ impl CertificateServices {
         }
         Err(last.unwrap_or_else(|| anyhow!("certificate publication retry budget exhausted")))
     }
+}
+fn publication_displaced(error: &anyhow::Error, slot: &CertificateResidency) -> bool {
+    !slot.live()
+        && (error.is::<CertificateResidencyRetired>()
+            || error.is::<CertificatePublicationConflict>())
+}
+fn shared_victim<'a>(
+    victim: Option<(&'a [String], &'a ResidencyBinding)>,
+) -> Option<(&'a [String], &'a Arc<CertificateResidency>)> {
+    victim.and_then(|(names, binding)| binding.source.as_ref().map(|source| (names, source)))
 }
 fn next_check(group: &Group, at: i64) -> i64 {
     group
