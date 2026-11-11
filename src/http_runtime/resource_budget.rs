@@ -201,6 +201,7 @@ pub struct ResourceDiagnostics {
     pub file_streams: BudgetSnapshot,
     pub file_reads: BudgetSnapshot,
     pub compression: super::CompressionDiagnostics,
+    pub proxy_selection: BudgetSnapshot,
     pub access_capture_rejected: u64,
     pub access_capture_reduced: u64,
     pub access_response_headers_omitted: u64,
@@ -221,6 +222,8 @@ pub(crate) struct Resources {
     pub(super) access_capture: Arc<super::access_log::CaptureBudget>,
     pub fastcgi: BlockingBudget,
     pub(super) compression: super::encode_body::CompressionBudget,
+    pub(super) proxy_hosts: Arc<super::proxy_policy::HostRegistry>,
+    pub proxy_selection: BlockingBudget,
     pub(super) fastcgi_admission: super::fastcgi::admission::Admission,
     pub fastcgi_dns: BlockingBudget,
     pub fastcgi_spool_io: BlockingBudget,
@@ -298,6 +301,10 @@ impl Resources {
             .auth_running
             .saturating_add(limits.auth_waiting)
             .min(Semaphore::MAX_PERMITS);
+        let established = limits.auth_running + limits.metadata_running + limits.file_read_running;
+        let spare = crate::runtime::BLOCKING_POOL_MAX.saturating_sub(established);
+        let selection_running = cpu.div_ceil(2).clamp(1, 32).min((spare / 2).max(1));
+        let proxy_selection = BlockingBudget::new(selection_running, cpu.saturating_mul(16).clamp(128, 512), Duration::ZERO)?;
         Ok(Self {
             auth,
             metadata,
@@ -313,8 +320,10 @@ impl Resources {
             fastcgi,
             compression: super::encode_body::CompressionBudget::new(
                 cpu,
-                limits.auth_running + limits.metadata_running + limits.file_read_running,
+                established + selection_running,
             )?,
+            proxy_hosts: Arc::new(super::proxy_policy::HostRegistry::default()),
+            proxy_selection,
             fastcgi_admission: super::fastcgi::admission::Admission::new(capacity),
             fastcgi_dns,
             fastcgi_spool_io,
@@ -332,6 +341,7 @@ impl Resources {
         self.reads.tasks.close();
         self.fastcgi.tasks.close();
         self.compression.close();
+        self.proxy_selection.tasks.close();
         self.fastcgi_dns.tasks.close();
         self.fastcgi_spool_io.tasks.close();
         self.fastcgi_admission.diagnostics.close();
@@ -346,6 +356,7 @@ impl Resources {
         self.reads.tasks.wait().await;
         self.fastcgi.tasks.wait().await;
         self.compression.wait().await;
+        self.proxy_selection.tasks.wait().await;
         self.fastcgi_dns.tasks.wait().await;
         self.fastcgi_spool_io.tasks.wait().await;
         self.fastcgi_admission.diagnostics.wait().await;
@@ -368,6 +379,7 @@ impl Resources {
             file_streams: self.streams.snapshot(),
             file_reads: self.reads.snapshot(),
             compression: self.compression.snapshot(),
+            proxy_selection: self.proxy_selection.snapshot(),
         }
     }
 }

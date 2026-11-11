@@ -293,7 +293,7 @@ impl SendStream {
 ///
 /// Returns `Some` if the stream is stopped or the connection is closed.
 /// Returns `None` if the stream is not stopped.
-fn send_stream_stopped(
+pub(crate) fn send_stream_stopped(
     conn: &mut State,
     stream: StreamId,
     is_0rtt: bool,

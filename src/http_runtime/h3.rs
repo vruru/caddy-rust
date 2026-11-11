@@ -544,6 +544,7 @@ async fn serve_connection(
                 let activity=activity.clone();
                 let leaf=leaf.clone();
                 let sni = sni.clone();
+                let quic_for_stream=quic.clone();
                 streams.spawn(async move {
                     let _stream_slot=stream_slot;
                     let Ok(Ok((mut request,wire)))=tokio::time::timeout(server.plan.read_header_timeout,resolver.resolve_request()).await else{return;};
@@ -552,6 +553,13 @@ async fn serve_connection(
                         .is_some_and(|(s,a)|Arc::ptr_eq(&s,&server)&&Arc::ptr_eq(&a,&activity))
                         || !leaf.admission().allow_certificate
                     {return;}
+                    let Ok(id)=quinn::VarInt::from_u64(wire.send_id().into_inner()) else{return;};
+                    let Ok(stopped)=quic_for_stream.observe_send_stopped(quinn::StreamId::from(id)) else{return;};
+                    let stopped=async move {
+                        if let Ok(None)=stopped.await {
+                            std::future::pending::<()>().await;
+                        }
+                    };
                     let head=request.method()==Method::HEAD;
                     let Ok(metadata)=trailer_policy::prepare_request(&mut request) else{return;};
                     request.extensions_mut().insert(metadata);
@@ -564,6 +572,7 @@ async fn serve_connection(
                     };
                     tokio::select! { biased;
                         _=activity.hard_stop.cancelled()=>{},
+                        _=stopped=>{},
                         _=task=>{},
                     };
                 });

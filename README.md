@@ -510,3 +510,16 @@ optional encoding falls back to another representation. Named pipes are
 never opened in blocking mode, and ETag files are limited to 64 KiB. The
 encoding-order and ETag-extension lists are each limited to 64 entries.
 These safety bounds intentionally reject pathological configurations.
+
+Static reverse proxies support the standard selection policies, including
+weighted round robin, least connections and header/query/IP/cookie affinity.
+Active request counts are shared by configured dial across routes and retained
+generations; each endpoint applies its own configured maximum. Streaming
+requests, encoded responses and WebSocket tunnels retain their admission until
+the corresponding work ends. Large selector work has a separate bounded CPU
+lane. Health checks, dynamic upstreams and general retry policies remain separate
+compatibility work.
+
+HTTP/3 observes peer stream cancellation while a route or upstream body is
+pending. Cancelling a request releases its resources without closing sibling
+streams; normal FIN acknowledgement does not cancel application cleanup.

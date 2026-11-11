@@ -245,3 +245,7 @@ Quinn
 
 The quinn 0.11.12 and quinn-proto 0.11.19 source copies retain their
 original Apache-2.0 and MIT license texts.
+
+The vendored Quinn extension provides opt-in, read-only cancellation observation
+for established server request streams. The application enables that extension;
+its original SendStream ownership and transport event handling remain intact.

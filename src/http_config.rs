@@ -1136,6 +1136,7 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
             "flush_interval",
             "stream_close_delay",
             "request_buffers",
+            "load_balancing",
         ],
         path,
     )?;
@@ -1145,7 +1146,7 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
         .ok_or_else(|| anyhow::anyhow!("upstream array required"))?
     {
         let u = object(v, path)?;
-        deny_unknown(u, &["dial"], path)?;
+        deny_unknown(u, &["dial", "max_requests"], path)?;
         let dial = string(required(u, "dial")?, path)?;
         ensure!(
             !dial.contains(['\r', '\n', '\0'])
@@ -1158,12 +1159,23 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
                 "unsupported FastCGI network address"
             );
         }
-        upstreams.push(dial);
+        let max_requests = typed_proxy_int(u.get("max_requests"))?;
+        ensure!(!is_fastcgi || max_requests == 0, "FastCGI upstream capacity not available");
+        upstreams.push(crate::http_runtime::proxy_policy::Upstream { dial, max_requests });
     }
     ensure!(
         !upstreams.is_empty() && upstreams.len() <= 4096,
         "upstream count invalid"
     );
+    let load_balancing = m.get("load_balancing").filter(|v| !v.is_null());
+    ensure!(!is_fastcgi || load_balancing.is_none(), "FastCGI selection policies not available");
+    let selection = if let Some(value) = load_balancing {
+        let lb = object(value, path)?;
+        deny_unknown(lb, &["selection_policy"], path)?;
+        parse_selector(lb.get("selection_policy"), path, upstreams.len(), 0)?
+    } else {
+        crate::http_runtime::proxy_policy::Selection::Random
+    };
     let fastcgi = if is_fastcgi {
         let t = transport.expect("FastCGI protocol requires a transport object");
         deny_unknown(
@@ -1388,6 +1400,7 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
     }
     Ok(ProxyConfig {
         upstreams,
+        selection,
         fastcgi,
         tls,
         http2_only,
@@ -1439,6 +1452,9 @@ fn pending_placeholders_depth(value: &Value, depth: usize) -> Result<()> {
                                     | "http.reverse_proxy.upstream.hostport"
                                     | "http.reverse_proxy.upstream.host"
                                     | "http.reverse_proxy.upstream.port"
+                                    | "http.reverse_proxy.upstream.requests"
+                                    | "http.reverse_proxy.upstream.max_requests"
+                                    | "http.reverse_proxy.upstream.fails"
                             ))
                     {
                         return Err(helpers::unsupported("/placeholder/provider"));
@@ -1564,5 +1580,90 @@ fn parse_file_sidecars(m: &serde_json::Map<String, Value>, path: &str) -> Result
         encodings,
         order,
         etag_suffixes: suffixes.into(),
+    })
+}
+
+fn typed_proxy_int(value: Option<&Value>) -> Result<i64> {
+    match value {
+        None | Some(Value::Null) => Ok(0),
+        Some(value) => value.as_number().and_then(serde_json::Number::as_go_i64)
+            .ok_or_else(|| anyhow::anyhow!("invalid proxy integer")),
+    }
+}
+
+fn parse_selector(
+    value: Option<&Value>, path: &str, upstreams: usize, depth: u8,
+) -> Result<crate::http_runtime::proxy_policy::Selection> {
+    use crate::http_runtime::proxy_policy::Selection;
+    ensure!(depth <= 12, "proxy selection fallback depth exceeded");
+    let Some(value) = value else {
+        return Ok(Selection::Random);
+    };
+    let m = object(value, path)?;
+    let policy = string(required(m, "policy")?, path)?;
+    let child = || parse_selector(m.get("fallback"), path, upstreams, depth + 1).map(Box::new);
+    let optional_string = |field| m.get(field).filter(|v| !v.is_null())
+        .map(|v| string(v, path)).transpose();
+    let allowed: &[&str] = match policy.as_str() {
+        "random" | "first" | "least_conn" | "round_robin" | "ip_hash" | "client_ip_hash" | "uri_hash" => &["policy"],
+        "weighted_round_robin" => &["policy", "weights"],
+        "random_choose" => &["policy", "choose"],
+        "query" => &["policy", "key", "fallback"],
+        "header" => &["policy", "field", "fallback"],
+        "cookie" => &["policy", "name", "secret", "max_age", "fallback"],
+        _ => return Err(unsupported("/reverse_proxy/load_balancing/selection_policy")),
+    };
+    deny_unknown(m, allowed, path)?;
+    Ok(match policy.as_str() {
+        "random" => Selection::Random,
+        "first" => Selection::First,
+        "least_conn" => Selection::Least,
+        "round_robin" => Selection::RoundRobin,
+        "weighted_round_robin" => {
+            let array = required(m, "weights")?.as_array()
+                .ok_or_else(|| anyhow::anyhow!("invalid proxy weights"))?;
+            ensure!(array.len() == 1 || array.len() == upstreams, "proxy weights must match upstream count");
+            let mut weights = Vec::with_capacity(upstreams);
+            let mut sum: i64 = 0;
+            for item in array {
+                let n = typed_proxy_int(Some(item))?;
+                ensure!(n >= 0, "invalid proxy weight");
+                sum = sum.checked_add(n).ok_or_else(|| anyhow::anyhow!("proxy weight sum overflow"))?;
+                weights.push(n as u64);
+            }
+            ensure!(sum > 0, "proxy weights cannot all be zero");
+            // The pinned module supports a single weight with a larger
+            // pool: it chooses the first upstream. Preserve that shape,
+            // while still honoring its capacity and never panicking.
+            weights.resize(upstreams, 0);
+            Selection::Weighted(weights)
+        }
+        "random_choose" => {
+            let n = typed_proxy_int(m.get("choose"))?;
+            let n = if n == 0 { 2 } else { n };
+            ensure!(n >= 2, "proxy random_choose requires at least two choices");
+            Selection::RandomChoose(usize::try_from(n).unwrap_or(usize::MAX))
+        }
+        "ip_hash" => Selection::Ip,
+        "client_ip_hash" => Selection::ClientIp,
+        "uri_hash" => Selection::Uri,
+        "query" => {
+            let key = optional_string("key")?.filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("proxy query key is required"))?;
+            Selection::Query { key, fallback: child()? }
+        }
+        "header" => {
+            let field = optional_string("field")?.filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("proxy hash header field is required"))?;
+            Selection::Header { field, fallback: child()? }
+        }
+        "cookie" => {
+            let name = optional_string("name")?.filter(|s| !s.is_empty()).unwrap_or_else(|| "lb".to_owned());
+            let secret = optional_string("secret")?.unwrap_or_default();
+            let max_age = m.get("max_age").filter(|v| !v.is_null()).map(|v| signed_duration(v, path))
+                .transpose()?.unwrap_or(0);
+            Selection::Cookie { name, secret, max_age_secs: (max_age.max(0) / 1_000_000_000) as u64, fallback: child()? }
+        }
+        _ => unreachable!("policy keys checked before parsing"),
     })
 }

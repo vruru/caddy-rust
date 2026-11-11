@@ -107,7 +107,8 @@ pub(crate) struct Account {
 
 #[derive(Clone)]
 pub(crate) struct ProxyConfig {
-    pub(crate) upstreams: Vec<String>,
+    pub(crate) upstreams: Vec<crate::http_runtime::proxy_policy::Upstream>,
+    pub(crate) selection: crate::http_runtime::proxy_policy::Selection,
     pub(crate) fastcgi: Option<FastCgiConfig>,
     pub(crate) tls: Option<ProxyTls>,
     pub(crate) http2_only: bool,

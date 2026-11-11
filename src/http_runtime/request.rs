@@ -439,6 +439,10 @@ where
         }
         *response.body_mut() = full(Bytes::new());
     }
+    if let Some(lease) = response.extensions_mut().remove::<Arc<super::proxy_policy::RequestLease>>() {
+        let body = std::mem::replace(response.body_mut(), full(Bytes::new()));
+        *response.body_mut() = super::proxy_policy::with_lease(body, lease);
+    }
     if let Some(access) = access.filter(|_| !ctx.skip_access) {
         return (*access).attach(
             response,

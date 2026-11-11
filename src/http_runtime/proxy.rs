@@ -1,3 +1,4 @@
+use super::proxy_policy::{HostRegistry, PreparedSelection, SelectionInput};
 use super::request::{Context, apply_headers, apply_response_headers};
 use super::upstream_tls::{FixedDialConnector, PreparedTransport};
 use super::*;
@@ -14,6 +15,7 @@ use std::{
 use tokio::sync::Notify;
 type HyperClient = Client<FixedDialConnector, Body>;
 pub(super) struct ProxyClient {
+    selection: Arc<PreparedSelection>,
     connector: PreparedTransport,
     http1_connector: PreparedTransport,
     http2_only: bool,
@@ -90,6 +92,7 @@ impl ProxyClient {
 pub(super) fn prepare_clients(
     routes: &[Route],
     output: &mut HashMap<usize, ProxyClient>,
+    hosts: &HostRegistry,
     logging_available: bool,
 ) -> Result<()> {
     crate::http_config::helpers::initialize_globals();
@@ -97,8 +100,8 @@ pub(super) fn prepare_clients(
         for handler in &route.handlers {
             match handler {
                 Handler::Subroute { routes, errors, .. } => {
-                    prepare_clients(routes, output, logging_available)?;
-                    prepare_clients(errors, output, logging_available)?;
+                    prepare_clients(routes, output, hosts, logging_available)?;
+                    prepare_clients(errors, output, hosts, logging_available)?;
                 }
                 Handler::FileServer { .. } => {
                     super::mime::initialize();
@@ -115,6 +118,7 @@ pub(super) fn prepare_clients(
                     output.insert(
                         config as *const ProxyConfig as usize,
                         ProxyClient {
+                            selection: Arc::new(PreparedSelection::new(hosts, &config.selection, &config.upstreams)),
                             connector,
                             http1_connector,
                             http2_only: config.http2_only,
@@ -155,26 +159,46 @@ pub(super) async fn serve(
         !trailer_metadata.invalid_upstream,
         "invalid outgoing trailer declaration"
     );
-    // Caddy's default policy chooses an upstream randomly, independently for
-    // each request; no request waits on a global selection lock.
-    ensure!(
-        !config.upstreams.is_empty(),
-        "upstream list cannot be empty"
-    );
-    let mut random = [0u8; 8];
-    rustls::crypto::ring::default_provider()
-        .secure_random
-        .fill(&mut random)
-        .map_err(|_| anyhow::anyhow!("upstream selection entropy unavailable"))?;
-    let index = (u64::from_le_bytes(random) % config.upstreams.len() as u64) as usize;
-    let dial = ctx.expand(&config.upstreams[index])?;
     if let Some(transport) = &config.fastcgi {
+        let index = super::proxy_policy::random_below(config.upstreams.len())?;
+        let dial = ctx.expand(&config.upstreams[index].dial)?;
         return super::fastcgi::serve(ctx, config, transport, dial, server.logging.as_ref()).await;
     }
-    let state = server
-        .clients
-        .get(&(config as *const ProxyConfig as usize))
+    let state = server.clients.get(&(config as *const ProxyConfig as usize))
         .ok_or_else(|| anyhow::anyhow!("proxy transport not provisioned"))?;
+    let secure_cookie = ctx.tls || ctx.trusted && ctx.req().headers()
+        .get_all("x-forwarded-proto").iter().next_back().is_some_and(|v| v.as_bytes() == b"https");
+    let selection = {
+        let input = SelectionInput {
+            authority: &ctx.authority,
+            uri: ctx.req().uri(),
+            version: ctx.req().version(),
+            headers: ctx.req().headers(),
+            peer_ip: ctx.peer.ip(),
+            client_ip: ctx.client_ip,
+            secure: secure_cookie,
+        };
+        if state.selection.needs_worker(&input) {
+            let owned = input.owned();
+            let policy = state.selection.clone();
+            ctx.resources.proxy_selection.run(move || policy.select(&owned.borrowed())).await
+                .map_err(|error| super::request::budget_failure(ctx, error))??
+        } else {
+            state.selection.select(&input)?
+        }
+    }.ok_or_else(|| super::request::failure(StatusCode::SERVICE_UNAVAILABLE))?;
+    let mut lease = Some(selection.lease);
+    for value in selection.cookies {
+        ctx.immediate.append(http::header::SET_COOKIE, value);
+    }
+    let dial = ctx.expand(&config.upstreams[selection.index].dial)?;
+    for (name, value) in [
+        ("http.reverse_proxy.upstream.requests", selection.prior_requests.to_string()),
+        ("http.reverse_proxy.upstream.max_requests", selection.max_requests.to_string()),
+        ("http.reverse_proxy.upstream.fails", "0".to_owned()),
+    ] {
+        ctx.values.insert(name.into(), value);
+    }
     let scheme = if config.tls.is_some() {
         "https"
     } else {
@@ -332,7 +356,9 @@ pub(super) async fn serve(
     // Pinned Caddy clones the request's trailer map before reading its body;
     // values received later do not enter the outgoing request. Apply this
     // policy before either HTTP version can serialize a trailer frame.
-    request = request.map(|body| super::trailer_policy::policy(body, true));
+    request = request.map(|body| super::proxy_policy::with_lease(
+        super::trailer_policy::policy(body, true), lease.as_ref().expect("attempt lease").clone(),
+    ));
     // Keep the bounded upstream-event waiter out of the outer route
     // future, which shares its allocation with non-proxy handlers.
     let mut response = Box::pin(fetch_with_informational(
@@ -367,7 +393,9 @@ pub(super) async fn serve(
         let hold_client = client.clone();
         let business = ctx.business.clone();
         let hard_stop = business.generation().hard_stop.clone();
+        let admission = lease.take().expect("upgrade attempt lease");
         upgrades.spawn(async move {
+            let _admission = admission;
             let _hold_client=hold_client;
             let _business=business;
             let tunnel=async {
@@ -423,6 +451,7 @@ pub(super) async fn serve(
         )?;
     }
     *response.version_mut() = downstream_version;
+    if let Some(lease) = lease { response.extensions_mut().insert(lease); }
     Ok(response.map(|body| {
         let body = ProxyBody { body, client };
         let body = if decompress {

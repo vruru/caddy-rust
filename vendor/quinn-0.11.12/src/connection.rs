@@ -32,6 +32,23 @@ use proto::{
     StreamId, congestion::Controller,
 };
 
+// Registered only while the owning HTTP request is active. Existing Quinn
+// waiters retain their own Arc, so abandoning this observer cannot orphan them.
+#[cfg(feature = "native-stream-observer")]
+struct SendStopObservation {
+    conn: ConnectionRef,
+    stream: StreamId,
+}
+#[cfg(feature = "native-stream-observer")]
+impl Drop for SendStopObservation {
+    fn drop(&mut self) {
+        let mut state = self.conn.state.lock("observe_send_stopped::drop");
+        if state.stopped.get(&self.stream).is_some_and(|notify| Arc::strong_count(notify) == 1) {
+            state.stopped.remove(&self.stream);
+        }
+    }
+}
+
 /// In-progress connection attempt future
 #[derive(Debug)]
 pub struct Connecting {
@@ -392,6 +409,51 @@ impl Connection {
             .as_ref()
             .expect("closed without an error")
             .clone()
+    }
+
+    /// Observe termination of the send side of an accepted peer-initiated
+    /// bidirectional stream without creating or owning another stream handle.
+    ///
+    /// This server-side API is intended for HTTP request cancellation while
+    /// the application is not writing. It never finishes or resets a stream.
+    /// Like `SendStream::stopped`, completion means peer STOP_SENDING, an
+    /// acknowledged local FIN, or a lost connection. Only established server
+    /// connections are accepted: this observer does not authorize early data.
+    #[cfg(feature = "native-stream-observer")]
+    pub fn observe_send_stopped(
+        &self,
+        stream: StreamId,
+    ) -> Result<
+        impl Future<Output = Result<Option<VarInt>, crate::StoppedError>> + Send + Sync + 'static,
+        std::io::Error,
+    > {
+        {
+            let state = self.0.state.lock("observe_send_stopped::validate");
+            if !state.connected || state.inner.side() != Side::Server
+                || stream.dir() != Dir::Bi || stream.initiator() != Side::Client
+            {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                    "stream observation requires an established server peer-bidi stream"));
+            }
+        }
+        let conn = self.0.clone();
+        let guard = SendStopObservation { conn: conn.clone(), stream };
+        Ok(async move {
+            let _guard = guard;
+            loop {
+                let notify;
+                {
+                    let mut state = conn.state.lock("observe_send_stopped");
+                    if let Some(result) = crate::send_stream::send_stream_stopped(&mut state, stream, false) {
+                        return result;
+                    }
+                    // Create Notified under the connection lock, as stopped()
+                    // does, so STOP_SENDING cannot be lost between check/wait.
+                    notify = state.stopped.entry(stream).or_default().clone();
+                    notify.notified()
+                }.await
+            }
+        })
     }
 
     /// If the connection is closed, the reason why.

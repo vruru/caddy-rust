@@ -51,6 +51,8 @@ mod path_glob;
 pub(crate) use path_glob::go_path_glob;
 #[path = "http_runtime/proxy.rs"]
 mod proxy;
+#[path = "http_runtime/proxy_policy.rs"]
+pub(crate) mod proxy_policy;
 #[path = "http_runtime/retirement.rs"]
 mod retirement;
 use retirement::{BusinessGeneration, BusinessGuard};
@@ -511,6 +513,7 @@ async fn prepare_servers(
     let mut actual_managed = std::collections::BTreeSet::new();
     let mut redirects = HashMap::<SocketAddr, Vec<Route>>::new();
     let mut output = HashMap::new();
+    resources.proxy_hosts.prune();
     for server in &config.servers {
         // One generation owns one manual resolver. Tags are per-server
         // identity filters, not separate key/OCSP snapshots.
@@ -628,10 +631,11 @@ async fn prepare_servers(
             (None, None)
         };
         let client_plan = server.clone();
+        let proxy_hosts = resources.proxy_hosts.clone();
         let clients = tokio::task::spawn_blocking(move || {
             let mut clients = HashMap::new();
-            proxy::prepare_clients(&client_plan.routes, &mut clients, logging_available)?;
-            proxy::prepare_clients(&client_plan.errors, &mut clients, logging_available)?;
+            proxy::prepare_clients(&client_plan.routes, &mut clients, &proxy_hosts, logging_available)?;
+            proxy::prepare_clients(&client_plan.errors, &mut clients, &proxy_hosts, logging_available)?;
             Ok::<_, anyhow::Error>(clients)
         })
         .await
@@ -669,10 +673,11 @@ async fn prepare_servers(
             plan.routes.splice(split..split, routes);
             let plan = Arc::new(plan);
             let client_plan = plan.clone();
+            let proxy_hosts = resources.proxy_hosts.clone();
             let clients = tokio::task::spawn_blocking(move || {
                 let mut clients = HashMap::new();
-                proxy::prepare_clients(&client_plan.routes, &mut clients, logging_available)?;
-                proxy::prepare_clients(&client_plan.errors, &mut clients, logging_available)?;
+                proxy::prepare_clients(&client_plan.routes, &mut clients, &proxy_hosts, logging_available)?;
+                proxy::prepare_clients(&client_plan.errors, &mut clients, &proxy_hosts, logging_available)?;
                 Ok::<_, anyhow::Error>(clients)
             })
             .await

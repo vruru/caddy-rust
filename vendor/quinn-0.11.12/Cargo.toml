@@ -43,6 +43,8 @@ features = [
 ]
 
 [features]
+# Optional read-only observation of accepted request-stream cancellation.
+native-stream-observer = []
 __rustls-post-quantum-test = [
     "rustls/prefer-post-quantum",
     "rustls-aws-lc-rs",
