@@ -114,10 +114,12 @@ retains accepted writes after client disconnection, and separates parallel reads
 from serialized publication. Management requests have a 16 MiB default
 per-request body limit. Uploads and raw JSON adaptation responses use separate
 64 MiB aggregate budgets; a busy body lane returns 503 and reserves capacity
-for reads and shutdown. These budgets do not cover expanded configuration trees
-or custom adapter output. The backend contract requires real candidate
-provisioning, identity acquisition and rollback. Those product-level connections
-are still incomplete: the CLI remains the read-only inspector described above.
+for reads and shutdown. Ordinary configuration reads have their own 64 MiB
+response budget; slow reads keep the charge until their output is released.
+Queued JSON writes keep bounded input bytes and parse at the serialized write
+worker, after conditional validation. These budgets do not cap the entire
+expanded configuration tree or custom adapter output. Native serving remains
+opt-in while full production compatibility is being validated.
 Unsupported modules and transport options fail validation instead of being
 silently ignored. The vendored HTTP crates contain opt-in compatibility changes;
 see vendor/VENDOR.md and THIRD-PARTY-NOTICES.

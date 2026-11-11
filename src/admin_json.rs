@@ -24,17 +24,7 @@ pub fn decoded(input: &[u8]) -> Result<Value, ConfigError> {
     // Go's any -> marshal -> typed-decode path rounds all numbers to f64.
     // Re-read the canonical representation to retain integral typed fields.
     let bytes = encoded(&value)?;
-    let mut decoder = serde_json::Deserializer::from_slice(&bytes);
-    decoder.disable_recursion_limit();
-    let normalized = decoder.deserialize_go_value().map_err(|_| ConfigError {
-        status: 400,
-        category: "invalid_json_configuration",
-    })?;
-    decoder.end().map_err(|_| ConfigError {
-        status: 400,
-        category: "invalid_json_configuration",
-    })?;
-    Ok(normalized)
+    parse_sanitized(&bytes)
 }
 
 /// Decode a direct typed configuration without passing its integer fields
@@ -42,7 +32,18 @@ pub fn decoded(input: &[u8]) -> Result<Value, ConfigError> {
 /// depth bounds still apply. CLI validation needs this distinct original path.
 pub fn decoded_typed(input: &[u8]) -> Result<Value, ConfigError> {
     let sanitized = codec::sanitize(input, MAX_CONFIG_DEPTH)?;
-    let mut decoder = serde_json::Deserializer::from_slice(&sanitized);
+    parse_sanitized(&sanitized)
+}
+
+/// Decode configuration bytes from this module's Go-compatible encoder. Apply
+/// the same aggregate shape guard after edits combine separate subtrees.
+pub(crate) fn decode_canonical(input: &[u8]) -> Result<Value, ConfigError> {
+    codec::check_canonical(input, MAX_CONFIG_DEPTH)?;
+    parse_sanitized(input)
+}
+
+fn parse_sanitized(input: &[u8]) -> Result<Value, ConfigError> {
+    let mut decoder = serde_json::Deserializer::from_slice(input);
     decoder.disable_recursion_limit();
     let value = decoder.deserialize_go_value().map_err(|_| ConfigError {
         status: 400,
@@ -328,6 +329,35 @@ pub fn encoded_len(value: &Value, limit: usize) -> Result<usize, ConfigError> {
     Ok(sink.count)
 }
 
+/// Reserve the exact encoded length before allocating a response buffer.
+pub(crate) fn encoded_reserved<G>(
+    value: &Value,
+    limit: usize,
+    reserve: impl FnOnce(usize) -> Result<G, ConfigError>,
+) -> Result<(Vec<u8>, G), ConfigError> {
+    let length = encoded_len(value, limit)?;
+    let reservation = reserve(length)?;
+    let exhausted = || ConfigError {
+        status: 503,
+        category: "admin_buffer_allocation_failed",
+    };
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(length).map_err(|_| exhausted())?;
+    if bytes.capacity() != length {
+        return Err(exhausted());
+    }
+    let mut sink = EncodingBoundedBytes {
+        bytes,
+        limit: length,
+    };
+    write_encoded(value, &mut sink, 0)?;
+    sink.put(b"\n")?;
+    if sink.bytes.len() != length {
+        return Err(failure("json_encoding_length_mismatch"));
+    }
+    Ok((sink.bytes, reservation))
+}
+
 /// Encode a typed adapter/CLI result without rounding integer durations through
 /// float64. Raw Admin configuration maps and their ETags must keep using encoded.
 pub fn encoded_typed(value: &Value) -> Result<Vec<u8>, ConfigError> {
@@ -371,6 +401,43 @@ struct EncodingBytes<'a>(&'a mut Vec<u8>);
 impl EncodingSink for EncodingBytes<'_> {
     fn put(&mut self, bytes: &[u8]) -> Result<(), ConfigError> {
         self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+/// Compare the previous configuration to already encoded candidate bytes.
+pub(crate) fn encoded_matches(value: &Value, expected: &[u8]) -> Result<bool, ConfigError> {
+    let mut sink = EncodingMatch {
+        remaining: expected,
+        matched: true,
+    };
+    write_encoded(value, &mut sink, 0)?;
+    sink.put(b"\n")?;
+    Ok(sink.matched && sink.remaining.is_empty())
+}
+
+struct EncodingMatch<'a> {
+    remaining: &'a [u8],
+    matched: bool,
+}
+
+impl EncodingSink for EncodingMatch<'_> {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), ConfigError> {
+        if self.matched {
+            if let Some(remaining) = self.remaining.strip_prefix(bytes) {
+                self.remaining = remaining;
+            } else {
+                self.matched = false;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct EncodingHash(xxhash_rust::xxh64::Xxh64);
+impl EncodingSink for EncodingHash {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), ConfigError> {
+        self.0.update(bytes);
         Ok(())
     }
 }
@@ -597,14 +664,21 @@ fn html_escape(bytes: &[u8], index: usize, escape_html: bool) -> Option<(&'stati
 }
 
 pub fn etag(path: &str, value: Option<&Value>) -> Result<String, ConfigError> {
-    let bytes = value.map(encoded).transpose()?.unwrap_or_default();
-    Ok(etag_encoded(path, &bytes))
+    let mut sink = EncodingHash(xxhash_rust::xxh64::Xxh64::new(0));
+    if let Some(value) = value {
+        write_encoded(value, &mut sink, 0)?;
+        sink.put(b"\n")?;
+    }
+    Ok(format_etag(path, sink.0.digest()))
 }
 
 /// Use the exact response bytes, including Encoder.Encode's trailing newline;
 /// an absent output is the empty slice. This avoids encoding a large read twice.
 pub fn etag_encoded(path: &str, bytes: &[u8]) -> String {
-    let hash = xxhash_rust::xxh64::xxh64(bytes, 0);
+    format_etag(path, xxhash_rust::xxh64::xxh64(bytes, 0))
+}
+
+fn format_etag(path: &str, hash: u64) -> String {
     format!("\"{path} {hash:016x}\"")
 }
 

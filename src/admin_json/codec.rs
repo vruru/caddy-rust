@@ -6,6 +6,65 @@ use super::ConfigError;
 // duplicate keys. Raw /adapt validation intentionally does not build a DOM.
 const MAX_SHAPE_TOKENS: usize = 400_000;
 
+#[derive(Default)]
+struct Shape {
+    tokens: usize,
+    depth: usize,
+}
+
+impl Shape {
+    fn advance(&mut self, byte: u8, max_depth: usize) -> Result<(), ConfigError> {
+        if matches!(byte, b'[' | b'{' | b',' | b':') {
+            self.tokens += 1;
+            if self.tokens > MAX_SHAPE_TOKENS {
+                return Err(ConfigError {
+                    status: 413,
+                    category: "configuration_materialization_limit",
+                });
+            }
+        }
+        match byte {
+            b'[' | b'{' => {
+                self.depth += 1;
+                if self.depth > max_depth {
+                    return Err(ConfigError {
+                        status: 400,
+                        category: "configuration_depth_limit",
+                    });
+                }
+            }
+            b']' | b'}' => self.depth = self.depth.saturating_sub(1),
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// Check shape on bytes emitted by the canonical encoder. These bytes already
+/// contain valid UTF-8 and well-formed escapes and need no sanitizer copy.
+pub(super) fn check_canonical(input: &[u8], max_depth: usize) -> Result<(), ConfigError> {
+    let mut shape = Shape::default();
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in input {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else {
+                match byte {
+                    b'\\' => escaped = true,
+                    b'"' => in_string = false,
+                    _ => {}
+                }
+            }
+        } else {
+            shape.advance(byte, max_depth)?;
+            in_string = byte == b'"';
+        }
+    }
+    Ok(())
+}
+
 /// Pure O(n) iterative byte-scan sanitizer for JSON body bytes.
 /// - Inside strings: validates UTF-8 in ≤4-byte windows (rejects overlong,
 ///   surrogates, >U+10FFFF via `std::str::from_utf8`), emits one U+FFFD per
@@ -18,8 +77,7 @@ const MAX_SHAPE_TOKENS: usize = 400_000;
 /// - No unsafe, no unwrap, no panic, no allocation beyond the output Vec.
 pub(super) fn sanitize(input: &[u8], max_depth: usize) -> Result<Vec<u8>, ConfigError> {
     let mut out: Vec<u8> = Vec::with_capacity(input.len().min(1024 * 1024));
-    let mut shape = 0usize;
-    let mut depth: usize = 0usize;
+    let mut shape = Shape::default();
     let mut in_string = false;
     let mut i: usize = 0;
 
@@ -123,35 +181,11 @@ pub(super) fn sanitize(input: &[u8], max_depth: usize) -> Result<Vec<u8>, Config
             // Outside a JSON string. Colons count object values, commas
             // count array continuation, and delimiters count containers.
             // No byte within a string or escape advances this budget.
-            if matches!(b, b'[' | b'{' | b',' | b':') {
-                shape += 1;
-                if shape > MAX_SHAPE_TOKENS {
-                    return Err(ConfigError {
-                        status: 413,
-                        category: "configuration_materialization_limit",
-                    });
-                }
-            }
+            shape.advance(b, max_depth)?;
             match b {
                 b'"' => {
                     in_string = true;
                     out.push(b'"');
-                    i += 1;
-                }
-                b'[' | b'{' => {
-                    depth = depth.saturating_add(1);
-                    if depth > max_depth {
-                        return Err(ConfigError {
-                            status: 400,
-                            category: "configuration_depth_limit",
-                        });
-                    }
-                    out.push(b);
-                    i += 1;
-                }
-                b']' | b'}' => {
-                    depth = depth.saturating_sub(1);
-                    out.push(b);
                     i += 1;
                 }
                 _ => {

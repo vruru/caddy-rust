@@ -1,7 +1,7 @@
 use super::{
     AdminController, AdminError, AdminOptions,
     byte_budget::{Buffer, Pool},
-    controller::{Authorization, Inner},
+    controller::{Authorization, ChangeAdmission, ChangeBody, Inner, JsonRoute},
     files, ids,
     local_access::{AdmissionState, LocalAdmission},
     policy::{LocalPolicy, OriginPolicy},
@@ -1193,7 +1193,7 @@ async fn dispatch(
             let (value, tag) = controller
                 .read_authorized(p, grant.clone(), local.clone())
                 .await?;
-            let mut response = reply(200, value);
+            let mut response = reply_bytes(200, value);
             response.headers_mut().insert(
                 header::ETAG,
                 http::HeaderValue::from_bytes(tag.as_bytes()).map_err(|_| io_failure())?,
@@ -1259,26 +1259,26 @@ async fn dispatch(
                 }
                 return Ok(reply_bytes(200, encoded));
             }
-            let (adapted, body_credit) = if adapter.is_none() {
-                inner
-                    .offload_bulk(move || {
-                        let result = crate::admin_json::decoded(bytes.as_ref()).map_err(|e| {
-                            let status = if e.category == "configuration_materialization_limit" {
-                                413
-                            } else {
-                                400
-                            };
-                            AdminError::new(status, e.category)
-                        })?;
-                        Ok((
-                            super::AdaptedConfig {
-                                result,
-                                warnings: Vec::new(),
-                            },
-                            bytes.release_data(),
-                        ))
-                    })
-                    .await?
+            let authorization = Authorization {
+                grant: grant.clone(),
+                local: local.clone(),
+            };
+            if adapter.is_none() {
+                controller
+                    .submit_authorized(
+                        "POST",
+                        "/config",
+                        Some(ChangeBody::HttpJson(Box::new(bytes), JsonRoute::Load)),
+                        tag.as_deref(),
+                        force,
+                        ChangeAdmission {
+                            authorization,
+                            source,
+                            body_credit: None,
+                        },
+                    )
+                    .await?;
+                reply(200, Vec::new())
             } else {
                 let lane = inner
                     .bulk_cpu
@@ -1289,53 +1289,52 @@ async fn dispatch(
                 let backend = inner.backend.clone();
                 // Keep the adapter future alive after a client disconnect.
                 // Its actual asynchronous work holds both reservations.
-                tokio::spawn(async move {
+                let (adapted, body_credit) = tokio::spawn(async move {
                     let _lane = lane;
                     let (data, credit) = bytes.into_parts();
                     let adapted = backend.adapt(data, adapter, filename).await?;
                     Ok::<_, AdminError>((adapted, credit))
                 })
                 .await
-                .map_err(|_| AdminError::new(500, "admin_adapter_task_failed"))??
-            };
-            if path == "/load" {
-                controller
-                    .submit_authorized(
-                        "POST",
-                        "/config",
-                        Some(adapted.result),
-                        tag.as_deref(),
-                        force,
-                        super::controller::ChangeAdmission {
-                            authorization: Authorization {
-                                grant: grant.clone(),
-                                local: local.clone(),
+                .map_err(|_| AdminError::new(500, "admin_adapter_task_failed"))??;
+                if path == "/load" {
+                    controller
+                        .submit_authorized(
+                            "POST",
+                            "/config",
+                            Some(ChangeBody::Loaded(super::loader::Loaded::Adapted(
+                                adapted.result,
+                            ))),
+                            tag.as_deref(),
+                            force,
+                            ChangeAdmission {
+                                authorization,
+                                source,
+                                body_credit: Some(body_credit),
                             },
-                            source,
-                            body_credit: Some(body_credit),
-                        },
-                    )
-                    .await?;
-                if adapted.warnings.is_empty() {
-                    reply(200, Vec::new())
+                        )
+                        .await?;
+                    if adapted.warnings.is_empty() {
+                        reply(200, Vec::new())
+                    } else {
+                        reply(
+                            200,
+                            serde_json::to_vec(&serde_json::json!({"warnings":adapted.warnings}))
+                                .map_err(|_| io_failure())?,
+                        )
+                    }
                 } else {
+                    if let Some(local) = &local {
+                        local.check()?;
+                    }
                     reply(
                         200,
-                        serde_json::to_vec(&serde_json::json!({"warnings":adapted.warnings}))
-                            .map_err(|_| io_failure())?,
+                        serde_json::to_vec(
+                            &serde_json::json!({"result":adapted.result,"warnings":adapted.warnings}),
+                        )
+                        .map_err(|_| io_failure())?,
                     )
                 }
-            } else {
-                if let Some(local) = &local {
-                    local.check()?;
-                }
-                reply(
-                    200,
-                    serde_json::to_vec(
-                        &serde_json::json!({"result":adapted.result,"warnings":adapted.warnings}),
-                    )
-                    .map_err(|_| io_failure())?,
-                )
             }
         }
         (m, p)
@@ -1353,25 +1352,12 @@ async fn dispatch(
             )
             .await?;
             let (value, body_credit) = if method == "DELETE" {
-                (None, bytes.release_data())
+                (None, Some(bytes.release_data()))
             } else {
-                inner
-                    .offload_bulk(move || {
-                        let result = crate::admin_json::decoded(bytes.as_ref()).map_err(|e| {
-                            AdminError::new(
-                                if e.category == "configuration_depth_limit" {
-                                    400
-                                } else if e.category == "configuration_materialization_limit" {
-                                    413
-                                } else {
-                                    500
-                                },
-                                e.category,
-                            )
-                        })?;
-                        Ok((Some(result), bytes.release_data()))
-                    })
-                    .await?
+                (
+                    Some(ChangeBody::HttpJson(Box::new(bytes), JsonRoute::Mutation)),
+                    None,
+                )
             };
             controller
                 .submit_authorized(
@@ -1380,13 +1366,13 @@ async fn dispatch(
                     value,
                     tag.as_deref(),
                     force,
-                    super::controller::ChangeAdmission {
+                    ChangeAdmission {
                         authorization: Authorization {
                             grant: grant.clone(),
                             local: local.clone(),
                         },
                         source: super::source::Action::None,
-                        body_credit: Some(body_credit),
+                        body_credit,
                     },
                 )
                 .await?;

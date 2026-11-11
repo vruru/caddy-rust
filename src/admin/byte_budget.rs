@@ -6,6 +6,7 @@ use super::AdminError;
 
 pub(super) const DEFAULT_INGRESS: usize = 64 << 20;
 pub(super) const ADAPT_EGRESS: usize = 64 << 20;
+pub(super) const CONFIG_EGRESS: usize = 64 << 20;
 
 #[derive(Clone)]
 pub(super) struct Pool {

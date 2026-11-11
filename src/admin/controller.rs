@@ -1,6 +1,7 @@
 use super::{
     AdminBackend, AdminError, AdminOptions, AdminTransaction, StopMode,
     activation::transact_admin,
+    byte_budget::{Buffer, CONFIG_EGRESS},
     files,
     ids::Indexed,
     policy::LocalPolicy,
@@ -8,6 +9,7 @@ use super::{
 };
 use arc_swap::ArcSwap;
 use futures_util::FutureExt;
+use hyper::body::Bytes;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{mpsc, oneshot};
@@ -82,6 +84,7 @@ pub(super) struct Inner {
     pub controls: Arc<tokio::sync::Semaphore>,
     pub ingress: super::byte_budget::Pool,
     pub adapt_egress: super::byte_budget::Pool,
+    config_egress: super::byte_budget::Pool,
     pub bulk_cpu: Arc<tokio::sync::Semaphore>,
     pub cpu: Arc<tokio::sync::Semaphore>,
     pub cancel: tokio_util::sync::CancellationToken,
@@ -97,10 +100,32 @@ enum Admission {
     StopPending(u64),
     Closed,
 }
+pub(super) enum ChangeBody {
+    Loaded(super::loader::Loaded),
+    HttpJson(Box<Buffer>, JsonRoute),
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum JsonRoute {
+    Load,
+    Mutation,
+}
+
+impl JsonRoute {
+    fn error(self, error: crate::admin_json::ConfigError) -> AdminError {
+        let status = match (self, error.category) {
+            (_, "configuration_materialization_limit") => 413,
+            (Self::Load, _) | (_, "configuration_depth_limit") => 400,
+            (Self::Mutation, _) => 500,
+        };
+        AdminError::new(status, error.category)
+    }
+}
+
 struct Change {
     method: String,
     path: String,
-    body: Option<super::loader::Loaded>,
+    body: Option<ChangeBody>,
     if_match: Option<String>,
     force: bool,
     grant: Option<super::remote::Grant>,
@@ -110,7 +135,7 @@ struct Change {
     source: super::source::Action,
     // Retain the upload's accounting through queueing and accepted apply,
     // even if the HTTP reply waiter has disconnected.
-    _body_credit: Option<super::byte_budget::Credit>,
+    body_credit: Option<super::byte_budget::Credit>,
 }
 pub(super) struct Authorization {
     pub grant: Option<super::remote::Grant>,
@@ -165,9 +190,10 @@ impl AdminController {
         source: Option<(std::path::PathBuf, std::path::PathBuf, Option<String>)>,
     ) -> Result<Self, AdminError> {
         options.validate()?;
-        let initial =
-            crate::admin_json::decoded(&crate::admin_json::encoded(&initial).map_err(dom)?)
-                .map_err(dom)?;
+        let encoded = crate::admin_json::encoded(&initial).map_err(dom)?;
+        drop(initial);
+        let initial = crate::admin_json::decode_canonical(&encoded).map_err(dom)?;
+        drop(encoded);
         LocalPolicy::parse(&initial)?;
         let indexed = Indexed::new(initial)?;
         // Changes are independently bounded by reply_slots. Reserve one
@@ -183,6 +209,8 @@ impl AdminController {
             super::byte_budget::ADAPT_EGRESS,
             "admin_adapt_egress_capacity_exceeded",
         );
+        let config_egress =
+            super::byte_budget::Pool::new(CONFIG_EGRESS, "admin_config_egress_capacity_exceeded");
         let cpu_count = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(1, 4));
         let (stop_events, _) = tokio::sync::watch::channel(None);
         let (force_join, _) = tokio::sync::watch::channel(None);
@@ -206,6 +234,7 @@ impl AdminController {
             controls,
             ingress,
             adapt_egress,
+            config_egress,
             bulk_cpu: Arc::new(tokio::sync::Semaphore::new(cpu_count)),
             cpu: Arc::new(tokio::sync::Semaphore::new(cpu_count)),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -241,14 +270,14 @@ impl AdminController {
             .enqueue(Work::Change(Change {
                 method: "POST".into(),
                 path: "/config".into(),
-                body: Some(super::loader::Loaded::Adapted(body)),
+                body: Some(ChangeBody::Loaded(super::loader::Loaded::Adapted(body))),
                 if_match: None,
                 force,
                 grant: None,
                 local: None,
                 expected_generation: None,
                 loader_budget: 16,
-                _body_credit: None,
+                body_credit: None,
                 source: super::source::Action::ProcessFile,
             }))
             .await
@@ -399,14 +428,14 @@ impl AdminController {
             .enqueue(Work::Change(Change {
                 method: method.to_owned(),
                 path: path.to_owned(),
-                body: body.map(super::loader::Loaded::Adapted),
+                body: body.map(|value| ChangeBody::Loaded(super::loader::Loaded::Adapted(value))),
                 if_match: if_match.map(str::to_owned),
                 force,
                 grant: None,
                 local: None,
                 expected_generation: None,
                 loader_budget: 16,
-                _body_credit: None,
+                body_credit: None,
                 source: super::source::Action::None,
             }))
             .await
@@ -415,7 +444,7 @@ impl AdminController {
         &self,
         method: &str,
         path: &str,
-        body: Option<Value>,
+        body: Option<ChangeBody>,
         if_match: Option<&str>,
         force: bool,
         admission: ChangeAdmission,
@@ -432,7 +461,7 @@ impl AdminController {
             .enqueue(Work::Change(Change {
                 method: method.to_owned(),
                 path: path.to_owned(),
-                body: body.map(super::loader::Loaded::Adapted),
+                body,
                 if_match: if_match.map(str::to_owned),
                 force,
                 local,
@@ -440,7 +469,7 @@ impl AdminController {
                 loader_budget: 16,
                 source,
                 grant,
-                _body_credit: body_credit,
+                body_credit,
             }))
             .await
     }
@@ -461,7 +490,7 @@ impl AdminController {
         path: &str,
         grant: Option<super::remote::Grant>,
         local: Option<super::local_access::LocalAdmission>,
-    ) -> Result<(Vec<u8>, String), AdminError> {
+    ) -> Result<(Bytes, String), AdminError> {
         self.inner.check_readable()?;
         let inner = self.inner.clone();
         let path = path.to_owned();
@@ -478,11 +507,21 @@ impl AdminController {
                 }
                 let value = crate::admin_json::read_config(&current.raw, &path)
                     .map_err(|e| AdminError::new(400, e.category))?;
-                let body = value
-                    .map(crate::admin_json::encoded)
-                    .transpose()
-                    .map_err(dom)?
-                    .unwrap_or_default();
+                let body = if let Some(value) = value {
+                    let (data, credit) =
+                        crate::admin_json::encoded_reserved(value, CONFIG_EGRESS, |size| {
+                            inner.config_egress.reserve(size).map_err(|e| {
+                                crate::admin_json::ConfigError {
+                                    status: e.status,
+                                    category: e.category,
+                                }
+                            })
+                        })
+                        .map_err(dom)?;
+                    Buffer::into_bytes(data, credit)
+                } else {
+                    Bytes::new()
+                };
                 let etag = crate::admin_json::etag_encoded(&path, &body);
                 inner.check_readable()?;
                 if let Some(local) = &local {
@@ -646,14 +685,14 @@ impl Inner {
                 work: Work::Change(Change {
                     method: "POST".into(),
                     path: "/config".into(),
-                    body: Some(value),
+                    body: Some(ChangeBody::Loaded(value)),
                     if_match: None,
                     force: false,
                     grant: None,
                     local: None,
                     expected_generation: Some(generation),
                     loader_budget: budget,
-                    _body_credit: None,
+                    body_credit: None,
                     source: super::source::Action::None,
                 }),
                 reply,
@@ -849,12 +888,7 @@ fn match_etag(
         current.authorize(&read, Some(&path))?;
     }
     let value = crate::admin_json::read_config(&current.raw, &path).map_err(dom)?;
-    let bytes = value
-        .map(crate::admin_json::encoded)
-        .transpose()
-        .map_err(dom)?
-        .unwrap_or_default();
-    let actual = crate::admin_json::etag_encoded(fields[0], &bytes);
+    let actual = crate::admin_json::etag(fields[0], value).map_err(dom)?;
     if actual != condition {
         return Err(AdminError::new(412, "configuration_precondition_failed"));
     }
@@ -896,29 +930,41 @@ fn prepare_change(
     if path != "/config" && !path.starts_with("/config/") {
         return Err(AdminError::new(404, "admin_route_not_found"));
     }
-    let mut wrapper = json!({"config":previous.raw.as_ref()});
-    let body = change
-        .body
-        .take()
-        .map(super::loader::Loaded::decode)
-        .transpose()?;
+    // Keep only the raw, charged body in the queue. Once selected, decode
+    // before traversing/editing the candidate. If-Match is checked first.
+    let body = match change.body.take() {
+        Some(ChangeBody::HttpJson(bytes, route)) => {
+            let bytes = *bytes;
+            let value = crate::admin_json::decoded_typed(bytes.as_ref())
+                .map_err(|error| route.error(error))?;
+            change.body_credit = Some(bytes.release_data());
+            Some(value)
+        }
+        Some(ChangeBody::Loaded(value)) => Some(value.decode()?),
+        None => None,
+    };
     if change.expected_generation.is_some() && body.as_ref().is_none_or(|value| !value.is_object())
     {
         return Err(AdminError::new(400, "config_loader_requires_object"));
     }
+    let mut wrapper = Value::Object(
+        std::iter::once(("config".to_owned(), previous.raw.as_ref().clone())).collect(),
+    );
     crate::admin_json::access(&mut wrapper, &change.method, &path, body).map_err(dom)?;
-    let raw = wrapper.get("config").cloned().unwrap_or(Value::Null);
-    let normalized =
-        crate::admin_json::decoded(&crate::admin_json::encoded(&raw).map_err(dom)?).map_err(dom)?;
+    let raw = wrapper
+        .as_object_mut()
+        .and_then(|map| map.remove("config"))
+        .unwrap_or(Value::Null);
+    let encoded = crate::admin_json::encoded(&raw).map_err(dom)?;
+    drop(raw);
+    let normalized = crate::admin_json::decode_canonical(&encoded).map_err(dom)?;
     let candidate = Indexed::new(normalized)?;
     let policy = LocalPolicy::parse(&candidate.raw)?;
 
-    if !change.force
-        && crate::admin_json::encoded(&candidate.raw).map_err(dom)?
-            == crate::admin_json::encoded(&previous.raw).map_err(dom)?
-    {
+    if !change.force && crate::admin_json::encoded_matches(&previous.raw, &encoded).map_err(dom)? {
         return Ok(None);
     }
+    drop(encoded);
     let runtime = candidate.runtime();
     Ok(Some(Candidate {
         previous,
