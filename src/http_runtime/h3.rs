@@ -1,17 +1,16 @@
 //! Transactional QUIC listener and isolated HTTP/3 request streams.
 use super::*;
-use crate::{leaf_guard::LeafState, tls_resolver::CertificateSelection};
+use crate::leaf_guard::LeafState;
 use http::{HeaderValue, Method};
 use quinn::{
     Endpoint, ServerConfig as QuicConfig, TransportConfig, crypto::rustls::QuicServerConfig,
 };
-use std::{
-    net::UdpSocket,
-    sync::{OnceLock, Weak},
-};
-use tokio::{sync::Semaphore, task::JoinSet};
+use sha2::{Digest, Sha256};
+use std::{net::UdpSocket, sync::Weak};
+use tokio::{sync::Semaphore, task::JoinSet, time::Instant};
 
 mod hello;
+mod sessions;
 pub(super) mod stream;
 pub(super) type Pool = HashMap<SocketAddr, Weak<Binding>>;
 const STREAMS: usize = 64;
@@ -67,6 +66,8 @@ pub(super) struct Listener {
     pub(super) binding: Arc<Binding>,
     crypto: Arc<rustls::ServerConfig>,
     transport: Arc<TransportConfig>,
+    sessions: Arc<sessions::Shared>,
+    scope: IpScope,
 }
 
 pub(super) fn enabled(server: &ActiveServer) -> bool {
@@ -84,10 +85,12 @@ pub(super) fn tcp_enabled(server: &ActiveServer) -> bool {
 fn initial_config(
     crypto: rustls::ServerConfig,
     transport: &Arc<TransportConfig>,
+    scope: IpScope,
 ) -> Result<QuicConfig> {
     let mut config = QuicConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto)?));
     config
         .transport_config(transport.clone())
+        .migration(!scope.remote && !scope.local)
         .max_incoming(128)
         .incoming_buffer_size(64 * 1024)
         .incoming_buffer_size_total(4 * 1024 * 1024);
@@ -123,6 +126,7 @@ pub(super) fn stage(
             .receive_window((2u32 * 1024 * 1024).into())
             .send_window(2u64 * 1024 * 1024);
         let transport = Arc::new(transport);
+        let scope = IpScope::of(server);
         let tcp_actual = tcp
             .iter()
             .find(|address| address.declared == key)
@@ -138,7 +142,7 @@ pub(super) fn stage(
             let socket = udp_socket(wanted)?;
             let endpoint = Endpoint::new(
                 quinn::EndpointConfig::default(),
-                Some(initial_config(crypto.clone(), &transport)?),
+                Some(initial_config(crypto.clone(), &transport, scope)?),
                 socket,
                 Arc::new(quinn::TokioRuntime),
             )?;
@@ -171,6 +175,8 @@ pub(super) fn stage(
                 binding,
                 crypto: Arc::new(crypto),
                 transport,
+                sessions: Arc::new(sessions::Shared::new()),
+                scope,
             },
         );
     }
@@ -196,8 +202,9 @@ fn udp_socket(address: SocketAddr) -> std::io::Result<UdpSocket> {
 /// candidate at a later instant. QUIC does not consult the TCP proof resolver.
 struct SeenCert {
     resolver: Arc<CandidateResolver>,
-    selected: OnceLock<CertificateSelection>,
+    selection: Arc<sessions::SelectionSlot>,
     inspected_name: Option<String>,
+    policy: PolicyScope,
 }
 impl fmt::Debug for SeenCert {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -206,32 +213,34 @@ impl fmt::Debug for SeenCert {
 }
 impl ResolvesServerCert for SeenCert {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        if let Some(name) = &self.inspected_name
-            && !hello
-                .server_name()
-                .is_some_and(|actual| actual.eq_ignore_ascii_case(name))
-        {
-            return None;
-        }
+        let wire_name = hello.server_name()?;
+        let name = crate::challenge::normalize_domain(wire_name).ok()?;
         let protocols = hello.alpn()?.collect::<Vec<_>>();
         let version = hello.negotiated_version()?;
-        if !protocols.contains(&b"h3".as_slice())
+        if self
+            .inspected_name
+            .as_ref()
+            .is_some_and(|expected| expected != wire_name)
+            || !protocols.contains(&b"h3".as_slice())
             || protocols.contains(&ACME_ALPN)
             || version != rustls::ProtocolVersion::TLSv1_3
         {
+            self.selection.poison();
             return None;
         }
-        if self.selected.get().is_none() {
-            let key = self.resolver.select_for_version(
-                hello.server_name(),
+        let selected = self.selection.select(&name, self.policy.digest, || {
+            self.resolver.select_for_version(
+                Some(&name),
                 &protocols,
                 hello.signature_schemes(),
                 version,
-            )?;
-            let _ = self.selected.set(key);
+            )
+        })?;
+        let key = &selected.certificate.key;
+        if key.key.choose_scheme(hello.signature_schemes()).is_none() {
+            self.selection.poison();
+            return None;
         }
-        let key = &self.selected.get()?.key;
-        key.key.choose_scheme(hello.signature_schemes())?;
         Some(key.clone())
     }
 }
@@ -261,27 +270,44 @@ fn inspect_client_hello(
     })
 }
 
-enum Prepared {
+enum Preflight {
+    Ready(hello::Hello),
     Retry,
-    Inspected(String),
 }
 
-async fn prepare_certificate(
+struct PolicyScope {
+    digest: [u8; 32],
+    client_auth: bool,
+}
+
+impl PolicyScope {
+    fn new(server: &ActiveServer, index: usize, policy: &tls_policies::PreparedPolicy) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"caddy-rust/h3/policy-scope/v1");
+        hash.update(server.policy_identity);
+        hash.update((index as u64).to_be_bytes());
+        hash.update(policy.identity);
+        Self {
+            digest: hash.finalize().into(),
+            client_auth: policy.definition.client_auth.is_some(),
+        }
+    }
+}
+
+async fn inspect_hello(
     incoming: &quinn::Incoming,
-    resolver: &CandidateResolver,
     tls: &rustls::ServerConfig,
-    provider: &dyn ScopedCertificateProvider,
     header_timeout: Duration,
     listener: &PreflightLanes,
     process: &PreflightLanes,
-) -> Option<Prepared> {
+) -> Option<Preflight> {
     let validated = incoming.remote_address_validated();
     let hello = match inspect_client_hello(incoming, tls, None)? {
         FlightState::Ready(hello) => hello,
         FlightState::Unchanged => return None,
         // Don't keep an unverified source in the fragment-wait lane. Retry is
         // stateless; even many incomplete first packets cannot occupy it.
-        FlightState::Incomplete(_) if !validated => return Some(Prepared::Retry),
+        FlightState::Incomplete(_) if !validated => return Some(Preflight::Retry),
         FlightState::Incomplete(revision) => {
             let _fragments = (
                 listener.fragments.try_acquire().ok()?,
@@ -302,17 +328,30 @@ async fn prepare_certificate(
             .ok()??
         }
     };
-    let name = hello.server_name?.to_ascii_lowercase();
+    Some(Preflight::Ready(hello))
+}
+
+enum Prepared {
+    Ready,
+    Retry,
+}
+
+async fn prepare_certificate(
+    incoming: &quinn::Incoming,
+    resolver: &CandidateResolver,
+    hello: &hello::Hello,
+    provider: &dyn ScopedCertificateProvider,
+    name: &str,
+    lanes: (&PreflightLanes, &PreflightLanes),
+) -> Option<Prepared> {
+    let validated = incoming.remote_address_validated();
     let protocols = hello
         .protocols
         .iter()
         .map(Vec::as_slice)
         .collect::<Vec<_>>();
-    if !protocols.contains(&b"h3".as_slice()) || protocols.contains(&ACME_ALPN) {
-        return None;
-    }
     let selected = resolver.select_for_version_with_origin(
-        Some(&name),
+        Some(name),
         &protocols,
         &hello.signatures,
         rustls::ProtocolVersion::TLSv1_3,
@@ -320,31 +359,31 @@ async fn prepare_certificate(
     if selected
         .as_ref()
         .is_some_and(|(_, origin)| *origin == CertificateOrigin::Manual)
-        || !provider.can_acquire_quic_name(&name)
+        || !provider.can_acquire_quic_name(name)
     {
-        return Some(Prepared::Inspected(name));
+        return Some(Prepared::Ready);
     }
     if !validated {
         return Some(if selected.is_none() {
             Prepared::Retry
         } else {
-            Prepared::Inspected(name)
+            Prepared::Ready
         });
     }
     // A hit can become unusable before ensure() so even a validated cache hit
     // requires a cold slot for the ensure call, never borrowing a warm slot.
     let _issuance = match (
-        listener.issuance.try_acquire(),
-        process.issuance.try_acquire(),
+        lanes.0.issuance.try_acquire(),
+        lanes.1.issuance.try_acquire(),
     ) {
         (Ok(a), Ok(b)) => (a, b),
-        _ if selected.is_some() => return Some(Prepared::Inspected(name)),
+        _ if selected.is_some() => return Some(Prepared::Ready),
         _ => return None,
     };
     let cancel = CancellationToken::new();
     let _cancel_on_drop = cancel.clone().drop_guard();
-    provider.ensure(name.clone(), cancel).await.ok()?;
-    Some(Prepared::Inspected(name))
+    provider.ensure(name.to_owned(), cancel).await.ok()?;
+    Some(Prepared::Ready)
 }
 
 async fn accept_loop(
@@ -401,48 +440,91 @@ async fn accept_loop(
             incoming.refuse();
             continue;
         };
-        let Some(resolver) = server.resolver.clone() else {
-            incoming.refuse();
-            continue;
-        };
         let peer = incoming.remote_address();
+        let local_ip = incoming.local_ip();
         let local = SocketAddr::new(
-            incoming.local_ip().unwrap_or(binding.actual.ip()),
+            local_ip.unwrap_or(binding.actual.ip()),
             binding.actual.port(),
         );
         let runtime = inner.clone();
         inner.tasks.spawn(async move {
             let _connection_slot=(connection_slot,process_connection);
-            let deadline=server.plan.read_header_timeout.min(Duration::from_secs(15));
-            let mut inspected_name = None;
-            if let Some(provider) = resolver.provider.as_deref().filter(|provider| provider.needs_quic_preflight()) {
+            let budget = server.plan.read_header_timeout.min(Duration::from_secs(15));
+            let deadline = Instant::now() + budget;
+            let Some(first) = server.tls_policies.first() else { return; };
+            let preflight = server.tls_policies.len() != 1
+                || first.definition.has_custom_settings()
+                || first.resolver.provider.as_ref().is_some_and(|p| p.needs_quic_preflight());
+            let (index, policy, inspected_name) = if preflight {
                 let prepared = tokio::select! {
                     biased;
                     _=activity.superseded.cancelled()=>return,
                     _=activity.admission_closed.cancelled()=>return,
                     _=activity.hard_stop.cancelled()=>return,
-                    value=tokio::time::timeout(deadline,prepare_certificate(&incoming,&resolver,&config.crypto,provider,deadline.min(Duration::from_secs(3)),&binding.preflight,&runtime.quic_limits.preflight))=>value.ok().flatten(),
+                    value=tokio::time::timeout_at(deadline, inspect_hello(&incoming, &config.crypto, budget.min(Duration::from_secs(3)), &binding.preflight, &runtime.quic_limits.preflight))=>value.ok().flatten(),
                 };
-                match prepared {
-                    Some(Prepared::Inspected(name)) => inspected_name = Some(name),
-                    Some(Prepared::Retry) => {
-                        let _ = incoming.retry();
-                        return;
-                    },
+                let hello = match prepared {
+                    Some(Preflight::Ready(hello)) => hello,
+                    Some(Preflight::Retry) => { let _ = incoming.retry(); return; }
                     None => return,
+                };
+                let Some(wire_name) = hello.server_name.as_deref() else { return; };
+                let Ok(name) = crate::challenge::normalize_domain(wire_name) else { return; };
+                if !hello.protocols.iter().any(|p| p == b"h3") || hello.protocols.iter().any(|p| p == ACME_ALPN) {
+                    return;
                 }
-            }
+                if local_ip.is_none() && local.ip().is_unspecified() && config.scope.local {
+                    return;
+                }
+                let policy_server = server.clone();
+                let inspected_name = wire_name.to_owned();
+                let match_name = inspected_name.clone();
+                let selected = tokio::select! {
+                    biased;
+                    _=activity.superseded.cancelled()=>return,
+                    _=activity.admission_closed.cancelled()=>return,
+                    _=activity.hard_stop.cancelled()=>return,
+                    value=tokio::time::timeout_at(deadline, runtime.resources.metadata.run(move || {
+                        policy_server.policy(&match_name, canonical(peer), canonical(local))
+                    }))=>value,
+                };
+                let Ok(Ok(Some((index, policy)))) = selected else { return; };
+                if policy.definition.drop || policy.definition.protocol_max == Some(crate::tls_policy::ProtocolVersion::Tls12) {
+                    return;
+                }
+                let resolver = &policy.resolver;
+                if let Some(provider) = resolver.provider.as_deref().filter(|p| p.needs_quic_preflight()) {
+                    let prepared = tokio::select! {
+                        biased;
+                        _=activity.superseded.cancelled()=>return,
+                        _=activity.admission_closed.cancelled()=>return,
+                        _=activity.hard_stop.cancelled()=>return,
+                        value=tokio::time::timeout_at(deadline, prepare_certificate(&incoming, resolver, &hello, provider, &name, (&binding.preflight, &runtime.quic_limits.preflight)))=>value.ok().flatten(),
+                    };
+                    match prepared {
+                        Some(Prepared::Ready) => {}
+                        Some(Prepared::Retry) => { let _ = incoming.retry(); return; }
+                        None => return,
+                    }
+                }
+                (index, policy, Some(inspected_name))
+            } else {
+                (0, first.clone(), None)
+            };
             if activity.superseded.is_cancelled() || activity.admission_closed.is_cancelled() {
                 return;
             }
             let seen = Arc::new(SeenCert {
-                resolver,
-                selected: OnceLock::new(),
+                resolver: policy.resolver.clone(),
+                selection: Arc::new(sessions::SelectionSlot::default()),
                 inspected_name,
+                policy: PolicyScope::new(&server, index, &policy),
             });
-            let mut crypto = (*config.crypto).clone();
+            let mut crypto = (*policy.tls).clone();
+            crypto.alpn_protocols = vec![b"h3".to_vec()];
             crypto.cert_resolver = seen.clone();
-            let Ok(crypto) = initial_config(crypto, &config.transport) else {
+            sessions::configure(&mut crypto, &server.tickets, &config.sessions, seen.selection.clone(), &seen.policy);
+            let Ok(crypto) = initial_config(crypto, &config.transport, config.scope) else {
                 return;
             };
             let Ok(connecting) = incoming.accept_with(Arc::new(crypto)) else {
@@ -453,14 +535,38 @@ async fn accept_loop(
                 _=activity.superseded.cancelled()=>return,
                 _=activity.drain.cancelled()=>return,
                 _=activity.hard_stop.cancelled()=>return,
-                value=tokio::time::timeout(deadline,connecting)=>match value {Ok(Ok(value))=>value,_=>return},
+                value=tokio::time::timeout_at(deadline,connecting)=>match value {Ok(Ok(value))=>value,_=>return},
             };
             drop((handshake_slot,process_handshake));
-            let leaf = seen.selected.get().and_then(|selected| selected.leaf_state.clone());
+            let leaf = seen.selection.current().map(|selected| selected.leaf().clone());
             let Some(leaf)=leaf else {return;};
-            serve_connection(runtime,connection,Peer {key,peer,local},server,activity,leaf).await;
+            let peer = Peer {key,peer,local,scope:config.scope};
+            if !peer.permits(&connection) { return; }
+            serve_connection(runtime,connection,peer,server,activity,leaf).await;
             drop(binding);
         });
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct IpScope {
+    remote: bool,
+    local: bool,
+}
+impl IpScope {
+    fn of(server: &ActiveServer) -> Self {
+        let mut scope = Self::default();
+        for policy in &server.tls_policies {
+            for matcher in &policy.definition.matcher {
+                use crate::tls_policy::Matcher;
+                match matcher {
+                    Matcher::RemoteIp { .. } => scope.remote = true,
+                    Matcher::LocalIp { .. } => scope.local = true,
+                    _ => {}
+                }
+            }
+        }
+        scope
     }
 }
 
@@ -469,6 +575,17 @@ struct Peer {
     key: SocketAddr,
     peer: SocketAddr,
     local: SocketAddr,
+    scope: IpScope,
+}
+impl Peer {
+    fn permits(&self, connection: &quinn::Connection) -> bool {
+        (!self.scope.remote
+            || canonical(connection.remote_address()).ip() == canonical(self.peer).ip())
+            && (!self.scope.local
+                || connection
+                    .local_ip()
+                    .is_none_or(|ip| ip.to_canonical() == self.local.ip().to_canonical()))
+    }
 }
 fn canonical(address: SocketAddr) -> SocketAddr {
     SocketAddr::new(address.ip().to_canonical(), address.port())
@@ -551,7 +668,7 @@ async fn serve_connection(
                     let Ok(business)=activity.begin() else {return;};
                     if !runtime.current.load().business(&peer.key)
                         .is_some_and(|(s,a)|Arc::ptr_eq(&s,&server)&&Arc::ptr_eq(&a,&activity))
-                        || !leaf.admission().allow_certificate
+                        || !leaf.admission().allow_certificate || !peer.permits(&quic_for_stream)
                     {return;}
                     let Ok(id)=quinn::VarInt::from_u64(wire.send_id().into_inner()) else{return;};
                     let Ok(stopped)=quic_for_stream.observe_send_stopped(quinn::StreamId::from(id)) else{return;};

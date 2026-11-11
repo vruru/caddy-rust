@@ -1,4 +1,4 @@
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use serde_json::{Map, Value};
 use std::time::Duration;
 
@@ -54,18 +54,47 @@ pub(crate) fn replace(
     unknown_empty: bool,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<String> {
+    replace_accounted(input, unknown_empty, lookup, |_| Ok(()))
+}
+
+fn append_replacement(
+    output: &mut String,
+    text: &str,
+    charge: &mut impl FnMut(usize) -> Result<()>,
+) -> Result<()> {
+    let length = output.len().checked_add(text.len()).ok_or_else(|| anyhow::anyhow!("replacement length overflow"))?;
+    ensure!(length <= 4 * 1024 * 1024, "replacement output exceeds limit");
+    if length > output.capacity() {
+        let capacity = output.capacity().saturating_mul(2).max(length).min(4 * 1024 * 1024);
+        // The old and new buffers may coexist during a reallocation. Reserve
+        // twice the requested capacity before growth and retain that credit.
+        charge(capacity * 2)?;
+        output.try_reserve_exact(capacity - output.len()).map_err(|_| anyhow::anyhow!("replacement allocation unavailable"))?;
+    }
+    output.push_str(text);
+    Ok(())
+}
+
+pub(crate) fn replace_accounted(
+    input: &str,
+    unknown_empty: bool,
+    lookup: impl Fn(&str) -> Option<String>,
+    mut charge: impl FnMut(usize) -> Result<()>,
+) -> Result<String> {
     ensure!(
         input.len() <= 1024 * 1024,
         "replacement input exceeds limit"
     );
     let bytes = input.as_bytes();
-    let mut out = String::with_capacity(input.len());
+    charge(input.len().checked_mul(2).ok_or_else(|| anyhow::anyhow!("replacement capacity overflow"))?)?;
+    let mut out = String::new();
+    out.try_reserve_exact(input.len()).map_err(|_| anyhow::anyhow!("replacement allocation unavailable"))?;
     let mut cursor = 0;
     let mut i = 0;
     let mut unclosed = 0;
     while i < bytes.len() {
         if i > 0 && bytes[i - 1] == b'\\' && matches!(bytes[i], b'{' | b'}') {
-            out.push_str(&input[cursor..i - 1]);
+            append_replacement(&mut out, &input[cursor..i - 1], &mut charge)?;
             cursor = i;
             i += 1;
             continue;
@@ -86,9 +115,9 @@ pub(crate) fn replace(
             i += 1;
             continue;
         }
-        out.push_str(&input[cursor..i]);
+        append_replacement(&mut out, &input[cursor..i], &mut charge)?;
         match lookup(&input[i + 1..end]) {
-            Some(value) => out.push_str(&value),
+            Some(value) => append_replacement(&mut out, &value, &mut charge)?,
             None if !unknown_empty => {
                 cursor = i;
                 i += 1;
@@ -98,15 +127,8 @@ pub(crate) fn replace(
         }
         i = end + 1;
         cursor = i;
-        ensure!(
-            out.len() <= 4 * 1024 * 1024,
-            "replacement output exceeds limit"
-        );
     }
-    out.push_str(&input[cursor..]);
-    if out.len() > 4 * 1024 * 1024 {
-        bail!("replacement output exceeds limit");
-    }
+    append_replacement(&mut out, &input[cursor..], &mut charge)?;
     Ok(out)
 }
 

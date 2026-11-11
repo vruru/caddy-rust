@@ -1,8 +1,7 @@
-# TCP TLS session tickets
+# TLS session tickets
 
 The native TLS app accepts the standard and filesystem-backed distributed STEK
-configuration for ordinary unauthenticated TCP HTTPS. This integration is
-separate from QUIC ticket handling and administrative client authentication.
+configuration for ordinary TCP HTTPS and HTTP/3 without client authentication.
 
 An omitted session ticket service, or explicit disable_rotation, preserves
 same-generation runtime resumption. Reload starts a fresh runtime session cache.
@@ -59,6 +58,25 @@ with the original Go lock protocol. Cross-host/NFS fencing and every third-party
 storage plugin are not implied. Expired ring data is unusable even if a blocked
 storage operation is still draining; forced kernel I/O completion or immediate
 memory erasure during such a block cannot be promised.
+
+HTTP/3 selects the certificate during the actual QUIC TLS handshake and
+binds resumption to the selected name and certificate chain. Its local cache
+is isolated per listener generation. Rotating tickets use a QUIC-specific
+realm, and shared storage can resume across processes in the same namespace.
+The QUIC ticket binding also includes the selected TLS policy and the ordered
+policy set. An explicit client authentication policy, including an empty
+object, disables ticket resumption. QUIC has no TLS 1.2 or session-ID fallback. A full handshake can serve requests
+while a new storage namespace initializes; it issues no ticket until its key
+ring is ready.
+
+In the Caddy 2.11.7 comparison, the original server could resume without an
+explicit ticket provider after a route reload, reuse tickets across TCP and
+QUIC or between copies of the same seed in different storage directories, and
+resume after a certificate replacement. Native mode isolates these cases and
+performs a full handshake. The original also accepted QUIC 0-RTT, which native
+mode does not accept. Clients can still reconnect and send requests once the
+handshake completes. The original could select an IP-SAN certificate for a
+client that sent no SNI; the native resolver currently requires a DNS SNI.
 
 References: [Caddy session service](https://github.com/caddyserver/caddy/blob/v2.11.7/modules/caddytls/sessiontickets.go),
 [distributed provider](https://github.com/caddyserver/caddy/blob/v2.11.7/modules/caddytls/distributedstek/distributedstek.go),

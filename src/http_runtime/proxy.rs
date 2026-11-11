@@ -109,8 +109,10 @@ pub(super) fn prepare_clients(
                 Handler::ReverseProxy(config) => {
                     let config = config.as_ref();
                     if let Some(fastcgi) = &config.fastcgi {
-                        ensure!(!fastcgi.capture_stderr || logging_available,
-                            "FastCGI capture_stderr requires generation logging");
+                        ensure!(
+                            !fastcgi.capture_stderr || logging_available,
+                            "FastCGI capture_stderr requires generation logging"
+                        );
                         continue;
                     }
                     let connector = PreparedTransport::prepare(config)?;
@@ -118,7 +120,11 @@ pub(super) fn prepare_clients(
                     output.insert(
                         config as *const ProxyConfig as usize,
                         ProxyClient {
-                            selection: Arc::new(PreparedSelection::new(hosts, &config.selection, &config.upstreams)),
+                            selection: Arc::new(PreparedSelection::new(
+                                hosts,
+                                &config.selection,
+                                &config.upstreams,
+                            )),
                             connector,
                             http1_connector,
                             http2_only: config.http2_only,
@@ -164,10 +170,19 @@ pub(super) async fn serve(
         let dial = ctx.expand(&config.upstreams[index].dial)?;
         return super::fastcgi::serve(ctx, config, transport, dial, server.logging.as_ref()).await;
     }
-    let state = server.clients.get(&(config as *const ProxyConfig as usize))
+    let state = server
+        .clients
+        .get(&(config as *const ProxyConfig as usize))
         .ok_or_else(|| anyhow::anyhow!("proxy transport not provisioned"))?;
-    let secure_cookie = ctx.tls || ctx.trusted && ctx.req().headers()
-        .get_all("x-forwarded-proto").iter().next_back().is_some_and(|v| v.as_bytes() == b"https");
+    let secure_cookie = ctx.tls
+        || ctx.trusted
+            && ctx
+                .req()
+                .headers()
+                .get_all("x-forwarded-proto")
+                .iter()
+                .next_back()
+                .is_some_and(|v| v.as_bytes() == b"https");
     let selection = {
         let input = SelectionInput {
             authority: &ctx.authority,
@@ -181,20 +196,30 @@ pub(super) async fn serve(
         if state.selection.needs_worker(&input) {
             let owned = input.owned();
             let policy = state.selection.clone();
-            ctx.resources.proxy_selection.run(move || policy.select(&owned.borrowed())).await
+            ctx.resources
+                .proxy_selection
+                .run(move || policy.select(&owned.borrowed()))
+                .await
                 .map_err(|error| super::request::budget_failure(ctx, error))??
         } else {
             state.selection.select(&input)?
         }
-    }.ok_or_else(|| super::request::failure(StatusCode::SERVICE_UNAVAILABLE))?;
+    }
+    .ok_or_else(|| super::request::failure(StatusCode::SERVICE_UNAVAILABLE))?;
     let mut lease = Some(selection.lease);
     for value in selection.cookies {
         ctx.immediate.append(http::header::SET_COOKIE, value);
     }
     let dial = ctx.expand(&config.upstreams[selection.index].dial)?;
     for (name, value) in [
-        ("http.reverse_proxy.upstream.requests", selection.prior_requests.to_string()),
-        ("http.reverse_proxy.upstream.max_requests", selection.max_requests.to_string()),
+        (
+            "http.reverse_proxy.upstream.requests",
+            selection.prior_requests.to_string(),
+        ),
+        (
+            "http.reverse_proxy.upstream.max_requests",
+            selection.max_requests.to_string(),
+        ),
         ("http.reverse_proxy.upstream.fails", "0".to_owned()),
     ] {
         ctx.values.insert(name.into(), value);
@@ -281,6 +306,16 @@ pub(super) async fn serve(
     };
     let mut headers = proxy_headers(ctx, config, ctx.req().headers().clone(), is_upgrade, false)?;
     trailer_metadata.write_upstream_declaration(&mut headers);
+    let replacement = ctx
+        .req()
+        .extensions()
+        .get::<super::request_body::Replacement>()
+        .cloned();
+    super::request_body::outgoing_headers(
+        replacement.as_ref(),
+        &mut headers,
+        config.http2_only && !is_upgrade,
+    );
     // Go's empty UA is a sentinel that suppresses serialization. Hyper has
     // no automatic default UA, so absence is the equivalent wire behavior.
     if headers
@@ -337,6 +372,7 @@ pub(super) async fn serve(
         .request
         .take()
         .ok_or_else(|| anyhow::anyhow!("request body already consumed"))?;
+    ctx.body_limit = None;
     // Retain request metadata for response-phase placeholders without retaining
     // or cloning its streaming body.
     let mut metadata = Request::new(full(Bytes::new()));
@@ -356,9 +392,12 @@ pub(super) async fn serve(
     // Pinned Caddy clones the request's trailer map before reading its body;
     // values received later do not enter the outgoing request. Apply this
     // policy before either HTTP version can serialize a trailer frame.
-    request = request.map(|body| super::proxy_policy::with_lease(
-        super::trailer_policy::policy(body, true), lease.as_ref().expect("attempt lease").clone(),
-    ));
+    request = request.map(|body| {
+        super::proxy_policy::with_lease(
+            super::request_body::outgoing_body(body, replacement),
+            lease.as_ref().expect("attempt lease").clone(),
+        )
+    });
     // Keep the bounded upstream-event waiter out of the outer route
     // future, which shares its allocation with non-proxy handlers.
     let mut response = Box::pin(fetch_with_informational(
@@ -451,7 +490,9 @@ pub(super) async fn serve(
         )?;
     }
     *response.version_mut() = downstream_version;
-    if let Some(lease) = lease { response.extensions_mut().insert(lease); }
+    if let Some(lease) = lease {
+        response.extensions_mut().insert(lease);
+    }
     Ok(response.map(|body| {
         let body = ProxyBody { body, client };
         let body = if decompress {
@@ -664,7 +705,7 @@ pub(super) fn proxy_headers(
     Ok(headers)
 }
 
-fn header_has_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool {
+pub(super) fn header_has_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool {
     headers
         .get_all(name)
         .iter()

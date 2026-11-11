@@ -480,10 +480,14 @@ under flow control and drains active streams when a generation retires.
 A cold on-demand handshake validates the peer's address with QUIC Retry
 before requesting a certificate. ClientHello inspection and issuance run
 outside the endpoint lock, with separate capacity for fragmented flights
-and issuance so ordinary connections can continue. This covers server
-HTTP/3 with the currently supported TLS policies. Outgoing HTTP/3,
-extended CONNECT/datagrams, early data and full production compatibility
-are separate work.
+and issuance so ordinary connections can continue. The first matching TLS
+policy controls the certificate, protocol versions, key exchange and client
+verification. HTTP/3 uses its own ALPN and requires TLS 1.3. If a policy
+uses source or destination IP, active migration is disabled. Source IP is
+checked again for each request. A destination-IP policy uses the local IP of
+the handshake or the explicitly bound address; a wildcard bind requires
+real destination-address metadata. Outgoing HTTP/3, extended CONNECT/datagrams,
+early data and full production compatibility are separate work.
 
 The native `encode` handler negotiates gzip and Zstandard for HTTP/1.1,
 HTTP/2 and HTTP/3, preserves eligible response trailers, and flushes SSE as
@@ -530,8 +534,28 @@ initial TLS record headers follow the original server's early responses;
 Rustls may reject some malformed records more strictly. Proof-only prefix
 reads have a separate ten-second deadline.
 
-TCP TLS session tickets support the default local cache and the standard or
-file-storage distributed rotating providers. Reload and retained rollback
-keep ticket publication tied to the admitted configuration generation. See
-[session ticket behavior](docs/SESSION-TICKETS.md). QUIC ticket integration
-remains a separate compatibility item.
+TCP and HTTP/3 TLS session tickets support a local cache and the standard or
+file-storage distributed rotating providers. The transports use separate
+ticket realms. Reload and retained rollback keep key publication tied to the
+admitted configuration generation. See [session ticket behavior](docs/SESSION-TICKETS.md).
+
+
+HTTP routes support `error`, named `invoke` and `log_append` in the native
+runtime. Added log fields are local to each request. Body-derived log fields
+are omitted past 64 KiB without cutting short the body sent or received.
+
+The `request_body` handler enforces limits when the body is read, or replaces
+the body before a downstream handler consumes it. Replacement uses a bounded
+32 MiB shared allocation budget and preserves the original request headers
+for placeholders. HTTP/1.1, HTTP/2, HTTP/3 and FastCGI have been exercised with
+ordinary clients. On an HTTP/2 upload still in progress, replacing the body can
+reach the origin correctly but lose the response headers at the client; this
+compatibility gap is still open. Some trailer and FastCGI cancellation timing
+also differs from the original.
+
+TLS connection policies support ordered SNI, regexp and IP matching, manual
+certificate tags, TLS 1.2 and 1.3, explicit key exchange groups including
+P-521, and supported file/inline/combined or pinned client trust. A TLS 1.2
+only policy still serves TCP and will not accept QUIC. Custom TLS providers,
+additional trust loaders, default and fallback SNI, and certificates selected
+without a DNS SNI are separate compatibility items.

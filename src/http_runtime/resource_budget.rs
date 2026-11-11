@@ -220,6 +220,7 @@ pub(crate) struct Resources {
     pub streams: BlockingBudget,
     pub reads: BlockingBudget,
     pub(super) access_capture: Arc<super::access_log::CaptureBudget>,
+    pub(super) request_body_bytes: Arc<Semaphore>,
     pub fastcgi: BlockingBudget,
     pub(super) compression: super::encode_body::CompressionBudget,
     pub(super) proxy_hosts: Arc<super::proxy_policy::HostRegistry>,
@@ -306,6 +307,7 @@ impl Resources {
         let selection_running = cpu.div_ceil(2).clamp(1, 32).min((spare / 2).max(1));
         let proxy_selection = BlockingBudget::new(selection_running, cpu.saturating_mul(16).clamp(128, 512), Duration::ZERO)?;
         Ok(Self {
+            request_body_bytes: Arc::new(Semaphore::new(super::request_body::REPLACEMENT_UNITS)),
             auth,
             metadata,
             streams,

@@ -46,6 +46,12 @@ pub(crate) struct HeaderOps {
 
 #[derive(Clone)]
 pub(crate) enum Handler {
+    StaticError {
+        status: String,
+        message: String,
+    },
+    Invoke(String),
+    LogAppend(std::sync::Arc<LogAppendConfig>),
     StaticResponse {
         status: String,
         body: String,
@@ -68,7 +74,7 @@ pub(crate) enum Handler {
         strip_path_prefix: Option<String>,
         strip_path_suffix: Option<String>,
     },
-    Vars(Vec<(String, serde_json::Value)>),
+    Vars(Vec<(String, std::sync::Arc<serde_json::Value>)>),
     Map {
         source: String,
         destinations: Vec<String>,
@@ -89,7 +95,21 @@ pub(crate) enum Handler {
         sidecars: crate::http_runtime::file_sidecars::SidecarPlan,
     },
     Encode(std::sync::Arc<crate::http_runtime::encode_response::EncodePlan>),
+    RequestBody(RequestBodyConfig),
     ReverseProxy(Box<ProxyConfig>),
+}
+
+#[derive(Clone)]
+pub(crate) struct RequestBodyConfig {
+    pub(crate) max_size: i64,
+    pub(crate) set: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct LogAppendConfig {
+    pub(crate) key: String,
+    pub(crate) value: String,
+    pub(crate) early: bool,
 }
 
 #[derive(Clone)]

@@ -177,6 +177,9 @@ impl LeafState {
             allow_staple: value & STAPLE != 0,
         }
     }
+    pub(crate) fn not_after(&self) -> i64 {
+        self.not_after
+    }
     pub fn needs_renewal(&self) -> bool {
         self.fast.load(Ordering::Acquire) & NEEDS_RENEW != 0
     }

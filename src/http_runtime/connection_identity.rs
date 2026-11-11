@@ -18,8 +18,10 @@ pub(super) struct TlsIdentity {
     leaf: Arc<LeafState>,
     scope: std::sync::Weak<CandidateResolver>,
     origin: CertificateOrigin,
+    policy_index: usize,
+    policy_identity: [u8; 32],
 }
-fn chain_hash(key: &CertifiedKey) -> [u8; 32] {
+pub(super) fn chain_hash(key: &CertifiedKey) -> [u8; 32] {
     let mut hash = Sha256::new();
     for certificate in &key.cert {
         hash.update((certificate.as_ref().len() as u64).to_be_bytes());
@@ -56,7 +58,14 @@ impl TlsIdentity {
             .iter()
             .map(Vec::as_slice)
             .collect::<Vec<_>>();
-        let Some(key) = current.resolver.as_ref().and_then(|r| {
+        if current.policy_identity != self.policy_identity {
+            return TlsVerdict::Reject;
+        }
+        let current_resolver = current
+            .tls_policies
+            .get(self.policy_index)
+            .map(|policy| &policy.resolver);
+        let Some(key) = current_resolver.and_then(|r| {
             r.select_for_version(Some(&self.sni), &alpn, &self.schemes, self.version)
         }) else {
             // On-demand permission/storage errors can evict a managed cache
@@ -64,18 +73,20 @@ impl TlsIdentity {
             // Retain that connection only inside this exact immutable policy;
             // policy replacement, manual selection and leaf withdrawal do not
             // inherit this exception. New handshakes still need a real key.
-            let same_scope=current.resolver.as_ref().is_some_and(|resolver| {
-                self.scope.upgrade().is_some_and(|scope| Arc::ptr_eq(&scope,resolver))
+            let same_scope = current_resolver.is_some_and(|resolver| {
+                self.scope
+                    .upgrade()
+                    .is_some_and(|scope| Arc::ptr_eq(&scope, resolver))
             });
             // Certificate dates are checked when admitting TLS, not repeatedly
             // as access credentials for an already established connection. The
             // fixed Go server keeps accepted manual HTTP alive across NotAfter.
             // This only retains that exact immutable scope and still respects
             // the leaf-withdrawal and current protocol gates above.
-            let naturally_expired=i64::try_from(rustls::pki_types::UnixTime::now().as_secs())
+            let naturally_expired = i64::try_from(rustls::pki_types::UnixTime::now().as_secs())
                 .is_ok_and(|now| now >= self.not_after);
-            let managed_eviction=self.origin == CertificateOrigin::Managed
-                && current.resolver.as_ref().is_some_and(|resolver|resolver.provider.is_some());
+            let managed_eviction = self.origin == CertificateOrigin::Managed
+                && current_resolver.is_some_and(|resolver| resolver.provider.is_some());
             return if same_scope && (naturally_expired || managed_eviction) {
                 TlsVerdict::Serve
             } else {
@@ -235,9 +246,12 @@ async fn server_for_hello(
     inner: &Arc<Inner>,
     address: SocketAddr,
     sni: &str,
+    wire_sni: &str,
     alpn: &[&[u8]],
     schemes: &[SignatureScheme],
-) -> Result<Arc<ActiveServer>> {
+    peer_local: (SocketAddr, SocketAddr),
+) -> Result<(Arc<ActiveServer>, usize, Arc<tls_policies::PreparedPolicy>)> {
+    let (peer, local) = peer_local;
     let mut retries = 0usize;
     'view: loop {
         retries += 1;
@@ -250,10 +264,20 @@ async fn server_for_hello(
         let (server, activity) = observed
             .business(&address)
             .ok_or_else(|| anyhow::anyhow!("TLS listener retired"))?;
-        let resolver = server
-            .resolver
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("TLS listener policy changed"))?;
+        let server_to_match = server.clone();
+        let sni_to_match = wire_sni.to_owned();
+        let (policy_index, policy) = inner
+            .resources
+            .metadata
+            .run(move || server_to_match.policy(&sni_to_match, peer, local))
+            .await
+            .map_err(|_| anyhow::anyhow!("TLS policy matching worker unavailable"))?
+            .ok_or_else(|| anyhow::anyhow!("no TLS connection policy matched"))?;
+        ensure!(
+            !policy.definition.drop,
+            "TLS connection policy dropped the connection"
+        );
+        let resolver = &policy.resolver;
         // A loaded manual candidate does not ask permission or acquire another
         // certificate. Actual negotiated-version selection remains authoritative.
         let manual = resolver
@@ -290,7 +314,7 @@ async fn server_for_hello(
             }
         }
         if same_business_view(&inner.current.load_full(), &address, &server, &activity) {
-            return Ok(server);
+            return Ok((server, policy_index, policy));
         }
     }
 }
@@ -323,10 +347,12 @@ pub(super) async fn accept<I>(
     address: SocketAddr,
     deadline: Option<tokio::time::Instant>,
     reply_http: bool,
+    peer_local: (SocketAddr, SocketAddr),
 ) -> Result<AcceptedTls<http_redirect::ReplayIo<I>>>
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let (peer, local) = peer_local;
     let start = tls_io_deadline(deadline, async move {
         let stream = tls_first_record::prepare(stream, reply_http).await?;
         Ok(
@@ -359,8 +385,31 @@ where
     // disappeared while ClientHello was paused. A separate legitimate proof
     // owner still has the right to use the runtime registry on the same socket.
     if protocols == [ACME_ALPN] {
-        connection_budget::classify_proof(&admission,deadline).await?;
-        let config = proof_tls_config(inner.challenge_resolver.clone())?;
+        connection_budget::classify_proof(&admission, deadline).await?;
+        let config = if let Some((business, _)) = inner.current.load_full().business(&address) {
+            let matching = business.clone();
+            let proof_name = raw_sni.clone();
+            let (_, policy) = inner
+                .resources
+                .metadata
+                .run(move || matching.policy(&proof_name, peer, local))
+                .await
+                .map_err(|_| anyhow::anyhow!("TLS proof policy worker unavailable"))?
+                .ok_or_else(|| anyhow::anyhow!("no TLS proof connection policy matched"))?;
+            ensure!(
+                !policy.definition.drop,
+                "TLS connection policy dropped proof connection"
+            );
+            let mut config = (*policy.tls).clone();
+            config.cert_resolver = inner.challenge_resolver.clone();
+            config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+            config.send_tls13_tickets = 0;
+            config.max_tls13_tickets = 0;
+            config.max_early_data_size = 0;
+            Arc::new(config)
+        } else {
+            proof_tls_config(inner.challenge_resolver.clone())?
+        };
         let Some(executor) = inner.tls_executor.get() else {
             anyhow::bail!("TLS executor unavailable");
         };
@@ -377,25 +426,40 @@ where
             .await?;
         anyhow::bail!("TLS validation completed");
     }
-    connection_budget::classify(&admission,connection_budget::ConnectionClass::Business)?;
-    let server = server_for_hello(inner, address, &sni, &protocols, &schemes).await?;
-    let resolver = server
-        .resolver
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("TLS listener policy changed"))?;
+    connection_budget::classify(&admission, connection_budget::ConnectionClass::Business)?;
+    let (server, policy_index, policy) = server_for_hello(
+        inner, address, &sni, &raw_sni, &protocols, &schemes, peer_local,
+    )
+    .await?;
+    let resolver = &policy.resolver;
     // Availability is not authorization; final protocol-bound selection still
     // runs in the real resolver callback before session lookup.
     resolver
         .select_candidate(Some(&sni), &protocols, &schemes)
         .ok_or_else(|| anyhow::anyhow!("TLS identity unavailable"))?;
-    let mut config = (**server
-        .tls
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("TLS listener policy changed"))?)
-    .clone();
+    let mut config = (*policy.tls).clone();
+    // Go permits an h1-only client to reach a server which only advertised h2
+    // without negotiating ALPN. This exception never applies to QUIC or proof.
+    if protocols.contains(&b"http/1.1".as_slice())
+        && config.alpn_protocols.iter().any(|value| value == b"h2")
+        && !protocols.iter().any(|offer| {
+            config
+                .alpn_protocols
+                .iter()
+                .any(|value| value.as_slice() == *offer)
+        })
+    {
+        config.alpn_protocols.clear();
+    }
     let state = Arc::new(connection_sessions::HandshakeState::new());
-    let tickets =
-        connection_sessions::configure(&mut config, &server.tickets, &server.sessions, &state);
+    let tickets = connection_sessions::configure(
+        &mut config,
+        &server.tickets,
+        &policy.sessions,
+        &state,
+        policy.definition.client_auth.is_some(),
+        policy.identity,
+    );
     let fixed = Arc::new(FixedResolver {
         resolver: resolver.clone(),
         state: state.clone(),
@@ -432,6 +496,8 @@ where
             leaf: selection.leaf.clone(),
             scope: Arc::downgrade(&resolver),
             origin: selection.origin,
+            policy_index,
+            policy_identity: server.policy_identity,
         });
         if stream.get_ref().1.handshake_kind() == Some(rustls::HandshakeKind::Resumed) {
             if let Some(tickets) = &tickets {

@@ -1,4 +1,6 @@
 use super::*;
+#[path = "log_append.rs"]
+mod log_append;
 use crate::http_config::{helpers::replace, types::*};
 use base64::Engine;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Uri, Version};
@@ -20,6 +22,9 @@ struct LazyMap {
 pub(super) struct Context {
     pub request: Option<Request<Body>>,
     pub fastcgi_body_claimed: bool,
+    pub(super) body_limit: Option<Arc<super::request_body::LimitState>>,
+    pub(super) replaced_receive: Option<Body>,
+    pub(super) original_framing: super::request_body::OriginalFraming,
     pub resources: Arc<super::resource_budget::Resources>,
     pub peer: SocketAddr,
     pub local: SocketAddr,
@@ -32,17 +37,23 @@ pub(super) struct Context {
     pub drain: CancellationToken,
     pub business: Arc<BusinessGuard>,
     pub original_uri: Uri,
+    original_method: Method,
+    error_status: Option<StatusCode>,
+    access_start: Option<std::time::Instant>,
+    log_fields: Option<Box<log_append::LogFields>>,
     pub values: HashMap<String, String>,
     pub immediate: HeaderMap,
     informational: Option<InformationalOutput>,
-    close_after_response: bool,
+    pub(super) close_after_response: bool,
     deferred: Vec<DeferredResponse>,
     groups: HashSet<String>,
+    invoke_depth: u8,
     maps: Vec<LazyMap>,
 }
 enum DeferredResponse {
     Headers(HeaderOps),
     Encode(super::encode_response::ResponseEncoding),
+    LogBody(usize),
 }
 impl Context {
     pub fn req(&self) -> &Request<Body> {
@@ -106,6 +117,7 @@ impl Context {
                 }
             }
             "http.request.method" => req?.method().to_string(),
+            "http.request.orig_method" => self.original_method.to_string(),
             "http.request.uri" => req?
                 .uri()
                 .path_and_query()
@@ -131,6 +143,7 @@ impl Context {
                 .map(|query| format!("?{query}"))
                 .unwrap_or_default(),
             "http.request.proto" => match req?.version() {
+                Version::HTTP_3 => "HTTP/3",
                 Version::HTTP_2 => "HTTP/2.0",
                 Version::HTTP_10 => "HTTP/1.0",
                 _ => "HTTP/1.1",
@@ -281,10 +294,15 @@ pub(super) async fn handle_business<B>(
     informational: Option<InformationalOutput>,
 ) -> Response<Body>
 where
-    B: hyper::body::Body<Data=Bytes> + Unpin + Send + 'static,
+    B: hyper::body::Body<Data = Bytes> + Unpin + Send + 'static,
     B::Error: Into<BoxError>,
 {
-    let RequestOrigin { peer, local, tls, sni } = origin;
+    let RequestOrigin {
+        peer,
+        local,
+        tls,
+        sni,
+    } = origin;
     let authority = match request_authority(&request) {
         Ok(authority) => authority,
         Err(()) => return simple(StatusCode::BAD_REQUEST, "Bad Request\n"),
@@ -312,8 +330,10 @@ where
             )
         })
         .map(Box::new);
+    let original_framing = super::request_body::original_framing(&request);
     server.plan.header_aliases.sanitize(request.headers_mut());
     let original_uri = request.uri().clone();
+    let original_method = request.method().clone();
     let trailer_metadata = request
         .extensions()
         .get::<super::trailer_policy::RequestMetadata>()
@@ -336,6 +356,9 @@ where
     let mut ctx = Context {
         request: Some(Request::from_parts(parts, body)),
         fastcgi_body_claimed: false,
+        body_limit: None,
+        replaced_receive: None,
+        original_framing,
         resources: inner.resources.clone(),
         peer,
         local,
@@ -348,12 +371,16 @@ where
         drain: business.generation().drain.clone(),
         business,
         original_uri,
+        original_method,
+        error_status: None,
+        access_start: access.as_ref().map(|access| access.started_at()),
+        log_fields: None,
         values: HashMap::new(),
         immediate: {
             let mut h = HeaderMap::new();
             h.insert(http::header::SERVER, HeaderValue::from_static("Caddy"));
             if let Some(alt_svc) = alt_svc {
-                h.insert(http::header::ALT_SVC,alt_svc.0);
+                h.insert(http::header::ALT_SVC, alt_svc.0);
             }
             h
         },
@@ -361,6 +388,7 @@ where
         close_after_response: false,
         deferred: Vec::new(),
         groups: HashSet::new(),
+        invoke_depth: 0,
         maps: Vec::new(),
     };
     let result = if tls
@@ -377,6 +405,13 @@ where
         Ok(Flow::ImplicitResponse(response)) => (response, false),
         Ok(Flow::Continue | Flow::Stop) => (simple(StatusCode::OK, Bytes::new()), false),
         Err(error) => {
+            log_append::unwind(&mut ctx, 0, None).await;
+            // The server error chain uses the original request target and
+            // method. Ordinary middleware above it already unwound.
+            if let Some(request) = &mut ctx.request {
+                *request.uri_mut() = ctx.original_uri.clone();
+                *request.method_mut() = ctx.original_method.clone();
+            }
             let status = populate_error(&mut ctx, &error);
             // The failed handler stack has unwound. Its deferred writers did
             // not commit headers and must not wrap the server error routes.
@@ -390,6 +425,7 @@ where
                     Ok(Flow::ImplicitResponse(response)) => (response, false),
                     Ok(Flow::Continue | Flow::Stop) => (simple(status, Bytes::new()), true),
                     Err(_) => {
+                        log_append::unwind(&mut ctx, 0, None).await;
                         ctx.deferred.clear();
                         (simple(status, Bytes::new()), true)
                     }
@@ -409,45 +445,92 @@ where
             headers.append(name, value.clone());
         }
     }
-    let any_encoding = ctx.deferred.iter().any(|step| matches!(step, DeferredResponse::Encode(_)));
-    if any_encoding {
-        if finalize_transforms(&mut headers, &mut response, explicit_headers, &mut ctx).await.is_err() {
-            return simple(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error\n");
+    let any_transform = ctx
+        .deferred
+        .iter()
+        .any(|step| !matches!(step, DeferredResponse::Headers(_)));
+    if any_transform {
+        if finalize_transforms(&mut headers, &mut response, explicit_headers, &mut ctx)
+            .await
+            .is_err()
+        {
+            let response = simple(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error\n");
+            return match ctx.replaced_receive.take() {
+                Some(receive) => super::request_body::retain_receive(response, receive),
+                None => response,
+            };
         }
-    } else if explicit_headers && apply_deferred_headers(&mut headers, response.status(), &ctx).is_err() {
-        return simple(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error\n");
+    } else if explicit_headers
+        && apply_deferred_headers(&mut headers, response.status(), &ctx).is_err()
+    {
+        let response = simple(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error\n");
+        return match ctx.replaced_receive.take() {
+            Some(receive) => super::request_body::retain_receive(response, receive),
+            None => response,
+        };
     }
     if ctx.close_after_response {
         headers.insert(http::header::CONNECTION, HeaderValue::from_static("close"));
     }
+    log_append::unwind(&mut ctx, 0, Some(&headers)).await;
     *response.headers_mut() = headers;
     if ctx
         .request
         .as_ref()
         .is_some_and(|r| r.method() == Method::HEAD)
     {
-        if !response.headers().contains_key(http::header::CONTENT_LENGTH)
-            && !response.headers().contains_key(http::header::CONTENT_ENCODING)
-            && !response.headers().contains_key(http::header::TRANSFER_ENCODING)
-            && !matches!(response.status(), StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED)
+        if !response
+            .headers()
+            .contains_key(http::header::CONTENT_LENGTH)
+            && !response
+                .headers()
+                .contains_key(http::header::CONTENT_ENCODING)
+            && !response
+                .headers()
+                .contains_key(http::header::TRANSFER_ENCODING)
+            && !matches!(
+                response.status(),
+                StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+            )
             && !response.status().is_informational()
-            && let Some(length) = response.extensions().get::<StaticHeadLength>().map(|length| length.0 as u64)
-                .or_else(|| if http3 { response.body().size_hint().exact() } else { None })
+            && let Some(length) = response
+                .extensions()
+                .get::<StaticHeadLength>()
+                .map(|length| length.0 as u64)
+                .or_else(|| {
+                    if http3 {
+                        response.body().size_hint().exact()
+                    } else {
+                        None
+                    }
+                })
             && let Ok(value) = HeaderValue::from_str(&length.to_string())
         {
-            response.headers_mut().insert(http::header::CONTENT_LENGTH, value);
+            response
+                .headers_mut()
+                .insert(http::header::CONTENT_LENGTH, value);
         }
         *response.body_mut() = full(Bytes::new());
     }
-    if let Some(lease) = response.extensions_mut().remove::<Arc<super::proxy_policy::RequestLease>>() {
+    if let Some(lease) = response
+        .extensions_mut()
+        .remove::<Arc<super::proxy_policy::RequestLease>>()
+    {
         let body = std::mem::replace(response.body_mut(), full(Bytes::new()));
         *response.body_mut() = super::proxy_policy::with_lease(body, lease);
+    }
+    if let Some(receive) = ctx.replaced_receive.take() {
+        response = super::request_body::retain_receive(response, receive);
     }
     if let Some(access) = access.filter(|_| !ctx.skip_access) {
         return (*access).attach(
             response,
             ctx.access_names,
             ctx.values.remove("http.auth.user.id").unwrap_or_default(),
+            ctx.log_fields
+                .take()
+                .map(|log| log.output)
+                .unwrap_or_default(),
         );
     }
     response
@@ -507,6 +590,7 @@ pub(super) fn budget_failure(
 #[derive(Debug)]
 struct HttpError {
     status: StatusCode,
+    message: Option<String>,
     id: String,
     trace: String,
 }
@@ -518,12 +602,25 @@ impl std::fmt::Display for HttpError {
             self.id,
             self.trace,
             self.status.as_u16()
-        )
+        )?;
+        if let Some(message) = &self.message {
+            if message.is_empty() {
+                f.write_str(":")?;
+            } else {
+                write!(f, ": {message}")?;
+            }
+        }
+        Ok(())
     }
 }
 impl std::error::Error for HttpError {}
 #[track_caller]
 pub(super) fn failure(status: StatusCode) -> anyhow::Error {
+    failure_with_message(status, None)
+}
+
+#[track_caller]
+fn failure_with_message(status: StatusCode, message: Option<String>) -> anyhow::Error {
     let origin = std::panic::Location::caller();
     let mut random = [0u8; 9];
     if rustls::crypto::ring::default_provider()
@@ -540,6 +637,7 @@ pub(super) fn failure(status: StatusCode) -> anyhow::Error {
     let chars = b"abcdefghijkmnpqrstuvwxyz23456789";
     HttpError {
         status,
+        message,
         id: random
             .into_iter()
             .map(|b| chars[b as usize % chars.len()] as char)
@@ -555,7 +653,23 @@ pub(super) fn failure(status: StatusCode) -> anyhow::Error {
     }
     .into()
 }
+#[derive(Debug)]
+struct MissingNamedRoute(String);
+impl std::fmt::Display for MissingNamedRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invoke: route '{}' not found", self.0)
+    }
+}
+impl std::error::Error for MissingNamedRoute {}
+
 fn populate_error(ctx: &mut Context, error: &anyhow::Error) -> StatusCode {
+    if let Some(error) = error.downcast_ref::<MissingNamedRoute>() {
+        // A missing name is an ordinary Go error, so WithError adds only
+        // the error object. It does not fabricate the HandlerError fields.
+        ctx.values.insert("http.error".into(), error.to_string());
+        ctx.error_status = None;
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
     let fallback = failure(StatusCode::INTERNAL_SERVER_ERROR);
     let error = error.downcast_ref::<HttpError>().unwrap_or_else(|| {
         fallback
@@ -570,22 +684,25 @@ fn populate_error(ctx: &mut Context, error: &anyhow::Error) -> StatusCode {
             error
                 .status
                 .canonical_reason()
-                .unwrap_or("Error")
+                .unwrap_or_default()
                 .to_owned(),
         ),
         (
             "http.error.message",
-            error
-                .status
-                .canonical_reason()
-                .unwrap_or("Error")
-                .to_owned(),
+            error.message.clone().unwrap_or_else(|| {
+                error
+                    .status
+                    .canonical_reason()
+                    .unwrap_or_default()
+                    .to_owned()
+            }),
         ),
         ("http.error.id", error.id.clone()),
         ("http.error.trace", error.trace.clone()),
     ] {
         ctx.values.insert(key.into(), value);
     }
+    ctx.error_status = Some(error.status);
     error.status
 }
 type ResponseFuture<'a> = Pin<Box<dyn Future<Output = Result<Flow>> + Send + 'a>>;
@@ -624,6 +741,53 @@ fn handlers<'a>(
     Box::pin(async move {
         for handler in list {
             match handler {
+                Handler::StaticError { status, message } => {
+                    let code = if status.is_empty() {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        let raw = ctx.expand(status)?;
+                        let code = raw.parse::<i64>().map_err(|error| {
+                            let reason = match error.kind() {
+                                std::num::IntErrorKind::PosOverflow
+                                | std::num::IntErrorKind::NegOverflow => "value out of range",
+                                _ => "invalid syntax",
+                            };
+                            failure_with_message(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Some(format!("strconv.Atoi: parsing {raw:?}: {reason}")),
+                            )
+                        })?;
+                        u16::try_from(code)
+                            .ok()
+                            .and_then(|code| StatusCode::from_u16(code).ok())
+                            .filter(|status| !status.is_informational())
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+                    };
+                    let message = replace(message, false, |name| ctx.lookup(name))?;
+                    return Err(failure_with_message(code, Some(message)));
+                }
+                Handler::Invoke(name) => {
+                    let route = server
+                        .plan
+                        .named_routes
+                        .get(name)
+                        .ok_or_else(|| MissingNamedRoute(name.clone()))?;
+                    if ctx.invoke_depth >= 64 {
+                        return Err(failure(StatusCode::INTERNAL_SERVER_ERROR));
+                    }
+                    ctx.invoke_depth += 1;
+                    let result = routes(std::slice::from_ref(route), ctx, inner, server).await;
+                    ctx.invoke_depth -= 1;
+                    match result? {
+                        Flow::Continue => {}
+                        flow => return Ok(flow),
+                    }
+                }
+                Handler::LogAppend(plan) => {
+                    if let Some(index) = log_append::enter(ctx, plan).await {
+                        ctx.deferred.push(DeferredResponse::LogBody(index));
+                    }
+                }
                 Handler::StaticResponse {
                     status,
                     body,
@@ -640,11 +804,7 @@ fn handlers<'a>(
                     ctx.immediate = fields;
                     prepared?;
                     let status = if status.is_empty() {
-                        ctx.values
-                            .get("http.error.status_code")
-                            .and_then(|s| s.parse::<u16>().ok())
-                            .and_then(|s| StatusCode::from_u16(s).ok())
-                            .unwrap_or(StatusCode::OK)
+                        ctx.error_status.unwrap_or(StatusCode::OK)
                     } else {
                         StatusCode::from_u16(ctx.expand(status)?.parse()?)
                             .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR))?
@@ -666,13 +826,18 @@ fn handlers<'a>(
                     }
                     return Ok(Flow::Response(response));
                 }
+                Handler::RequestBody(plan) => {
+                    Box::pin(super::request_body::apply(ctx, plan)).await?;
+                }
                 Handler::Encode(plan) => {
                     if let Some(codec) = plan.select(ctx.req_mut().headers_mut()) {
-                        ctx.deferred.push(DeferredResponse::Encode(super::encode_response::ResponseEncoding {
-                            plan: plan.clone(),
-                            codec,
-                            method: ctx.req().method().clone(),
-                        }));
+                        ctx.deferred.push(DeferredResponse::Encode(
+                            super::encode_response::ResponseEncoding {
+                                plan: plan.clone(),
+                                codec,
+                                method: ctx.req().method().clone(),
+                            },
+                        ));
                     }
                 }
                 Handler::Headers {
@@ -697,7 +862,8 @@ fn handlers<'a>(
                     headers.remove(http::header::HOST);
                     *ctx.req_mut().headers_mut() = headers;
                     if *deferred || response.require.is_some() {
-                        ctx.deferred.push(DeferredResponse::Headers(response.clone()));
+                        ctx.deferred
+                            .push(DeferredResponse::Headers(response.clone()));
                     } else {
                         let mut headers = std::mem::take(&mut ctx.immediate);
                         apply_headers(&mut headers, response, ctx)?;
@@ -710,6 +876,7 @@ fn handlers<'a>(
                     errors_configured,
                 } => {
                     let pending_headers = ctx.deferred.len();
+                    let pending_logs = log_append::mark(ctx);
                     let result = routes(list, ctx, inner, server).await;
                     match result {
                         Ok(Flow::Continue) => {}
@@ -717,6 +884,7 @@ fn handlers<'a>(
                         Err(error) if *errors_configured => {
                             // Keep wrappers outside this subroute, while
                             // dropping the failed inner route's deferred work.
+                            log_append::unwind(ctx, pending_logs, None).await;
                             ctx.deferred.truncate(pending_headers);
                             populate_error(ctx, &error);
                             match routes(errors, ctx, inner, server).await? {
@@ -789,6 +957,8 @@ fn handlers<'a>(
                 }
                 Handler::Vars(vars) => {
                     for (name, value) in vars {
+                        let name = ctx.expand(name)?;
+                        log_append::remember_var(ctx, &name, value);
                         if name == "log_skip" {
                             ctx.skip_access = value.as_bool() == Some(true);
                         } else if name == "access_logger_names" {
@@ -798,15 +968,23 @@ fn handlers<'a>(
                                 .and_then(|names| {
                                     names
                                         .iter()
-                                        .map(|value| value.as_str().filter(|name| name.len()<=128).map(str::to_owned))
+                                        .map(|value| {
+                                            value
+                                                .as_str()
+                                                .filter(|name| name.len() <= 128)
+                                                .map(str::to_owned)
+                                        })
                                         .collect()
                                 });
                         }
-                        let value = match value {
+                        let value = match value.as_ref() {
                             serde_json::Value::String(s) => ctx.expand(s)?,
                             serde_json::Value::Null => String::new(),
                             other => crate::http_config::helpers::value_string(other),
                         };
+                        if name == "http.auth.user.id" {
+                            ctx.values.insert(name.clone(), value.clone());
+                        }
                         ctx.values.insert(format!("http.vars.{name}"), value);
                     }
                 }
@@ -926,18 +1104,32 @@ fn handlers<'a>(
                     pass_thru,
                     canonical_uris,
                     sidecars,
-                } => match super::files::serve(ctx, root.as_deref(), hide, index_names, *canonical_uris, sidecars).await? {
+                } => match super::files::serve(
+                    ctx,
+                    root.as_deref(),
+                    hide,
+                    index_names,
+                    *canonical_uris,
+                    sidecars,
+                )
+                .await?
+                {
                     Some(response) => return Ok(Flow::Response(response)),
                     None if *pass_thru => {}
                     None => return Err(failure(StatusCode::NOT_FOUND)),
                 },
                 Handler::ReverseProxy(config) => {
+                    let body_limit = ctx.body_limit.clone();
                     return Ok(Flow::Response(
                         super::proxy::serve(ctx, config, server, inner)
                             .await
                             .map_err(|error| {
                                 if error.is::<HttpError>() {
                                     error
+                                } else if super::request_body::limit_error(error.as_ref())
+                                    || super::request_body::limit_hit(body_limit.as_deref())
+                                {
+                                    failure(StatusCode::PAYLOAD_TOO_LARGE)
                                 } else if error.chain().any(|source| {
                                     source
                                         .downcast_ref::<std::io::Error>()
@@ -1165,9 +1357,7 @@ fn static_informational<'a>(
     bytes: String,
 ) -> ResponseFuture<'a> {
     Box::pin(async move {
-        if status == StatusCode::SWITCHING_PROTOCOLS
-            && ctx.req().version() != Version::HTTP_11
-        {
+        if status == StatusCode::SWITCHING_PROTOCOLS && ctx.req().version() != Version::HTTP_11 {
             // 101 is an HTTP/1.1 switch, not an HTTP/2 extended
             // CONNECT. A malformed static response must not break
             // neighboring streams or confuse HTTP/1.0 framing.
@@ -1203,7 +1393,9 @@ fn static_informational<'a>(
             response.extensions_mut().insert(head_length);
         }
         if !empty_implicit && status != StatusCode::SWITCHING_PROTOCOLS {
-            response.extensions_mut().insert(StaticInterimStatus(status.as_u16()));
+            response
+                .extensions_mut()
+                .insert(StaticInterimStatus(status.as_u16()));
         }
         *response.headers_mut() = fields;
         Ok(if empty_implicit {
@@ -1215,8 +1407,7 @@ fn static_informational<'a>(
 }
 
 fn static_head_length(ctx: &Context, body: &str) -> Option<StaticHeadLength> {
-    (ctx.req().method() == Method::HEAD && !body.is_empty())
-        .then_some(StaticHeadLength(body.len()))
+    (ctx.req().method() == Method::HEAD && !body.is_empty()).then_some(StaticHeadLength(body.len()))
 }
 
 #[inline]
@@ -1258,11 +1449,7 @@ fn apply_static_headers(
     Ok(())
 }
 
-fn apply_deferred_headers(
-    fields: &mut HeaderMap,
-    status: StatusCode,
-    ctx: &Context,
-) -> Result<()> {
+fn apply_deferred_headers(fields: &mut HeaderMap, status: StatusCode, ctx: &Context) -> Result<()> {
     for operations in ctx.deferred.iter().rev() {
         if let DeferredResponse::Headers(operations) = operations {
             apply_response_headers(fields, status.as_u16(), operations, ctx)?;
@@ -1640,9 +1827,13 @@ fn finalize_transforms<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         let status = response.status();
-        let interim = response.extensions().get::<StaticInterimStatus>().map(|code| code.0);
+        let interim = response
+            .extensions()
+            .get::<StaticInterimStatus>()
+            .map(|code| code.0);
         let mut body = std::mem::replace(response.body_mut(), full(Bytes::new()));
-        for entry in ctx.deferred.iter().rev() {
+        let deferred = std::mem::take(&mut ctx.deferred);
+        for entry in deferred.iter().rev() {
             match entry {
                 DeferredResponse::Headers(ops) if explicit => {
                     apply_response_headers(headers, status.as_u16(), ops, ctx)?;
@@ -1654,6 +1845,9 @@ fn finalize_transforms<'a>(
                         .await;
                 }
                 DeferredResponse::Encode(_) => {}
+                DeferredResponse::LogBody(index) => {
+                    log_append::capture_response(ctx, *index, headers, &mut body, explicit).await;
+                }
             }
         }
         *response.body_mut() = body;

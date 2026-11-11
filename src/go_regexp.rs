@@ -124,6 +124,36 @@ impl GoRegexp {
     pub(crate) fn memory_usage(&self) -> usize {
         self.memory
     }
+    /// First-match captures for bounded handshake inputs. The caller runs this
+    /// within its TLS CPU lane and supplies the existing workspace allowance.
+    pub(crate) fn first_match(
+        &self,
+        input: &str,
+        budget: &ReplaceBudget,
+    ) -> std::result::Result<Option<BTreeMap<String, String>>, OperationError> {
+        budget.check()?;
+        if input.len() > MAX_INPUT_BYTES || self.search_memory > budget.scratch {
+            return Err(OperationError::ByteLimit);
+        }
+        let mut captures = self.native.create_captures();
+        let mut cache = self.native.create_cache();
+        if !self.search_captures(input, 0, &mut cache, &mut captures, budget)? {
+            return Ok(None);
+        }
+        let mut result = BTreeMap::new();
+        for (index, name) in self.names.iter().enumerate() {
+            let value = captures
+                .get_group(index)
+                .and_then(|range| input.get(range.range()))
+                .unwrap_or_default()
+                .to_owned();
+            result.insert(index.to_string(), value.clone());
+            if let Some(name) = name {
+                result.insert(name.to_string(), value);
+            }
+        }
+        Ok(Some(result))
+    }
     /// A bounded-width expression can safely scan large inputs in overlapping
     /// windows. The whole input is retained for assertions (anchors and word
     /// boundaries), and a match is never accepted in the overlap. An unbounded

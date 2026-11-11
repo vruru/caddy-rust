@@ -19,7 +19,18 @@ pub(super) fn configure(
     runtime: &TicketRuntime,
     sessions: &Arc<SharedSessions>,
     state: &Arc<HandshakeState>,
+    client_auth_configured: bool,
+    policy_identity: [u8; 32],
 ) -> Option<Arc<ConnectionTickets>> {
+    if client_auth_configured {
+        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        config.send_tls13_tickets = 0;
+        config.max_tls13_tickets = 0;
+        config.max_early_data_size = 0;
+        return None;
+    }
+    #[cfg(not(feature = "native-run"))]
+    let _ = policy_identity;
     match runtime {
         TicketRuntime::RuntimeDefault => {
             config.send_tls13_tickets = 1;
@@ -39,7 +50,15 @@ pub(super) fn configure(
         }
         #[cfg(feature = "native-run")]
         TicketRuntime::Rotating { owner, realm, .. } => {
-            let tickets = Arc::new(ConnectionTickets::new(owner.clone(), *realm));
+            use sha2::{Digest, Sha256};
+            let mut bound = Sha256::new();
+            bound.update(b"caddy-connection-ticket-policy-v1");
+            bound.update(realm);
+            bound.update(policy_identity);
+            let tickets = Arc::new(ConnectionTickets::new(
+                owner.clone(),
+                bound.finalize().into(),
+            ));
             config.ticketer = tickets.clone();
             config.session_storage = Arc::new(NoServerSessionStorage {});
             config.send_tls13_tickets = 1;
@@ -79,23 +98,30 @@ impl fmt::Debug for HandshakeState {
     }
 }
 
-struct Entry {
+struct Entry<Owner> {
     secret: Zeroizing<Vec<u8>>,
-    owner: Arc<HandshakeState>,
+    owner: Arc<Owner>,
     inserted: Instant,
 }
-impl Entry {
+
+impl<Owner> Entry<Owner> {
     fn expired_at(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.inserted) >= SESSION_LIFETIME
     }
 }
 
-struct Cache {
-    entries: HashMap<Vec<u8>, Entry>,
+pub(super) enum OwnerCheck<T> {
+    Pending,
+    Reject,
+    Accept(T),
+}
+
+struct Cache<Owner> {
+    entries: HashMap<Vec<u8>, Entry<Owner>>,
     order: VecDeque<Vec<u8>>,
 }
 
-impl fmt::Debug for Cache {
+impl<Owner> fmt::Debug for Cache<Owner> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Cache")
             .field("len", &self.entries.len())
@@ -103,11 +129,11 @@ impl fmt::Debug for Cache {
     }
 }
 
-pub(super) struct SharedSessions {
-    state: Mutex<Cache>,
+pub(super) struct SessionCache<Owner> {
+    state: Mutex<Cache<Owner>>,
 }
 
-impl SharedSessions {
+impl<Owner> SessionCache<Owner> {
     pub(super) fn new() -> Self {
         Self {
             state: Mutex::new(Cache {
@@ -116,89 +142,25 @@ impl SharedSessions {
             }),
         }
     }
-}
 
-impl fmt::Debug for SharedSessions {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SharedSessions")
-            .field(
-                "state",
-                &self.state.lock().unwrap_or_else(|e| e.into_inner()),
-            )
-            .finish_non_exhaustive()
-    }
-}
-
-pub(super) struct PerConnectionSessions {
-    shared: Arc<SharedSessions>,
-    handshake: Arc<HandshakeState>,
-}
-
-impl PerConnectionSessions {
-    pub(super) fn new(shared: Arc<SharedSessions>, handshake: Arc<HandshakeState>) -> Self {
-        Self { shared, handshake }
-    }
-    fn lookup(&self, key: &[u8], consume: bool) -> Option<Vec<u8>> {
-        // rustls 0.23.46 calls the version-aware resolver before consulting
-        // session storage. An absent actual selection must never use a hint.
-        let current_chain = self.handshake.selected_chain.get()?;
-        let (result, discarded) = {
-            let mut cache = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-            let entry = cache.entries.get(key)?;
-            // An unfinished handshake has not established an identity yet.
-            // Leave its entry intact and safely fall back to a full handshake.
-            let identity = if entry.expired_at(Instant::now()) {
-                None
-            } else {
-                Some(entry.owner.identity.get()?.clone())
-            };
-            if identity
-                .as_ref()
-                .is_none_or(|identity| !identity.resumable_for(current_chain))
-            {
-                cache.order.retain(|k| k.as_slice() != key);
-                (None, cache.entries.remove(key))
-            } else {
-                let value = entry.secret.to_vec();
-                let discarded = if consume {
-                    cache.order.retain(|k| k.as_slice() != key);
-                    cache.entries.remove(key)
-                } else {
-                    None
-                };
-                (Some((value, identity?)), discarded)
-            }
-        };
-        drop(discarded);
-        let (value, identity) = result?;
-        *self
-            .handshake
-            .resumed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(identity);
-        Some(value)
-    }
-}
-
-impl fmt::Debug for PerConnectionSessions {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PerConnectionSessions")
-            .field("shared", &self.shared)
-            .field("handshake", &self.handshake)
-            .finish_non_exhaustive()
-    }
-}
-
-impl StoresServerSessions for PerConnectionSessions {
-    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
-        let mut abandoned: Vec<Entry> = Vec::with_capacity(2);
-        let mut guard = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+    pub(super) fn remember(
+        &self,
+        key: Vec<u8>,
+        value: Zeroizing<Vec<u8>>,
+        owner: Arc<Owner>,
+    ) -> bool {
+        let mut abandoned: Vec<Entry<Owner>> = Vec::with_capacity(2);
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         // Insertion order is also age order, including replacement. Retire
         // stale secrets during activity without a task per server/connection;
         // zeroize their bytes only after releasing the cache mutex.
         while let Some(oldest) = guard.order.front() {
-            if guard.entries.get(oldest).is_some_and(|entry| !entry.expired_at(now)) {
+            if guard
+                .entries
+                .get(oldest)
+                .is_some_and(|entry| !entry.expired_at(now))
+            {
                 break;
             }
             let oldest = guard.order.pop_front().expect("front checked");
@@ -212,8 +174,8 @@ impl StoresServerSessions for PerConnectionSessions {
         }
 
         let entry = Entry {
-            secret: Zeroizing::new(value),
-            owner: Arc::clone(&self.handshake),
+            secret: value,
+            owner,
             inserted: now,
         };
 
@@ -237,6 +199,107 @@ impl StoresServerSessions for PerConnectionSessions {
         }
 
         true
+    }
+
+    pub(super) fn lookup<T>(
+        &self,
+        key: &[u8],
+        consume: bool,
+        check: impl FnOnce(&Owner) -> OwnerCheck<T>,
+    ) -> Option<(Vec<u8>, T)> {
+        let (result, discarded) = {
+            let mut cache = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = cache.entries.get(key)?;
+            let check = if entry.expired_at(Instant::now()) {
+                OwnerCheck::Reject
+            } else {
+                check(entry.owner.as_ref())
+            };
+            match check {
+                OwnerCheck::Pending => {
+                    return None;
+                }
+                OwnerCheck::Reject => {
+                    cache.order.retain(|k| k.as_slice() != key);
+                    (None, cache.entries.remove(key))
+                }
+                OwnerCheck::Accept(t) => {
+                    let value = entry.secret.to_vec();
+                    let discarded = if consume {
+                        cache.order.retain(|k| k.as_slice() != key);
+                        cache.entries.remove(key)
+                    } else {
+                        None
+                    };
+                    (Some((value, t)), discarded)
+                }
+            }
+        };
+        drop(discarded);
+        result
+    }
+}
+
+impl<Owner> fmt::Debug for SessionCache<Owner> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedSessions")
+            .field(
+                "state",
+                &self.state.lock().unwrap_or_else(|e| e.into_inner()),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+pub(super) type SharedSessions = SessionCache<HandshakeState>;
+
+pub(super) struct PerConnectionSessions {
+    shared: Arc<SharedSessions>,
+    handshake: Arc<HandshakeState>,
+}
+
+impl PerConnectionSessions {
+    pub(super) fn new(shared: Arc<SharedSessions>, handshake: Arc<HandshakeState>) -> Self {
+        Self { shared, handshake }
+    }
+    fn lookup(&self, key: &[u8], consume: bool) -> Option<Vec<u8>> {
+        // rustls 0.23.46 calls the version-aware resolver before consulting
+        // session storage. An absent actual selection must never use a hint.
+        let current_chain = self.handshake.selected_chain.get()?;
+        let (value, identity) =
+            self.shared
+                .lookup(key, consume, |owner| match owner.identity.get() {
+                    None => OwnerCheck::Pending,
+                    Some(identity) => {
+                        if identity.resumable_for(current_chain) {
+                            OwnerCheck::Accept(identity.clone())
+                        } else {
+                            OwnerCheck::Reject
+                        }
+                    }
+                })?;
+        *self
+            .handshake
+            .resumed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(identity);
+        Some(value)
+    }
+}
+
+impl fmt::Debug for PerConnectionSessions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PerConnectionSessions")
+            .field("shared", &self.shared)
+            .field("handshake", &self.handshake)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StoresServerSessions for PerConnectionSessions {
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        self.shared
+            .remember(key, Zeroizing::new(value), Arc::clone(&self.handshake))
     }
 
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {

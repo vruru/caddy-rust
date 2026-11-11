@@ -1,32 +1,32 @@
 //! Native HTTP listeners with request-scoped configuration snapshots. Preparation is
 //! isolated from publication; failed binds and certificate loads preserve the
 //! active generation. This module never starts a Go process.
-#[path = "http_runtime/pressure.rs"]
-mod pressure;
 #[path = "http_runtime/connection_budget.rs"]
 mod connection_budget;
 #[path = "http_runtime/descriptor_budget.rs"]
 mod descriptor_budget;
-pub use connection_budget::{ConnectionLimits,ConnectionDiagnostics,ConnectionPoolSnapshot};
+#[path = "http_runtime/pressure.rs"]
+mod pressure;
+pub use connection_budget::{ConnectionDiagnostics, ConnectionLimits, ConnectionPoolSnapshot};
 #[path = "http_runtime/auth_cache.rs"]
 pub(crate) mod auth_cache;
 #[path = "http_runtime/certificate_provider.rs"]
 mod certificate_provider;
 pub use certificate_provider::ScopedCertificateProvider;
-#[path = "http_runtime/http_redirect.rs"]
-mod http_redirect;
-#[path = "http_runtime/tls_first_record.rs"]
-mod tls_first_record;
 #[path = "http_runtime/connection_identity.rs"]
 mod connection_identity;
 #[path = "http_runtime/connection_sessions.rs"]
 mod connection_sessions;
-#[path = "http_runtime/files.rs"]
-mod files;
 #[path = "http_runtime/file_preconditions.rs"]
 mod file_preconditions;
 #[path = "http_runtime/file_sidecars.rs"]
 pub(crate) mod file_sidecars;
+#[path = "http_runtime/files.rs"]
+mod files;
+#[path = "http_runtime/http_redirect.rs"]
+mod http_redirect;
+#[path = "http_runtime/tls_first_record.rs"]
+mod tls_first_record;
 
 #[path = "http_runtime/fastcgi/mod.rs"]
 mod fastcgi;
@@ -35,13 +35,14 @@ mod fastcgi;
 mod access_log;
 #[path = "http_runtime/tls_executor.rs"]
 mod tls_executor;
-pub use tls_executor::TlsHandshakeDiagnostics;
 use connection_identity::{TlsIdentity, TlsVerdict};
+pub use tls_executor::TlsHandshakeDiagnostics;
+mod h3;
 #[path = "http_runtime/lifecycle.rs"]
 mod lifecycle;
-mod h3;
 #[path = "http_runtime/manual_certificates.rs"]
 mod manual_certificates;
+mod tls_policies;
 pub use lifecycle::{CommitOutcome, HttpStage, StagedAddress};
 #[path = "http_runtime/listener_lease.rs"]
 mod listener_lease;
@@ -57,6 +58,8 @@ pub(crate) use path_glob::go_path_glob;
 mod proxy;
 #[path = "http_runtime/proxy_policy.rs"]
 pub(crate) mod proxy_policy;
+#[path = "http_runtime/request_body.rs"]
+mod request_body;
 #[path = "http_runtime/retirement.rs"]
 mod retirement;
 use retirement::{BusinessGeneration, BusinessGuard};
@@ -64,23 +67,23 @@ pub use retirement::{HttpRetirement, RetirementOutcome};
 #[path = "http_runtime/resource_budget.rs"]
 mod resource_budget;
 pub use resource_budget::{BudgetSnapshot, ResourceDiagnostics, ResourceLimits};
-#[path = "http_runtime/request.rs"]
-mod request;
-#[path = "http_runtime/response_matcher.rs"]
-mod response_matcher;
 #[path = "http_runtime/accepted_encodings.rs"]
 pub(crate) mod accepted_encodings;
 #[path = "http_runtime/encode_body.rs"]
 pub(crate) mod encode_body;
+#[path = "http_runtime/request.rs"]
+mod request;
+#[path = "http_runtime/response_matcher.rs"]
+mod response_matcher;
 pub use encode_body::CompressionDiagnostics;
 #[path = "http_runtime/encode_response.rs"]
 pub(crate) mod encode_response;
 #[path = "http_runtime/gzip_codec.rs"]
 mod gzip_codec;
-#[path = "http_runtime/zstd_codec.rs"]
-mod zstd_codec;
 #[path = "http_runtime/incremental.rs"]
 mod incremental;
+#[path = "http_runtime/zstd_codec.rs"]
+mod zstd_codec;
 
 #[path = "http_runtime/rewrite_uri.rs"]
 mod rewrite_uri;
@@ -148,7 +151,7 @@ impl HttpRuntime {
     }
 }
 struct Inner {
-    connections:Arc<connection_budget::Budgets>,
+    connections: Arc<connection_budget::Budgets>,
     tls_executor: std::sync::OnceLock<tls_executor::TlsExecutor>,
     tls_executor_init: std::sync::Mutex<()>,
     tls_executor_failure: std::sync::atomic::AtomicU8,
@@ -175,7 +178,10 @@ struct Generation {
 impl Generation {
     fn business(&self, key: &SocketAddr) -> Option<(Arc<ActiveServer>, Arc<BusinessGeneration>)> {
         if let Some(server) = self.servers.get(key) {
-            return self.activity.is_admitting().then(|| (server.clone(),self.activity.clone()));
+            return self
+                .activity
+                .is_admitting()
+                .then(|| (server.clone(), self.activity.clone()));
         }
         let binding = self.retiring.get(key)?.upgrade()?;
         binding
@@ -189,12 +195,17 @@ struct ActiveServer {
     plan: Arc<ServerConfig>,
     tls: Option<Arc<rustls::ServerConfig>>,
     resolver: Option<Arc<CandidateResolver>>,
-    sessions: Arc<connection_sessions::SharedSessions>,
+    tls_policies: Vec<Arc<tls_policies::PreparedPolicy>>,
+    policy_identity: [u8; 32],
     tickets: crate::stek::TicketRuntime,
     clients: Arc<HashMap<usize, proxy::ProxyClient>>,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum CertificateOrigin { Manual, Managed, Proof }
+enum CertificateOrigin {
+    Manual,
+    Managed,
+    Proof,
+}
 struct CandidateResolver {
     challenges: Arc<HotCertificateResolver>,
     static_certificates: Arc<HotCertificateResolver>,
@@ -238,26 +249,50 @@ impl CandidateResolver {
         })
     }
     fn select_for_version(
-        &self, sni: Option<&str>, alpn: &[&[u8]], schemes: &[rustls::SignatureScheme], version: rustls::ProtocolVersion,
+        &self,
+        sni: Option<&str>,
+        alpn: &[&[u8]],
+        schemes: &[rustls::SignatureScheme],
+        version: rustls::ProtocolVersion,
     ) -> Option<crate::tls_resolver::CertificateSelection> {
-        self.select_for_version_with_origin(sni,alpn,schemes,version).map(|(selection,_)|selection)
+        self.select_for_version_with_origin(sni, alpn, schemes, version)
+            .map(|(selection, _)| selection)
     }
     fn select_for_version_with_origin(
-        &self, sni: Option<&str>, alpn: &[&[u8]], schemes: &[rustls::SignatureScheme], version: rustls::ProtocolVersion,
+        &self,
+        sni: Option<&str>,
+        alpn: &[&[u8]],
+        schemes: &[rustls::SignatureScheme],
+        version: rustls::ProtocolVersion,
     ) -> Option<(crate::tls_resolver::CertificateSelection, CertificateOrigin)> {
-        let sni=sni?;
+        let sni = sni?;
         if alpn.contains(&ACME_ALPN) {
-            return self.challenges.select_for_version(Some(sni),alpn,schemes,version).map(|key|(key,CertificateOrigin::Proof));
+            return self
+                .challenges
+                .select_for_version(Some(sni), alpn, schemes, version)
+                .map(|key| (key, CertificateOrigin::Proof));
         }
-        self.static_certificates.select_for_version_filtered(Some(sni),alpn,schemes,version,&self.allowed_static)
-            .map(|key|(key,CertificateOrigin::Manual))
-            .or_else(|| self.managed_name_allowed(sni)
-                .then(||self.managed.select_for_version(Some(sni),alpn,schemes,version)).flatten()
-                .map(|key|(key,CertificateOrigin::Managed)))
+        self.static_certificates
+            .select_for_version_filtered(Some(sni), alpn, schemes, version, &self.allowed_static)
+            .map(|key| (key, CertificateOrigin::Manual))
+            .or_else(|| {
+                self.managed_name_allowed(sni)
+                    .then(|| {
+                        self.managed
+                            .select_for_version(Some(sni), alpn, schemes, version)
+                    })
+                    .flatten()
+                    .map(|key| (key, CertificateOrigin::Managed))
+            })
     }
-    fn managed_name_allowed(&self, sni:&str)->bool {
-        self.allowed_managed.iter().any(|name|dns_covers(name,sni))
-            || self.provider.as_ref().is_some_and(|provider|provider.cached_name(sni))
+    fn managed_name_allowed(&self, sni: &str) -> bool {
+        self.allowed_managed
+            .iter()
+            .any(|name| dns_covers(name, sni))
+            || self
+                .provider
+                .as_ref()
+                .is_some_and(|provider| provider.cached_name(sni))
     }
     fn select_using(
         &self,
@@ -286,7 +321,8 @@ impl HttpRuntime {
             registry,
             resolver,
             Arc::new(resource_budget::Resources::automatic()),
-            connection_budget::Budgets::new(ConnectionLimits::automatic()).expect("valid automatic connection budgets"),
+            connection_budget::Budgets::new(ConnectionLimits::automatic())
+                .expect("valid automatic connection budgets"),
         )
     }
     /// Explicit native resource policy. `None` disables an independent timer;
@@ -297,24 +333,40 @@ impl HttpRuntime {
         resolver: Arc<HotCertificateResolver>,
         limits: ResourceLimits,
     ) -> Result<Self> {
-        Self::with_limits(registry,resolver,limits,ConnectionLimits::automatic())
+        Self::with_limits(registry, resolver, limits, ConnectionLimits::automatic())
     }
     /// Native admission options do not add or ignore Caddy JSON fields.
-    pub fn with_connection_limits(registry:ChallengeRegistry,resolver:Arc<HotCertificateResolver>,limits:ConnectionLimits)->Result<Self> {
-        Self::with_limits(registry,resolver,ResourceLimits::automatic(),limits)
+    pub fn with_connection_limits(
+        registry: ChallengeRegistry,
+        resolver: Arc<HotCertificateResolver>,
+        limits: ConnectionLimits,
+    ) -> Result<Self> {
+        Self::with_limits(registry, resolver, ResourceLimits::automatic(), limits)
     }
-    pub fn with_limits(registry:ChallengeRegistry,resolver:Arc<HotCertificateResolver>,resources:ResourceLimits,connections:ConnectionLimits)->Result<Self> {
-        let resources=Arc::new(resource_budget::Resources::from_limits(resources)?);
-        let connections=connection_budget::Budgets::new(connections)?;
-        Ok(Self::from_resources(registry,resolver,resources,connections))
+    pub fn with_limits(
+        registry: ChallengeRegistry,
+        resolver: Arc<HotCertificateResolver>,
+        resources: ResourceLimits,
+        connections: ConnectionLimits,
+    ) -> Result<Self> {
+        let resources = Arc::new(resource_budget::Resources::from_limits(resources)?);
+        let connections = connection_budget::Budgets::new(connections)?;
+        Ok(Self::from_resources(
+            registry,
+            resolver,
+            resources,
+            connections,
+        ))
     }
     /// Independent-pool diagnostics; not one atomic cross-pool snapshot.
-    pub fn connection_diagnostics(&self)->ConnectionDiagnostics { self.inner.connections.snapshot() }
+    pub fn connection_diagnostics(&self) -> ConnectionDiagnostics {
+        self.inner.connections.snapshot()
+    }
     fn from_resources(
         registry: ChallengeRegistry,
         resolver: Arc<HotCertificateResolver>,
         resources: Arc<resource_budget::Resources>,
-        connections:Arc<connection_budget::Budgets>,
+        connections: Arc<connection_budget::Budgets>,
     ) -> Self {
         let activity =
             BusinessGeneration::new(0, crate::http_config::HttpShutdownPolicy::default());
@@ -334,7 +386,7 @@ impl HttpRuntime {
         Self {
             inner: Arc::new(Inner {
                 current: ArcSwap::from_pointee(initial),
-            quic_limits: h3::Limits::new(),
+                quic_limits: h3::Limits::new(),
                 tls_executor: std::sync::OnceLock::new(),
                 tls_executor_init: std::sync::Mutex::new(()),
                 tls_executor_failure: std::sync::atomic::AtomicU8::new(0),
@@ -358,16 +410,25 @@ impl HttpRuntime {
     /// Counts describe live handshake running/waiting lanes. CPU work executes
     /// on the separate all-available-CPU runtime; this snapshot is not atomic
     /// across pools and does not include pre-ClientHello socket admission.
-    pub fn tls_handshake_diagnostics(&self)->Option<TlsHandshakeDiagnostics> {
-        self.inner.tls_executor.get().map(tls_executor::TlsExecutor::diagnostics)
+    pub fn tls_handshake_diagnostics(&self) -> Option<TlsHandshakeDiagnostics> {
+        self.inner
+            .tls_executor
+            .get()
+            .map(tls_executor::TlsExecutor::diagnostics)
     }
     /// Last safe failure category; retained after a successful retry.
-    pub fn last_tls_executor_initialization_failure(&self)->Option<&'static str> {
-        tls_initialization_failure_name(self.inner.tls_executor_failure.load(std::sync::atomic::Ordering::Acquire))
+    pub fn last_tls_executor_initialization_failure(&self) -> Option<&'static str> {
+        tls_initialization_failure_name(
+            self.inner
+                .tls_executor_failure
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
     }
     /// Number of actual constructor attempts, excluding already initialized reads.
-    pub fn tls_executor_initialization_attempts(&self)->u64 {
-        self.inner.tls_executor_attempts.load(std::sync::atomic::Ordering::Relaxed)
+    pub fn tls_executor_initialization_attempts(&self) -> u64 {
+        self.inner
+            .tls_executor_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn generation(&self) -> u64 {
         self.inner.current.load().id
@@ -493,7 +554,13 @@ async fn prepare_servers(
     material: ServingMaterial<'_>,
     resources: &Arc<resource_budget::Resources>,
 ) -> Result<(HashMap<SocketAddr, Arc<ActiveServer>>, Vec<Vec<String>>)> {
-    let ServingMaterial { manual, provider, logging, tickets, validate_only } = material;
+    let ServingMaterial {
+        manual,
+        provider,
+        logging,
+        tickets,
+        validate_only,
+    } = material;
     let logging_available = logging.is_some() || validate_only;
     let standalone;
     let manual = if let Some(manual) = manual {
@@ -516,6 +583,7 @@ async fn prepare_servers(
         .run(move || manual_certificates::validate(&validation))
         .await
         .map_err(|_| anyhow::anyhow!("manual inventory worker unavailable"))??;
+    let mut retained_client_auth_bytes = 0usize;
     let mut actual_managed = std::collections::BTreeSet::new();
     let mut redirects = HashMap::<SocketAddr, Vec<Route>>::new();
     let mut output = HashMap::new();
@@ -523,30 +591,17 @@ async fn prepare_servers(
     for server in &config.servers {
         // One generation owns one manual resolver. Tags are per-server
         // identity filters, not separate key/OCSP snapshots.
-        let selected_manual = manual
+        let loaded_names = manual
             .certificates
-            .iter()
-            .filter(|certificate| {
-                server.certificate_tags.is_empty()
-                    || certificate
-                        .tags
-                        .iter()
-                        .any(|tag| server.certificate_tags.contains(tag))
-            })
-            .collect::<Vec<_>>();
-        ensure!(
-            !server.tls || server.certificate_tags.is_empty() || !selected_manual.is_empty(),
-            "TLS certificate tags matched no certificate"
-        );
-        let allowed_static = selected_manual
-            .iter()
-            .map(|certificate| certificate.identity)
-            .collect::<std::collections::HashSet<_>>();
-        let loaded_names = selected_manual
             .iter()
             .flat_map(|certificate| certificate.names.iter())
             .collect::<Vec<_>>();
-        let managed_names = if server.manage_certificates && server.certificate_tags.is_empty() {
+        let managed_names = if server.manage_certificates
+            && server
+                .tls_policies
+                .iter()
+                .any(|policy| policy.any_tag.as_ref().is_none_or(Vec::is_empty))
+        {
             crate::http_config::server_names(server)
                 .into_iter()
                 .filter(|name| {
@@ -604,44 +659,46 @@ async fn prepare_servers(
                 }
             }
         }
-        let (tls, resolver) = if server.tls {
-            let resolver = Arc::new(CandidateResolver {
-                challenges: challenges.clone(),
-                static_certificates: manual.resolver.clone(),
-                allowed_static,
-                provider: if server.certificate_tags.is_empty() { provider.cloned() } else { None },
-                managed: managed.clone(),
-                allowed_managed: if server.certificate_tags.is_empty() {
-                    managed_names.clone()
-                } else {
-                    Vec::new()
-                },
-            });
-            let mut tls = rustls::ServerConfig::builder_with_provider(crate::crypto::provider())
-                .with_safe_default_protocol_versions()?
-                .with_no_client_auth()
-                .with_cert_resolver(resolver.clone());
-            if server.protocols.iter().any(|p| p == "h2") {
-                tls.alpn_protocols.push(b"h2".to_vec());
-            }
-            if server.protocols.iter().any(|p| p == "h1") {
-                tls.alpn_protocols.push(b"http/1.1".to_vec());
-            }
-            tls.alpn_protocols.push(ACME_ALPN.to_vec());
-            ensure!(
-                !tls.ticketer.enabled() && tls.max_early_data_size == 0,
-                "unsupported TLS session policy"
-            );
-            (Some(Arc::new(tls)), Some(resolver))
-        } else {
-            (None, None)
-        };
+        let policies = tls_policies::prepare(
+            server,
+            tls_policies::Sources {
+                manual,
+                managed,
+                challenges,
+                provider,
+                managed_names: &managed_names,
+            },
+            resources,
+            &mut retained_client_auth_bytes,
+        )
+        .await?;
+        let policy_identity = tls_policies::set_identity(&policies);
+        let tls = policies.first().map(|policy| policy.tls.clone());
+        let resolver = policies.first().map(|policy| policy.resolver.clone());
         let client_plan = server.clone();
         let proxy_hosts = resources.proxy_hosts.clone();
         let clients = tokio::task::spawn_blocking(move || {
             let mut clients = HashMap::new();
-            proxy::prepare_clients(&client_plan.routes, &mut clients, &proxy_hosts, logging_available)?;
-            proxy::prepare_clients(&client_plan.errors, &mut clients, &proxy_hosts, logging_available)?;
+            proxy::prepare_clients(
+                &client_plan.routes,
+                &mut clients,
+                &proxy_hosts,
+                logging_available,
+            )?;
+            proxy::prepare_clients(
+                &client_plan.errors,
+                &mut clients,
+                &proxy_hosts,
+                logging_available,
+            )?;
+            for route in client_plan.named_routes.values() {
+                proxy::prepare_clients(
+                    std::slice::from_ref(route),
+                    &mut clients,
+                    &proxy_hosts,
+                    logging_available,
+                )?;
+            }
             Ok::<_, anyhow::Error>(clients)
         })
         .await
@@ -651,7 +708,8 @@ async fn prepare_servers(
             plan: server.clone(),
             tls,
             resolver,
-            sessions: Arc::new(connection_sessions::SharedSessions::new()),
+            tls_policies: policies,
+            policy_identity,
             tickets: tickets.cloned().unwrap_or_default(),
             clients: Arc::new(clients),
         };
@@ -683,8 +741,26 @@ async fn prepare_servers(
             let proxy_hosts = resources.proxy_hosts.clone();
             let clients = tokio::task::spawn_blocking(move || {
                 let mut clients = HashMap::new();
-                proxy::prepare_clients(&client_plan.routes, &mut clients, &proxy_hosts, logging_available)?;
-                proxy::prepare_clients(&client_plan.errors, &mut clients, &proxy_hosts, logging_available)?;
+                proxy::prepare_clients(
+                    &client_plan.routes,
+                    &mut clients,
+                    &proxy_hosts,
+                    logging_available,
+                )?;
+                proxy::prepare_clients(
+                    &client_plan.errors,
+                    &mut clients,
+                    &proxy_hosts,
+                    logging_available,
+                )?;
+                for route in client_plan.named_routes.values() {
+                    proxy::prepare_clients(
+                        std::slice::from_ref(route),
+                        &mut clients,
+                        &proxy_hosts,
+                        logging_available,
+                    )?;
+                }
                 Ok::<_, anyhow::Error>(clients)
             })
             .await
@@ -696,7 +772,8 @@ async fn prepare_servers(
                     plan,
                     tls: None,
                     resolver: None,
-                    sessions: Arc::new(connection_sessions::SharedSessions::new()),
+                    tls_policies: Vec::new(),
+                    policy_identity: [0; 32],
                     tickets: crate::stek::TicketRuntime::RuntimeDefault,
                     clients: Arc::new(clients),
                 }),
@@ -704,6 +781,7 @@ async fn prepare_servers(
         } else {
             let plan = ServerConfig {
                 access_logs: None,
+                named_routes: Default::default(),
                 header_aliases: Default::default(),
                 listen: vec![address],
                 routes,
@@ -712,7 +790,7 @@ async fn prepare_servers(
                 redirect_before_tls: None,
                 redirect_after_tls: None,
                 strict_sni_host: false,
-                certificate_tags: Vec::new(),
+                tls_policies: Vec::new(),
                 trusted_proxies: Vec::new(),
                 trusted_strict: false,
                 client_ip_headers: vec!["X-Forwarded-For".into()],
@@ -732,7 +810,8 @@ async fn prepare_servers(
                     plan: Arc::new(plan),
                     tls: None,
                     resolver: None,
-                    sessions: Arc::new(connection_sessions::SharedSessions::new()),
+                    tls_policies: Vec::new(),
+                    policy_identity: [0; 32],
                     tickets: crate::stek::TicketRuntime::RuntimeDefault,
                     clients: Arc::new(HashMap::new()),
                 }),
@@ -871,33 +950,54 @@ async fn accept_loop(
             .load()
             .business(&key)
             .map(|(server, _)| server)
-            .filter(|server|h3::tcp_enabled(server));
+            .filter(|server| h3::tcp_enabled(server));
         let canonical =
             |address: SocketAddr| SocketAddr::new(address.ip().to_canonical(), address.port());
         let peer = canonical(peer);
         let local = canonical(stream.local_addr().unwrap_or(key));
         let _ = stream.set_nodelay(true);
         let task_inner = inner.clone();
-        let class=if server.is_some(){connection_budget::ConnectionClass::Classifying}else{connection_budget::ConnectionClass::Proof};
-        let admission=tokio::select! {biased;
+        let class = if server.is_some() {
+            connection_budget::ConnectionClass::Classifying
+        } else {
+            connection_budget::ConnectionClass::Proof
+        };
+        let admission = tokio::select! {biased;
             _=cancel.cancelled()=>break,
             _=inner.stopped.cancelled()=>break,
             result=socket.admission.admit_with_pressure(class,&cancel)=>match result{Ok(admission)=>admission,Err(_)=>{drop(stream);continue;}},
         };
-        let stream=connection_budget::AdmittedIo::new(stream,admission);
-        let admission=stream.admission();
-        let eviction=stream.eviction_token();
+        let stream = connection_budget::AdmittedIo::new(stream, admission);
+        let admission = stream.admission();
+        let eviction = stream.eviction_token();
         if let Some(server) = server {
-            spawn_admitted(&inner,eviction,async move {
-                let Some(deadline) = tokio::time::Instant::now().checked_add(server.plan.read_header_timeout) else { return; };
+            spawn_admitted(&inner, eviction, async move {
+                let Some(deadline) =
+                    tokio::time::Instant::now().checked_add(server.plan.read_header_timeout)
+                else {
+                    return;
+                };
                 let stream = match http_redirect::prepare(
-                    stream, server.plan.redirect_before_tls, deadline, task_inner.stopped.child_token()
-                ).await {
+                    stream,
+                    server.plan.redirect_before_tls,
+                    deadline,
+                    task_inner.stopped.child_token(),
+                )
+                .await
+                {
                     Ok(stream) => stream,
                     Err(_) => return,
                 };
                 if server.tls.is_some() {
-                    let handshake = connection_identity::accept(&task_inner, stream, admission.clone(), key,Some(deadline),server.plan.redirect_after_tls.is_none());
+                    let handshake = connection_identity::accept(
+                        &task_inner,
+                        stream,
+                        admission.clone(),
+                        key,
+                        Some(deadline),
+                        server.plan.redirect_after_tls.is_none(),
+                        (peer, local),
+                    );
                     let accepted = tokio::select! {
                         biased;
                         _ = task_inner.stopped.cancelled() => return,
@@ -910,32 +1010,73 @@ async fn accept_loop(
                     let tls_details = fastcgi::TlsDetails::of(accepted.stream.get_ref().1);
                     let tls_log = Some(Arc::new(access_log::Tls::of(accepted.stream.get_ref().1)));
 
-                    let Some(deadline) = tokio::time::Instant::now().checked_add(server.plan.read_header_timeout) else { return; };
+                    let Some(deadline) =
+                        tokio::time::Instant::now().checked_add(server.plan.read_header_timeout)
+                    else {
+                        return;
+                    };
                     let stream = match http_redirect::prepare(
-                        accepted.stream, server.plan.redirect_after_tls, deadline, task_inner.stopped.child_token()
-                    ).await {
+                        accepted.stream,
+                        server.plan.redirect_after_tls,
+                        deadline,
+                        task_inner.stopped.child_token(),
+                    )
+                    .await
+                    {
                         Ok(stream) => stream,
                         Err(_) => return,
                     };
-                    serve_connection(task_inner, TokioIo::new(stream), peer, local, ConnectionView {
-                        key, server: accepted.server, admission,
-                        negotiated_tls_h2: Some(negotiated_h2), identity: Some(accepted.identity), tls_log, tls_details: Some(tls_details),
-                    }).await;
+                    serve_connection(
+                        task_inner,
+                        TokioIo::new(stream),
+                        peer,
+                        local,
+                        ConnectionView {
+                            key,
+                            server: accepted.server,
+                            admission,
+                            negotiated_tls_h2: Some(negotiated_h2),
+                            identity: Some(accepted.identity),
+                            tls_log,
+                            tls_details: Some(tls_details),
+                        },
+                    )
+                    .await;
                 } else {
                     let stream = match http_redirect::prepare(
-                        stream, server.plan.redirect_after_tls, deadline, task_inner.stopped.child_token()
-                    ).await {
+                        stream,
+                        server.plan.redirect_after_tls,
+                        deadline,
+                        task_inner.stopped.child_token(),
+                    )
+                    .await
+                    {
                         Ok(stream) => stream,
                         Err(_) => return,
                     };
-                    serve_connection(task_inner, TokioIo::new(stream), peer, local, ConnectionView { key, server, admission, negotiated_tls_h2: None, identity: None, tls_log: None, tls_details: None }).await;
+                    serve_connection(
+                        task_inner,
+                        TokioIo::new(stream),
+                        peer,
+                        local,
+                        ConnectionView {
+                            key,
+                            server,
+                            admission,
+                            negotiated_tls_h2: None,
+                            identity: None,
+                            tls_log: None,
+                            tls_details: None,
+                        },
+                    )
+                    .await;
                 }
             });
         } else {
             let proof = fallback.load_full();
             // A proof connection accepted before commit cannot turn into a
             // business connection after commit, even if it delays its headers.
-            spawn_admitted(&inner,eviction,async move {
+            spawn_admitted(&inner, eviction, async move {
                 if proof.cancel.is_cancelled() {
                     return;
                 }
@@ -950,11 +1091,19 @@ async fn accept_loop(
                             match result { Ok(Ok(stream)) => stream, _ => return }
                         }
                     };
-                    let Some(executor)=task_inner.tls_executor.get() else { return; };
-                    let handshake=executor.execute_proof(async move {
-                        let stream=tokio_rustls::TlsAcceptor::from(tls).accept(stream).await?;
-                        drop(stream);Ok(())
-                    },proof.cancel.child_token(),None);
+                    let Some(executor) = task_inner.tls_executor.get() else {
+                        return;
+                    };
+                    let handshake = executor.execute_proof(
+                        async move {
+                            let stream =
+                                tokio_rustls::TlsAcceptor::from(tls).accept(stream).await?;
+                            drop(stream);
+                            Ok(())
+                        },
+                        proof.cancel.child_token(),
+                        None,
+                    );
                     tokio::select! {
                         biased;
                         _ = proof.cancel.cancelled() => {},
@@ -970,8 +1119,14 @@ async fn accept_loop(
         }
     }
 }
-fn spawn_admitted(inner:&Arc<Inner>,eviction:CancellationToken,future:impl std::future::Future<Output=()>+Send+'static) {
-    inner.tasks.spawn(async move {tokio::select!{biased;_=eviction.cancelled()=>{},_=future=>{}}});
+fn spawn_admitted(
+    inner: &Arc<Inner>,
+    eviction: CancellationToken,
+    future: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    inner.tasks.spawn(async move {
+        tokio::select! {biased;_=eviction.cancelled()=>{},_=future=>{}}
+    });
 }
 async fn serve_proof_connection<I>(inner: Arc<Inner>, io: I, cancel: CancellationToken)
 where
@@ -1001,7 +1156,7 @@ where
     }
 }
 struct ConnectionView {
-    admission:std::sync::Weak<connection_budget::Admission>,
+    admission: std::sync::Weak<connection_budget::Admission>,
     key: SocketAddr,
     server: Arc<ActiveServer>,
     negotiated_tls_h2: Option<bool>,
@@ -1038,7 +1193,7 @@ async fn serve_connection<I>(
         let identity = identity.clone();
         let requested_drain = service_drain.clone();
         let tls_log = tls_log.clone();
-        let admission=admission.clone();
+        let admission = admission.clone();
         async move {
             // Count admission before confirming that this exact view is still
             // current. A retire/join cannot observe zero and later miss a live
@@ -1066,8 +1221,10 @@ async fn serve_connection<I>(
                 let Ok(business) = business else {
                     break (None, None, None);
                 };
-                let alt_svc = tls.then(||snapshot.quic.get(&key)).flatten()
-                    .map(|entry|entry.binding.advertisement.clone());
+                let alt_svc = tls
+                    .then(|| snapshot.quic.get(&key))
+                    .flatten()
+                    .map(|entry| entry.binding.advertisement.clone());
                 break (Some(current), Some(business), alt_svc);
             };
             let verdict = match (identity.as_ref(), current.as_ref()) {
@@ -1111,16 +1268,25 @@ async fn serve_connection<I>(
             };
             // Pin this lookup once: an expired proof cannot later fall through
             // to business routes while still using the proof connection pool.
-            let proof=request::proof_response(&inner.registry,&request).unwrap_or_default();
-            let classified=if proof.is_some() {
-                connection_budget::classify_proof(&admission,None).await
-            }else{
-                connection_budget::classify(&admission,connection_budget::ConnectionClass::Business)
+            let proof = request::proof_response(&inner.registry, &request).unwrap_or_default();
+            let classified = if proof.is_some() {
+                connection_budget::classify_proof(&admission, None).await
+            } else {
+                connection_budget::classify(
+                    &admission,
+                    connection_budget::ConnectionClass::Business,
+                )
             };
             if classified.is_err() {
-                let mut response=simple(StatusCode::SERVICE_UNAVAILABLE,"Service Unavailable\n");
-                if request.version()==http::Version::HTTP_2 { requested_drain.cancel(); }
-                else {response.headers_mut().insert(http::header::CONNECTION,http::HeaderValue::from_static("close"));}
+                let mut response = simple(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable\n");
+                if request.version() == http::Version::HTTP_2 {
+                    requested_drain.cancel();
+                } else {
+                    response.headers_mut().insert(
+                        http::header::CONNECTION,
+                        http::HeaderValue::from_static("close"),
+                    );
+                }
                 return Ok(response);
             }
             let activity = business.generation().clone();
@@ -1141,10 +1307,10 @@ async fn serve_connection<I>(
             if let Some(tls_log) = tls_log.filter(|_| current.plan.access_logs.is_some()) {
                 request.extensions_mut().insert(tls_log);
             }
-            if let Some(details)=tls_details {
+            if let Some(details) = tls_details {
                 request.extensions_mut().insert(details);
             }
-            if let Some(alt_svc)=alt_svc {
+            if let Some(alt_svc) = alt_svc {
                 request.extensions_mut().insert(alt_svc);
             }
             let fault = metadata.fault.clone();
@@ -1198,12 +1364,10 @@ async fn serve_connection<I>(
     let mut builder = Builder::new(TokioExecutor::new());
     // The original HTTP/2 sender queues informational headers separately
     // from DATA flow control. Limit their aggregate per request/stream.
-    builder
-        .http2()
-        .informational_responses(
-            request::MAX_INFORMATIONAL_HEADS,
-            request::MAX_INFORMATIONAL_BYTES,
-        );
+    builder.http2().informational_responses(
+        request::MAX_INFORMATIONAL_HEADS,
+        request::MAX_INFORMATIONAL_BYTES,
+    );
     builder
         .http1()
         .informational_responses(

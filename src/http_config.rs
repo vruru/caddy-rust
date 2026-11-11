@@ -38,12 +38,13 @@ pub(crate) struct ServerConfig {
     pub(crate) header_aliases: HeaderAliases,
     pub(crate) listen: Vec<SocketAddr>,
     pub(crate) routes: Vec<Route>,
+    pub(crate) named_routes: std::collections::BTreeMap<String, Route>,
     pub(crate) errors: Vec<Route>,
     pub(crate) tls: bool,
     pub(crate) redirect_before_tls: Option<i64>,
     pub(crate) redirect_after_tls: Option<i64>,
     pub(crate) strict_sni_host: bool,
-    pub(crate) certificate_tags: Vec<String>,
+    pub(crate) tls_policies: Vec<crate::tls_policy::ConnectionPolicy>,
     pub(crate) trusted_proxies: Vec<ipnet::IpNet>,
     pub(crate) trusted_strict: bool,
     pub(crate) client_ip_headers: Vec<String>,
@@ -67,28 +68,68 @@ pub(crate) struct AccessLogConfig {
 
 fn access_logs(value: &Value, path: &str) -> Result<AccessLogConfig> {
     let map = object(value, path)?;
-    deny_unknown(map,&["default_logger_name","logger_names","skip_hosts","skip_unmapped_hosts","should_log_credentials","trace"],path)?;
-    ensure!(!boolean(map.get("trace"),false,path)?, "HTTP handler trace logging is not implemented");
-    let mut names=std::collections::BTreeMap::new();
-    if let Some(value)=map.get("logger_names").filter(|value|!value.is_null()) {
-        let map=object(value,path)?;
-        ensure!(map.len()<=8192, "too many access logger hosts");
-        for (host,value) in map {
-            let mapped=if let Some(value)=value.as_str() {vec![value.to_owned()]} else {strings(value,path)?};
-            ensure!(mapped.len()<=16 && mapped.iter().all(|name|name.len()<=128),"too many or oversized access logger destinations");
+    deny_unknown(
+        map,
+        &[
+            "default_logger_name",
+            "logger_names",
+            "skip_hosts",
+            "skip_unmapped_hosts",
+            "should_log_credentials",
+            "trace",
+        ],
+        path,
+    )?;
+    ensure!(
+        !boolean(map.get("trace"), false, path)?,
+        "HTTP handler trace logging is not implemented"
+    );
+    let mut names = std::collections::BTreeMap::new();
+    if let Some(value) = map.get("logger_names").filter(|value| !value.is_null()) {
+        let map = object(value, path)?;
+        ensure!(map.len() <= 8192, "too many access logger hosts");
+        for (host, value) in map {
+            let mapped = if let Some(value) = value.as_str() {
+                vec![value.to_owned()]
+            } else {
+                strings(value, path)?
+            };
+            ensure!(
+                mapped.len() <= 16 && mapped.iter().all(|name| name.len() <= 128),
+                "too many or oversized access logger destinations"
+            );
             let normalized = host.trim_end_matches('.').to_ascii_lowercase();
-            ensure!(!names.contains_key(&normalized), "ambiguous access logger host");
-            names.insert(normalized,mapped);
+            ensure!(
+                !names.contains_key(&normalized),
+                "ambiguous access logger host"
+            );
+            names.insert(normalized, mapped);
         }
     }
-    let default_name=map.get("default_logger_name").filter(|value|!value.is_null()).map(|value|string(value,path)).transpose()?.unwrap_or_default();
-    ensure!(default_name.len()<=128,"oversized default access logger name");
-    Ok(AccessLogConfig{
+    let default_name = map
+        .get("default_logger_name")
+        .filter(|value| !value.is_null())
+        .map(|value| string(value, path))
+        .transpose()?
+        .unwrap_or_default();
+    ensure!(
+        default_name.len() <= 128,
+        "oversized default access logger name"
+    );
+    Ok(AccessLogConfig {
         default_name,
         names,
-        skip_hosts:map.get("skip_hosts").filter(|value|!value.is_null()).map(|value|strings(value,path)).transpose()?.unwrap_or_default().into_iter().map(|host|host.trim_end_matches('.').to_ascii_lowercase()).collect(),
-        skip_unmapped:boolean(map.get("skip_unmapped_hosts"),false,path)?,
-        credentials:boolean(map.get("should_log_credentials"),false,path)?,
+        skip_hosts: map
+            .get("skip_hosts")
+            .filter(|value| !value.is_null())
+            .map(|value| strings(value, path))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+            .collect(),
+        skip_unmapped: boolean(map.get("skip_unmapped_hosts"), false, path)?,
+        credentials: boolean(map.get("should_log_credentials"), false, path)?,
     })
 }
 
@@ -206,9 +247,21 @@ pub fn validate_json(value: &Value) -> Result<PreparedConfig> {
     )?;
     ensure!(raw.len() <= 1024, "server count exceeded");
     let mut servers = Vec::new();
+    let mut compiled_tls_memory = 0usize;
     let mut listen = std::collections::HashSet::new();
     for value in raw.values() {
         let config = parse_server(value)?;
+        compiled_tls_memory = compiled_tls_memory.saturating_add(
+            config
+                .tls_policies
+                .iter()
+                .map(|policy| policy.compiled_memory())
+                .sum::<usize>(),
+        );
+        ensure!(
+            compiled_tls_memory <= 64 << 20,
+            "TLS regexp configuration memory budget exceeded"
+        );
         for addr in &config.listen {
             ensure!(listen.insert(*addr), "duplicate listener address");
         }
@@ -226,7 +279,13 @@ pub fn validate_json(value: &Value) -> Result<PreparedConfig> {
 pub fn managed_names(config: &PreparedConfig) -> Vec<Vec<String>> {
     let mut names = std::collections::BTreeSet::new();
     for server in &config.servers {
-        if server.tls && server.manage_certificates && server.certificate_tags.is_empty() {
+        if server.tls
+            && server.manage_certificates
+            && server
+                .tls_policies
+                .iter()
+                .any(|policy| policy.any_tag.as_ref().is_none_or(Vec::is_empty))
+        {
             for name in server_names(server) {
                 if !server
                     .skip_manage
@@ -296,14 +355,18 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
             "read_idle_timeout",
             "idle_timeout",
             "logs",
+            "named_routes",
         ],
         path,
     )?;
     if m.contains_key("idle_timeout") {
         return Err(unsupported("/apps/http/servers/*/idle_timeout"));
     }
-    let access_logs = m.get("logs").filter(|value|!value.is_null())
-        .map(|value| access_logs(value,path)).transpose()?;
+    let access_logs = m
+        .get("logs")
+        .filter(|value| !value.is_null())
+        .map(|value| access_logs(value, path))
+        .transpose()?;
     let mut listen = Vec::new();
     for raw in strings(required(m, "listen")?, path)? {
         let raw = helpers::replace(&raw, true, helpers::global_lookup)?;
@@ -324,39 +387,8 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
     );
     let policies = m
         .get("tls_connection_policies")
-        .map(|v| {
-            v.as_array()
-                .ok_or_else(|| anyhow::anyhow!("TLS policy array required"))
-        })
-        .transpose()?;
-    let mut tags = Vec::new();
-    if let Some(policies) = policies {
-        ensure!(
-            policies.len() <= 1,
-            "multiple TLS policies not yet supported"
-        );
-        for policy in policies {
-            let policy = object(policy, path)?;
-            deny_unknown(
-                policy,
-                &["certificate_selection"],
-                "/apps/http/servers/*/tls_connection_policies/*",
-            )?;
-            if let Some(selection) = policy.get("certificate_selection") {
-                let selection = object(selection, path)?;
-                deny_unknown(
-                    selection,
-                    &["any_tag"],
-                    "/apps/http/servers/*/tls_connection_policies/*/certificate_selection",
-                )?;
-                tags = selection
-                    .get("any_tag")
-                    .map(|v| strings(v, path))
-                    .transpose()?
-                    .unwrap_or_default();
-            }
-        }
-    }
+        .filter(|value| !value.is_null());
+    let tls_policies = crate::tls_policy::parse_policies(policies)?;
     let mut tls_wrapper = None;
     let mut redirects = Vec::new();
     if let Some(wrappers) = m.get("listener_wrappers").filter(|v| !v.is_null()) {
@@ -375,11 +407,18 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
                 }
                 Some("http_redirect") => {
                     deny_unknown(wrapper, &["wrapper", "max_header_bytes"], path)?;
-                    let maximum = wrapper.get("max_header_bytes")
+                    let maximum = wrapper
+                        .get("max_header_bytes")
                         .filter(|v| !v.is_null())
-                        .map(|v| v.as_number().and_then(serde_json::Number::as_go_i64)
-                            .ok_or_else(|| anyhow::anyhow!("integer redirect header limit required")))
-                        .transpose()?.unwrap_or(0);
+                        .map(|v| {
+                            v.as_number()
+                                .and_then(serde_json::Number::as_go_i64)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("integer redirect header limit required")
+                                })
+                        })
+                        .transpose()?
+                        .unwrap_or(0);
                     redirects.push((index, maximum));
                 }
                 _ => return Err(unsupported("listener wrapper")),
@@ -389,10 +428,12 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
     // The original app inserts a leading TLS placeholder when none is explicit.
     // Repeated redirect wrappers first see identical five bytes at the innermost
     // wrapper, which either redirects or replays them for the outer layers.
-    let redirect_before_tls = redirects.iter()
+    let redirect_before_tls = redirects
+        .iter()
         .find(|(index, _)| tls_wrapper.is_some_and(|tls| *index < tls))
         .map(|(_, limit)| *limit);
-    let redirect_after_tls = redirects.iter()
+    let redirect_after_tls = redirects
+        .iter()
         .find(|(index, _)| tls_wrapper.is_none_or(|tls| *index > tls))
         .map(|(_, limit)| *limit);
     let mut disabled = false;
@@ -444,7 +485,9 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
         && route_names(&routes)
             .iter()
             .any(|n| !skip_redirect.iter().any(|s| s.eq_ignore_ascii_case(n)));
-    let tls = policies.is_some_and(|policies| !policies.is_empty())
+    let tls = policies
+        .and_then(Value::as_array)
+        .is_some_and(|policies| !policies.is_empty())
         || (!disabled && listen.iter().any(|a| a.port() == 443))
         || inferred;
     let protocols = m
@@ -508,6 +551,19 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
         header_aliases,
         listen,
         routes,
+        named_routes: m
+            .get("named_routes")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                let named = object(value, "/apps/http/servers/*/named_routes")?;
+                ensure!(named.len() <= 65536, "named route count limit exceeded");
+                named
+                    .iter()
+                    .map(|(name, value)| Ok((name.clone(), parse_route(value, 0, false)?)))
+                    .collect::<Result<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
         errors: if let Some(v) = m.get("errors") {
             let e = object(v, path)?;
             deny_unknown(e, &["routes"], path)?;
@@ -518,8 +574,17 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
         tls,
         redirect_before_tls,
         redirect_after_tls,
-        strict_sni_host: boolean(m.get("strict_sni_host"), false, path)?,
-        certificate_tags: tags,
+        strict_sni_host: boolean(
+            m.get("strict_sni_host"),
+            tls_policies.iter().any(|policy| {
+                policy
+                    .client_auth
+                    .as_ref()
+                    .is_some_and(|auth| auth.is_active())
+            }),
+            path,
+        )?,
+        tls_policies,
         trusted_proxies,
         trusted_strict,
         client_ip_headers: m
@@ -533,7 +598,11 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
             .transpose()?
             .filter(|d| !d.is_zero())
             .unwrap_or(Duration::from_secs(60)),
-        read_idle_timeout: match m.get("read_idle_timeout").map(|v| signed_duration(v, path)).transpose()? {
+        read_idle_timeout: match m
+            .get("read_idle_timeout")
+            .map(|v| signed_duration(v, path))
+            .transpose()?
+        {
             None | Some(0) => Duration::from_secs(60),
             Some(nanos) if nanos > 0 => Duration::from_nanos(nanos as u64),
             Some(_) => Duration::ZERO,
@@ -565,28 +634,33 @@ fn parse_routes(value: Option<&Value>, depth: usize, normalized: bool) -> Result
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("route array required"))?;
     ensure!(raw.len() <= 65536, "route count limit exceeded");
-    let mut routes = Vec::new();
-    for v in raw {
-        let path = "/apps/http/servers/*/routes/*";
-        let m = object(v, path)?;
-        deny_unknown(m, &["group", "match", "handle", "terminal"], path)?;
-        let mut handlers = vec![];
-        if let Some(values) = m.get("handle") {
-            for v in values
+    raw.iter()
+        .map(|value| parse_route(value, depth, normalized))
+        .collect()
+}
+
+fn parse_route(value: &Value, depth: usize, normalized: bool) -> Result<Route> {
+    let path = "/apps/http/servers/*/routes/*";
+    let m = object(value, path)?;
+    deny_unknown(m, &["group", "match", "handle", "terminal"], path)?;
+    let handlers = m
+        .get("handle")
+        .map(|values| {
+            values
                 .as_array()
                 .ok_or_else(|| anyhow::anyhow!("handler array required"))?
-            {
-                handlers.push(parse_handler(v, depth + 1, normalized)?);
-            }
-        }
-        routes.push(Route {
-            group: m.get("group").map(|v| string(v, path)).transpose()?,
-            matchers: parse_matcher_sets(m.get("match"), depth + 1)?,
-            handlers,
-            terminal: boolean(m.get("terminal"), false, path)?,
-        });
-    }
-    Ok(routes)
+                .iter()
+                .map(|value| parse_handler(value, depth + 1, normalized))
+                .collect::<Result<_>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(Route {
+        group: m.get("group").map(|v| string(v, path)).transpose()?,
+        matchers: parse_matcher_sets(m.get("match"), depth + 1)?,
+        handlers,
+        terminal: boolean(m.get("terminal"), false, path)?,
+    })
 }
 fn parse_matcher_sets(value: Option<&Value>, depth: usize) -> Result<Vec<MatcherSet>> {
     ensure!(depth < 64, "matcher nesting limit exceeded");
@@ -724,6 +798,18 @@ fn parse_matcher_sets(value: Option<&Value>, depth: usize) -> Result<Vec<Matcher
     }
     Ok(sets)
 }
+fn optional_handler_string(
+    m: &serde_json::Map<String, Value>,
+    name: &str,
+    path: &str,
+) -> Result<String> {
+    m.get(name)
+        .filter(|value| !value.is_null())
+        .map(|value| string(value, path))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
 fn parse_handler(value: &Value, depth: usize, normalized: bool) -> Result<Handler> {
     let normalized_value = crate::module_json::inline(value, "handler", normalized)?;
     let value = normalized_value.as_ref();
@@ -733,6 +819,29 @@ fn parse_handler(value: &Value, depth: usize, normalized: bool) -> Result<Handle
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("handler ID required"))?;
     Ok(match handler {
+        "error" => {
+            deny_unknown(m, &["handler", "status_code", "error"], path)?;
+            Handler::StaticError {
+                status: m
+                    .get("status_code")
+                    .map(crate::module_json::weak_string)
+                    .transpose()?
+                    .unwrap_or_default(),
+                message: optional_handler_string(m, "error", path)?,
+            }
+        }
+        "invoke" => {
+            deny_unknown(m, &["handler", "name"], path)?;
+            Handler::Invoke(optional_handler_string(m, "name", path)?)
+        }
+        "log_append" => {
+            deny_unknown(m, &["handler", "key", "value", "early"], path)?;
+            Handler::LogAppend(std::sync::Arc::new(LogAppendConfig {
+                key: optional_handler_string(m, "key", path)?,
+                value: optional_handler_string(m, "value", path)?,
+                early: boolean(m.get("early").filter(|value| !value.is_null()), false, path)?,
+            }))
+        }
         "static_response" => {
             deny_unknown(
                 m,
@@ -761,6 +870,44 @@ fn parse_handler(value: &Value, depth: usize, normalized: bool) -> Result<Handle
                 },
                 close: boolean(m.get("close"), false, path)?,
             }
+        }
+        "request_body" => {
+            let mut config = RequestBodyConfig {
+                max_size: 0,
+                set: String::new(),
+            };
+            // Go encoding/json accepts folded aliases for typed struct fields.
+            // Inline module normalization already put keys in Go encoding order.
+            for (name, value) in m {
+                let field = |expected: &str| {
+                    name.chars()
+                        .map(|ch| match ch {
+                            '\u{017f}' => 's',
+                            _ => ch.to_ascii_lowercase(),
+                        })
+                        .eq(expected.chars())
+                };
+                if matches!(name.as_str(), "handler" | "@id") {
+                    continue;
+                }
+                if field("max_size") {
+                    if !value.is_null() {
+                        config.max_size = value
+                            .as_number()
+                            .and_then(serde_json::Number::as_go_i64)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("request_body max_size requires a signed integer")
+                            })?;
+                    }
+                } else if field("set") {
+                    if !value.is_null() {
+                        config.set = string(value, path)?;
+                    }
+                } else {
+                    return Err(anyhow::anyhow!("unknown request_body configuration field"));
+                }
+            }
+            Handler::RequestBody(config)
         }
         "encode" => Handler::Encode(std::sync::Arc::new(parse_encode(m, path)?)),
         "headers" => {
@@ -826,7 +973,7 @@ fn parse_handler(value: &Value, depth: usize, normalized: bool) -> Result<Handle
         "vars" => Handler::Vars(
             m.iter()
                 .filter(|(k, _)| k.as_str() != "handler" && k.as_str() != "@id")
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .map(|(k, v)| (k.clone(), std::sync::Arc::new(v.clone())))
                 .collect(),
         ),
         "map" => {
@@ -995,8 +1142,15 @@ fn parse_handler(value: &Value, depth: usize, normalized: bool) -> Result<Handle
             deny_unknown(
                 m,
                 &[
-                    "handler", "root", "hide", "index_names", "pass_thru", "canonical_uris",
-                    "precompressed", "precompressed_order", "etag_file_extensions",
+                    "handler",
+                    "root",
+                    "hide",
+                    "index_names",
+                    "pass_thru",
+                    "canonical_uris",
+                    "precompressed",
+                    "precompressed_order",
+                    "etag_file_extensions",
                 ],
                 path,
             )?;
@@ -1013,7 +1167,11 @@ fn parse_handler(value: &Value, depth: usize, normalized: bool) -> Result<Handle
                     .transpose()?
                     .unwrap_or_else(|| vec!["index.html".into(), "index.txt".into()]),
                 pass_thru: boolean(m.get("pass_thru"), false, path)?,
-                canonical_uris: boolean(m.get("canonical_uris").filter(|v| !v.is_null()), true, path)?,
+                canonical_uris: boolean(
+                    m.get("canonical_uris").filter(|v| !v.is_null()),
+                    true,
+                    path,
+                )?,
                 sidecars: parse_file_sidecars(m, path)?,
             }
         }
@@ -1053,9 +1211,11 @@ fn parse_response_matcher(value: &Value, path: &str) -> Result<ResponseMatcher> 
                 let code = if item.is_null() {
                     0
                 } else {
-                    item.as_number().and_then(serde_json::Number::as_go_i64).ok_or_else(|| {
-                        anyhow::anyhow!("{}: status_code[{}]: expected integer", path, i)
-                    })?
+                    item.as_number()
+                        .and_then(serde_json::Number::as_go_i64)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("{}: status_code[{}]: expected integer", path, i)
+                        })?
                 };
                 codes.push(code);
             }
@@ -1073,7 +1233,6 @@ fn parse_response_matcher(value: &Value, path: &str) -> Result<ResponseMatcher> 
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("{}: headers: expected object", path))?;
         for (key, val) in headers_obj.iter() {
-
             let header_value = if val.is_null() {
                 None
             } else {
@@ -1185,7 +1344,10 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
             );
         }
         let max_requests = typed_proxy_int(u.get("max_requests"))?;
-        ensure!(!is_fastcgi || max_requests == 0, "FastCGI upstream capacity not available");
+        ensure!(
+            !is_fastcgi || max_requests == 0,
+            "FastCGI upstream capacity not available"
+        );
         upstreams.push(crate::http_runtime::proxy_policy::Upstream { dial, max_requests });
     }
     ensure!(
@@ -1193,7 +1355,10 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
         "upstream count invalid"
     );
     let load_balancing = m.get("load_balancing").filter(|v| !v.is_null());
-    ensure!(!is_fastcgi || load_balancing.is_none(), "FastCGI selection policies not available");
+    ensure!(
+        !is_fastcgi || load_balancing.is_none(),
+        "FastCGI selection policies not available"
+    );
     let selection = if let Some(value) = load_balancing {
         let lb = object(value, path)?;
         deny_unknown(lb, &["selection_policy"], path)?;
@@ -1524,83 +1689,150 @@ fn pending_placeholders_depth(value: &Value, depth: usize) -> Result<()> {
     Ok(())
 }
 
-fn parse_encode(m: &serde_json::Map<String, Value>, path: &str) -> Result<crate::http_runtime::encode_response::EncodePlan> {
-    use crate::http_runtime::{accepted_encodings::Coding, encode_body::CodecPlan, encode_response::EncodePlan};
-    deny_unknown(m, &["handler", "encodings", "prefer", "minimum_length", "match"], path)?;
+fn parse_encode(
+    m: &serde_json::Map<String, Value>,
+    path: &str,
+) -> Result<crate::http_runtime::encode_response::EncodePlan> {
+    use crate::http_runtime::{
+        accepted_encodings::Coding, encode_body::CodecPlan, encode_response::EncodePlan,
+    };
+    deny_unknown(
+        m,
+        &["handler", "encodings", "prefer", "minimum_length", "match"],
+        path,
+    )?;
     let int = |value: Option<&Value>, default: i64| -> Result<i64> {
         match value {
             None | Some(Value::Null) => Ok(default),
-            Some(value) => value.as_number().and_then(serde_json::Number::as_go_i64).ok_or_else(|| anyhow::anyhow!("encode integer expected")),
+            Some(value) => value
+                .as_number()
+                .and_then(serde_json::Number::as_go_i64)
+                .ok_or_else(|| anyhow::anyhow!("encode integer expected")),
         }
     };
     let mut encodings = Vec::new();
     if let Some(raw) = m.get("encodings").filter(|v| !v.is_null()) {
         for (name, value) in object(raw, path)? {
-            let settings = object(value,path)?;
+            let settings = object(value, path)?;
             let coding = match name.as_str() {
                 "gzip" => {
-                    deny_unknown(settings,&["level"],path)?;
+                    deny_unknown(settings, &["level"], path)?;
                     let level = int(settings.get("level"), 0)?;
-                    ensure!((-3..=9).contains(&level),"invalid gzip level");
+                    ensure!((-3..=9).contains(&level), "invalid gzip level");
                     CodecPlan::Gzip(level as i32)
                 }
                 "zstd" => {
-                    deny_unknown(settings,&["level","checksum"],path)?;
-                    let level = settings.get("level").filter(|v| !v.is_null()).map(|v| string(v,path)).transpose()?.unwrap_or_default();
+                    deny_unknown(settings, &["level", "checksum"], path)?;
+                    let level = settings
+                        .get("level")
+                        .filter(|v| !v.is_null())
+                        .map(|v| string(v, path))
+                        .transpose()?
+                        .unwrap_or_default();
                     let level = match level.to_ascii_lowercase().as_str() {
-                        ""|"default" => "default",
+                        "" | "default" => "default",
                         "fastest" => "fastest",
                         "better" => "better",
                         "best" => "best",
                         _ => anyhow::bail!("invalid zstd level"),
                     };
-                    let checksum = settings.get("checksum").filter(|v| !v.is_null()).map(|v| {
-                        v.as_bool().ok_or_else(|| anyhow::anyhow!("invalid zstd checksum setting"))
-                    }).transpose()?;
-                    CodecPlan::Zstd {level,checksum}
+                    let checksum = settings
+                        .get("checksum")
+                        .filter(|v| !v.is_null())
+                        .map(|v| {
+                            v.as_bool()
+                                .ok_or_else(|| anyhow::anyhow!("invalid zstd checksum setting"))
+                        })
+                        .transpose()?;
+                    CodecPlan::Zstd { level, checksum }
                 }
-                _ => return Err(unsupported("/apps/http/servers/*/routes/*/handle/*/encodings/module")),
+                _ => {
+                    return Err(unsupported(
+                        "/apps/http/servers/*/routes/*/handle/*/encodings/module",
+                    ));
+                }
             };
             encodings.push(coding);
         }
     }
-    let names = m.get("prefer").filter(|v| !v.is_null()).map(|v| strings(v,path)).transpose()?.unwrap_or_default();
+    let names = m
+        .get("prefer")
+        .filter(|v| !v.is_null())
+        .map(|v| strings(v, path))
+        .transpose()?
+        .unwrap_or_default();
     let enabled = |coding| encodings.iter().any(|plan| plan.coding() == coding);
     let mut prefer = Vec::new();
     if names.is_empty() {
-        prefer.extend([Coding::Zstd,Coding::Brotli,Coding::Gzip].into_iter().filter(|c| enabled(*c)));
+        prefer.extend(
+            [Coding::Zstd, Coding::Brotli, Coding::Gzip]
+                .into_iter()
+                .filter(|c| enabled(*c)),
+        );
     } else {
         for name in names {
-            let coding = Coding::parse(&name).filter(|c| enabled(*c)).ok_or_else(|| anyhow::anyhow!("preferred encoder not enabled"))?;
+            let coding = Coding::parse(&name)
+                .filter(|c| enabled(*c))
+                .ok_or_else(|| anyhow::anyhow!("preferred encoder not enabled"))?;
             ensure!(!prefer.contains(&coding), "duplicate encoder preference");
             prefer.push(coding);
         }
     }
-    let minimum_length = int(m.get("minimum_length"),512)?;
-    let minimum_length = if minimum_length == 0 {512} else {minimum_length};
-    let matcher = m.get("match").filter(|v| !v.is_null()).map(|v| parse_response_matcher(v,path)).transpose()?;
-    Ok(EncodePlan {encodings,prefer,minimum_length,matcher})
+    let minimum_length = int(m.get("minimum_length"), 512)?;
+    let minimum_length = if minimum_length == 0 {
+        512
+    } else {
+        minimum_length
+    };
+    let matcher = m
+        .get("match")
+        .filter(|v| !v.is_null())
+        .map(|v| parse_response_matcher(v, path))
+        .transpose()?;
+    Ok(EncodePlan {
+        encodings,
+        prefer,
+        minimum_length,
+        matcher,
+    })
 }
 
-
-fn parse_file_sidecars(m: &serde_json::Map<String, Value>, path: &str) -> Result<crate::http_runtime::file_sidecars::SidecarPlan> {
+fn parse_file_sidecars(
+    m: &serde_json::Map<String, Value>,
+    path: &str,
+) -> Result<crate::http_runtime::file_sidecars::SidecarPlan> {
     use crate::http_runtime::{accepted_encodings::Coding, file_sidecars::SidecarPlan};
     let mut encodings = Vec::new();
     if let Some(raw) = m.get("precompressed").filter(|v| !v.is_null()) {
         for (module, settings) in object(raw, path)? {
-            let encoding = Coding::parse(module).ok_or_else(|| unsupported("/file_server/precompressed/module"))?;
+            let encoding = Coding::parse(module)
+                .ok_or_else(|| unsupported("/file_server/precompressed/module"))?;
             deny_unknown(object(settings, path)?, &[], path)?;
             encodings.push(encoding);
         }
     }
     let strings_or_default = |name| -> Result<Vec<String>> {
-        let Some(raw) = m.get(name).filter(|v| !v.is_null()) else { return Ok(Vec::new()); };
-        raw.as_array().ok_or_else(|| anyhow::anyhow!("invalid file server array"))?
-            .iter().map(|v| if v.is_null() { Ok(String::new()) } else { string(v, path) }).collect()
+        let Some(raw) = m.get(name).filter(|v| !v.is_null()) else {
+            return Ok(Vec::new());
+        };
+        raw.as_array()
+            .ok_or_else(|| anyhow::anyhow!("invalid file server array"))?
+            .iter()
+            .map(|v| {
+                if v.is_null() {
+                    Ok(String::new())
+                } else {
+                    string(v, path)
+                }
+            })
+            .collect()
     };
     let order = strings_or_default("precompressed_order")?;
     let suffixes = strings_or_default("etag_file_extensions")?;
-    ensure!(order.len() <= 64 && suffixes.len() <= 64, "file representation configuration limit exceeded");
+    ensure!(
+        order.len() <= 64 && suffixes.len() <= 64,
+        "file representation configuration limit exceeded"
+    );
     Ok(SidecarPlan {
         encodings,
         order,
@@ -1611,13 +1843,18 @@ fn parse_file_sidecars(m: &serde_json::Map<String, Value>, path: &str) -> Result
 fn typed_proxy_int(value: Option<&Value>) -> Result<i64> {
     match value {
         None | Some(Value::Null) => Ok(0),
-        Some(value) => value.as_number().and_then(serde_json::Number::as_go_i64)
+        Some(value) => value
+            .as_number()
+            .and_then(serde_json::Number::as_go_i64)
             .ok_or_else(|| anyhow::anyhow!("invalid proxy integer")),
     }
 }
 
 fn parse_selector(
-    value: Option<&Value>, path: &str, upstreams: usize, depth: u8,
+    value: Option<&Value>,
+    path: &str,
+    upstreams: usize,
+    depth: u8,
 ) -> Result<crate::http_runtime::proxy_policy::Selection> {
     use crate::http_runtime::proxy_policy::Selection;
     ensure!(depth <= 12, "proxy selection fallback depth exceeded");
@@ -1627,16 +1864,25 @@ fn parse_selector(
     let m = object(value, path)?;
     let policy = string(required(m, "policy")?, path)?;
     let child = || parse_selector(m.get("fallback"), path, upstreams, depth + 1).map(Box::new);
-    let optional_string = |field| m.get(field).filter(|v| !v.is_null())
-        .map(|v| string(v, path)).transpose();
+    let optional_string = |field| {
+        m.get(field)
+            .filter(|v| !v.is_null())
+            .map(|v| string(v, path))
+            .transpose()
+    };
     let allowed: &[&str] = match policy.as_str() {
-        "random" | "first" | "least_conn" | "round_robin" | "ip_hash" | "client_ip_hash" | "uri_hash" => &["policy"],
+        "random" | "first" | "least_conn" | "round_robin" | "ip_hash" | "client_ip_hash"
+        | "uri_hash" => &["policy"],
         "weighted_round_robin" => &["policy", "weights"],
         "random_choose" => &["policy", "choose"],
         "query" => &["policy", "key", "fallback"],
         "header" => &["policy", "field", "fallback"],
         "cookie" => &["policy", "name", "secret", "max_age", "fallback"],
-        _ => return Err(unsupported("/reverse_proxy/load_balancing/selection_policy")),
+        _ => {
+            return Err(unsupported(
+                "/reverse_proxy/load_balancing/selection_policy",
+            ));
+        }
     };
     deny_unknown(m, allowed, path)?;
     Ok(match policy.as_str() {
@@ -1645,15 +1891,21 @@ fn parse_selector(
         "least_conn" => Selection::Least,
         "round_robin" => Selection::RoundRobin,
         "weighted_round_robin" => {
-            let array = required(m, "weights")?.as_array()
+            let array = required(m, "weights")?
+                .as_array()
                 .ok_or_else(|| anyhow::anyhow!("invalid proxy weights"))?;
-            ensure!(array.len() == 1 || array.len() == upstreams, "proxy weights must match upstream count");
+            ensure!(
+                array.len() == 1 || array.len() == upstreams,
+                "proxy weights must match upstream count"
+            );
             let mut weights = Vec::with_capacity(upstreams);
             let mut sum: i64 = 0;
             for item in array {
                 let n = typed_proxy_int(Some(item))?;
                 ensure!(n >= 0, "invalid proxy weight");
-                sum = sum.checked_add(n).ok_or_else(|| anyhow::anyhow!("proxy weight sum overflow"))?;
+                sum = sum
+                    .checked_add(n)
+                    .ok_or_else(|| anyhow::anyhow!("proxy weight sum overflow"))?;
                 weights.push(n as u64);
             }
             ensure!(sum > 0, "proxy weights cannot all be zero");
@@ -1673,21 +1925,40 @@ fn parse_selector(
         "client_ip_hash" => Selection::ClientIp,
         "uri_hash" => Selection::Uri,
         "query" => {
-            let key = optional_string("key")?.filter(|s| !s.is_empty())
+            let key = optional_string("key")?
+                .filter(|s| !s.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("proxy query key is required"))?;
-            Selection::Query { key, fallback: child()? }
+            Selection::Query {
+                key,
+                fallback: child()?,
+            }
         }
         "header" => {
-            let field = optional_string("field")?.filter(|s| !s.is_empty())
+            let field = optional_string("field")?
+                .filter(|s| !s.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("proxy hash header field is required"))?;
-            Selection::Header { field, fallback: child()? }
+            Selection::Header {
+                field,
+                fallback: child()?,
+            }
         }
         "cookie" => {
-            let name = optional_string("name")?.filter(|s| !s.is_empty()).unwrap_or_else(|| "lb".to_owned());
+            let name = optional_string("name")?
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "lb".to_owned());
             let secret = optional_string("secret")?.unwrap_or_default();
-            let max_age = m.get("max_age").filter(|v| !v.is_null()).map(|v| signed_duration(v, path))
-                .transpose()?.unwrap_or(0);
-            Selection::Cookie { name, secret, max_age_secs: (max_age.max(0) / 1_000_000_000) as u64, fallback: child()? }
+            let max_age = m
+                .get("max_age")
+                .filter(|v| !v.is_null())
+                .map(|v| signed_duration(v, path))
+                .transpose()?
+                .unwrap_or(0);
+            Selection::Cookie {
+                name,
+                secret,
+                max_age_secs: (max_age.max(0) / 1_000_000_000) as u64,
+                fallback: child()?,
+            }
         }
         _ => unreachable!("policy keys checked before parsing"),
     })

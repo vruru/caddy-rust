@@ -408,7 +408,9 @@ async fn prefix(
                     overwritten = Some(seen);
                     break;
                 }
-                Some(Err(_)) => return Err(failure(StatusCode::BAD_REQUEST)),
+                Some(Err(error)) => return Err(failure(if super::request_body::limit_error(error.as_ref()) {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else { StatusCode::BAD_REQUEST })),
                 Some(Ok(frame)) => frame,
             };
             if let Ok(mut data) = frame.into_data() {
@@ -495,14 +497,16 @@ pub(super) async fn serve(
     // Error routes can still inspect headers and serve a static response;
     // another proxy must never send an empty retry after consumption.
     ctx.fastcgi_body_claimed = true;
+    ctx.body_limit = None;
     let (parts, body) = request.into_parts();
     let incoming_headers = parts.headers.clone();
-    let known_length = body.size_hint().exact();
+    let replacement_length = parts.extensions.get::<super::request_body::Replacement>().map(|body| body.length);
+    let known_length = replacement_length.or_else(|| body.size_hint().exact());
     ctx.request = Some(Request::from_parts(parts, full(Bytes::new())));
     let is_incremental = super::incremental::is_enabled(&incoming_headers);
     let mut source = prefix(ctx, body, known_length, transport, is_incremental).await?;
     let mut headers = incoming_headers;
-    if let Some(size) = source.content_length_override {
+    if let Some(size) = source.content_length_override.or(replacement_length) {
         headers.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
     }
     let headers = proxy::proxy_headers(ctx, config, headers, false, true)?;
@@ -594,7 +598,9 @@ pub(super) async fn serve(
         source.prefix_credits.clear();
         while let Some(frame) = source.body.frame().await {
             if let Ok(data) = frame
-                .map_err(|_| failure(StatusCode::BAD_REQUEST))?
+                .map_err(|error| failure(if super::request_body::limit_error(error.as_ref()) {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else { StatusCode::BAD_REQUEST }))?
                 .into_data()
             {
                 remaining = send_checked(&mut socket.io, &data, remaining, write_limit).await?;

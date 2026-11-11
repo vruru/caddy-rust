@@ -44,7 +44,7 @@ impl CaptureBudget {
             omitted: AtomicU64::new(0),
         })
     }
-    fn reserve(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+    pub(super) fn reserve(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
         if bytes > MAX_CAPTURE_PART {
             return None;
         }
@@ -52,6 +52,9 @@ impl CaptureBudget {
             .clone()
             .try_acquire_many_owned(bytes.max(1).div_ceil(CAPTURE_UNIT) as u32)
             .ok()
+    }
+    pub(super) fn record_omitted(&self) {
+        self.omitted.fetch_add(1, Ordering::Relaxed);
     }
     pub(super) fn stats(&self) -> (u64, u64, u64) {
         (
@@ -203,6 +206,12 @@ fn log_headers(headers: &HeaderMap, credentials: bool, omit_host: bool) -> V {
     )
 }
 
+#[derive(Default)]
+pub(super) struct ExtraFields {
+    pub(super) fields: Vec<Field>,
+    pub(super) permits: Vec<OwnedSemaphorePermit>,
+}
+
 pub(super) struct Access {
     logging: Arc<Logging>,
     names: Vec<String>,
@@ -216,6 +225,10 @@ pub(super) struct Access {
 }
 
 impl Access {
+    pub(super) fn started_at(&self) -> Instant {
+        self.start
+    }
+
     pub(super) fn start<T>(
         logging: Arc<Logging>,
         config: &AccessLogConfig,
@@ -305,6 +318,7 @@ impl Access {
         response: Response<Body>,
         override_names: Option<Vec<String>>,
         user_id: String,
+        extra: ExtraFields,
     ) -> Response<Body> {
         if let Some(names) = override_names {
             self.names = names;
@@ -335,6 +349,7 @@ impl Access {
                 headers,
                 _response_capture: permit,
                 user_id,
+                extra,
                 bytes: 0,
                 failed: false,
                 ended: false,
@@ -378,6 +393,7 @@ struct WriteCount {
     headers: Option<V>,
     _response_capture: Option<OwnedSemaphorePermit>,
     user_id: String,
+    extra: ExtraFields,
     bytes: u64,
     failed: bool,
     ended: bool,
@@ -459,6 +475,7 @@ impl Drop for WriteCount {
                     V::String("response body interrupted".into()),
                 ));
             }
+            event.fields.extend(self.extra.fields.iter().cloned());
             let _ = self.access.logging.try_emit(event);
         }
     }
