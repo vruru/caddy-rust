@@ -118,7 +118,11 @@ for reads and shutdown. Ordinary configuration reads have their own 64 MiB
 response budget; slow reads keep the charge until their output is released.
 Queued JSON writes keep bounded input bytes and parse at the serialized write
 worker, after conditional validation. These budgets do not cap the entire
-expanded configuration tree or custom adapter output. Native serving remains
+expanded configuration tree. HTTP custom adaptation and warning responses
+reserve output capacity before encoding; a failed reservation cannot publish a
+candidate. A queued adapted configuration owns its bounded canonical bytes.
+An external adapter's own allocations before returning its value remain outside
+this endpoint budget. Native serving remains
 opt-in while full production compatibility is being validated.
 Unsupported modules and transport options fail validation instead of being
 silently ignored. The vendored HTTP crates contain opt-in compatibility changes;

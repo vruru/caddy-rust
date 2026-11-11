@@ -11,6 +11,8 @@ mod candidate;
 pub use candidate::{CandidateHandle, CandidateOwner, CandidateScope};
 #[path = "admin/activation.rs"]
 mod activation;
+#[path = "admin/adapter.rs"]
+mod adapter;
 #[path = "admin/byte_budget.rs"]
 mod byte_budget;
 #[path = "admin/controller.rs"]

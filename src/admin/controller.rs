@@ -84,6 +84,7 @@ pub(super) struct Inner {
     pub controls: Arc<tokio::sync::Semaphore>,
     pub ingress: super::byte_budget::Pool,
     pub adapt_egress: super::byte_budget::Pool,
+    pub adapted_configs: super::byte_budget::Pool,
     config_egress: super::byte_budget::Pool,
     pub bulk_cpu: Arc<tokio::sync::Semaphore>,
     pub cpu: Arc<tokio::sync::Semaphore>,
@@ -103,6 +104,7 @@ enum Admission {
 pub(super) enum ChangeBody {
     Loaded(super::loader::Loaded),
     HttpJson(Box<Buffer>, JsonRoute),
+    AdaptedJson(Box<Buffer>),
 }
 
 #[derive(Clone, Copy)]
@@ -209,6 +211,10 @@ impl AdminController {
             super::byte_budget::ADAPT_EGRESS,
             "admin_adapt_egress_capacity_exceeded",
         );
+        let adapted_configs = super::byte_budget::Pool::new(
+            super::byte_budget::ADAPTED_CONFIG,
+            "admin_adapted_config_capacity_exceeded",
+        );
         let config_egress =
             super::byte_budget::Pool::new(CONFIG_EGRESS, "admin_config_egress_capacity_exceeded");
         let cpu_count = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(1, 4));
@@ -234,6 +240,7 @@ impl AdminController {
             controls,
             ingress,
             adapt_egress,
+            adapted_configs,
             config_egress,
             bulk_cpu: Arc::new(tokio::sync::Semaphore::new(cpu_count)),
             cpu: Arc::new(tokio::sync::Semaphore::new(cpu_count)),
@@ -939,6 +946,10 @@ fn prepare_change(
                 .map_err(|error| route.error(error))?;
             change.body_credit = Some(bytes.release_data());
             Some(value)
+        }
+        Some(ChangeBody::AdaptedJson(bytes)) => {
+            let bytes = *bytes;
+            Some(crate::admin_json::decode_canonical(bytes.as_ref()).map_err(dom)?)
         }
         Some(ChangeBody::Loaded(value)) => Some(value.decode()?),
         None => None,
