@@ -272,7 +272,16 @@ where
     }
 
     pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.flush_pipeline && !self.read_buf.is_empty() {
+        self.poll_flush_inner(cx, false)
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn poll_flush_forced(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_flush_inner(cx, true)
+    }
+
+    fn poll_flush_inner(&mut self, cx: &mut Context<'_>, force: bool) -> Poll<io::Result<()>> {
+        if !force && self.flush_pipeline && !self.read_buf.is_empty() {
             Poll::Ready(Ok(()))
         } else if self.write_buf.remaining() == 0 {
             Pin::new(&mut self.io).poll_flush(cx)

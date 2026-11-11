@@ -16,6 +16,8 @@ use crate::body::{Body, DecodedLength, Incoming as IncomingBody};
 #[cfg(feature = "client")]
 use crate::client::dispatch::TrySendError;
 use crate::common::task;
+#[cfg(feature = "server")]
+use crate::ext::{InformationalHead, InformationalLimits, InformationalReceiver};
 use crate::proto::{BodyLength, Conn, Dispatched, MessageHead, RequestHead};
 use crate::upgrade::OnUpgrade;
 
@@ -25,6 +27,8 @@ pub(crate) struct Dispatcher<D, Bs: Body, I, T> {
     body_tx: SenderDropGuard,
     body_rx: Pin<Box<Option<Bs>>>,
     is_closing: bool,
+    #[cfg(feature = "server")]
+    informational_flush: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 pub(crate) trait Dispatch {
@@ -40,6 +44,14 @@ pub(crate) trait Dispatch {
         -> crate::Result<()>;
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ()>>;
     fn should_poll(&self) -> bool;
+    #[cfg(feature = "server")]
+    fn poll_informational(&mut self, _cx: &mut Context<'_>) -> Poll<InformationalHead> {
+        Poll::Pending
+    }
+    #[cfg(feature = "server")]
+    fn close_informational(&mut self) -> Option<InformationalHead> {
+        None
+    }
 }
 
 cfg_server! {
@@ -48,6 +60,8 @@ cfg_server! {
     pub(crate) struct Server<S: HttpService<B>, B> {
         in_flight: Pin<Box<Option<S::Future>>>,
         pub(crate) service: S,
+        informational_limits: Option<InformationalLimits>,
+        informational: Option<InformationalReceiver>,
     }
 }
 
@@ -84,6 +98,8 @@ where
             body_tx: SenderDropGuard::none(),
             body_rx: Box::pin(None),
             is_closing: false,
+            #[cfg(feature = "server")]
+            informational_flush: None,
         }
     }
 
@@ -361,7 +377,27 @@ where
                 && self.conn.can_write_head()
                 && self.dispatch.should_poll()
             {
-                if let Some(msg) = ready!(Pin::new(&mut self.dispatch).poll_msg(cx)) {
+                #[cfg(feature = "server")]
+                if self.informational_flush.is_some() {
+                    return Poll::Pending;
+                }
+                let msg = match Pin::new(&mut self.dispatch).poll_msg(cx) {
+                    Poll::Pending => {
+                        #[cfg(feature = "server")]
+                        if let Poll::Ready(head) = self.dispatch.poll_informational(cx) {
+                            self.write_informational(head);
+                        }
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(msg) => msg,
+                };
+                if let Some(msg) = msg {
+                    #[cfg(feature = "server")]
+                    if msg.is_ok() {
+                        if let Some(head) = self.dispatch.close_informational() {
+                            self.write_informational(head);
+                        }
+                    }
                     let (head, body) = msg.map_err(crate::Error::new_user_service)?;
 
                     let body_type = if body.is_end_stream() {
@@ -447,7 +483,28 @@ where
         }
     }
 
+    #[cfg(feature = "server")]
+    fn write_informational(&mut self, head: InformationalHead) {
+        debug_assert!(self.informational_flush.is_none());
+        self.conn.write_informational(head.response);
+        self.informational_flush = Some(head.ack);
+    }
+
     fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
+        #[cfg(feature = "server")]
+        if self.informational_flush.is_some() {
+            let result = ready!(self.conn.poll_flush_informational(cx));
+            if let Some(ack) = self.informational_flush.take() {
+                if result.is_ok() {
+                    let _ = ack.send(());
+                    // The service may have become ready while this flush
+                    // blocked. Its earlier wake could have been consumed
+                    // while the dispatcher could not yet poll the service.
+                    cx.waker().wake_by_ref();
+                }
+            }
+            return Poll::Ready(result.map_err(crate::Error::new_body_write));
+        }
         self.conn.poll_flush(cx).map_err(|err| {
             debug!("error writing: {}", err);
             crate::Error::new_body_write(err)
@@ -568,10 +625,15 @@ cfg_server! {
     where
         S: HttpService<B>,
     {
-        pub(crate) fn new(service: S) -> Server<S, B> {
+        pub(crate) fn new(
+            service: S,
+            informational_limits: Option<InformationalLimits>,
+        ) -> Server<S, B> {
             Server {
                 in_flight: Box::pin(None),
                 service,
+                informational_limits,
+                informational: None,
             }
         }
 
@@ -626,6 +688,13 @@ cfg_server! {
             *req.headers_mut() = msg.headers;
             *req.version_mut() = msg.version;
             *req.extensions_mut() = msg.extensions;
+            let recycled = self.informational.take();
+            self.informational = if req.version() == http::Version::HTTP_11 {
+                self.informational_limits
+                    .map(|limits| crate::ext::install_informational(&mut req, limits, recycled))
+            } else {
+                None
+            };
             let fut = self.service.call(req);
             self.in_flight.set(Some(fut));
             Ok(())
@@ -641,6 +710,14 @@ cfg_server! {
 
         fn should_poll(&self) -> bool {
             self.in_flight.is_some()
+        }
+
+        fn poll_informational(&mut self, cx: &mut Context<'_>) -> Poll<InformationalHead> {
+            self.informational.as_mut().map_or(Poll::Pending, |rx| rx.poll_take(cx))
+        }
+
+        fn close_informational(&mut self) -> Option<InformationalHead> {
+            self.informational.as_mut().and_then(|rx| rx.close_take())
         }
     }
 }

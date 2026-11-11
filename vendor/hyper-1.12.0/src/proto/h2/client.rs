@@ -415,6 +415,7 @@ where
     is_connect: bool,
     eos: bool,
     fut: ResponseFuture,
+    informational: Option<crate::ext::OnInformational>,
     body_tx: SendStream<SendBuf<B::Data>>,
     body: B,
     cb: Callback<Request<B>, Response<IncomingBody>>,
@@ -567,6 +568,7 @@ where
             send_when: SendWhen {
                 when: ResponseFutMap {
                     fut: f.fut,
+                    informational: f.informational,
                     ping: Some(ping),
                     send_stream: Some(send_stream),
                     exec: self.executor.clone(),
@@ -586,6 +588,7 @@ pin_project! {
     {
         #[pin]
         fut: ResponseFuture,
+        informational: Option<crate::ext::OnInformational>,
         ping: Option<Recorder>,
         #[pin]
         send_stream: Option<Option<SendStream<SendBuf<<B as Body>::Data>>>>,
@@ -612,6 +615,30 @@ where
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.as_mut().project();
+
+        if let Some(callback) = this.informational.as_ref() {
+            // Deliver every head before the final response. Yield after a
+            // small burst so an upstream cannot monopolize this executor.
+            let mut ended = false;
+            for _ in 0..16 {
+                match this.fut.poll_informational(cx) {
+                    Poll::Ready(Some(Ok(head))) => callback.call(head),
+                    Poll::Ready(Some(Err(err))) => {
+                        return Poll::Ready(Err((crate::Error::new_h2(err), None)));
+                    }
+                    Poll::Ready(None) => {
+                        ended = true;
+                        break;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            if !ended {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            *this.informational = None;
+        }
 
         let result = ready!(this.fut.poll(cx));
 
@@ -732,6 +759,7 @@ where
                         req.extensions_mut().insert(protocol.into_inner());
                     }
 
+                    let informational = req.extensions_mut().remove::<crate::ext::OnInformational>();
                     let (fut, body_tx) = match self.h2_tx.send_request(req, !is_connect && eos) {
                         Ok(ok) => ok,
                         Err(err) => {
@@ -748,6 +776,7 @@ where
                         is_connect,
                         eos,
                         fut,
+                        informational,
                         body_tx,
                         body,
                         cb,

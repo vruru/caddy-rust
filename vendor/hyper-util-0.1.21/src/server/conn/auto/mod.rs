@@ -719,6 +719,19 @@ pub struct Http1Builder<'a, E> {
 
 #[cfg(feature = "http1")]
 impl<E> Http1Builder<'_, E> {
+    /// Enable informational responses with aggregate per-request count and
+    /// header-byte limits. A zero limit disables them.
+    pub fn informational_responses(
+        &mut self,
+        max_count: u16,
+        max_header_bytes: usize,
+    ) -> &mut Self {
+        self.inner
+            .http1
+            .informational_responses(max_count, max_header_bytes);
+        self
+    }
+
     /// Http2 configuration.
     #[cfg(feature = "http2")]
     pub fn http2(&mut self) -> Http2Builder<'_, E> {
@@ -960,6 +973,19 @@ pub struct Http2Builder<'a, E> {
 
 #[cfg(feature = "http2")]
 impl<E> Http2Builder<'_, E> {
+    /// Enable informational responses with aggregate per-request count and
+    /// header-byte limits. A zero limit disables them.
+    pub fn informational_responses(
+        &mut self,
+        max_count: u16,
+        max_header_bytes: usize,
+    ) -> &mut Self {
+        self.inner
+            .http2
+            .informational_responses(max_count, max_header_bytes);
+        self
+    }
+
     #[cfg(feature = "http1")]
     /// Http1 configuration.
     pub fn http1(&mut self) -> Http1Builder<'_, E> {

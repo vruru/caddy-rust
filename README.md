@@ -453,3 +453,9 @@ certificate entries are never eviction targets; a full manual inventory
 can still serve one managed certificate. Count limits do not replace the
 separate certificate-material byte limits. Exact rollback history includes
 only displaced, configured entries from the retained generation.
+
+Native HTTP/1.1 and HTTP/2 can forward upstream informational responses
+and emit configured informational responses such as 103 Early Hints. The
+bounded queue preserves order and does not buffer a body or retry a request.
+A request with no interim headers allocates no queue slots. HTTP/3 and
+FastCGI interim responses remain separate compatibility work.

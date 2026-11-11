@@ -52,6 +52,10 @@ where
             io: Buffered::new(io),
             state: State {
                 allow_half_close: false,
+                #[cfg(feature = "server")]
+                expects_continue: false,
+                #[cfg(feature = "server")]
+                sent_continue: false,
                 cached_headers: None,
                 error: None,
                 keep_alive: KA::Busy,
@@ -316,6 +320,11 @@ where
         self.state.busy();
         self.state.keep_alive &= msg.keep_alive;
         self.state.version = msg.head.version;
+        #[cfg(feature = "server")]
+        {
+            self.state.expects_continue = msg.expect_continue;
+            self.state.sent_continue = false;
+        }
 
         let mut wants = if msg.wants_upgrade {
             Wants::UPGRADE
@@ -431,6 +440,10 @@ where
                     trace!("automatically sending 100 Continue");
                     let cont = b"HTTP/1.1 100 Continue\r\n\r\n";
                     self.io.headers_buf().extend_from_slice(cont);
+                    #[cfg(feature = "server")]
+                    {
+                        self.state.sent_continue = true;
+                    }
                 }
 
                 // And now recurse once in the Reading::Body state...
@@ -880,6 +893,40 @@ where
         Err(err)
     }
 
+    #[cfg(feature = "server")]
+    pub(super) fn write_informational(&mut self, head: http::Response<()>) {
+        debug_assert!(T::is_server() && self.can_write_head());
+        // Explicit 100 satisfies the expectation without a second automatic
+        // 100 when the handler subsequently starts reading the request body.
+        if head.status() == http::StatusCode::CONTINUE {
+            if self.state.expects_continue && self.state.sent_continue {
+                // The dispatcher still flushes any already buffered 100
+                // before acknowledging the suppressed duplicate.
+                return;
+            }
+            self.state.sent_continue = true;
+            if let Reading::Continue(decoder) = &self.state.reading {
+                self.state.reading = Reading::Body(decoder.clone());
+            }
+        }
+        super::role::Server::encode_informational(
+            &head,
+            self.state.version,
+            self.state.title_case_headers,
+            self.io.headers_buf(),
+        );
+    }
+
+    #[cfg(feature = "server")]
+    pub(super) fn poll_flush_informational(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        ready!(self.io.poll_flush_forced(cx))?;
+        self.try_keep_alive(cx);
+        Poll::Ready(Ok(()))
+    }
+
     pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         ready!(Pin::new(&mut self.io).poll_flush(cx))?;
         self.try_keep_alive(cx);
@@ -966,6 +1013,10 @@ impl<I: Unpin, B, T> Unpin for Conn<I, B, T> {}
 
 struct State {
     allow_half_close: bool,
+    #[cfg(feature = "server")]
+    expects_continue: bool,
+    #[cfg(feature = "server")]
+    sent_continue: bool,
     /// Re-usable `HeaderMap` to reduce allocating new ones.
     cached_headers: Option<HeaderMap>,
     /// If an error occurs when there wasn't a direct way to return it

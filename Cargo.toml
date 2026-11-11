@@ -31,7 +31,7 @@ time = { version = "0.3", features = ["formatting", "parsing", "serde-human-read
 url = "2"
 base64 = "0.22"
 http = "1"
-h2 = "0.4"
+h2 = "=0.4.20"
 bytes = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }

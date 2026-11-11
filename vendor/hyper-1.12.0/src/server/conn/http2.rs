@@ -289,6 +289,18 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Enable per-stream informational responses with aggregate frame-count
+    /// and header-byte limits. A zero limit disables them.
+    pub fn informational_responses(
+        &mut self,
+        max_count: u16,
+        max_header_bytes: usize,
+    ) -> &mut Self {
+        self.h2_builder.informational =
+            crate::ext::InformationalLimits::new(max_count, max_header_bytes);
+        self
+    }
+
     /// Set whether the `date` header should be included in HTTP responses.
     ///
     /// Note that including the `date` header is recommended by RFC 7231.

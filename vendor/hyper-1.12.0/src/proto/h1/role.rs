@@ -426,44 +426,12 @@ impl Http1Transaction for Server {
         let init_cap = 30 + msg.head.headers.len() * AVERAGE_HEADER_SIZE;
         dst.reserve(init_cap);
 
-        let custom_reason_phrase = msg.head.extensions.get::<crate::ext::ReasonPhrase>();
-
-        if msg.head.version == Version::HTTP_11
-            && msg.head.subject == StatusCode::OK
-            && custom_reason_phrase.is_none()
-        {
-            extend(dst, b"HTTP/1.1 200 OK\r\n");
-        } else {
-            match msg.head.version {
-                Version::HTTP_10 => extend(dst, b"HTTP/1.0 "),
-                Version::HTTP_11 => extend(dst, b"HTTP/1.1 "),
-                Version::HTTP_2 => {
-                    debug!("response with HTTP2 version coerced to HTTP/1.1");
-                    extend(dst, b"HTTP/1.1 ");
-                }
-                #[allow(clippy::panic)]
-                other => panic!("unexpected response version: {other:?}"),
-            }
-
-            extend(dst, msg.head.subject.as_str().as_bytes());
-            extend(dst, b" ");
-
-            if let Some(reason) = custom_reason_phrase {
-                extend(dst, reason.as_bytes());
-            } else {
-                // a reason MUST be written, as many parsers will expect it.
-                extend(
-                    dst,
-                    msg.head
-                        .subject
-                        .canonical_reason()
-                        .unwrap_or("<none>")
-                        .as_bytes(),
-                );
-            }
-
-            extend(dst, b"\r\n");
-        }
+        Self::encode_status_line(
+            msg.head.version,
+            msg.head.subject,
+            msg.head.extensions.get::<crate::ext::ReasonPhrase>(),
+            dst,
+        );
 
         let orig_headers;
         let extensions = std::mem::take(&mut msg.head.extensions);
@@ -521,6 +489,75 @@ impl Http1Transaction for Server {
 
 #[cfg(feature = "server")]
 impl Server {
+    fn encode_status_line(
+        version: Version,
+        status: StatusCode,
+        custom_reason_phrase: Option<&crate::ext::ReasonPhrase>,
+        dst: &mut Vec<u8>,
+    ) {
+        if version == Version::HTTP_11 && status == StatusCode::OK && custom_reason_phrase.is_none()
+        {
+            extend(dst, b"HTTP/1.1 200 OK\r\n");
+        } else {
+            match version {
+                Version::HTTP_10 => extend(dst, b"HTTP/1.0 "),
+                Version::HTTP_11 => extend(dst, b"HTTP/1.1 "),
+                Version::HTTP_2 => {
+                    debug!("response with HTTP2 version coerced to HTTP/1.1");
+                    extend(dst, b"HTTP/1.1 ");
+                }
+                #[allow(clippy::panic)]
+                other => panic!("unexpected response version: {other:?}"),
+            }
+
+            extend(dst, status.as_str().as_bytes());
+            extend(dst, b" ");
+
+            if let Some(reason) = custom_reason_phrase {
+                extend(dst, reason.as_bytes());
+            } else {
+                // a reason MUST be written, as many parsers will expect it.
+                extend(
+                    dst,
+                    status.canonical_reason().unwrap_or("<none>").as_bytes(),
+                );
+            }
+
+            extend(dst, b"\r\n");
+        }
+    }
+
+    pub(super) fn encode_informational(
+        response: &http::Response<()>,
+        version: Version,
+        title_case_headers: bool,
+        dst: &mut Vec<u8>,
+    ) {
+        debug_assert!(response.status().is_informational());
+        debug_assert_ne!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        Self::encode_status_line(
+            version,
+            response.status(),
+            response.extensions().get::<crate::ext::ReasonPhrase>(),
+            dst,
+        );
+        for (name, value) in response.headers() {
+            // There is no message body or framing in a 1xx response.
+            if matches!(*name, header::CONTENT_LENGTH | header::TRANSFER_ENCODING) {
+                continue;
+            }
+            if title_case_headers {
+                title_case(dst, name.as_str().as_bytes());
+            } else {
+                extend(dst, name.as_str().as_bytes());
+            }
+            extend(dst, b": ");
+            extend(dst, value.as_bytes());
+            extend(dst, b"\r\n");
+        }
+        extend(dst, b"\r\n");
+    }
+
     fn can_have_body(method: Option<&Method>, status: StatusCode) -> bool {
         Server::can_chunked(method, status)
     }

@@ -86,6 +86,7 @@ pub struct Builder {
     max_buf_size: Option<usize>,
     pipeline_flush: bool,
     date_header: bool,
+    informational: Option<crate::ext::InformationalLimits>,
 }
 
 /// Deconstructed parts of a `Connection`.
@@ -261,6 +262,7 @@ impl Builder {
             max_buf_size: None,
             pipeline_flush: false,
             date_header: true,
+            informational: None,
         }
     }
     /// Set whether HTTP/1 connections should support half-closures.
@@ -450,6 +452,17 @@ impl Builder {
         self
     }
 
+    /// Enable per-request HTTP/1.1 informational responses with aggregate
+    /// frame-count and header-byte limits. A zero limit disables them.
+    pub fn informational_responses(
+        &mut self,
+        max_count: u16,
+        max_header_bytes: usize,
+    ) -> &mut Self {
+        self.informational = crate::ext::InformationalLimits::new(max_count, max_header_bytes);
+        self
+    }
+
     /// Aggregates flushes to better support pipelined responses.
     ///
     /// Experimental, may have bugs.
@@ -554,7 +567,7 @@ impl Builder {
         if !self.date_header {
             conn.disable_date_header();
         }
-        let sd = proto::h1::dispatch::Server::new(service);
+        let sd = proto::h1::dispatch::Server::new(service, self.informational);
         let proto = proto::h1::Dispatcher::new(sd, conn);
         Connection { conn: proto }
     }

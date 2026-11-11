@@ -33,6 +33,9 @@ pub(super) struct Context {
     pub original_uri: Uri,
     pub values: HashMap<String, String>,
     pub immediate: HeaderMap,
+    informational: Option<hyper::ext::InformationalSender>,
+    wrote_interim: bool,
+    close_after_response: bool,
     deferred: Vec<HeaderOps>,
     groups: HashSet<String>,
     maps: Vec<LazyMap>,
@@ -282,6 +285,7 @@ pub(super) async fn handle_business(
         .get::<super::trailer_policy::RequestMetadata>()
         .cloned()
         .unwrap_or_default();
+    let informational = hyper::ext::InformationalSender::take(&mut request);
     let (parts, body) = request.into_parts();
     let body = super::trailer_policy::validate_incoming(body, &trailer_metadata);
     let body = IdleBody::new(body, server.plan.read_idle_timeout);
@@ -315,14 +319,21 @@ pub(super) async fn handle_business(
             h.insert(http::header::SERVER, HeaderValue::from_static("Caddy"));
             h
         },
+        informational,
+        wrote_interim: false,
+        close_after_response: false,
         deferred: Vec::new(),
         groups: HashSet::new(),
         maps: Vec::new(),
     };
     let result = routes(&server.plan.routes, &mut ctx, &inner, &server).await;
-    let mut response = match result {
-        Ok(Flow::Response(response)) => response,
-        Ok(Flow::Continue | Flow::Stop) => simple(StatusCode::OK, Bytes::new()),
+    let (mut response, explicit_headers) = match result {
+        Ok(Flow::Response(response)) => (response, true),
+        Ok(Flow::ImplicitResponse(response)) => (response, false),
+        Ok(Flow::Continue | Flow::Stop) => (
+            simple(StatusCode::OK, Bytes::new()),
+            !ctx.wrote_interim,
+        ),
         Err(error) => {
             let status = populate_error(&mut ctx, &error);
             // The failed handler stack has unwound. Its deferred writers did
@@ -330,21 +341,29 @@ pub(super) async fn handle_business(
             ctx.deferred.clear();
             ctx.groups.clear();
             match routes(&server.plan.errors, &mut ctx, &inner, &server).await {
-                Ok(Flow::Response(response)) => response,
-                _ => simple(status, Bytes::new()),
+                Ok(Flow::Response(response)) => (response, true),
+                Ok(Flow::ImplicitResponse(response)) => (response, false),
+                _ => (simple(status, Bytes::new()), true),
             }
         }
     };
     // Non-deferred writer headers exist before a terminal handler copies its
     // headers; terminal headers append, matching Caddy's shared writer model.
     let mut headers = std::mem::take(&mut ctx.immediate);
-    for (name, value) in response.headers().iter() {
-        headers.append(name, value.clone());
-    }
-    for operations in ctx.deferred.iter().rev() {
-        if apply_headers(&mut headers, operations, &ctx).is_err() {
-            return simple(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error\n");
+    if headers.is_empty() {
+        // Static handlers already own the complete header map. Keep that
+        // allocation instead of cloning every entry back into an empty map.
+        headers = std::mem::take(response.headers_mut());
+    } else {
+        for (name, value) in response.headers().iter() {
+            headers.append(name, value.clone());
         }
+    }
+    if explicit_headers && apply_deferred_headers(&mut headers, response.status(), &ctx).is_err() {
+        return simple(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error\n");
+    }
+    if ctx.close_after_response {
+        headers.insert(http::header::CONNECTION, HeaderValue::from_static("close"));
     }
     *response.headers_mut() = headers;
     if ctx
@@ -367,6 +386,9 @@ enum Flow {
     Continue,
     Stop,
     Response(Response<Body>),
+    // The underlying server finishes an untouched 200 without calling an
+    // application writer's WriteHeader; deferred wrappers do not run again.
+    ImplicitResponse(Response<Body>),
 }
 pub(super) fn descriptor_exhausted(error: &std::io::Error) -> bool {
     #[cfg(unix)]
@@ -542,42 +564,16 @@ fn handlers<'a>(
                         StatusCode::from_u16(ctx.expand(status)?.parse()?)
                             .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR))?
                     };
+                    if status.is_informational() {
+                        match static_informational(ctx, status, body, headers, *close).await? {
+                            Flow::Continue => continue,
+                            result => return Ok(result),
+                        }
+                    }
                     let bytes = replace(body, false, |name| ctx.lookup(name))?;
                     let mut response = simple(status, bytes.clone());
                     *response.headers_mut() = std::mem::take(&mut ctx.immediate);
-                    for (name, values) in &headers.set {
-                        let name =
-                            HeaderName::try_from(replace(name, false, |name| ctx.lookup(name))?)?;
-                        response.headers_mut().remove(&name);
-                        for value in values {
-                            response.headers_mut().append(
-                                name.clone(),
-                                HeaderValue::from_str(&replace(value, false, |name| {
-                                    ctx.lookup(name)
-                                })?)?,
-                            );
-                        }
-                    }
-                    if !bytes.is_empty()
-                        && response
-                            .headers()
-                            .get(http::header::CONTENT_TYPE)
-                            .is_none_or(|v| v.is_empty())
-                    {
-                        let trimmed = bytes.trim();
-                        let json = trimmed.len() > 2
-                            && ((trimmed.starts_with('{') && trimmed.ends_with('}'))
-                                || (trimmed.starts_with('[') && trimmed.ends_with(']')))
-                            && serde_json::from_str::<serde_json::Value>(trimmed).is_ok();
-                        response.headers_mut().insert(
-                            http::header::CONTENT_TYPE,
-                            HeaderValue::from_static(if json {
-                                "application/json"
-                            } else {
-                                "text/plain; charset=utf-8"
-                            }),
-                        );
-                    }
+                    apply_static_headers(response.headers_mut(), headers, ctx, &bytes)?;
                     response
                         .headers_mut()
                         .entry(http::header::CONTENT_LENGTH)
@@ -1067,6 +1063,195 @@ fn matches<'a>(
             }
         })
     })
+}
+// A rare interim response can wait for socket flush. Keep its suspended
+// state out of every ordinary route future's allocation.
+#[cold]
+fn static_informational<'a>(
+    ctx: &'a mut Context,
+    status: StatusCode,
+    body: &'a str,
+    headers: &'a HeaderOps,
+    close: bool,
+) -> ResponseFuture<'a> {
+    Box::pin(async move {
+        if status == StatusCode::SWITCHING_PROTOCOLS
+            && ctx.req().version() != Version::HTTP_11
+        {
+            // 101 is an HTTP/1.1 switch, not an HTTP/2 extended
+            // CONNECT. A malformed static response must not break
+            // neighboring streams or confuse HTTP/1.0 framing.
+            return Err(failure(StatusCode::INTERNAL_SERVER_ERROR));
+        }
+        let bytes = replace(body, false, |name| ctx.lookup(name))?;
+        let mut fields = std::mem::take(&mut ctx.immediate);
+        if close && ctx.req().version() != Version::HTTP_2 {
+            ctx.close_after_response = true;
+            fields.insert(http::header::CONNECTION, HeaderValue::from_static("close"));
+        }
+        apply_static_headers(&mut fields, headers, ctx, &bytes)?;
+        let mut final_status = status;
+        if status.is_informational() && status != StatusCode::SWITCHING_PROTOCOLS {
+            apply_deferred_headers(&mut fields, status, ctx)?;
+            ctx.immediate = fields;
+            emit_informational(ctx, status).await?;
+            ctx.wrote_interim = true;
+            if status == StatusCode::EARLY_HINTS {
+                // A 103 does not write this handler's body. Keep its
+                // shared headers and continue at this chain level.
+                return Ok(Flow::Continue);
+            }
+            final_status = StatusCode::OK;
+            fields = std::mem::take(&mut ctx.immediate);
+        }
+        let empty_implicit = status.is_informational()
+            && status != StatusCode::SWITCHING_PROTOCOLS
+            && bytes.is_empty();
+        let body = if status == StatusCode::SWITCHING_PROTOCOLS {
+            fields.remove(http::header::CONTENT_LENGTH);
+            fields.remove(http::header::TRANSFER_ENCODING);
+            String::new()
+        } else {
+            if !fields.contains_key(http::header::TRANSFER_ENCODING) {
+                fields
+                    .entry(http::header::CONTENT_LENGTH)
+                    .or_insert(HeaderValue::from_str(&bytes.len().to_string())?);
+            }
+            bytes
+        };
+        let mut response = simple(final_status, body);
+        *response.headers_mut() = fields;
+        Ok(if empty_implicit {
+            Flow::ImplicitResponse(response)
+        } else {
+            Flow::Response(response)
+        })
+    })
+}
+
+#[inline]
+fn apply_static_headers(
+    fields: &mut HeaderMap,
+    operations: &HeaderOps,
+    ctx: &Context,
+    body: &str,
+) -> Result<()> {
+    for (name, values) in &operations.set {
+        let name = HeaderName::try_from(replace(name, false, |name| ctx.lookup(name))?)?;
+        fields.remove(&name);
+        for value in values {
+            fields.append(
+                name.clone(),
+                HeaderValue::from_str(&replace(value, false, |name| ctx.lookup(name))?)?,
+            );
+        }
+    }
+    if !body.is_empty()
+        && fields
+            .get(http::header::CONTENT_TYPE)
+            .is_none_or(|value| value.is_empty())
+    {
+        let trimmed = body.trim();
+        let json = trimmed.len() > 2
+            && ((trimmed.starts_with('{') && trimmed.ends_with('}'))
+                || (trimmed.starts_with('[') && trimmed.ends_with(']')))
+            && serde_json::from_str::<serde_json::Value>(trimmed).is_ok();
+        fields.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static(if json {
+                "application/json"
+            } else {
+                "text/plain; charset=utf-8"
+            }),
+        );
+    }
+    Ok(())
+}
+
+fn apply_deferred_headers(
+    fields: &mut HeaderMap,
+    status: StatusCode,
+    ctx: &Context,
+) -> Result<()> {
+    for operations in ctx.deferred.iter().rev() {
+        apply_response_headers(fields, status.as_u16(), operations, ctx)?;
+    }
+    Ok(())
+}
+
+pub(super) const MAX_INFORMATIONAL_HEADS: u16 = 64;
+pub(super) const MAX_INFORMATIONAL_BYTES: usize = 64 * 1024;
+static SUPPRESSED_INFORMATIONAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn suppressed_informational() -> u64 {
+    SUPPRESSED_INFORMATIONAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(super) fn record_suppressed_informational() {
+    SUPPRESSED_INFORMATIONAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(super) fn accepts_informational(ctx: &Context) -> bool {
+    ctx.informational.is_some()
+}
+
+pub(super) async fn forward_informational(
+    ctx: &mut Context,
+    status: StatusCode,
+    fields: HeaderMap,
+) -> Result<()> {
+    if ctx.informational.is_none() {
+        return Ok(());
+    }
+    let mut snapshot = ctx.immediate.clone();
+    for (name, value) in fields.iter() {
+        snapshot.append(name, value.clone());
+    }
+    apply_deferred_headers(&mut snapshot, status, ctx)?;
+    // Upstream interim headers are not part of the final response. Preserve
+    // prior application headers; never clear the underlying writer map.
+    write_informational(ctx, status, snapshot).await
+}
+
+async fn emit_informational(ctx: &mut Context, status: StatusCode) -> Result<()> {
+    if ctx.informational.is_none() {
+        return Ok(());
+    }
+    write_informational(ctx, status, ctx.immediate.clone()).await
+}
+
+async fn write_informational(
+    ctx: &mut Context,
+    status: StatusCode,
+    fields: HeaderMap,
+) -> Result<()> {
+    let Some(sender) = &mut ctx.informational else {
+        // In particular, RFC 9110 forbids a 1xx to an HTTP/1.0 client.
+        // Continue the handler semantics without sending that head.
+        return Ok(());
+    };
+    let mut response = Response::new(());
+    *response.status_mut() = status;
+    *response.headers_mut() = fields;
+    if let Err(error) = sender.send(response).await {
+        if error.is_limit() {
+            // No header values or user input belong in this diagnostic.
+            record_suppressed_informational();
+        } else {
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn apply_response_headers(
+    headers: &mut HeaderMap,
+    _status: u16,
+    operations: &HeaderOps,
+    ctx: &Context,
+) -> Result<()> {
+    apply_headers(headers, operations, ctx)
 }
 fn file_split<'a>(path: &'a str, extensions: &[String]) -> (&'a str, &'a str) {
     for extension in extensions.iter().filter(|value| !value.is_empty()) {

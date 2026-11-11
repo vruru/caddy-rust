@@ -111,6 +111,11 @@ impl HttpRuntime {
     pub fn filtered_trailer_values(&self) -> u64 {
         trailer_policy::filtered_values()
     }
+    /// Informational heads excluded by bounded per-request response budgets.
+    /// Values and per-client labels are not retained.
+    pub fn suppressed_informational_responses(&self) -> u64 {
+        request::suppressed_informational()
+    }
     /// Process-wide later request trailer values omitted by the pinned clone
     /// policy; separate from forbidden response trailer value diagnostics.
     pub fn dropped_request_trailer_values(&self) -> u64 {
@@ -1113,8 +1118,20 @@ async fn serve_connection<I>(
         }
     });
     let mut builder = Builder::new(TokioExecutor::new());
+    // The original HTTP/2 sender queues informational headers separately
+    // from DATA flow control. Limit their aggregate per request/stream.
+    builder
+        .http2()
+        .informational_responses(
+            request::MAX_INFORMATIONAL_HEADS,
+            request::MAX_INFORMATIONAL_BYTES,
+        );
     builder
         .http1()
+        .informational_responses(
+            request::MAX_INFORMATIONAL_HEADS,
+            request::MAX_INFORMATIONAL_BYTES,
+        )
         .allow_undeclared_trailers(true)
         .max_trailer_size(4096)
         .allow_obsolete_multiline_trailers(true)

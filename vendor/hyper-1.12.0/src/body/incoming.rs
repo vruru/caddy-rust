@@ -38,6 +38,8 @@ use crate::proto::h2::ping;
 #[must_use = "streams do nothing unless polled"]
 pub struct Incoming {
     kind: Kind,
+    #[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
+    informational: Option<crate::ext::InformationalSender>,
 }
 
 enum Kind {
@@ -53,6 +55,8 @@ enum Kind {
         data_done: bool,
         ping: ping::Recorder,
         recv: h2::RecvStream,
+        #[cfg(feature = "server")]
+        continue_on_read: Option<tokio::sync::oneshot::Sender<()>>,
     },
     #[cfg(feature = "ffi")]
     Ffi(crate::ffi::UserBody),
@@ -86,7 +90,21 @@ impl Incoming {
     }
 
     fn new(kind: Kind) -> Incoming {
-        Incoming { kind }
+        Incoming {
+            kind,
+            #[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
+            informational: None,
+        }
+    }
+
+    #[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
+    pub(crate) fn set_informational(&mut self, sender: crate::ext::InformationalSender) {
+        self.informational = Some(sender);
+    }
+
+    #[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
+    pub(crate) fn take_informational(&mut self) -> Option<crate::ext::InformationalSender> {
+        self.informational.take()
     }
 
     #[allow(dead_code)]
@@ -116,7 +134,16 @@ impl Incoming {
             ping,
             content_length,
             recv,
+            #[cfg(feature = "server")]
+            continue_on_read: None,
         })
+    }
+
+    #[cfg(all(feature = "server", feature = "http2"))]
+    pub(crate) fn h2_continue_on_read(&mut self, sender: tokio::sync::oneshot::Sender<()>) {
+        if let Kind::H2 { continue_on_read, .. } = &mut self.kind {
+            *continue_on_read = Some(sender);
+        }
     }
 
     #[cfg(feature = "ffi")]
@@ -173,7 +200,13 @@ impl Body for Incoming {
                 ping,
                 recv: h2,
                 content_length: len,
+                #[cfg(feature = "server")]
+                continue_on_read,
             } => {
+                #[cfg(feature = "server")]
+                if let Some(signal) = continue_on_read.take() {
+                    let _ = signal.send(());
+                }
                 if !*data_done {
                     match ready!(h2.poll_data(cx)) {
                         Some(Ok(bytes)) => {

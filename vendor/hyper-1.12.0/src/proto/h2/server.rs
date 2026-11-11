@@ -56,6 +56,7 @@ pub(crate) struct Config {
     pub(crate) header_table_size: Option<u32>,
     pub(crate) max_header_list_size: u32,
     pub(crate) date_header: bool,
+    pub(crate) informational: Option<crate::ext::InformationalLimits>,
 }
 
 impl Default for Config {
@@ -75,6 +76,7 @@ impl Default for Config {
             max_send_buffer_size: DEFAULT_MAX_SEND_BUF_SIZE,
             max_header_list_size: DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE,
             date_header: true,
+            informational: None,
         }
     }
 }
@@ -90,6 +92,7 @@ pin_project! {
         service: S,
         state: State<T, B>,
         date_header: bool,
+        informational: Option<crate::ext::InformationalLimits>,
         close_pending: bool
     }
 }
@@ -115,6 +118,7 @@ where
     conn: Connection<Compat<T>, SendBuf<B::Data>>,
     closing: Option<crate::Error>,
     date_header: bool,
+    informational: Option<crate::ext::InformationalLimits>,
 }
 
 impl<T, S, B, E> Server<T, S, B, E>
@@ -178,6 +182,7 @@ where
             },
             service,
             date_header: config.date_header,
+            informational: config.informational,
             close_pending: false,
         }
     }
@@ -224,6 +229,7 @@ where
                         conn,
                         closing: None,
                         date_header: me.date_header,
+                        informational: me.informational,
                     })
                 }
                 State::Serving(srv) => {
@@ -274,14 +280,23 @@ where
 
                         let is_connect = req.method() == Method::CONNECT;
                         let (mut parts, stream) = req.into_parts();
-                        let (mut req, connect_parts) = if !is_connect {
-                            (
-                                Request::from_parts(
-                                    parts,
-                                    IncomingBody::h2(stream, content_length.into(), ping),
-                                ),
-                                None,
-                            )
+                        let (mut req, connect_parts, continue_demand) = if !is_connect {
+                            let expects_continue = self.informational.is_some()
+                                && !stream.is_end_stream()
+                                && content_length != Some(0)
+                                && parts.headers.get_all(::http::header::EXPECT).iter()
+                                    .filter_map(|value| value.to_str().ok())
+                                    .flat_map(|value| value.split(','))
+                                    .any(|token| token.trim().eq_ignore_ascii_case("100-continue"));
+                            let mut body = IncomingBody::h2(stream, content_length.into(), ping);
+                            let continue_demand = if expects_continue {
+                                let (send, receive) = tokio::sync::oneshot::channel();
+                                body.h2_continue_on_read(send);
+                                Some(receive)
+                            } else {
+                                None
+                            };
+                            (Request::from_parts(parts, body), None, continue_demand)
                         } else {
                             if content_length.map_or(false, |len| len != 0) {
                                 warn!("h2 connect request with non-zero body not supported");
@@ -298,6 +313,7 @@ where
                                     ping,
                                     recv_stream: stream,
                                 }),
+                                None,
                             )
                         };
 
@@ -305,12 +321,17 @@ where
                             req.extensions_mut().insert(Protocol::from_inner(protocol));
                         }
 
+                        let informational = self
+                            .informational
+                            .map(|limits| crate::ext::install_informational(&mut req, limits, None));
                         let fut = H2Stream::new(
                             service.call(req),
                             connect_parts,
                             respond,
                             self.date_header,
                             exec.clone(),
+                            informational,
+                            ContinueOnRead::new(continue_demand),
                         );
 
                         exec.execute_h2stream(fut);
@@ -382,6 +403,8 @@ pin_project! {
             #[pin]
             fut: F,
             connect_parts: Option<ConnectParts>,
+            informational: Option<crate::ext::InformationalReceiver>,
+            continue_on_read: ContinueOnRead,
         },
         Body {
             #[pin]
@@ -406,14 +429,93 @@ where
         respond: SendResponse<SendBuf<B::Data>>,
         date_header: bool,
         exec: E,
+        informational: Option<crate::ext::InformationalReceiver>,
+        continue_on_read: ContinueOnRead,
     ) -> H2Stream<F, B, E> {
         H2Stream {
             reply: respond,
-            state: H2StreamState::Service { fut, connect_parts },
+            state: H2StreamState::Service {
+                fut,
+                connect_parts,
+                informational,
+                continue_on_read,
+            },
             date_header,
             exec,
         }
     }
+}
+
+struct ContinueOnRead {
+    demand: Option<tokio::sync::oneshot::Receiver<()>>,
+    expected: bool,
+    sent: bool,
+}
+
+impl ContinueOnRead {
+    fn new(demand: Option<tokio::sync::oneshot::Receiver<()>>) -> Self {
+        Self {
+            expected: demand.is_some(),
+            demand,
+            sent: false,
+        }
+    }
+
+    fn poll_send<B: bytes::Buf>(
+        &mut self,
+        cx: &mut Context<'_>,
+        reply: &mut SendResponse<B>,
+    ) -> crate::Result<()> {
+        let demand = match &mut self.demand {
+            Some(demand) => demand,
+            None => return Ok(()),
+        };
+        if let Poll::Ready(result) = Pin::new(demand).poll(cx) {
+            self.demand = None;
+            if result.is_ok() && !self.sent {
+                let mut response = Response::new(());
+                *response.status_mut() = ::http::StatusCode::CONTINUE;
+                reply.send_informational(response).map_err(crate::Error::new_h2)?;
+                self.sent = true;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn send_informational<B: bytes::Buf>(
+    reply: &mut SendResponse<B>,
+    mut head: crate::ext::InformationalHead,
+    continuation: &mut ContinueOnRead,
+) -> crate::Result<()> {
+    let is_continue = head.response.status() == ::http::StatusCode::CONTINUE;
+    if is_continue && continuation.expected && continuation.sent {
+        let _ = head.ack.send(());
+        return Ok(());
+    }
+    let fields = head.response.headers_mut();
+    // Remove every Connection nomination, not just the first field value.
+    // The map is bounded by the per-stream informational header budget.
+    let nominated: Vec<_> = fields
+        .get_all(::http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|name| ::http::header::HeaderName::from_bytes(name.trim().as_bytes()).ok())
+        .collect();
+    for name in nominated {
+        fields.remove(name);
+    }
+    super::strip_connection_headers(fields, super::MessageKind::Response);
+    fields.remove(::http::header::TE);
+    fields.remove(::http::header::CONTENT_LENGTH);
+    fields.remove(::http::header::TRANSFER_ENCODING);
+    reply
+        .send_informational(head.response)
+        .map_err(crate::Error::new_h2)?;
+    continuation.sent |= is_continue;
+    let _ = head.ack.send(());
+    Ok(())
 }
 
 macro_rules! reply {
@@ -445,6 +547,8 @@ where
                 H2StreamStateProj::Service {
                     fut: h,
                     connect_parts,
+                    informational,
+                    continue_on_read,
                 } => {
                     let res = match h.poll(cx) {
                         Poll::Ready(Ok(r)) => r,
@@ -457,6 +561,12 @@ where
                                 debug!("stream received RST_STREAM: {:?}", reason);
                                 return Poll::Ready(Err(crate::Error::new_h2(reason.into())));
                             }
+                            if let Some(rx) = informational {
+                                if let Poll::Ready(head) = rx.poll_take(cx) {
+                                    send_informational(me.reply, head, continue_on_read)?;
+                                }
+                            }
+                            continue_on_read.poll_send(cx, me.reply)?;
                             return Poll::Pending;
                         }
                         Poll::Ready(Err(e)) => {
@@ -466,6 +576,13 @@ where
                             return Poll::Ready(Err(err));
                         }
                     };
+
+                    if let Some(mut rx) = informational.take() {
+                        if let Some(head) = rx.close_take() {
+                            send_informational(me.reply, head, continue_on_read)?;
+                        }
+                    }
+                    continue_on_read.poll_send(cx, me.reply)?;
 
                     let (head, body) = res.into_parts();
                     let mut res = ::http::Response::from_parts(head, ());

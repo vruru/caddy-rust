@@ -1,9 +1,17 @@
-use super::request::{Context, apply_headers};
+use super::request::{Context, apply_headers, apply_response_headers};
 use super::upstream_tls::{FixedDialConnector, PreparedTransport};
 use super::*;
 use http::{HeaderMap, HeaderName, HeaderValue, Uri, Version};
 use hyper_util::client::legacy::Client;
 use rustls::pki_types::ServerName;
+use std::{
+    collections::VecDeque,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+use tokio::sync::Notify;
 type HyperClient = Client<FixedDialConnector, Body>;
 pub(super) struct ProxyClient {
     connector: PreparedTransport,
@@ -325,15 +333,15 @@ pub(super) async fn serve(
     // values received later do not enter the outgoing request. Apply this
     // policy before either HTTP version can serialize a trailer frame.
     request = request.map(|body| super::trailer_policy::policy(body, true));
-    let fetch = client.request(request);
-    let mut response =
-        if let Some(timeout) = config.response_header_timeout.filter(|d| !d.is_zero()) {
-            tokio::time::timeout(timeout, fetch)
-                .await
-                .map_err(|_| super::request::failure(StatusCode::GATEWAY_TIMEOUT))??
-        } else {
-            fetch.await?
-        };
+    // Keep the bounded upstream-event waiter out of the outer route
+    // future, which shares its allocation with non-proxy handlers.
+    let mut response = Box::pin(fetch_with_informational(
+        ctx,
+        &client,
+        request,
+        config.response_header_timeout.filter(|d| !d.is_zero()),
+    ))
+    .await?;
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         ensure!(is_upgrade, "unsolicited upstream upgrade");
         ensure!(
@@ -395,7 +403,25 @@ pub(super) async fn serve(
         response.headers_mut().remove(http::header::CONTENT_LENGTH);
     }
     remove_hop_headers(response.headers_mut(), upgrade, false);
-    apply_headers(response.headers_mut(), &config.response_headers, ctx)?;
+    if !upgrade {
+        // Go finalizes normal responses before copying upstream fields. Via
+        // belongs to the downstream writer, outside the require matcher input.
+        ctx.immediate.remove(http::header::SERVER);
+        let via = match response.version() {
+            Version::HTTP_10 => "1.0 Caddy",
+            Version::HTTP_2 => "2.0 Caddy",
+            _ => "1.1 Caddy",
+        };
+        ctx.immediate
+            .append(http::header::VIA, HeaderValue::from_static(via));
+        let status = response.status().as_u16();
+        apply_response_headers(
+            response.headers_mut(),
+            status,
+            &config.response_headers,
+            ctx,
+        )?;
+    }
     *response.version_mut() = downstream_version;
     Ok(response.map(|body| {
         let body = ProxyBody { body, client };
@@ -407,6 +433,140 @@ pub(super) async fn serve(
         super::trailer_policy::policy(body, false)
     }))
 }
+async fn fetch_with_informational(
+    ctx: &mut Context,
+    client: &HyperClient,
+    mut request: Request<Body>,
+    timeout: Option<Duration>,
+) -> Result<Response<Incoming>> {
+    use super::request::accepts_informational;
+    let interim = if accepts_informational(ctx) {
+        // Callbacks run on the transport's driver, not the current handler.
+        // Allocate the queue's storage only when there is an actual hint.
+        let receive = Arc::new(ProxyInterim::default());
+        let send = receive.clone();
+        hyper::ext::on_informational(&mut request, move |head| {
+            send.enqueue(head.status(), head.headers());
+        });
+        Some(receive)
+    } else {
+        None
+    };
+    let fetch = async {
+        let pending = client.request(request);
+        let response = if let Some(timeout) = timeout {
+            tokio::time::timeout(timeout, pending)
+                .await
+                .map_err(|_| super::request::failure(StatusCode::GATEWAY_TIMEOUT))??
+        } else {
+            pending.await?
+        };
+        anyhow::Ok(response)
+    };
+    let Some(receive) = interim else {
+        return fetch.await;
+    };
+    tokio::pin!(fetch);
+    loop {
+        tokio::select! {biased;
+            result = &mut fetch => {
+                // The transport delivers callbacks before resolving final
+                // headers (or an error). Send those already committed first.
+                while let Some(head) = receive.try_pop() {
+                    deliver_proxy_hint(ctx, head).await?;
+                }
+                return result;
+            }
+            head = receive.next() => deliver_proxy_hint(ctx, head).await?,
+        }
+    }
+}
+
+type ProxyHint = (StatusCode, HeaderMap);
+
+#[derive(Default)]
+struct ProxyInterim {
+    state: Mutex<HintState>,
+    nonempty: AtomicBool,
+    ready: Notify,
+}
+
+#[derive(Default)]
+struct HintState {
+    heads: u16,
+    bytes: usize,
+    queue: VecDeque<ProxyHint>,
+}
+
+impl ProxyInterim {
+    fn enqueue(&self, status: StatusCode, headers: &HeaderMap) {
+        use super::request::{
+            MAX_INFORMATIONAL_BYTES, MAX_INFORMATIONAL_HEADS, record_suppressed_informational,
+        };
+        if !status.is_informational() || status == StatusCode::SWITCHING_PROTOCOLS {
+            return;
+        }
+        let bytes = headers.iter().try_fold(48usize, |size, (name, value)| {
+            size.checked_add(name.as_str().len())?
+                .checked_add(value.as_bytes().len())?
+                .checked_add(32)
+                .filter(|size| *size <= MAX_INFORMATIONAL_BYTES)
+        });
+        let Some(bytes) = bytes else {
+            record_suppressed_informational();
+            return;
+        };
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.heads == MAX_INFORMATIONAL_HEADS
+            || state.bytes.saturating_add(bytes) > MAX_INFORMATIONAL_BYTES
+        {
+            record_suppressed_informational();
+            return;
+        }
+        state.heads += 1;
+        state.bytes += bytes;
+        let first = state.queue.is_empty();
+        state.queue.push_back((status, headers.clone()));
+        if first {
+            self.nonempty.store(true, Ordering::Release);
+        }
+        drop(state);
+        if first {
+            // Only one consumer. notify_one retains a permit even when no
+            // waiter has yet polled, closing the try_pop/register race.
+            self.ready.notify_one();
+        }
+    }
+
+    fn try_pop(&self) -> Option<ProxyHint> {
+        if !self.nonempty.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let value = state.queue.pop_front();
+        if state.queue.is_empty() {
+            self.nonempty.store(false, Ordering::Release);
+        }
+        value
+    }
+
+    async fn next(&self) -> ProxyHint {
+        loop {
+            if let Some(head) = self.try_pop() {
+                return head;
+            }
+            self.ready.notified().await;
+        }
+    }
+}
+
+async fn deliver_proxy_hint(ctx: &mut Context, (status, mut headers): ProxyHint) -> Result<()> {
+    remove_hop_headers(&mut headers, false, false);
+    headers.remove(http::header::CONTENT_LENGTH);
+    headers.remove(http::header::TRAILER);
+    super::request::forward_informational(ctx, status, headers).await
+}
+
 pub(super) fn proxy_headers(
     ctx: &Context,
     config: &ProxyConfig,
