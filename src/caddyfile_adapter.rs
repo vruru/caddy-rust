@@ -90,7 +90,7 @@ mod shorthands;
 #[path = "caddyfile_adapter/site.rs"]
 mod site;
 #[path = "caddyfile_adapter/stable_sort.rs"]
-mod stable_sort;
+pub(crate) mod stable_sort;
 #[path = "caddyfile_adapter/subjects.rs"]
 mod subjects;
 #[path = "caddyfile_adapter/tls_client_auth.rs"]

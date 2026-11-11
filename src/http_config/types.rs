@@ -31,7 +31,14 @@ pub(crate) enum Matcher {
 }
 
 #[derive(Clone, Default)]
+pub(crate) struct ResponseMatcher {
+    pub(crate) status_codes: Option<Vec<i64>>,
+    pub(crate) headers: Vec<(String, Option<Vec<String>>)>,
+}
+
+#[derive(Clone, Default)]
 pub(crate) struct HeaderOps {
+    pub(crate) require: Option<ResponseMatcher>,
     pub(crate) set: Vec<(String, Vec<String>)>,
     pub(crate) add: Vec<(String, Vec<String>)>,
     pub(crate) delete: Vec<String>,
@@ -79,6 +86,7 @@ pub(crate) enum Handler {
         index_names: Vec<String>,
         pass_thru: bool,
     },
+    Encode(std::sync::Arc<crate::http_runtime::encode_response::EncodePlan>),
     ReverseProxy(Box<ProxyConfig>),
 }
 

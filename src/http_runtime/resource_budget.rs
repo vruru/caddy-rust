@@ -200,6 +200,7 @@ pub struct ResourceDiagnostics {
     pub metadata: BudgetSnapshot,
     pub file_streams: BudgetSnapshot,
     pub file_reads: BudgetSnapshot,
+    pub compression: super::CompressionDiagnostics,
     pub access_capture_rejected: u64,
     pub access_capture_reduced: u64,
     pub access_response_headers_omitted: u64,
@@ -219,6 +220,7 @@ pub(crate) struct Resources {
     pub reads: BlockingBudget,
     pub(super) access_capture: Arc<super::access_log::CaptureBudget>,
     pub fastcgi: BlockingBudget,
+    pub(super) compression: super::encode_body::CompressionBudget,
     pub(super) fastcgi_admission: super::fastcgi::admission::Admission,
     pub fastcgi_dns: BlockingBudget,
     pub fastcgi_spool_io: BlockingBudget,
@@ -309,6 +311,10 @@ impl Resources {
             auth_leader_limit,
             auth_follower_limit: limits.auth_followers,
             fastcgi,
+            compression: super::encode_body::CompressionBudget::new(
+                cpu,
+                limits.auth_running + limits.metadata_running + limits.file_read_running,
+            )?,
             fastcgi_admission: super::fastcgi::admission::Admission::new(capacity),
             fastcgi_dns,
             fastcgi_spool_io,
@@ -325,6 +331,7 @@ impl Resources {
         self.streams.tasks.close();
         self.reads.tasks.close();
         self.fastcgi.tasks.close();
+        self.compression.close();
         self.fastcgi_dns.tasks.close();
         self.fastcgi_spool_io.tasks.close();
         self.fastcgi_admission.diagnostics.close();
@@ -338,6 +345,7 @@ impl Resources {
         self.streams.tasks.wait().await;
         self.reads.tasks.wait().await;
         self.fastcgi.tasks.wait().await;
+        self.compression.wait().await;
         self.fastcgi_dns.tasks.wait().await;
         self.fastcgi_spool_io.tasks.wait().await;
         self.fastcgi_admission.diagnostics.wait().await;
@@ -359,6 +367,7 @@ impl Resources {
             metadata: self.metadata.snapshot(),
             file_streams: self.streams.snapshot(),
             file_reads: self.reads.snapshot(),
+            compression: self.compression.snapshot(),
         }
     }
 }

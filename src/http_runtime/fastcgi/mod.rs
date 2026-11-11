@@ -352,41 +352,6 @@ fn deadline(duration: Option<Duration>) -> Result<Option<Instant>> {
         .transpose()
 }
 
-fn incremental(headers: &http::HeaderMap) -> bool {
-    let mut entries = headers.get_all("incremental").iter();
-    let Some(value) = entries.next() else {
-        return false;
-    };
-    if entries.next().is_some() {
-        return false;
-    }
-    if value.as_bytes() == b"?1" {
-        return true;
-    }
-    struct TrueItem(bool);
-    impl<'de> sfv::visitor::ParameterVisitor<'de> for TrueItem {
-        type Out = bool;
-        type Error = std::convert::Infallible;
-        fn parameter(
-            &mut self,
-            _: &'de sfv::KeyRef,
-            _: sfv::BareItemFromInput<'de>,
-        ) -> Result<(), Self::Error> {
-            Ok(())
-        }
-        fn finish(self) -> Result<Self::Out, Self::Error> {
-            Ok(self.0)
-        }
-    }
-    sfv::Parser::new(value.as_bytes())
-        .parse_item_with_visitor(|bare| {
-            Ok::<_, std::convert::Infallible>(TrueItem(matches!(
-                bare,
-                sfv::BareItemFromInput::Boolean(true)
-            )))
-        })
-        .unwrap_or(false)
-}
 
 fn has_content(method: &Method, length: Option<u64>) -> bool {
     match length {
@@ -534,7 +499,7 @@ pub(super) async fn serve(
     let incoming_headers = parts.headers.clone();
     let known_length = body.size_hint().exact();
     ctx.request = Some(Request::from_parts(parts, full(Bytes::new())));
-    let is_incremental = incremental(&incoming_headers);
+    let is_incremental = super::incremental::is_enabled(&incoming_headers);
     let mut source = prefix(ctx, body, known_length, transport, is_incremental).await?;
     let mut headers = incoming_headers;
     if let Some(size) = source.content_length_override {
@@ -549,7 +514,7 @@ pub(super) async fn serve(
     let budget = ctx.resources.fastcgi.clone();
     let permit = budget.acquire().await.map_err(|e| budget_failure(ctx, e))?;
     let method = ctx.req().method();
-    if !is_incremental && incremental(&headers) && has_content(method, known_length) {
+    if !is_incremental && super::incremental::is_enabled(&headers) && has_content(method, known_length) {
         return Err(failure(StatusCode::NOT_IMPLEMENTED));
     }
     let protocol = match ctx.req().version() {

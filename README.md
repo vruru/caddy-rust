@@ -478,3 +478,13 @@ and issuance so ordinary connections can continue. This covers server
 HTTP/3 with the currently supported TLS policies. Outgoing HTTP/3,
 extended CONNECT/datagrams, early data and full production compatibility
 are separate work.
+
+The native `encode` handler negotiates gzip and Zstandard for HTTP/1.1,
+HTTP/2 and HTTP/3, preserves eligible response trailers, and flushes SSE as
+events become available. Encoders use a separate bounded worker and codec
+budget. If no codec is available before the response starts, the server
+can send identity; a stream already compressed must finish correctly or
+fail. The response matcher is also available for deferred header rules.
+For an upstream response without a declared length, the minimum-length
+decision can differ when the first data chunk is split differently by the
+transport. Precompressed file sidecars remain separate work.

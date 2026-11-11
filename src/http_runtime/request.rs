@@ -1,7 +1,7 @@
 use super::*;
 use crate::http_config::{helpers::replace, types::*};
 use base64::Engine;
-use http::{HeaderMap, HeaderName, HeaderValue, Method, Uri, Version, header};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, Uri, Version};
 use hyper::body::Body as _;
 use std::{
     collections::{HashMap, HashSet},
@@ -35,11 +35,14 @@ pub(super) struct Context {
     pub values: HashMap<String, String>,
     pub immediate: HeaderMap,
     informational: Option<InformationalOutput>,
-    wrote_interim: bool,
     close_after_response: bool,
-    deferred: Vec<HeaderOps>,
+    deferred: Vec<DeferredResponse>,
     groups: HashSet<String>,
     maps: Vec<LazyMap>,
+}
+enum DeferredResponse {
+    Headers(HeaderOps),
+    Encode(super::encode_response::ResponseEncoding),
 }
 impl Context {
     pub fn req(&self) -> &Request<Body> {
@@ -335,7 +338,6 @@ where
             h
         },
         informational,
-        wrote_interim: false,
         close_after_response: false,
         deferred: Vec::new(),
         groups: HashSet::new(),
@@ -345,20 +347,25 @@ where
     let (mut response, explicit_headers) = match result {
         Ok(Flow::Response(response)) => (response, true),
         Ok(Flow::ImplicitResponse(response)) => (response, false),
-        Ok(Flow::Continue | Flow::Stop) => (
-            simple(StatusCode::OK, Bytes::new()),
-            !ctx.wrote_interim,
-        ),
+        Ok(Flow::Continue | Flow::Stop) => (simple(StatusCode::OK, Bytes::new()), false),
         Err(error) => {
             let status = populate_error(&mut ctx, &error);
             // The failed handler stack has unwound. Its deferred writers did
             // not commit headers and must not wrap the server error routes.
             ctx.deferred.clear();
             ctx.groups.clear();
-            match routes(&server.plan.errors, &mut ctx, &inner, &server).await {
-                Ok(Flow::Response(response)) => (response, true),
-                Ok(Flow::ImplicitResponse(response)) => (response, false),
-                _ => (simple(status, Bytes::new()), true),
+            if server.plan.errors.is_empty() {
+                (simple(status, Bytes::new()), true)
+            } else {
+                match routes(&server.plan.errors, &mut ctx, &inner, &server).await {
+                    Ok(Flow::Response(response)) => (response, true),
+                    Ok(Flow::ImplicitResponse(response)) => (response, false),
+                    Ok(Flow::Continue | Flow::Stop) => (simple(status, Bytes::new()), true),
+                    Err(_) => {
+                        ctx.deferred.clear();
+                        (simple(status, Bytes::new()), true)
+                    }
+                }
             }
         }
     };
@@ -374,7 +381,12 @@ where
             headers.append(name, value.clone());
         }
     }
-    if explicit_headers && apply_deferred_headers(&mut headers, response.status(), &ctx).is_err() {
+    let any_encoding = ctx.deferred.iter().any(|step| matches!(step, DeferredResponse::Encode(_)));
+    if any_encoding {
+        if finalize_transforms(&mut headers, &mut response, explicit_headers, &mut ctx).await.is_err() {
+            return simple(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error\n");
+        }
+    } else if explicit_headers && apply_deferred_headers(&mut headers, response.status(), &ctx).is_err() {
         return simple(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error\n");
     }
     if ctx.close_after_response {
@@ -386,13 +398,16 @@ where
         .as_ref()
         .is_some_and(|r| r.method() == Method::HEAD)
     {
-        if http3
-            && !response.headers().contains_key(header::CONTENT_LENGTH)
-            && !matches!(response.status(),StatusCode::NO_CONTENT|StatusCode::NOT_MODIFIED)
-            && let Some(length)=response.body().size_hint().exact()
-            && let Ok(value)=HeaderValue::from_str(&length.to_string())
+        if !response.headers().contains_key(http::header::CONTENT_LENGTH)
+            && !response.headers().contains_key(http::header::CONTENT_ENCODING)
+            && !response.headers().contains_key(http::header::TRANSFER_ENCODING)
+            && !matches!(response.status(), StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED)
+            && !response.status().is_informational()
+            && let Some(length) = response.extensions().get::<StaticHeadLength>().map(|length| length.0 as u64)
+                .or_else(|| if http3 { response.body().size_hint().exact() } else { None })
+            && let Ok(value) = HeaderValue::from_str(&length.to_string())
         {
-            response.headers_mut().insert(header::CONTENT_LENGTH,value);
+            response.headers_mut().insert(http::header::CONTENT_LENGTH, value);
         }
         *response.body_mut() = full(Bytes::new());
     }
@@ -413,6 +428,12 @@ enum Flow {
     // application writer's WriteHeader; deferred wrappers do not run again.
     ImplicitResponse(Response<Body>),
 }
+
+#[derive(Clone, Copy)]
+struct StaticHeadLength(usize);
+
+#[derive(Clone, Copy)]
+struct StaticInterimStatus(u16);
 pub(super) fn descriptor_exhausted(error: &std::io::Error) -> bool {
     #[cfg(unix)]
     {
@@ -577,6 +598,15 @@ fn handlers<'a>(
                     headers,
                     close,
                 } => {
+                    let bytes = replace(body, false, |name| ctx.lookup(name))?;
+                    let mut fields = std::mem::take(&mut ctx.immediate);
+                    if *close && ctx.req().version() != Version::HTTP_2 {
+                        ctx.close_after_response = true;
+                        fields.insert(http::header::CONNECTION, HeaderValue::from_static("close"));
+                    }
+                    let prepared = apply_static_headers(&mut fields, headers, ctx, &bytes);
+                    ctx.immediate = fields;
+                    prepared?;
                     let status = if status.is_empty() {
                         ctx.values
                             .get("http.error.status_code")
@@ -588,25 +618,30 @@ fn handlers<'a>(
                             .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR))?
                     };
                     if status.is_informational() {
-                        match static_informational(ctx, status, body, headers, *close).await? {
+                        match static_informational(ctx, status, bytes).await? {
                             Flow::Continue => continue,
                             result => return Ok(result),
                         }
                     }
-                    let bytes = replace(body, false, |name| ctx.lookup(name))?;
-                    let mut response = simple(status, bytes.clone());
+                    let head_length = static_head_length(ctx, &bytes);
+                    let mut response = simple(status, bytes);
                     *response.headers_mut() = std::mem::take(&mut ctx.immediate);
-                    apply_static_headers(response.headers_mut(), headers, ctx, &bytes)?;
-                    response
-                        .headers_mut()
-                        .entry(http::header::CONTENT_LENGTH)
-                        .or_insert(HeaderValue::from_str(&bytes.len().to_string())?);
-                    if *close && ctx.req().version() != Version::HTTP_2 {
-                        response
-                            .headers_mut()
-                            .insert(http::header::CONNECTION, HeaderValue::from_static("close"));
+                    // Framing comes after response writers have examined the
+                    // actual application headers. Hyper can use the exact
+                    // static body length without inserting a premature field.
+                    if let Some(head_length) = head_length {
+                        response.extensions_mut().insert(head_length);
                     }
                     return Ok(Flow::Response(response));
+                }
+                Handler::Encode(plan) => {
+                    if let Some(codec) = plan.select(ctx.req_mut().headers_mut()) {
+                        ctx.deferred.push(DeferredResponse::Encode(super::encode_response::ResponseEncoding {
+                            plan: plan.clone(),
+                            codec,
+                            method: ctx.req().method().clone(),
+                        }));
+                    }
                 }
                 Handler::Headers {
                     request,
@@ -629,8 +664,8 @@ fn handlers<'a>(
                         .unwrap_or_default();
                     headers.remove(http::header::HOST);
                     *ctx.req_mut().headers_mut() = headers;
-                    if *deferred {
-                        ctx.deferred.push(response.clone());
+                    if *deferred || response.require.is_some() {
+                        ctx.deferred.push(DeferredResponse::Headers(response.clone()));
                     } else {
                         let mut headers = std::mem::take(&mut ctx.immediate);
                         apply_headers(&mut headers, response, ctx)?;
@@ -1093,9 +1128,7 @@ fn matches<'a>(
 fn static_informational<'a>(
     ctx: &'a mut Context,
     status: StatusCode,
-    body: &'a str,
-    headers: &'a HeaderOps,
-    close: bool,
+    bytes: String,
 ) -> ResponseFuture<'a> {
     Box::pin(async move {
         if status == StatusCode::SWITCHING_PROTOCOLS
@@ -1106,19 +1139,12 @@ fn static_informational<'a>(
             // neighboring streams or confuse HTTP/1.0 framing.
             return Err(failure(StatusCode::INTERNAL_SERVER_ERROR));
         }
-        let bytes = replace(body, false, |name| ctx.lookup(name))?;
         let mut fields = std::mem::take(&mut ctx.immediate);
-        if close && ctx.req().version() != Version::HTTP_2 {
-            ctx.close_after_response = true;
-            fields.insert(http::header::CONNECTION, HeaderValue::from_static("close"));
-        }
-        apply_static_headers(&mut fields, headers, ctx, &bytes)?;
         let mut final_status = status;
         if status.is_informational() && status != StatusCode::SWITCHING_PROTOCOLS {
             apply_deferred_headers(&mut fields, status, ctx)?;
             ctx.immediate = fields;
             emit_informational(ctx, status).await?;
-            ctx.wrote_interim = true;
             if status == StatusCode::EARLY_HINTS {
                 // A 103 does not write this handler's body. Keep its
                 // shared headers and continue at this chain level.
@@ -1135,14 +1161,16 @@ fn static_informational<'a>(
             fields.remove(http::header::TRANSFER_ENCODING);
             String::new()
         } else {
-            if !fields.contains_key(http::header::TRANSFER_ENCODING) {
-                fields
-                    .entry(http::header::CONTENT_LENGTH)
-                    .or_insert(HeaderValue::from_str(&bytes.len().to_string())?);
-            }
             bytes
         };
+        let head_length = static_head_length(ctx, &body);
         let mut response = simple(final_status, body);
+        if let Some(head_length) = head_length {
+            response.extensions_mut().insert(head_length);
+        }
+        if !empty_implicit && status != StatusCode::SWITCHING_PROTOCOLS {
+            response.extensions_mut().insert(StaticInterimStatus(status.as_u16()));
+        }
         *response.headers_mut() = fields;
         Ok(if empty_implicit {
             Flow::ImplicitResponse(response)
@@ -1150,6 +1178,11 @@ fn static_informational<'a>(
             Flow::Response(response)
         })
     })
+}
+
+fn static_head_length(ctx: &Context, body: &str) -> Option<StaticHeadLength> {
+    (ctx.req().method() == Method::HEAD && !body.is_empty())
+        .then(|| StaticHeadLength(body.len()))
 }
 
 #[inline]
@@ -1197,7 +1230,9 @@ fn apply_deferred_headers(
     ctx: &Context,
 ) -> Result<()> {
     for operations in ctx.deferred.iter().rev() {
-        apply_response_headers(fields, status.as_u16(), operations, ctx)?;
+        if let DeferredResponse::Headers(operations) = operations {
+            apply_response_headers(fields, status.as_u16(), operations, ctx)?;
+        }
     }
     Ok(())
 }
@@ -1278,11 +1313,18 @@ async fn write_informational(
 
 pub(super) fn apply_response_headers(
     headers: &mut HeaderMap,
-    _status: u16,
+    status: u16,
     operations: &HeaderOps,
     ctx: &Context,
 ) -> Result<()> {
-    apply_headers(headers, operations, ctx)
+    if operations
+        .require
+        .as_ref()
+        .is_none_or(|matcher| matcher.matches(status, headers))
+    {
+        apply_headers(headers, operations, ctx)?;
+    }
+    Ok(())
 }
 fn file_split<'a>(path: &'a str, extensions: &[String]) -> (&'a str, &'a str) {
     for extension in extensions.iter().filter(|value| !value.is_empty()) {
@@ -1553,4 +1595,34 @@ where
 
 fn header_pattern(pattern: &str, value: &str) -> bool {
     header_value_pattern(&pattern.to_ascii_lowercase(), &value.to_ascii_lowercase())
+}
+
+#[cold]
+fn finalize_transforms<'a>(
+    headers: &'a mut HeaderMap,
+    response: &'a mut Response<Body>,
+    explicit: bool,
+    ctx: &'a mut Context,
+) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        let status = response.status();
+        let interim = response.extensions().get::<StaticInterimStatus>().map(|code| code.0);
+        let mut body = std::mem::replace(response.body_mut(), full(Bytes::new()));
+        for entry in ctx.deferred.iter().rev() {
+            match entry {
+                DeferredResponse::Headers(ops) if explicit => {
+                    apply_response_headers(headers, status.as_u16(), ops, ctx)?;
+                }
+                DeferredResponse::Headers(_) => {}
+                DeferredResponse::Encode(encoding) if explicit => {
+                    body = encoding
+                        .finish(status, interim, headers, body, &ctx.resources.compression)
+                        .await;
+                }
+                DeferredResponse::Encode(_) => {}
+            }
+        }
+        *response.body_mut() = body;
+        Ok(())
+    })
 }

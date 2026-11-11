@@ -1,8 +1,9 @@
 // Copyright 2009 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
-// Ports readFloat, underscoreOK and binary64 atofHex from Go 1.27.3.
-// Decimal conversion uses Rust's correctly rounded binary64 parser.
+// Ports readFloat, underscoreOK and atofHex from Go 1.27.3.
+// Decimal conversion rounds directly to the requested Rust float width.
+use std::borrow::Cow;
 
 struct FloatInfo {
     mantbits: u32,
@@ -15,34 +16,94 @@ const FLOAT64INFO: FloatInfo = FloatInfo {
     bias: -1023,
 };
 
+const FLOAT32INFO: FloatInfo = FloatInfo {
+    mantbits: 23,
+    expbits: 8,
+    bias: -127,
+};
+
+enum FloatToken<'a> {
+    Nan,
+    Infinity {
+        negative: bool,
+    },
+    Hex {
+        mantissa: u64,
+        exponent: i64,
+        negative: bool,
+        truncated: bool,
+    },
+    Decimal(Cow<'a, str>),
+}
 pub(crate) fn parse_float(s: &str) -> Option<f64> {
+    match float_token(s)? {
+        FloatToken::Nan => Some(f64::NAN),
+        FloatToken::Infinity { negative } => Some(if negative {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        }),
+        FloatToken::Hex {
+            mantissa,
+            exponent,
+            negative,
+            truncated,
+        } => {
+            atof_hex_bits(&FLOAT64INFO, mantissa, exponent, negative, truncated).map(f64::from_bits)
+        }
+        FloatToken::Decimal(clean) => clean.parse::<f64>().ok().filter(|v| v.is_finite()),
+    }
+}
+pub(crate) fn parse_float32(s: &str) -> Option<f32> {
+    match float_token(s)? {
+        FloatToken::Nan => Some(f32::NAN),
+        FloatToken::Infinity { negative } => Some(if negative {
+            f32::NEG_INFINITY
+        } else {
+            f32::INFINITY
+        }),
+        FloatToken::Hex {
+            mantissa,
+            exponent,
+            negative,
+            truncated,
+        } => atof_hex_bits(&FLOAT32INFO, mantissa, exponent, negative, truncated)
+            .map(|bits| f32::from_bits(bits as u32)),
+        FloatToken::Decimal(clean) => clean.parse::<f32>().ok().filter(|v| v.is_finite()),
+    }
+}
+fn float_token(s: &str) -> Option<FloatToken<'_>> {
     if s.len() > 16 << 20 {
         return None;
     }
     if s.eq_ignore_ascii_case("nan") {
-        return Some(f64::NAN);
+        return Some(FloatToken::Nan);
     }
-    let unsigned = s
-        .strip_prefix('+')
-        .or_else(|| s.strip_prefix('-'))
-        .unwrap_or(s);
+    let unsigned = s.strip_prefix(['+', '-']).unwrap_or(s);
     if unsigned.eq_ignore_ascii_case("inf") || unsigned.eq_ignore_ascii_case("infinity") {
-        return Some(if s.starts_with('-') {
-            f64::NEG_INFINITY
-        } else {
-            f64::INFINITY
+        return Some(FloatToken::Infinity {
+            negative: s.starts_with('-'),
         });
     }
     let b = s.as_bytes();
-    let (mantissa, exp, neg, trunc, hex, n, ok) = read_float(s, b, b.len());
+    let (mantissa, exponent, negative, truncated, hex, n, ok) = read_float(s, b, b.len());
     if !ok || n != b.len() {
         return None;
     }
     if hex {
-        return atof_hex(b, &FLOAT64INFO, mantissa, exp, neg, trunc);
+        return Some(FloatToken::Hex {
+            mantissa,
+            exponent,
+            negative,
+            truncated,
+        });
     }
-    let clean: String = s.chars().filter(|c| *c != '_').collect();
-    clean.parse::<f64>().ok().filter(|v| v.is_finite())
+    let clean = if s.contains('_') {
+        Cow::Owned(s.chars().filter(|c| *c != '_').collect())
+    } else {
+        Cow::Borrowed(s)
+    };
+    Some(FloatToken::Decimal(clean))
 }
 
 fn read_float(_s: &str, b: &[u8], len: usize) -> (u64, i64, bool, bool, bool, usize, bool) {
@@ -274,14 +335,13 @@ fn underscore_ok(b: &[u8], n: usize) -> bool {
     saw != b'_'
 }
 
-fn atof_hex(
-    _b: &[u8],
+fn atof_hex_bits(
     flt: &FloatInfo,
     mut mantissa: u64,
     mut exp: i64,
     neg: bool,
     trunc: bool,
-) -> Option<f64> {
+) -> Option<u64> {
     let mantbits = flt.mantbits;
     let expbits = flt.expbits;
     let bias = flt.bias;
@@ -346,5 +406,5 @@ fn atof_hex(
         return None;
     }
 
-    Some(f64::from_bits(bits))
+    Some(bits)
 }

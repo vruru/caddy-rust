@@ -56,11 +56,25 @@ mod resource_budget;
 pub use resource_budget::{BudgetSnapshot, ResourceDiagnostics, ResourceLimits};
 #[path = "http_runtime/request.rs"]
 mod request;
+#[path = "http_runtime/response_matcher.rs"]
+mod response_matcher;
+#[path = "http_runtime/accepted_encodings.rs"]
+pub(crate) mod accepted_encodings;
+#[path = "http_runtime/encode_body.rs"]
+pub(crate) mod encode_body;
+pub use encode_body::CompressionDiagnostics;
+#[path = "http_runtime/encode_response.rs"]
+pub(crate) mod encode_response;
+#[path = "http_runtime/gzip_codec.rs"]
+mod gzip_codec;
+#[path = "http_runtime/zstd_codec.rs"]
+mod zstd_codec;
+#[path = "http_runtime/incremental.rs"]
+mod incremental;
 
 #[path = "http_runtime/rewrite_uri.rs"]
 mod rewrite_uri;
 #[path = "http_runtime/sniff.rs"]
-#[allow(dead_code)] // Used by the following encode middleware stage, not file_server.
 mod sniff;
 #[path = "http_runtime/timeout_io.rs"]
 mod timeout_io;

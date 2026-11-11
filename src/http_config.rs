@@ -735,6 +735,7 @@ fn parse_handler(value: &Value, depth: usize, normalized: bool) -> Result<Handle
                 close: boolean(m.get("close"), false, path)?,
             }
         }
+        "encode" => Handler::Encode(std::sync::Arc::new(parse_encode(m, path)?)),
         "headers" => {
             deny_unknown(m, &["handler", "request", "response"], path)?;
             let request = m
@@ -1004,12 +1005,79 @@ fn parse_header_values(value: &Value, path: &str) -> Result<Vec<(String, Vec<Str
     }
     Ok(values)
 }
+fn parse_response_matcher(value: &Value, path: &str) -> Result<ResponseMatcher> {
+    let obj = object(value, path)?;
+    deny_unknown(obj, &["status_code", "headers"], path)?;
+
+    let status_codes = if let Some(v) = obj.get("status_code") {
+        if v.is_null() {
+            None
+        } else {
+            let arr = v
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("{}: expected array for status_code", path))?;
+            let mut codes = Vec::with_capacity(arr.len());
+            for (i, item) in arr.iter().enumerate() {
+                let code = if item.is_null() {
+                    0
+                } else {
+                    item.as_number().and_then(serde_json::Number::as_go_i64).ok_or_else(|| {
+                        anyhow::anyhow!("{}: status_code[{}]: expected integer", path, i)
+                    })?
+                };
+                codes.push(code);
+            }
+            Some(codes)
+        }
+    } else {
+        None
+    };
+
+    let mut headers = Vec::new();
+    if let Some(v) = obj.get("headers")
+        && !v.is_null()
+    {
+        let headers_obj = v
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("{}: headers: expected object", path))?;
+        for (key, val) in headers_obj.iter() {
+
+            let header_value = if val.is_null() {
+                None
+            } else {
+                let arr = val
+                    .as_array()
+                    .ok_or_else(|| anyhow::anyhow!("{}: headers: expected array for key", path))?;
+                let mut strs = Vec::with_capacity(arr.len());
+                for (i, item) in arr.iter().enumerate() {
+                    let s = if item.is_null() {
+                        ""
+                    } else {
+                        item.as_str().ok_or_else(|| {
+                            anyhow::anyhow!("{}: headers: expected string at index {}", path, i)
+                        })?
+                    };
+                    strs.push(s.to_string());
+                }
+                Some(strs)
+            };
+
+            headers.push((key.clone(), header_value));
+        }
+    }
+
+    Ok(ResponseMatcher {
+        status_codes,
+        headers,
+    })
+}
+
 fn parse_header_ops(value: &Value, path: &str, response: bool) -> Result<HeaderOps> {
     let m = object(value, path)?;
     deny_unknown(
         m,
         if response {
-            &["set", "add", "delete", "deferred"]
+            &["set", "add", "delete", "deferred", "require"]
         } else {
             &["set", "add", "delete"]
         },
@@ -1038,6 +1106,11 @@ fn parse_header_ops(value: &Value, path: &str, response: bool) -> Result<HeaderO
             .transpose()?
             .unwrap_or_default(),
         delete,
+        require: m
+            .get("require")
+            .filter(|v| !v.is_null())
+            .map(|v| parse_response_matcher(v, path))
+            .transpose()?,
     })
 }
 fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyConfig> {
@@ -1300,7 +1373,10 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
             request_headers = parse_header_ops(v, path, false)?;
         }
         if let Some(v) = h.get("response") {
-            response_headers = parse_header_ops(v, path, false)?;
+            response_headers = parse_header_ops(v, path, true)?;
+            // Proxy headers are applied on the received upstream response;
+            // its deferred flag does not wrap a downstream writer in Caddy.
+            boolean(object(v, path)?.get("deferred"), false, path)?;
         }
     }
     Ok(ProxyConfig {
@@ -1398,4 +1474,62 @@ fn pending_placeholders_depth(value: &Value, depth: usize) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+fn parse_encode(m: &serde_json::Map<String, Value>, path: &str) -> Result<crate::http_runtime::encode_response::EncodePlan> {
+    use crate::http_runtime::{accepted_encodings::Coding, encode_body::CodecPlan, encode_response::EncodePlan};
+    deny_unknown(m, &["handler", "encodings", "prefer", "minimum_length", "match"], path)?;
+    let int = |value: Option<&Value>, default: i64| -> Result<i64> {
+        match value {
+            None | Some(Value::Null) => Ok(default),
+            Some(value) => value.as_number().and_then(serde_json::Number::as_go_i64).ok_or_else(|| anyhow::anyhow!("encode integer expected")),
+        }
+    };
+    let mut encodings = Vec::new();
+    if let Some(raw) = m.get("encodings").filter(|v| !v.is_null()) {
+        for (name, value) in object(raw, path)? {
+            let settings = object(value,path)?;
+            let coding = match name.as_str() {
+                "gzip" => {
+                    deny_unknown(settings,&["level"],path)?;
+                    let level = int(settings.get("level"), 0)?;
+                    ensure!((-3..=9).contains(&level),"invalid gzip level");
+                    CodecPlan::Gzip(level as i32)
+                }
+                "zstd" => {
+                    deny_unknown(settings,&["level","checksum"],path)?;
+                    let level = settings.get("level").filter(|v| !v.is_null()).map(|v| string(v,path)).transpose()?.unwrap_or_default();
+                    let level = match level.to_ascii_lowercase().as_str() {
+                        ""|"default" => "default",
+                        "fastest" => "fastest",
+                        "better" => "better",
+                        "best" => "best",
+                        _ => anyhow::bail!("invalid zstd level"),
+                    };
+                    let checksum = settings.get("checksum").filter(|v| !v.is_null()).map(|v| {
+                        v.as_bool().ok_or_else(|| anyhow::anyhow!("invalid zstd checksum setting"))
+                    }).transpose()?;
+                    CodecPlan::Zstd {level,checksum}
+                }
+                _ => return Err(unsupported("/apps/http/servers/*/routes/*/handle/*/encodings/module")),
+            };
+            encodings.push(coding);
+        }
+    }
+    let names = m.get("prefer").filter(|v| !v.is_null()).map(|v| strings(v,path)).transpose()?.unwrap_or_default();
+    let enabled = |coding| encodings.iter().any(|plan| plan.coding() == coding);
+    let mut prefer = Vec::new();
+    if names.is_empty() {
+        prefer.extend([Coding::Zstd,Coding::Brotli,Coding::Gzip].into_iter().filter(|c| enabled(*c)));
+    } else {
+        for name in names {
+            let coding = Coding::parse(&name).filter(|c| enabled(*c)).ok_or_else(|| anyhow::anyhow!("preferred encoder not enabled"))?;
+            ensure!(!prefer.contains(&coding), "duplicate encoder preference");
+            prefer.push(coding);
+        }
+    }
+    let minimum_length = int(m.get("minimum_length"),512)?;
+    let minimum_length = if minimum_length == 0 {512} else {minimum_length};
+    let matcher = m.get("match").filter(|v| !v.is_null()).map(|v| parse_response_matcher(v,path)).transpose()?;
+    Ok(EncodePlan {encodings,prefer,minimum_length,matcher})
 }

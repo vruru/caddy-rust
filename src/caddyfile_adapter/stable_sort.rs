@@ -4,7 +4,7 @@
 
 // Port of Go's stable_func, symMerge_func, rotate_func to Rust.
 
-pub(super) fn stable_sort<T, F>(values: &mut [T], mut less: F)
+pub(crate) fn stable_sort<T, F>(values: &mut [T], mut less: F)
 where
     F: FnMut(&T, &T) -> bool,
 {
