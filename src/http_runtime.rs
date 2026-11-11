@@ -71,8 +71,12 @@ pub use resource_budget::{BudgetSnapshot, ResourceDiagnostics, ResourceLimits};
 pub(crate) mod accepted_encodings;
 #[path = "http_runtime/encode_body.rs"]
 pub(crate) mod encode_body;
+#[path = "http_runtime/query_match.rs"]
+mod query_match;
 #[path = "http_runtime/request.rs"]
 mod request;
+#[path = "http_runtime/request_regex.rs"]
+mod request_regex;
 #[path = "http_runtime/response_matcher.rs"]
 mod response_matcher;
 pub use encode_body::CompressionDiagnostics;

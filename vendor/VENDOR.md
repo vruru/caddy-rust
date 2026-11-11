@@ -6,6 +6,7 @@ These are functional source copies of the versions locked by this project:
 | --- | --- | --- |
 | hyper | 1.12.0 | `2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c` |
 | hyper-util | 0.1.21 | `ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff` |
+| h2 | 0.4.20 | `7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118` |
 
 The original MIT licenses are retained in each crate. The trailer continuation
 normalizer follows Go 1.27.3 `src/net/textproto/reader.go`; its copyright notice
@@ -57,6 +58,20 @@ header-name and header-value parser checks; it cannot manufacture a folded name
 or turn CR/LF into an injected value. These dependency changes do not establish
 full Caddy or module compatibility. Remaining capability and validation gates
 continue to apply; no production replacement is authorized by vendoring alone.
+
+## Transport write completion
+
+The h2 copy retains the original MIT license. Its development targets and
+test-only code are omitted. The functional patch adds opt-in observation of
+the successful write flush of a request or final response head. An observer
+moves with its own stream until its frame reaches the codec. A dropped write
+resolves as abandoned. This does not change HTTP/2 stream state, encoding, or
+retry policy. Hyper observes the corresponding request completion on HTTP/1.
+A nonzero response-header timeout registers an upstream observer. The
+response-header clock begins at the successful flush and ends when final
+headers arrive. Negative values are disabled on HTTP/1 and already expired
+after the request flush on HTTP/2, matching the negotiated transport's
+behavior in the reference implementation.
 
 ## Typed JSON parser
 

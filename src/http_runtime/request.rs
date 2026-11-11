@@ -23,7 +23,7 @@ pub(super) struct Context {
     pub request: Option<Request<Body>>,
     pub fastcgi_body_claimed: bool,
     pub(super) body_limit: Option<Arc<super::request_body::LimitState>>,
-    pub(super) replaced_receive: Option<Body>,
+    pub(super) await_h2_response_head: bool,
     pub(super) original_framing: super::request_body::OriginalFraming,
     pub resources: Arc<super::resource_budget::Resources>,
     pub peer: SocketAddr,
@@ -42,6 +42,7 @@ pub(super) struct Context {
     access_start: Option<std::time::Instant>,
     log_fields: Option<Box<log_append::LogFields>>,
     pub values: HashMap<String, String>,
+    pub(super) regex_capture_budget: usize,
     pub immediate: HeaderMap,
     informational: Option<InformationalOutput>,
     pub(super) close_after_response: bool,
@@ -357,7 +358,7 @@ where
         request: Some(Request::from_parts(parts, body)),
         fastcgi_body_claimed: false,
         body_limit: None,
-        replaced_receive: None,
+        await_h2_response_head: false,
         original_framing,
         resources: inner.resources.clone(),
         peer,
@@ -376,6 +377,7 @@ where
         access_start: access.as_ref().map(|access| access.started_at()),
         log_fields: None,
         values: HashMap::new(),
+        regex_capture_budget: super::request_regex::CAPTURE_BYTES,
         immediate: {
             let mut h = HeaderMap::new();
             h.insert(http::header::SERVER, HeaderValue::from_static("Caddy"));
@@ -455,19 +457,13 @@ where
             .is_err()
         {
             let response = simple(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error\n");
-            return match ctx.replaced_receive.take() {
-                Some(receive) => super::request_body::retain_receive(response, receive),
-                None => response,
-            };
+            return super::request_body::mark_response(response, ctx.await_h2_response_head);
         }
     } else if explicit_headers
         && apply_deferred_headers(&mut headers, response.status(), &ctx).is_err()
     {
         let response = simple(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error\n");
-        return match ctx.replaced_receive.take() {
-            Some(receive) => super::request_body::retain_receive(response, receive),
-            None => response,
-        };
+        return super::request_body::mark_response(response, ctx.await_h2_response_head);
     }
     if ctx.close_after_response {
         headers.insert(http::header::CONNECTION, HeaderValue::from_static("close"));
@@ -519,9 +515,7 @@ where
         let body = std::mem::replace(response.body_mut(), full(Bytes::new()));
         *response.body_mut() = super::proxy_policy::with_lease(body, lease);
     }
-    if let Some(receive) = ctx.replaced_receive.take() {
-        response = super::request_body::retain_receive(response, receive);
-    }
+    response = super::request_body::mark_response(response, ctx.await_h2_response_head);
     if let Some(access) = access.filter(|_| !ctx.skip_access) {
         return (*access).attach(
             response,
@@ -1173,6 +1167,19 @@ fn match_sets<'a>(
         Ok(false)
     })
 }
+fn var_match_value(ctx: &Context, key: &str) -> String {
+    if let Some(key) = key
+        .strip_prefix('{')
+        .and_then(|key| key.strip_suffix('}'))
+        .filter(|key| !key.contains('{'))
+    {
+        ctx.lookup(key)
+    } else {
+        ctx.values.get(&format!("http.vars.{key}")).cloned()
+    }
+    .unwrap_or_default()
+}
+
 fn matches<'a>(
     matcher: &'a Matcher,
     ctx: &'a mut Context,
@@ -1195,37 +1202,62 @@ fn matches<'a>(
                 }
                 found
             }
-            Matcher::PathRegex { name, regex } => {
+            Matcher::PathRegex(plan) => {
                 let path = decoded_path(ctx.req().uri().path())?;
-                if let Some(captures) = regex.captures(&path) {
-                    for (i, value) in captures.iter().enumerate() {
-                        if let Some(value) = value {
-                            ctx.values
-                                .insert(format!("http.regexp.{i}"), value.as_str().to_owned());
-                            if !name.is_empty() {
-                                ctx.values.insert(
-                                    format!("http.regexp.{name}.{i}"),
-                                    value.as_str().to_owned(),
-                                );
-                            }
+                #[cfg(windows)]
+                let path = path
+                    .replace('\\', "/")
+                    .split('/')
+                    .map(|segment| {
+                        if matches!(segment, "." | "..") {
+                            segment
+                        } else {
+                            segment.trim_end_matches(['.', ' '])
                         }
-                    }
-                    for named in regex.capture_names().flatten() {
-                        if let Some(value) = captures.name(named) {
-                            ctx.values
-                                .insert(format!("http.regexp.{named}"), value.as_str().to_owned());
-                            if !name.is_empty() {
-                                ctx.values.insert(
-                                    format!("http.regexp.{name}.{named}"),
-                                    value.as_str().to_owned(),
-                                );
-                            }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/");
+                super::request_regex::matches(plan, vec![clean_path(&path, true)], ctx).await?
+            }
+            Matcher::HeaderRegex(rules) => {
+                let mut all = true;
+                for (header, plan) in rules {
+                    let values = if header == http::header::HOST {
+                        vec![ctx.authority.clone()]
+                    } else {
+                        let values = ctx
+                            .req()
+                            .headers()
+                            .get_all(header)
+                            .iter()
+                            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+                            .collect::<Vec<_>>();
+                        if values.is_empty()
+                            && header == http::header::TRANSFER_ENCODING
+                            && ctx.original_framing.chunked
+                        {
+                            vec!["chunked".into()]
+                        } else {
+                            values
                         }
+                    };
+                    if !super::request_regex::matches(plan, values, ctx).await? {
+                        all = false;
+                        break;
                     }
-                    true
-                } else {
-                    false
                 }
+                all
+            }
+            Matcher::VarsRegex(rules) => {
+                let mut matched = false;
+                for (key, plan) in rules {
+                    let value = var_match_value(ctx, key);
+                    if super::request_regex::matches(plan, vec![value], ctx).await? {
+                        matched = true;
+                        break;
+                    }
+                }
+                matched
             }
             Matcher::Method(methods) => methods.iter().any(|m| m == ctx.req().method().as_str()),
             Matcher::Header(headers) => {
@@ -1259,6 +1291,26 @@ fn matches<'a>(
                 }
                 all
             }
+            Matcher::Query(rules) => super::query_match::matches(
+                ctx.req().uri().query().unwrap_or_default(),
+                rules,
+                |value| ctx.expand(value),
+            )?,
+            Matcher::Vars(rules) => {
+                let mut matched = rules.is_empty();
+                'variables: for (key, values) in rules {
+                    let actual = var_match_value(ctx, key);
+                    for value in values {
+                        if actual == ctx.expand(value)? {
+                            matched = true;
+                            break 'variables;
+                        }
+                    }
+                }
+                matched
+            }
+            // All currently admitted TLS requests have completed a handshake.
+            Matcher::Tls(complete) => ctx.tls && *complete != Some(false),
             Matcher::Not(sets) => !match_sets(sets, ctx).await?,
             Matcher::RemoteIp(ranges) => ranges.iter().any(|r| r.contains(&ctx.peer.ip())),
             Matcher::ClientIp(ranges) => ranges.iter().any(|r| r.contains(&ctx.client_ip)),
@@ -1271,7 +1323,17 @@ fn matches<'a>(
                     .get(http::header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .is_some_and(|v| v.starts_with("application/grpc")),
+                "http/1.0+" => matches!(
+                    ctx.req().version(),
+                    Version::HTTP_10 | Version::HTTP_11 | Version::HTTP_2 | Version::HTTP_3
+                ),
+                "http/1.1+" => matches!(
+                    ctx.req().version(),
+                    Version::HTTP_11 | Version::HTTP_2 | Version::HTTP_3
+                ),
                 "http/2" => ctx.req().version() == Version::HTTP_2,
+                "http/2+" => matches!(ctx.req().version(), Version::HTTP_2 | Version::HTTP_3),
+                "http/3" | "http/3+" => ctx.req().version() == Version::HTTP_3,
                 "http/1.0" => ctx.req().version() == Version::HTTP_10,
                 _ => ctx.req().version() == Version::HTTP_11,
             },

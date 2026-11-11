@@ -131,6 +131,15 @@ impl GoRegexp {
         input: &str,
         budget: &ReplaceBudget,
     ) -> std::result::Result<Option<BTreeMap<String, String>>, OperationError> {
+        self.first_match_limited(input, budget, usize::MAX)
+    }
+
+    pub(crate) fn first_match_limited(
+        &self,
+        input: &str,
+        budget: &ReplaceBudget,
+        limit: usize,
+    ) -> std::result::Result<Option<BTreeMap<String, String>>, OperationError> {
         budget.check()?;
         if input.len() > MAX_INPUT_BYTES || self.search_memory > budget.scratch {
             return Err(OperationError::ByteLimit);
@@ -141,15 +150,25 @@ impl GoRegexp {
             return Ok(None);
         }
         let mut result = BTreeMap::new();
+        let mut output = 0usize;
         for (index, name) in self.names.iter().enumerate() {
             let value = captures
                 .get_group(index)
                 .and_then(|range| input.get(range.range()))
-                .unwrap_or_default()
-                .to_owned();
-            result.insert(index.to_string(), value.clone());
+                .unwrap_or_default();
+            let key = index.to_string();
+            output = output.saturating_add(key.len()).saturating_add(value.len());
             if let Some(name) = name {
-                result.insert(name.to_string(), value);
+                output = output
+                    .saturating_add(name.len())
+                    .saturating_add(value.len());
+            }
+            if output > limit {
+                return Err(OperationError::ByteLimit);
+            }
+            result.insert(key, value.to_owned());
+            if let Some(name) = name {
+                result.insert(name.to_string(), value.to_owned());
             }
         }
         Ok(Some(result))

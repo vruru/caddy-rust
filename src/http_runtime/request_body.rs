@@ -78,7 +78,7 @@ fn h1(version: Version) -> bool {
 }
 
 pub(super) struct OriginalFraming {
-    chunked: bool,
+    pub(super) chunked: bool,
     closing: bool,
 }
 
@@ -165,10 +165,11 @@ pub(super) async fn apply(ctx: &mut Context, plan: &RequestBodyConfig) -> Result
             drop(old);
             prior.trailers
         } else if ctx.req().version() == Version::HTTP_2 && !old.is_end_stream() {
-            // Keep the flow-controlled receive half through response sending.
-            // Dropping it in the handler can race the response with a reset
-            // when a client still has DATA in flight. Do not copy or drain it.
-            ctx.replaced_receive = Some(old);
+            // Discard buffered upload bytes now. The response marker keeps
+            // Hyper's existing stream handle alive through the final header
+            // flush, so the last reference cannot trigger a reset first.
+            ctx.await_h2_response_head = true;
+            drop(old);
             None
         } else {
             close_original(ctx, old, chunked).await?
@@ -226,17 +227,16 @@ pub(super) fn limit_hit(state: Option<&LimitState>) -> bool {
     state.is_some_and(LimitState::exceeded)
 }
 
-pub(super) fn retain_receive(
-    response: http::Response<Body>,
-    receive: Body,
+pub(super) fn mark_response(
+    mut response: http::Response<Body>,
+    await_h2_response_head: bool,
 ) -> http::Response<Body> {
-    response.map(|body| {
-        body.map_frame(move |frame| {
-            let _owner = &receive;
-            frame
-        })
-        .boxed_unsync()
-    })
+    if await_h2_response_head {
+        response
+            .extensions_mut()
+            .insert(hyper::ext::AwaitResponseHeadFlush);
+    }
+    response
 }
 
 pub(super) fn outgoing_headers(

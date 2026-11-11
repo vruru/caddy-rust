@@ -927,6 +927,19 @@ where
         Poll::Ready(Ok(()))
     }
 
+    #[cfg(feature = "client")]
+    pub(crate) fn can_complete_body_with(&self, bytes: usize) -> bool {
+        match &self.state.writing {
+            Writing::Body(encoder) => encoder.can_complete_with(bytes),
+            _ => false,
+        }
+    }
+
+    #[cfg(feature = "client")]
+    pub(crate) fn has_error(&self) -> bool {
+        self.state.error.is_some()
+    }
+
     pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         ready!(Pin::new(&mut self.io).poll_flush(cx))?;
         self.try_keep_alive(cx);

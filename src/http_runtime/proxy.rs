@@ -404,7 +404,7 @@ pub(super) async fn serve(
         ctx,
         &client,
         request,
-        config.response_header_timeout.filter(|d| !d.is_zero()),
+        config.response_header_timeout,
     ))
     .await?;
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
@@ -507,7 +507,7 @@ async fn fetch_with_informational(
     ctx: &mut Context,
     client: &HyperClient,
     mut request: Request<Body>,
-    timeout: Option<Duration>,
+    timeout: Option<i64>,
 ) -> Result<Response<Incoming>> {
     use super::request::accepts_informational;
     let interim = if accepts_informational(ctx) {
@@ -522,16 +522,45 @@ async fn fetch_with_informational(
     } else {
         None
     };
+    request.extensions_mut().remove::<hyper::ext::SendCompletion>();
+    let sent = timeout.map(|_| hyper::ext::SendCompletion::new());
+    if let Some(sent) = &sent {
+        request.extensions_mut().insert(sent.clone());
+    }
     let fetch = async {
         let pending = client.request(request);
-        let response = if let Some(timeout) = timeout {
-            tokio::time::timeout(timeout, pending)
-                .await
-                .map_err(|_| super::request::failure(StatusCode::GATEWAY_TIMEOUT))??
-        } else {
-            pending.await?
+        tokio::pin!(pending);
+        let Some((timeout, sent)) = timeout.zip(sent) else {
+            return anyhow::Ok(pending.await?);
         };
-        anyhow::Ok(response)
+        // The transport signals its actual successful final write/flush, not
+        // Body EOS or HTTP/2 queue admission. A peer may send final headers
+        // before finishing the upload; that response must remain immediately
+        // available and its subsequent body has no response-header deadline.
+        let completed = std::future::poll_fn(|cx| sent.poll_outcome(cx));
+        tokio::pin!(completed);
+        tokio::select! { biased;
+            result = &mut pending => anyhow::Ok(result?),
+            outcome = &mut completed => {
+                let hyper::ext::SendOutcome::Flushed(sent_at) = outcome else {
+                    return anyhow::Ok(pending.await?);
+                };
+                let deadline = if timeout > 0 {
+                    sent_at.checked_add(Duration::from_nanos(timeout as u64))
+                } else if sent.flushed_version() == Some(Version::HTTP_2) {
+                    Some(sent_at)
+                } else {
+                    None
+                };
+                let Some(deadline) = deadline else {
+                    return anyhow::Ok(pending.await?);
+                };
+                let response = tokio::time::timeout_at(deadline.into(), &mut pending)
+                    .await
+                    .map_err(|_| super::request::failure(StatusCode::GATEWAY_TIMEOUT))??;
+                anyhow::Ok(response)
+            }
+        }
     };
     let Some(receive) = interim else {
         return fetch.await;
@@ -547,7 +576,33 @@ async fn fetch_with_informational(
                 }
                 return result;
             }
-            head = receive.next() => deliver_proxy_hint(ctx, head).await?,
+            head = receive.next() => {
+                // Forwarding a hint can itself wait for a slow downstream
+                // flush. Keep polling the upstream response/deadline while
+                // that acknowledgment is pending, so a stalled hint cannot
+                // postpone cancellation of an expired upstream operation.
+                let completed = {
+                    let delivery = deliver_proxy_hint(ctx, head);
+                    tokio::pin!(delivery);
+                    tokio::select! { biased;
+                        result = &mut fetch => {
+                            let response = result?;
+                            // A successful final response does not overtake a
+                            // hint already being delivered. Once final headers
+                            // exist there is no response-header timer to extend.
+                            delivery.await?;
+                            Some(response)
+                        }
+                        result = &mut delivery => { result?; None },
+                    }
+                };
+                if let Some(response) = completed {
+                    while let Some(head) = receive.try_pop() {
+                        deliver_proxy_hint(ctx, head).await?;
+                    }
+                    return Ok(response);
+                }
+            },
         }
     }
 }

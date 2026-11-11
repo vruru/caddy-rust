@@ -548,10 +548,11 @@ The `request_body` handler enforces limits when the body is read, or replaces
 the body before a downstream handler consumes it. Replacement uses a bounded
 32 MiB shared allocation budget and preserves the original request headers
 for placeholders. HTTP/1.1, HTTP/2, HTTP/3 and FastCGI have been exercised with
-ordinary clients. On an HTTP/2 upload still in progress, replacing the body can
-reach the origin correctly but lose the response headers at the client; this
-compatibility gap is still open. Some trailer and FastCGI cancellation timing
-also differs from the original.
+ordinary clients. HTTP/2 retains the stream until the final response headers
+have been written, including when an informational response came first. An
+older curl 7.88.1 can time out during a cancelled upload after receiving the
+full response; curl 8.7.1 completed the tested large uploads. Some trailer and
+FastCGI cancellation timing also differs from the original.
 
 TLS connection policies support ordered SNI, regexp and IP matching, manual
 certificate tags, TLS 1.2 and 1.3, explicit key exchange groups including
@@ -559,3 +560,18 @@ P-521, and supported file/inline/combined or pinned client trust. A TLS 1.2
 only policy still serves TCP and will not accept QUIC. Custom TLS providers,
 additional trust loaders, default and fallback SNI, and certificates selected
 without a DNS SNI are separate compatibility items.
+
+
+The HTTP upstream response header timeout starts after the request's final
+write has flushed. It does not count a slow upload, restart on informational
+responses, or limit a slow response body. A timed-out HTTP/2 request leaves
+unrelated streams active. Zero disables the timeout. For negative values,
+HTTP/1 disables it and HTTP/2 expires after the request write, as in the
+tested upstream transports.
+
+The native route matcher supports query values, request variables, path,
+header and variable regex captures, TLS handshake status, and HTTP protocol
+version ranges. Regex work has its own bounded queue and request capture
+budget. Request-body placeholders in variable matchers require further
+integration. The early-data matcher does not match any request while QUIC
+early data is disabled.

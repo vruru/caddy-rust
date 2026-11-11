@@ -248,9 +248,10 @@ pub fn validate_json(value: &Value) -> Result<PreparedConfig> {
     ensure!(raw.len() <= 1024, "server count exceeded");
     let mut servers = Vec::new();
     let mut compiled_tls_memory = 0usize;
+    let mut regex_remaining = 64 << 20;
     let mut listen = std::collections::HashSet::new();
     for value in raw.values() {
-        let config = parse_server(value)?;
+        let config = parse_server(value, &mut regex_remaining)?;
         compiled_tls_memory = compiled_tls_memory.saturating_add(
             config
                 .tls_policies
@@ -332,7 +333,7 @@ fn required<'a>(m: &'a serde_json::Map<String, Value>, key: &str) -> Result<&'a 
     m.get(key)
         .ok_or_else(|| anyhow::anyhow!("required configuration field missing"))
 }
-fn parse_server(value: &Value) -> Result<ServerConfig> {
+fn parse_server(value: &Value, regex_remaining: &mut usize) -> Result<ServerConfig> {
     let path = "/apps/http/servers/*";
     let m = object(value, path)?;
     deny_unknown(
@@ -479,7 +480,7 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
             ));
         }
     }
-    let routes = parse_routes(m.get("routes"), 0, false)?;
+    let routes = parse_routes(m.get("routes"), 0, false, regex_remaining)?;
     let inferred = !disabled
         && listen.iter().any(|a| a.port() != 80)
         && route_names(&routes)
@@ -559,7 +560,9 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
                 ensure!(named.len() <= 65536, "named route count limit exceeded");
                 named
                     .iter()
-                    .map(|(name, value)| Ok((name.clone(), parse_route(value, 0, false)?)))
+                    .map(|(name, value)| {
+                        Ok((name.clone(), parse_route(value, 0, false, regex_remaining)?))
+                    })
                     .collect::<Result<_>>()
             })
             .transpose()?
@@ -567,7 +570,7 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
         errors: if let Some(v) = m.get("errors") {
             let e = object(v, path)?;
             deny_unknown(e, &["routes"], path)?;
-            parse_routes(e.get("routes"), 0, false)?
+            parse_routes(e.get("routes"), 0, false, regex_remaining)?
         } else {
             vec![]
         },
@@ -625,7 +628,12 @@ fn parse_ranges(value: &Value, path: &str) -> Result<Vec<ipnet::IpNet>> {
         })
         .collect()
 }
-fn parse_routes(value: Option<&Value>, depth: usize, normalized: bool) -> Result<Vec<Route>> {
+fn parse_routes(
+    value: Option<&Value>,
+    depth: usize,
+    normalized: bool,
+    regex_remaining: &mut usize,
+) -> Result<Vec<Route>> {
     ensure!(depth < 64, "route nesting limit exceeded");
     let Some(value) = value else {
         return Ok(vec![]);
@@ -635,11 +643,16 @@ fn parse_routes(value: Option<&Value>, depth: usize, normalized: bool) -> Result
         .ok_or_else(|| anyhow::anyhow!("route array required"))?;
     ensure!(raw.len() <= 65536, "route count limit exceeded");
     raw.iter()
-        .map(|value| parse_route(value, depth, normalized))
+        .map(|value| parse_route(value, depth, normalized, regex_remaining))
         .collect()
 }
 
-fn parse_route(value: &Value, depth: usize, normalized: bool) -> Result<Route> {
+fn parse_route(
+    value: &Value,
+    depth: usize,
+    normalized: bool,
+    regex_remaining: &mut usize,
+) -> Result<Route> {
     let path = "/apps/http/servers/*/routes/*";
     let m = object(value, path)?;
     deny_unknown(m, &["group", "match", "handle", "terminal"], path)?;
@@ -650,19 +663,41 @@ fn parse_route(value: &Value, depth: usize, normalized: bool) -> Result<Route> {
                 .as_array()
                 .ok_or_else(|| anyhow::anyhow!("handler array required"))?
                 .iter()
-                .map(|value| parse_handler(value, depth + 1, normalized))
+                .map(|value| parse_handler(value, depth + 1, normalized, regex_remaining))
                 .collect::<Result<_>>()
         })
         .transpose()?
         .unwrap_or_default();
     Ok(Route {
         group: m.get("group").map(|v| string(v, path)).transpose()?,
-        matchers: parse_matcher_sets(m.get("match"), depth + 1)?,
+        matchers: parse_matcher_sets(m.get("match"), depth + 1, regex_remaining)?,
         handlers,
         terminal: boolean(m.get("terminal"), false, path)?,
     })
 }
-fn parse_matcher_sets(value: Option<&Value>, depth: usize) -> Result<Vec<MatcherSet>> {
+fn parse_request_regexp(value: &Value, remaining: &mut usize) -> Result<RequestRegex> {
+    let fields = object(value, "request regexp")?;
+    deny_unknown(fields, &["name", "pattern"], "request regexp")?;
+    let name = optional_handler_string(fields, "name", "request regexp name")?;
+    ensure!(
+        name.len() <= 256
+            && (name.is_empty() || name.bytes().any(|b| b == b'_' || b.is_ascii_alphanumeric())),
+        "invalid request regexp name"
+    );
+    let pattern = optional_handler_string(fields, "pattern", "request regexp pattern")?;
+    let regex = crate::go_regexp::GoRegexp::compile(&pattern, (*remaining).min(2 << 20))?;
+    *remaining -= regex.memory_usage();
+    Ok(RequestRegex {
+        name: Arc::from(name),
+        regex: Arc::new(regex),
+    })
+}
+
+fn parse_matcher_sets(
+    value: Option<&Value>,
+    depth: usize,
+    regex_remaining: &mut usize,
+) -> Result<Vec<MatcherSet>> {
     ensure!(depth < 64, "matcher nesting limit exceeded");
     let Some(value) = value else {
         return Ok(vec![]);
@@ -704,23 +739,31 @@ fn parse_matcher_sets(value: Option<&Value>, depth: usize) -> Result<Vec<Matcher
                     }
                     Matcher::Path(patterns.iter().map(|s| s.to_lowercase()).collect())
                 }
-                "path_regexp" => {
-                    let m = object(v, "path_regexp")?;
-                    deny_unknown(m, &["name", "pattern"], "path_regexp")?;
-                    Matcher::PathRegex {
-                        name: m
-                            .get("name")
-                            .map(|v| string(v, "regex name"))
-                            .transpose()?
-                            .unwrap_or_default(),
-                        regex: regex::Regex::new(
-                            required(m, "pattern")?
-                                .as_str()
-                                .ok_or_else(|| anyhow::anyhow!("regex pattern string required"))?,
-                        )
-                        .map_err(|_| anyhow::anyhow!("invalid path regular expression"))?,
-                    }
-                }
+                "path_regexp" => Matcher::PathRegex(parse_request_regexp(v, regex_remaining)?),
+                "header_regexp" => Matcher::HeaderRegex(
+                    object(v, "header_regexp")?
+                        .iter()
+                        .map(|(name, value)| {
+                            Ok((
+                                http::HeaderName::try_from(name)?,
+                                parse_request_regexp(value, regex_remaining)?,
+                            ))
+                        })
+                        .collect::<Result<_>>()?,
+                ),
+                "vars_regexp" => Matcher::VarsRegex(
+                    object(v, "vars_regexp")?
+                        .iter()
+                        .map(|(name, value)| {
+                            if name == "{http.request.body}" {
+                                return Err(unsupported(
+                                    "/match/vars_regexp/request_body_placeholder",
+                                ));
+                            }
+                            Ok((name.clone(), parse_request_regexp(value, regex_remaining)?))
+                        })
+                        .collect::<Result<_>>()?,
+                ),
                 "method" => Matcher::Method(strings(v, "method")?),
                 "header" => {
                     let mut h = Vec::new();
@@ -738,7 +781,41 @@ fn parse_matcher_sets(value: Option<&Value>, depth: usize) -> Result<Vec<Matcher
                     }
                     Matcher::Header(h)
                 }
-                "not" => Matcher::Not(parse_matcher_sets(Some(v), depth + 1)?),
+                "query" | "vars" => {
+                    let values = v.as_object().filter(|_| !v.is_null());
+                    ensure!(
+                        values.is_some() || v.is_null(),
+                        "query/vars matcher object required"
+                    );
+                    let mut rules = Vec::new();
+                    for (key, value) in values.into_iter().flatten() {
+                        if k == "vars" && key == "{http.request.body}" {
+                            return Err(unsupported("/match/vars/request_body_placeholder"));
+                        }
+                        let values = if value.is_null() {
+                            Vec::new()
+                        } else {
+                            strings(value, k)?
+                        };
+                        rules.push((key.clone(), values));
+                    }
+                    if k == "query" {
+                        Matcher::Query(rules)
+                    } else {
+                        Matcher::Vars(rules)
+                    }
+                }
+                "tls" => {
+                    let fields = object(v, "tls matcher")?;
+                    deny_unknown(fields, &["handshake_complete"], "tls matcher")?;
+                    let complete = fields
+                        .get("handshake_complete")
+                        .filter(|v| !v.is_null())
+                        .map(|v| boolean(Some(v), false, "TLS handshake_complete"))
+                        .transpose()?;
+                    Matcher::Tls(complete)
+                }
+                "not" => Matcher::Not(parse_matcher_sets(Some(v), depth + 1, regex_remaining)?),
                 "remote_ip" | "client_ip" => {
                     let m = object(v, "IP matcher")?;
                     deny_unknown(m, &["ranges"], "IP matcher")?;
@@ -754,7 +831,17 @@ fn parse_matcher_sets(value: Option<&Value>, depth: usize) -> Result<Vec<Matcher
                     ensure!(
                         matches!(
                             s.as_str(),
-                            "http" | "https" | "grpc" | "http/1.0" | "http/1.1" | "http/2"
+                            "http"
+                                | "https"
+                                | "grpc"
+                                | "http/1.0"
+                                | "http/1.0+"
+                                | "http/1.1"
+                                | "http/1.1+"
+                                | "http/2"
+                                | "http/2+"
+                                | "http/3"
+                                | "http/3+"
                         ),
                         "unsupported protocol matcher"
                     );
@@ -810,7 +897,12 @@ fn optional_handler_string(
         .map(Option::unwrap_or_default)
 }
 
-fn parse_handler(value: &Value, depth: usize, normalized: bool) -> Result<Handler> {
+fn parse_handler(
+    value: &Value,
+    depth: usize,
+    normalized: bool,
+    regex_remaining: &mut usize,
+) -> Result<Handler> {
     let normalized_value = crate::module_json::inline(value, "handler", normalized)?;
     let value = normalized_value.as_ref();
     let path = "/apps/http/servers/*/routes/*/handle/*";
@@ -935,11 +1027,11 @@ fn parse_handler(value: &Value, depth: usize, normalized: bool) -> Result<Handle
             deny_unknown(m, &["handler", "routes", "errors"], path)?;
             Handler::Subroute {
                 errors_configured: m.contains_key("errors"),
-                routes: parse_routes(m.get("routes"), depth + 1, true)?,
+                routes: parse_routes(m.get("routes"), depth + 1, true, regex_remaining)?,
                 errors: if let Some(v) = m.get("errors") {
                     let e = object(v, path)?;
                     deny_unknown(e, &["routes"], path)?;
-                    parse_routes(e.get("routes"), depth + 1, true)?
+                    parse_routes(e.get("routes"), depth + 1, true, regex_remaining)?
                 } else {
                     vec![]
                 },
@@ -1547,13 +1639,10 @@ fn parse_proxy(m: &serde_json::Map<String, Value>, path: &str) -> Result<ProxyCo
             }
         }
         if let Some(v) = t.get("response_header_timeout") {
-            let timeout = duration(v, path)?;
-            if !timeout.is_zero() {
-                return Err(unsupported(
-                    "/reverse_proxy/transport/response_header_timeout/write_completion_gate",
-                ));
-            }
-            response_header_timeout = Some(timeout);
+            let nanos = signed_duration(v, path)?;
+            // A negative value is disabled by HTTP/1, and already expired
+            // when HTTP/2 finishes sending. Keep its sign until the writer reports.
+            response_header_timeout = (nanos != 0).then_some(nanos);
         }
         read_timeout = t
             .get("read_timeout")

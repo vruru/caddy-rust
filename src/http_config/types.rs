@@ -12,12 +12,14 @@ pub(crate) type MatcherSet = Vec<Matcher>;
 pub(crate) enum Matcher {
     Host(Vec<String>),
     Path(Vec<String>),
-    PathRegex {
-        name: String,
-        regex: regex::Regex,
-    },
+    PathRegex(RequestRegex),
+    HeaderRegex(Vec<(http::HeaderName, RequestRegex)>),
+    VarsRegex(Vec<(String, RequestRegex)>),
     Method(Vec<String>),
     Header(Vec<(String, Option<Vec<String>>)>),
+    Query(Vec<(String, Vec<String>)>),
+    Vars(Vec<(String, Vec<String>)>),
+    Tls(Option<bool>),
     Not(Vec<MatcherSet>),
     RemoteIp(Vec<ipnet::IpNet>),
     ClientIp(Vec<ipnet::IpNet>),
@@ -28,6 +30,12 @@ pub(crate) enum Matcher {
         split_path: Vec<String>,
         fallback: bool,
     },
+}
+
+#[derive(Clone)]
+pub(crate) struct RequestRegex {
+    pub(crate) name: std::sync::Arc<str>,
+    pub(crate) regex: std::sync::Arc<crate::go_regexp::GoRegexp>,
 }
 
 #[derive(Clone, Default)]
@@ -135,7 +143,7 @@ pub(crate) struct ProxyConfig {
     pub(crate) enable_http2: bool,
     pub(crate) compression: bool,
     pub(crate) dial_timeout: std::time::Duration,
-    pub(crate) response_header_timeout: Option<std::time::Duration>,
+    pub(crate) response_header_timeout: Option<i64>,
     pub(crate) read_timeout: Option<std::time::Duration>,
     pub(crate) write_timeout: Option<std::time::Duration>,
     pub(crate) request_headers: HeaderOps,

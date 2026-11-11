@@ -36,6 +36,13 @@
 //!
 //! See the documentation on each item for details about its usage and requirements.
 
+#[cfg(any(feature = "http2", all(feature = "http1", feature = "client")))]
+mod send_completion;
+#[cfg(any(feature = "http2", all(feature = "http1", feature = "client")))]
+pub use send_completion::{SendCompletion, SendOutcome};
+#[cfg(all(feature = "http1", feature = "client"))]
+pub(crate) use send_completion::SendCompletionOwner;
+
 #[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
 mod server_informational;
 #[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
@@ -47,6 +54,16 @@ pub(crate) use server_informational::{
 
 #[cfg(feature = "http1")]
 pub mod trailer_compat;
+
+/// Keep the HTTP/2 server stream referenced until its final response head has
+/// been written and flushed to the transport.
+///
+/// Put this marker on a response after intentionally discarding an unread
+/// request body. Response streaming still proceeds normally. The protocol
+/// task releases the stream on successful flush or terminal write failure.
+#[cfg(all(feature = "server", feature = "http2"))]
+#[derive(Clone, Copy, Debug)]
+pub struct AwaitResponseHeadFlush;
 
 #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
 use bytes::Bytes;

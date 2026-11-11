@@ -87,6 +87,16 @@ impl Encoder {
         }
     }
 
+    #[cfg(feature = "client")]
+    pub(super) fn can_complete_with(&self, bytes: usize) -> bool {
+        match self.kind {
+            Kind::Length(remaining) => bytes as u64 >= remaining,
+            Kind::Chunked(_) => true,
+            #[cfg(feature = "server")]
+            Kind::CloseDelimited => true,
+        }
+    }
+
     pub(crate) fn is_eof(&self) -> bool {
         matches!(self.kind, Kind::Length(0))
     }

@@ -388,6 +388,7 @@ pin_project! {
         reply: SendResponse<SendBuf<B::Data>>,
         #[pin]
         state: H2StreamState<F, B>,
+        response_head: Option<h2::ext::SendCompletion>,
         date_header: bool,
         exec: E,
     }
@@ -410,6 +411,7 @@ pin_project! {
             #[pin]
             pipe: PipeToSendStream<B>,
         },
+        FlushingResponseHead,
     }
 }
 
@@ -440,6 +442,7 @@ where
                 informational,
                 continue_on_read,
             },
+            response_head: None,
             date_header,
             exec,
         }
@@ -543,6 +546,19 @@ where
     fn poll2(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         let mut me = self.as_mut().project();
         loop {
+            if let Some(completion) = me.response_head.as_ref() {
+                match completion.poll_outcome(cx) {
+                    Poll::Ready(h2::ext::SendOutcome::Flushed(_)) => {
+                        *me.response_head = None;
+                    }
+                    Poll::Ready(h2::ext::SendOutcome::Abandoned) => {
+                        return Poll::Ready(Err(crate::Error::new_body_write(
+                            "HTTP/2 response head flush abandoned",
+                        )));
+                    }
+                    Poll::Pending => {}
+                }
+            }
             let next = match me.state.as_mut().project() {
                 H2StreamStateProj::Service {
                     fut: h,
@@ -628,6 +644,16 @@ where
                         }
                     }
 
+                    if !res.status().is_informational()
+                        && res
+                            .extensions_mut()
+                            .remove::<crate::ext::AwaitResponseHeadFlush>()
+                            .is_some()
+                    {
+                        let completion = h2::ext::SendCompletion::new();
+                        res.extensions_mut().insert(completion.clone());
+                        *me.response_head = Some(completion);
+                    }
                     if !body.is_end_stream() {
                         // automatically set Content-Length from body...
                         if let Some(len) = body.size_hint().exact() {
@@ -640,11 +666,26 @@ where
                         }
                     } else {
                         reply!(me, res, true);
-                        return Poll::Ready(Ok(()));
+                        if me.response_head.is_none() {
+                            return Poll::Ready(Ok(()));
+                        }
+                        H2StreamState::FlushingResponseHead
                     }
                 }
-                H2StreamStateProj::Body { pipe } => {
-                    return pipe.poll(cx);
+                H2StreamStateProj::Body { pipe } => match pipe.poll(cx) {
+                    Poll::Ready(Ok(())) if me.response_head.is_some() => {
+                        H2StreamState::FlushingResponseHead
+                    }
+                    result => return result,
+                },
+                H2StreamStateProj::FlushingResponseHead => {
+                    // The existing reply handle keeps the stream referenced
+                    // even after the response body and its send handle finish.
+                    return if me.response_head.is_some() {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Ok(()))
+                    };
                 }
             };
             me.state.set(next);

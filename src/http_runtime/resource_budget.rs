@@ -202,6 +202,7 @@ pub struct ResourceDiagnostics {
     pub file_reads: BudgetSnapshot,
     pub compression: super::CompressionDiagnostics,
     pub proxy_selection: BudgetSnapshot,
+    pub request_regexp: BudgetSnapshot,
     pub access_capture_rejected: u64,
     pub access_capture_reduced: u64,
     pub access_response_headers_omitted: u64,
@@ -225,6 +226,7 @@ pub(crate) struct Resources {
     pub(super) compression: super::encode_body::CompressionBudget,
     pub(super) proxy_hosts: Arc<super::proxy_policy::HostRegistry>,
     pub proxy_selection: BlockingBudget,
+    pub request_regexp: BlockingBudget,
     pub(super) fastcgi_admission: super::fastcgi::admission::Admission,
     pub fastcgi_dns: BlockingBudget,
     pub fastcgi_spool_io: BlockingBudget,
@@ -305,7 +307,20 @@ impl Resources {
         let established = limits.auth_running + limits.metadata_running + limits.file_read_running;
         let spare = crate::runtime::BLOCKING_POOL_MAX.saturating_sub(established);
         let selection_running = cpu.div_ceil(2).clamp(1, 32).min((spare / 2).max(1));
-        let proxy_selection = BlockingBudget::new(selection_running, cpu.saturating_mul(16).clamp(128, 512), Duration::ZERO)?;
+        let proxy_selection = BlockingBudget::new(
+            selection_running,
+            cpu.saturating_mul(16).clamp(128, 512),
+            Duration::ZERO,
+        )?;
+        let regex_running = cpu
+            .div_ceil(2)
+            .clamp(1, 16)
+            .min((spare.saturating_sub(selection_running) / 2).max(1));
+        let request_regexp = BlockingBudget::new(
+            regex_running,
+            cpu.saturating_mul(16).clamp(32, 256),
+            Duration::from_secs(2),
+        )?;
         Ok(Self {
             request_body_bytes: Arc::new(Semaphore::new(super::request_body::REPLACEMENT_UNITS)),
             auth,
@@ -322,10 +337,11 @@ impl Resources {
             fastcgi,
             compression: super::encode_body::CompressionBudget::new(
                 cpu,
-                established + selection_running,
+                established + selection_running + regex_running,
             )?,
             proxy_hosts: Arc::new(super::proxy_policy::HostRegistry::default()),
             proxy_selection,
+            request_regexp,
             fastcgi_admission: super::fastcgi::admission::Admission::new(capacity),
             fastcgi_dns,
             fastcgi_spool_io,
@@ -344,6 +360,7 @@ impl Resources {
         self.fastcgi.tasks.close();
         self.compression.close();
         self.proxy_selection.tasks.close();
+        self.request_regexp.tasks.close();
         self.fastcgi_dns.tasks.close();
         self.fastcgi_spool_io.tasks.close();
         self.fastcgi_admission.diagnostics.close();
@@ -359,6 +376,7 @@ impl Resources {
         self.fastcgi.tasks.wait().await;
         self.compression.wait().await;
         self.proxy_selection.tasks.wait().await;
+        self.request_regexp.tasks.wait().await;
         self.fastcgi_dns.tasks.wait().await;
         self.fastcgi_spool_io.tasks.wait().await;
         self.fastcgi_admission.diagnostics.wait().await;
@@ -382,6 +400,7 @@ impl Resources {
             file_reads: self.reads.snapshot(),
             compression: self.compression.snapshot(),
             proxy_selection: self.proxy_selection.snapshot(),
+            request_regexp: self.request_regexp.snapshot(),
         }
     }
 }

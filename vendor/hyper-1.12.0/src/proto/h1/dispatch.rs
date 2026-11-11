@@ -27,6 +27,10 @@ pub(crate) struct Dispatcher<D, Bs: Body, I, T> {
     body_tx: SenderDropGuard,
     body_rx: Pin<Box<Option<Bs>>>,
     is_closing: bool,
+    #[cfg(feature = "client")]
+    send_completion: Option<crate::ext::SendCompletionOwner>,
+    #[cfg(feature = "client")]
+    request_ended: bool,
     #[cfg(feature = "server")]
     informational_flush: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -98,6 +102,10 @@ where
             body_tx: SenderDropGuard::none(),
             body_rx: Box::pin(None),
             is_closing: false,
+            #[cfg(feature = "client")]
+            send_completion: None,
+            #[cfg(feature = "client")]
+            request_ended: false,
             #[cfg(feature = "server")]
             informational_flush: None,
         }
@@ -398,7 +406,16 @@ where
                             self.write_informational(head);
                         }
                     }
-                    let (head, body) = msg.map_err(crate::Error::new_user_service)?;
+                    #[allow(unused_mut)]
+                    let (mut head, body) = msg.map_err(crate::Error::new_user_service)?;
+                    #[cfg(feature = "client")]
+                    if T::is_client() {
+                        self.send_completion = head
+                            .extensions
+                            .remove::<crate::ext::SendCompletion>()
+                            .map(crate::ext::SendCompletion::into_owner);
+                        self.request_ended = false;
+                    }
 
                     let body_type = if body.is_end_stream() {
                         self.body_rx.set(None);
@@ -413,6 +430,13 @@ where
                         btype
                     };
                     self.conn.write_head(head, body_type);
+                    #[cfg(feature = "client")]
+                    if self.send_completion.is_some() {
+                        // A zero-length body can have a pending producer (for
+                        // example one capable of trailers) even though this
+                        // HTTP/1 message was encoded as headers only.
+                        self.request_ended = !self.conn.can_write_body();
+                    }
                 } else {
                     self.close();
                     return Poll::Ready(Ok(()));
@@ -450,7 +474,17 @@ where
                                     trace!("discarding empty chunk");
                                     self.conn.end_body()?;
                                 } else {
+                                    #[cfg(feature = "client")]
+                                    if T::is_client() {
+                                        self.request_ended = self.send_completion.is_some()
+                                            && self.conn.can_complete_body_with(chunk.remaining());
+                                    }
                                     self.conn.write_body_and_end(chunk);
+                                    continue;
+                                }
+                                #[cfg(feature = "client")]
+                                if T::is_client() {
+                                    self.request_ended = true;
                                 }
                             } else {
                                 if chunk.remaining() == 0 {
@@ -464,12 +498,20 @@ where
                             self.conn.write_trailers(
                                 frame.into_trailers().unwrap_or_else(|_| unreachable!()),
                             )?;
+                            #[cfg(feature = "client")]
+                            if T::is_client() {
+                                self.request_ended = true;
+                            }
                         } else {
                             trace!("discarding unknown frame");
                         }
                     } else {
                         *clear_body = true;
                         self.conn.end_body()?;
+                        #[cfg(feature = "client")]
+                        if T::is_client() {
+                            self.request_ended = true;
+                        }
                     }
                 } else {
                     // If there's no body_rx, end the body
@@ -505,10 +547,24 @@ where
             }
             return Poll::Ready(result.map_err(crate::Error::new_body_write));
         }
-        self.conn.poll_flush(cx).map_err(|err| {
+        let result = self.conn.poll_flush(cx).map_err(|err| {
             debug!("error writing: {}", err);
             crate::Error::new_body_write(err)
-        })
+        });
+        #[cfg(feature = "client")]
+        {
+            if matches!(&result, Poll::Ready(Err(_))) || self.conn.has_error() {
+                self.send_completion.take();
+            } else if matches!(&result, Poll::Ready(Ok(()))) && self.request_ended {
+                if let Some(completion) = self.send_completion.take() {
+                    completion.mark_flushed(
+                        std::time::Instant::now(),
+                        http::Version::HTTP_11,
+                    );
+                }
+            }
+        }
+        result
     }
 
     fn close(&mut self) {
@@ -843,5 +899,3 @@ cfg_client! {
         }
     }
 }
-
-

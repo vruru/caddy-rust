@@ -85,6 +85,7 @@ p224={version="0.13.2",features=["ecdsa"]}
 openssl = { version = "=0.10.82", features = ["vendored"] }
 
 [patch.crates-io]
+h2 = { path = "vendor/h2-0.4.20" }
 http = { path = "vendor/http-1.5.0" }
 reqwest = { path = "vendor/reqwest-0.12.28" }
 quinn = { path = "vendor/quinn-0.11.12" }
