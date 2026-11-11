@@ -1287,53 +1287,52 @@ async fn dispatch(
                     .await
                     .map_err(|_| AdminError::new(503, "admin_request_capacity_exceeded"))?;
                 let backend = inner.backend.clone();
-                // Keep the adapter future alive after a client disconnect.
-                // Its actual asynchronous work holds both reservations.
-                let (adapted, body_credit) = tokio::spawn(async move {
-                    let _lane = lane;
+                let egress = inner.adapt_egress.clone();
+                let configs = inner.adapted_configs.clone();
+                let load = path == "/load";
+                // Own the adapter and its serialization after disconnection.
+                // The actual blocking work, not its waiter, holds the lane.
+                let prepared = tokio::spawn(async move {
                     let (data, credit) = bytes.into_parts();
                     let adapted = backend.adapt(data, adapter, filename).await?;
-                    Ok::<_, AdminError>((adapted, credit))
+                    let adapted = super::adapter::Returned::new(adapted);
+                    tokio::task::spawn_blocking(move || {
+                        let _lane = lane;
+                        super::adapter::prepare(adapted, load, credit, &egress, &configs)
+                    })
+                    .await
+                    .map_err(|_| AdminError::new(500, "admin_adapter_task_failed"))?
                 })
                 .await
                 .map_err(|_| AdminError::new(500, "admin_adapter_task_failed"))??;
-                if path == "/load" {
-                    controller
-                        .submit_authorized(
-                            "POST",
-                            "/config",
-                            Some(ChangeBody::Loaded(super::loader::Loaded::Adapted(
-                                adapted.result,
-                            ))),
-                            tag.as_deref(),
-                            force,
-                            ChangeAdmission {
-                                authorization,
-                                source,
-                                body_credit: Some(body_credit),
-                            },
-                        )
-                        .await?;
-                    if adapted.warnings.is_empty() {
-                        reply(200, Vec::new())
-                    } else {
-                        reply(
-                            200,
-                            serde_json::to_vec(&serde_json::json!({"warnings":adapted.warnings}))
-                                .map_err(|_| io_failure())?,
-                        )
+                match prepared {
+                    super::adapter::Prepared::Load {
+                        config,
+                        warnings,
+                        ingress,
+                    } => {
+                        controller
+                            .submit_authorized(
+                                "POST",
+                                "/config",
+                                Some(ChangeBody::AdaptedJson(Box::new(config))),
+                                tag.as_deref(),
+                                force,
+                                ChangeAdmission {
+                                    authorization,
+                                    source,
+                                    body_credit: Some(ingress),
+                                },
+                            )
+                            .await?;
+                        reply_bytes(200, warnings)
                     }
-                } else {
-                    if let Some(local) = &local {
-                        local.check()?;
+                    super::adapter::Prepared::Adapt(response) => {
+                        if let Some(local) = &local {
+                            local.check()?;
+                        }
+                        reply_bytes(200, response)
                     }
-                    reply(
-                        200,
-                        serde_json::to_vec(
-                            &serde_json::json!({"result":adapted.result,"warnings":adapted.warnings}),
-                        )
-                        .map_err(|_| io_failure())?,
-                    )
                 }
             }
         }

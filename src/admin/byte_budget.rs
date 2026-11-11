@@ -7,6 +7,7 @@ use super::AdminError;
 pub(super) const DEFAULT_INGRESS: usize = 64 << 20;
 pub(super) const ADAPT_EGRESS: usize = 64 << 20;
 pub(super) const CONFIG_EGRESS: usize = 64 << 20;
+pub(super) const ADAPTED_CONFIG: usize = 64 << 20;
 
 #[derive(Clone)]
 pub(super) struct Pool {
@@ -84,6 +85,10 @@ impl Buffer {
         Ok(())
     }
 
+    pub(super) fn from_parts(data: Vec<u8>, credit: Credit) -> Self {
+        Self { data, credit }
+    }
+
     pub(super) fn into_parts(self) -> (Vec<u8>, Credit) {
         (self.data, self.credit)
     }
@@ -94,12 +99,26 @@ impl Buffer {
     }
 
     pub(super) fn into_bytes(data: Vec<u8>, credit: Credit) -> Bytes {
-        Bytes::from_owner(Self { data, credit })
+        Bytes::from_owner(Self::from_parts(data, credit))
     }
 }
 
 impl AsRef<[u8]> for Buffer {
     fn as_ref(&self) -> &[u8] {
         &self.data
+    }
+}
+
+impl std::io::Write for Buffer {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if data.len() > self.data.capacity() - self.data.len() {
+            return Err(std::io::Error::other("reserved buffer capacity exceeded"));
+        }
+        self.data.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
