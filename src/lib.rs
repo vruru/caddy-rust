@@ -31,4 +31,5 @@ pub(crate) mod module_json;
 #[cfg(feature = "native-run")]
 pub mod root_backend;
 
+mod go_regexp;
 pub mod logging;

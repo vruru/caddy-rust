@@ -146,6 +146,7 @@ pub(super) struct Destination {
     pub encoder: Encoder,
     pub static_bytes: usize,
     pub dynamic_count: usize,
+    pub regexp_search: usize,
     pub discard: bool,
 }
 struct WriterCandidate {
@@ -413,9 +414,10 @@ fn prepare_candidate(config: Option<Value>, limits: &RuntimeLimits) -> Result<Ca
         logs: Vec::new(),
         writers: BTreeMap::new(),
     };
-    let mut sampler_bytes = 0usize;
+    let mut provision_bytes = 0usize;
     if let Some(base) = config.sink {
-        candidate.sink = candidate.append("sink", base, None, true, limits, &mut sampler_bytes)?;
+        candidate.sink =
+            candidate.append("sink", base, None, true, limits, &mut provision_bytes)?;
     }
     let default = config
         .logs
@@ -430,7 +432,7 @@ fn prepare_candidate(config: Option<Value>, limits: &RuntimeLimits) -> Result<Ca
             Some(default.routing),
             true,
             limits,
-            &mut sampler_bytes,
+            &mut provision_bytes,
         )?
         .ok_or_else(|| anyhow!("default logger missing"))?;
     for (name, log) in config.logs {
@@ -440,7 +442,7 @@ fn prepare_candidate(config: Option<Value>, limits: &RuntimeLimits) -> Result<Ca
             Some(log.routing),
             false,
             limits,
-            &mut sampler_bytes,
+            &mut provision_bytes,
         )?;
     }
     Ok(candidate)
@@ -453,7 +455,7 @@ impl Candidate {
         routing: Option<Routing>,
         mandatory: bool,
         limits: &RuntimeLimits,
-        sampler_bytes: &mut usize,
+        provision_bytes: &mut usize,
     ) -> Result<Option<usize>> {
         let writer_options = base.writer.as_ref().unwrap_or(&Value::Null);
         let mut hasher = Sha256::new();
@@ -494,7 +496,18 @@ impl Candidate {
         };
         let coloring = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
             && std::env::var_os("TERM").is_none_or(|v| v != "xterm-mono");
-        let encoder = Encoder::prepare(base.encoder, terminal, coloring, limits.max_encoded_bytes)?;
+        let regexp_budget = limits
+            .max_config_owned_bytes
+            .checked_sub(*provision_bytes)
+            .ok_or_else(|| anyhow!("log provisioning memory limit exceeded"))?;
+        let encoder = Encoder::prepare(
+            base.encoder,
+            terminal,
+            coloring,
+            limits.max_encoded_bytes,
+            regexp_budget,
+        )?;
+        let (regexp_compiled, regexp_search) = encoder.regexp_memory();
         if let Some(core) = base.core {
             let (module, fields) =
                 module_config::inline(core, "module", limits.max_config_bytes, false)?;
@@ -506,8 +519,12 @@ impl Candidate {
         if discard && !mandatory {
             return Ok(None);
         }
+        *provision_bytes = provision_bytes
+            .checked_add(regexp_compiled)
+            .filter(|n| *n <= limits.max_config_owned_bytes)
+            .ok_or_else(|| anyhow!("log regexp configuration memory limit exceeded"))?;
         let sampler = if !discard && let Some(sampling) = base.sampling {
-            *sampler_bytes = sampler_bytes
+            *provision_bytes = provision_bytes
                 .checked_add(Sampler::allocation_bytes())
                 .filter(|n| *n <= limits.max_config_owned_bytes)
                 .ok_or_else(|| anyhow!("log sampling memory limit exceeded"))?;
@@ -536,6 +553,7 @@ impl Candidate {
             encoder,
             static_bytes,
             dynamic_count,
+            regexp_search,
             discard,
         });
         Ok(Some(position))

@@ -24,6 +24,8 @@ mod file_open;
 mod filter_cookie;
 #[path = "logging/filter_query.rs"]
 mod filter_query;
+#[path = "logging/filter_regexp.rs"]
+mod filter_regexp;
 #[path = "logging/filter_simple.rs"]
 mod filter_simple;
 #[path = "logging/float.rs"]

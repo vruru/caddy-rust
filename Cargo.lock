@@ -280,6 +280,8 @@ dependencies = [
  "percent-encoding",
  "rcgen",
  "regex",
+ "regex-automata",
+ "regex-syntax",
  "reqwest",
  "rsa",
  "rustix",

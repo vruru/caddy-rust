@@ -437,8 +437,10 @@ host selection and omits credentials by default. Captured FastCGI stderr
 uses the same generation's nonblocking logger. Bounded tail processing
 does not delay a completed response. The capture marks truncated data and
 limits stderr to 16 KiB. Under pressure the separate reduced access-log
-budget retains status and a shortened request without its headers. Regular-expression filters, handler tracing, and complete
-module-level log integration remain separate compatibility work.
+budget retains status and a shortened request without its headers. The regexp and multi_regexp log filters preserve original replacement and
+truncation semantics within explicit work and memory limits. A failed filter
+never sends the unfiltered record. Handler tracing and full module-level log
+integration remain separate compatibility work.
 
 Before dispatch, business requests drop ambiguous underscore and dot header
 spellings by default. Per-server exact and prefix allowlists preserve the

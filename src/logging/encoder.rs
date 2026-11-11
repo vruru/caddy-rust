@@ -6,6 +6,7 @@ use super::{
     console_encoder::ConsoleEncoder,
     filter_cookie::Cookie,
     filter_query::Query,
+    filter_regexp::Regexp,
     filter_simple::{Simple, View},
     json_encoder::{JsonEncoder, Sink},
     level::Level,
@@ -15,14 +16,19 @@ use super::{
 };
 use anyhow::{Result, anyhow, bail, ensure};
 use serde_json::{Map, Value};
-use std::{borrow::Cow, collections::BTreeMap};
+use std::{
+    borrow::Cow,
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 enum Filter {
     Simple(Simple),
     Cookie(Cookie),
     Query(Query),
+    Regexp(Regexp),
 }
 impl Filter {
-    fn parse(value: Value, limit: usize) -> Result<Self> {
+    fn parse(value: Value, limit: usize, regexp_remaining: &mut usize) -> Result<Self> {
         let (name, fields) = module_config::inline(value, "filter", limit, true)?;
         if matches!(
             name.as_str(),
@@ -45,9 +51,21 @@ impl Filter {
                     .ok_or_else(|| anyhow!("log query module invariant"))??,
             ));
         }
+        if matches!(name.as_str(), "regexp" | "multi_regexp") {
+            return Ok(Self::Regexp(Regexp::parse(
+                name == "multi_regexp",
+                fields,
+                regexp_remaining,
+            )?));
+        }
         bail!("unsupported native logging filter module")
     }
-    fn apply<'a>(&'a self, mut view: View<'a>, limit: usize) -> Result<Option<View<'a>>> {
+    fn apply<'a>(
+        &'a self,
+        mut view: View<'a>,
+        limit: usize,
+        deadline: Option<Instant>,
+    ) -> Result<Option<View<'a>>> {
         match self {
             Self::Simple(f) => f.apply(view, limit),
             Self::Cookie(f) => {
@@ -58,6 +76,12 @@ impl Filter {
             }
             Self::Query(f) => {
                 if let Some(value) = f.apply(&view.value, limit)? {
+                    view.value = Cow::Owned(value);
+                }
+                Ok(Some(view))
+            }
+            Self::Regexp(f) => {
+                if let Some(value) = f.apply(&view.value, limit, deadline)? {
                     view.value = Cow::Owned(value);
                 }
                 Ok(Some(view))
@@ -86,6 +110,8 @@ pub(super) struct Encoder {
     layers: Vec<Layer>,
     base: Base,
     limit: usize,
+    regexp_search: usize,
+    regexp_compiled: usize,
 }
 /// Only placeholder results are copied; static configured values stay borrowed.
 pub(super) struct Resolved {
@@ -97,7 +123,10 @@ impl Encoder {
         terminal: bool,
         coloring: bool,
         limit: usize,
+        regexp_budget: usize,
     ) -> Result<Self> {
+        let mut regexp_remaining = regexp_budget;
+        let mut regexp_search = 0usize;
         let mut layers = Vec::new();
         let mut work = limit;
         let mut journal = false;
@@ -160,7 +189,11 @@ impl Encoder {
                     let mut max_key = 0;
                     for (key, value) in raw {
                         max_key = max_key.max(key.len());
-                        parsed.insert(key, Filter::parse(value, limit)?);
+                        let filter = Filter::parse(value, limit, &mut regexp_remaining)?;
+                        if let Filter::Regexp(ref rule) = filter {
+                            regexp_search = regexp_search.max(rule.search_memory());
+                        }
+                        parsed.insert(key, filter);
                     }
                     layers.push(Layer::Filter(FilterLayer {
                         fields: parsed,
@@ -205,6 +238,8 @@ impl Encoder {
                         layers,
                         base,
                         limit,
+                        regexp_search,
+                        regexp_compiled: regexp_budget - regexp_remaining,
                     });
                 }
                 _ => bail!("unsupported native logging encoder module"),
@@ -212,6 +247,9 @@ impl Encoder {
             // Unspecified wrapped encoders default to JSON, then terminal adjustment.
             // Explicit null remains Some(null), causing the module loader to reject it.
         }
+    }
+    pub(super) fn regexp_memory(&self) -> (usize, usize) {
+        (self.regexp_compiled, self.regexp_search)
     }
     pub(super) fn dynamic_count(&self) -> usize {
         self.layers
@@ -283,6 +321,10 @@ impl Encoder {
             "log resolved placeholder generation mismatch"
         );
         let mut workspace = limit;
+        // Per destination render: one budget shared by nested filters, array
+        // elements and ordered multi-regexp operations.
+        let deadline =
+            (self.regexp_search > 0).then(|| Instant::now() + Duration::from_millis(100));
         let mut emit = |sink: &mut dyn Sink| -> Result<()> {
             for field in bound.iter().chain(&event.fields) {
                 self.push(
@@ -290,6 +332,7 @@ impl Encoder {
                     Walk {
                         start: 0,
                         prefix: Some(""),
+                        deadline,
                     },
                     View {
                         key: &field.key,
@@ -318,6 +361,7 @@ impl Encoder {
                             Walk {
                                 start: i + 1,
                                 prefix: Some(""),
+                                deadline,
                             },
                             View {
                                 key,
@@ -415,7 +459,7 @@ impl Encoder {
                     if !matches!(rule, Filter::Simple(Simple::Delete | Simple::Replace(_))) {
                         view.value = as_any(view.value, workspace)?;
                     }
-                    let Some(next) = rule.apply(view, *workspace)? else {
+                    let Some(next) = rule.apply(view, *workspace, walk.deadline)? else {
                         *workspace = saved;
                         return Ok(());
                     };
@@ -471,6 +515,7 @@ impl Encoder {
                         Walk {
                             start,
                             prefix: prefix.as_deref(),
+                            deadline: walk.deadline,
                         },
                         View {
                             key: &field.key,
@@ -494,6 +539,7 @@ impl Encoder {
 struct Walk<'a> {
     start: usize,
     prefix: Option<&'a str>,
+    deadline: Option<Instant>,
 }
 fn deny(fields: &Map<String, Value>, allowed: &[&str]) -> Result<()> {
     crate::http_config::helpers::deny_unknown(fields, allowed, "/logging/encoder")

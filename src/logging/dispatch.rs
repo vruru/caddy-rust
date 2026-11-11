@@ -108,6 +108,7 @@ struct Render {
     index: usize,
     sender: FrameSender,
     cap: usize,
+    reserved_cap: usize,
     workspace: Workspace,
     capture: Option<Arc<Captured>>,
     site: &'static Location<'static>,
@@ -263,7 +264,9 @@ impl Fanout {
             .min(base.saturating_add(provider));
         let reserve_cap = if provider > 0 { cap.max(1 << 20) } else { cap };
         let bytes = credits::encoding_reservation(reserve_cap)
-            .map_err(|_| AdmissionError::EncodingBytes)?;
+            .ok()
+            .and_then(|bytes| bytes.checked_add(destination.regexp_search))
+            .ok_or(AdmissionError::EncodingBytes)?;
         let local = core.reserve_workspace(bytes).map_err(admission)?;
         let job = registry.credits.job()?;
         let workspace = Workspace {
@@ -295,6 +298,7 @@ impl Fanout {
             index,
             sender: Arc::new(Mutex::new(Some(frame))),
             cap,
+            reserved_cap: reserve_cap,
             workspace,
             capture: self.capture.clone(),
             site: self.site,
@@ -473,7 +477,7 @@ impl Render {
                 .is_err_and(|e| e.is::<super::bounded::ByteLimit>())
         {
             let full = registry.limits.max_encoded_bytes;
-            let current = self.workspace.global.num_permits() / 8;
+            let current = self.reserved_cap;
             let additional = full.saturating_sub(current);
             let writer = &self.hold.scope.writers[destination.writer].core;
             let extra = credits::encoding_reservation(additional)
