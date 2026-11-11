@@ -508,12 +508,11 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
             .transpose()?
             .filter(|d| !d.is_zero())
             .unwrap_or(Duration::from_secs(60)),
-        read_idle_timeout: m
-            .get("read_idle_timeout")
-            .map(|v| duration(v, path))
-            .transpose()?
-            .filter(|d| !d.is_zero())
-            .unwrap_or(Duration::from_secs(60)),
+        read_idle_timeout: match m.get("read_idle_timeout").map(|v| signed_duration(v, path)).transpose()? {
+            None | Some(0) => Duration::from_secs(60),
+            Some(nanos) if nanos > 0 => Duration::from_nanos(nanos as u64),
+            Some(_) => Duration::ZERO,
+        },
         protocols,
         redirect_http,
         manage_certificates,

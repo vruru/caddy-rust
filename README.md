@@ -499,3 +499,6 @@ The `strict_sni_host` server option checks each HTTPS authority against the
 actual TLS SNI, including on existing HTTP/1.1 and HTTP/2 connections after a
 configuration reload. A mismatch uses the configured 421 error route; clear
 HTTP remains unaffected. HTTP/3 applies the same check per request.
+
+A negative server `read_idle_timeout` disables the per-read upload idle
+timer, as in Caddy. Omitted or zero values retain the one-minute default.
