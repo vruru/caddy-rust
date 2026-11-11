@@ -80,10 +80,29 @@ fn write_raw<S: EncodingSink>(input: &[u8], sink: &mut S) -> Result<(), ConfigEr
 /// Encode the JSON no-op `/adapt` response. The byte limit includes the wrapper
 /// and final newline. Ordinary configuration loads and ETags use the DOM codec.
 pub fn encoded_adapt_raw(input: &[u8], limit: usize) -> Result<Vec<u8>, ConfigError> {
+    encoded_adapt_raw_reserved(input, limit, |_| Ok(())).map(|(bytes, ())| bytes)
+}
+
+pub(crate) fn encoded_adapt_raw_reserved<G>(
+    input: &[u8],
+    limit: usize,
+    reserve: impl FnOnce(usize) -> Result<G, ConfigError>,
+) -> Result<(Vec<u8>, G), ConfigError> {
     validate(input)?;
     let mut count = EncodingCount { count: 0, limit };
     write_raw(input, &mut count)?;
-    let mut bytes = Vec::with_capacity(count.count);
+    let reservation = reserve(count.count)?;
+    let exhausted = || ConfigError {
+        status: 503,
+        category: "admin_buffer_allocation_failed",
+    };
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(count.count)
+        .map_err(|_| exhausted())?;
+    if bytes.capacity() != count.count {
+        return Err(exhausted());
+    }
     write_raw(input, &mut EncodingBytes(&mut bytes))?;
-    Ok(bytes)
+    Ok((bytes, reservation))
 }

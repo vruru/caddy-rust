@@ -12,6 +12,7 @@ mod adapt;
 #[path = "admin_json/codec.rs"]
 mod codec;
 pub use adapt::encoded_adapt_raw;
+pub(crate) use adapt::encoded_adapt_raw_reserved;
 
 /// An explicit control-plane resource bound, rather than serde's implicit
 /// 128-level parser bound. The original Go scanner accepts up to 10000 levels;

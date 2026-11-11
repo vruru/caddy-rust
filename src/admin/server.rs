@@ -1,5 +1,6 @@
 use super::{
     AdminController, AdminError, AdminOptions,
+    byte_budget::{Buffer, Pool},
     controller::{Authorization, Inner},
     files, ids,
     local_access::{AdmissionState, LocalAdmission},
@@ -9,7 +10,7 @@ use super::{
 use http::{Request, Response, header};
 use http_body_util::{BodyExt, Full};
 use hyper::{
-    body::{Bytes, Incoming},
+    body::{Body as _, Bytes, Incoming},
     service::service_fn,
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -869,7 +870,8 @@ async fn serve_accepted<S>(
         Security::Remote(access) => {
             let acceptor = tokio_rustls::TlsAcceptor::from(access.tls.clone());
             let accepted = tokio::select! {_=cancel.cancelled()=>return,r=tokio::time::timeout(options.header_timeout,acceptor.accept(stream))=>r};
-            if let Ok(Ok(tls)) = accepted {
+            if let Ok(Ok(mut tls)) = accepted {
+                tls.get_mut().1.set_buffer_limit(Some(64 * 1024));
                 let chain = tls
                     .get_ref()
                     .1
@@ -903,16 +905,22 @@ async fn serve<S>(
     builder
         .timer(TokioTimer::new())
         .header_read_timeout(options.header_timeout)
+        // Keep the Bytes owner (and its reservation) in the write queue.
+        // Flatten mode would copy the entire frame into the header Vec.
+        .writev(true)
         .max_buf_size(64 * 1024);
     let connection = builder.serve_connection(TokioIo::new(stream), service);
     tokio::pin!(connection);
     tokio::select! {_= &mut connection=>{},_=cancel.cancelled()=>{connection.as_mut().graceful_shutdown();let _=connection.await;},_=tokio::time::sleep(Duration::from_secs(60))=>{connection.as_mut().graceful_shutdown();let _=tokio::time::timeout(Duration::from_secs(2),connection).await;}}
 }
 fn reply(status: u16, body: Vec<u8>) -> Reply {
+    reply_bytes(status, Bytes::from(body))
+}
+fn reply_bytes(status: u16, body: Bytes) -> Reply {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(body)))
+        .body(Full::new(body))
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
 }
 fn error(error: AdminError, opid: &str) -> Reply {
@@ -957,7 +965,8 @@ async fn body(
     request: Request<Incoming>,
     limit: usize,
     timeout: Duration,
-) -> Result<Vec<u8>, AdminError> {
+    pool: &Pool,
+) -> Result<Buffer, AdminError> {
     if request
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -968,16 +977,26 @@ async fn body(
         return Err(AdminError::new(413, "admin_body_too_large"));
     }
     let mut incoming = request.into_body();
+    let exact = incoming.size_hint().exact();
+    if exact.is_some_and(|size| size > limit as u64) {
+        return Err(AdminError::new(413, "admin_body_too_large"));
+    }
+    let exact = exact.map(|size| size as usize);
     tokio::time::timeout(timeout, async move {
-        let mut output = Vec::new();
+        let mut output = Buffer::new(pool, exact.unwrap_or_default())?;
         while let Some(frame) = incoming.frame().await {
             let frame = frame.map_err(|_| failure("admin_body_read_failed"))?;
             if let Ok(bytes) = frame.into_data() {
-                if bytes.len() > limit.saturating_sub(output.len()) {
-                    return Err(AdminError::new(413, "admin_body_too_large"));
+                if exact
+                    .is_some_and(|size| bytes.len() > size.saturating_sub(output.as_ref().len()))
+                {
+                    return Err(failure("admin_body_length_mismatch"));
                 }
-                output.extend_from_slice(&bytes);
+                output.push(pool, &bytes, limit)?;
             }
+        }
+        if exact.is_some_and(|size| size != output.as_ref().len()) {
+            return Err(failure("admin_body_length_mismatch"));
         }
         Ok(output)
     })
@@ -1058,10 +1077,21 @@ async fn dispatch(
         .upgrade()
         .ok_or_else(|| AdminError::new(503, "admin_unavailable"))?;
     inner.check_readable()?;
+    let control = request.method() == http::Method::GET
+        || (request.method() == http::Method::POST && request.uri().path() == "/stop");
     let _permit = inner
         .requests
         .clone()
         .try_acquire_owned()
+        .or_else(|error| {
+            // Preserve the ordinary GET budget. Only controls may borrow
+            // from the independent reserve once bulk admission is saturated.
+            if control {
+                inner.controls.clone().try_acquire_owned()
+            } else {
+                Err(error)
+            }
+        })
         .map_err(|_| AdminError::new(503, "admin_request_capacity_exceeded"))?;
     if let Some(authority) = request.uri().authority() {
         let host = request
@@ -1201,39 +1231,72 @@ async fn dispatch(
                 request,
                 inner.options.body_limit,
                 inner.options.body_timeout,
+                &inner.ingress,
             )
             .await?;
             if path == "/adapt" && adapter.is_none() {
+                let egress = inner.adapt_egress.clone();
                 let encoded = inner
-                    .offload(move || {
-                        crate::admin_json::encoded_adapt_raw(&bytes, 64 * 1024 * 1024)
-                            .map_err(|e| AdminError::new(e.status, e.category))
+                    .offload_bulk(move || {
+                        let (data, credit) = crate::admin_json::encoded_adapt_raw_reserved(
+                            bytes.as_ref(),
+                            super::byte_budget::ADAPT_EGRESS,
+                            |size| {
+                                egress
+                                    .reserve(size)
+                                    .map_err(|e| crate::admin_json::ConfigError {
+                                        status: e.status,
+                                        category: e.category,
+                                    })
+                            },
+                        )
+                        .map_err(|e| AdminError::new(e.status, e.category))?;
+                        Ok(Buffer::into_bytes(data, credit))
                     })
                     .await?;
                 if let Some(local) = &local {
                     local.check()?;
                 }
-                return Ok(reply(200, encoded));
+                return Ok(reply_bytes(200, encoded));
             }
-            let adapted = if adapter.is_none() {
-                super::AdaptedConfig {
-                    result: inner
-                        .offload(move || {
-                            crate::admin_json::decoded(&bytes).map_err(|e| {
-                                let status = if e.category == "configuration_materialization_limit"
-                                {
-                                    413
-                                } else {
-                                    400
-                                };
-                                AdminError::new(status, e.category)
-                            })
-                        })
-                        .await?,
-                    warnings: Vec::new(),
-                }
+            let (adapted, body_credit) = if adapter.is_none() {
+                inner
+                    .offload_bulk(move || {
+                        let result = crate::admin_json::decoded(bytes.as_ref()).map_err(|e| {
+                            let status = if e.category == "configuration_materialization_limit" {
+                                413
+                            } else {
+                                400
+                            };
+                            AdminError::new(status, e.category)
+                        })?;
+                        Ok((
+                            super::AdaptedConfig {
+                                result,
+                                warnings: Vec::new(),
+                            },
+                            bytes.release_data(),
+                        ))
+                    })
+                    .await?
             } else {
-                inner.backend.adapt(bytes, adapter, filename).await?
+                let lane = inner
+                    .bulk_cpu
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| AdminError::new(503, "admin_request_capacity_exceeded"))?;
+                let backend = inner.backend.clone();
+                // Keep the adapter future alive after a client disconnect.
+                // Its actual asynchronous work holds both reservations.
+                tokio::spawn(async move {
+                    let _lane = lane;
+                    let (data, credit) = bytes.into_parts();
+                    let adapted = backend.adapt(data, adapter, filename).await?;
+                    Ok::<_, AdminError>((adapted, credit))
+                })
+                .await
+                .map_err(|_| AdminError::new(500, "admin_adapter_task_failed"))??
             };
             if path == "/load" {
                 controller
@@ -1249,6 +1312,7 @@ async fn dispatch(
                                 local: local.clone(),
                             },
                             source,
+                            body_credit: Some(body_credit),
                         },
                     )
                     .await?;
@@ -1285,29 +1349,29 @@ async fn dispatch(
                 request,
                 inner.options.body_limit,
                 inner.options.body_timeout,
+                &inner.ingress,
             )
             .await?;
-            let value = if method == "DELETE" {
-                None
+            let (value, body_credit) = if method == "DELETE" {
+                (None, bytes.release_data())
             } else {
-                Some(
-                    inner
-                        .offload(move || {
-                            crate::admin_json::decoded(&bytes).map_err(|e| {
-                                AdminError::new(
-                                    if e.category == "configuration_depth_limit" {
-                                        400
-                                    } else if e.category == "configuration_materialization_limit" {
-                                        413
-                                    } else {
-                                        500
-                                    },
-                                    e.category,
-                                )
-                            })
-                        })
-                        .await?,
-                )
+                inner
+                    .offload_bulk(move || {
+                        let result = crate::admin_json::decoded(bytes.as_ref()).map_err(|e| {
+                            AdminError::new(
+                                if e.category == "configuration_depth_limit" {
+                                    400
+                                } else if e.category == "configuration_materialization_limit" {
+                                    413
+                                } else {
+                                    500
+                                },
+                                e.category,
+                            )
+                        })?;
+                        Ok((Some(result), bytes.release_data()))
+                    })
+                    .await?
             };
             controller
                 .submit_authorized(
@@ -1322,6 +1386,7 @@ async fn dispatch(
                             local: local.clone(),
                         },
                         source: super::source::Action::None,
+                        body_credit: Some(body_credit),
                     },
                 )
                 .await?;

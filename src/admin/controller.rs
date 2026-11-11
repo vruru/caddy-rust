@@ -79,6 +79,10 @@ pub(super) struct Inner {
     pub listener: tokio::sync::Mutex<Option<Running>>,
     pub remote_listener: tokio::sync::Mutex<Option<Running>>,
     pub requests: Arc<tokio::sync::Semaphore>,
+    pub controls: Arc<tokio::sync::Semaphore>,
+    pub ingress: super::byte_budget::Pool,
+    pub adapt_egress: super::byte_budget::Pool,
+    pub bulk_cpu: Arc<tokio::sync::Semaphore>,
     pub cpu: Arc<tokio::sync::Semaphore>,
     pub cancel: tokio_util::sync::CancellationToken,
     stop_events: tokio::sync::watch::Sender<Option<super::AdminStopOutcome>>,
@@ -104,6 +108,9 @@ struct Change {
     expected_generation: Option<u64>,
     loader_budget: u8,
     source: super::source::Action,
+    // Retain the upload's accounting through queueing and accepted apply,
+    // even if the HTTP reply waiter has disconnected.
+    _body_credit: Option<super::byte_budget::Credit>,
 }
 pub(super) struct Authorization {
     pub grant: Option<super::remote::Grant>,
@@ -112,6 +119,7 @@ pub(super) struct Authorization {
 pub(super) struct ChangeAdmission {
     pub authorization: Authorization,
     pub source: super::source::Action,
+    pub body_credit: Option<super::byte_budget::Credit>,
 }
 enum Work {
     Change(Change),
@@ -166,6 +174,16 @@ impl AdminController {
         // channel position for stop and one for the drain barrier.
         let (sender, receiver) = mpsc::channel(options.queue_capacity + 3);
         let requests = Arc::new(tokio::sync::Semaphore::new(options.max_requests));
+        let controls = Arc::new(tokio::sync::Semaphore::new(options.max_requests.min(8)));
+        let ingress = super::byte_budget::Pool::new(
+            super::byte_budget::DEFAULT_INGRESS.max(options.body_limit * 2),
+            "admin_ingress_capacity_exceeded",
+        );
+        let adapt_egress = super::byte_budget::Pool::new(
+            super::byte_budget::ADAPT_EGRESS,
+            "admin_adapt_egress_capacity_exceeded",
+        );
+        let cpu_count = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(1, 4));
         let (stop_events, _) = tokio::sync::watch::channel(None);
         let (force_join, _) = tokio::sync::watch::channel(None);
         let reply_slots = Arc::new(tokio::sync::Semaphore::new(options.queue_capacity + 1));
@@ -185,9 +203,11 @@ impl AdminController {
             listener: tokio::sync::Mutex::new(None),
             remote_listener: tokio::sync::Mutex::new(None),
             requests,
-            cpu: Arc::new(tokio::sync::Semaphore::new(
-                std::thread::available_parallelism().map_or(2, |n| n.get().clamp(1, 4)),
-            )),
+            controls,
+            ingress,
+            adapt_egress,
+            bulk_cpu: Arc::new(tokio::sync::Semaphore::new(cpu_count)),
+            cpu: Arc::new(tokio::sync::Semaphore::new(cpu_count)),
             cancel: tokio_util::sync::CancellationToken::new(),
             stop_events,
             force_join,
@@ -228,6 +248,7 @@ impl AdminController {
                 local: None,
                 expected_generation: None,
                 loader_budget: 16,
+                _body_credit: None,
                 source: super::source::Action::ProcessFile,
             }))
             .await
@@ -385,6 +406,7 @@ impl AdminController {
                 local: None,
                 expected_generation: None,
                 loader_budget: 16,
+                _body_credit: None,
                 source: super::source::Action::None,
             }))
             .await
@@ -401,6 +423,7 @@ impl AdminController {
         let ChangeAdmission {
             authorization: Authorization { grant, local },
             source,
+            body_credit,
         } = admission;
         if let Some(local) = &local {
             local.check()?;
@@ -417,6 +440,7 @@ impl AdminController {
                 loader_budget: 16,
                 source,
                 grant,
+                _body_credit: body_credit,
             }))
             .await
     }
@@ -528,8 +552,25 @@ impl Inner {
         &self,
         work: F,
     ) -> Result<T, AdminError> {
-        let permit = self
-            .cpu
+        Self::offload_on(&self.cpu, work).await
+    }
+    pub(super) async fn offload_bulk<
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, AdminError> + Send + 'static,
+    >(
+        &self,
+        work: F,
+    ) -> Result<T, AdminError> {
+        Self::offload_on(&self.bulk_cpu, work).await
+    }
+    async fn offload_on<
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, AdminError> + Send + 'static,
+    >(
+        lane: &Arc<tokio::sync::Semaphore>,
+        work: F,
+    ) -> Result<T, AdminError> {
+        let permit = lane
             .clone()
             .acquire_owned()
             .await
@@ -612,6 +653,7 @@ impl Inner {
                     local: None,
                     expected_generation: Some(generation),
                     loader_budget: budget,
+                    _body_credit: None,
                     source: super::source::Action::None,
                 }),
                 reply,

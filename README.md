@@ -111,7 +111,11 @@ response bodies stream with backpressure, including long transfers and upgrades;
 configuration snapshots keep accepted requests independent of later publication.
 The Admin runtime bounds connections, requests and queued configuration writes,
 retains accepted writes after client disconnection, and separates parallel reads
-from serialized publication. Its backend contract requires real candidate
+from serialized publication. Management requests have a 16 MiB default
+per-request body limit. Uploads and raw JSON adaptation responses use separate
+64 MiB aggregate budgets; a busy body lane returns 503 and reserves capacity
+for reads and shutdown. These budgets do not cover expanded configuration trees
+or custom adapter output. The backend contract requires real candidate
 provisioning, identity acquisition and rollback. Those product-level connections
 are still incomplete: the CLI remains the read-only inspector described above.
 Unsupported modules and transport options fail validation instead of being
