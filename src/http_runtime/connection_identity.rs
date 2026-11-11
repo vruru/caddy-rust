@@ -33,6 +33,9 @@ pub(super) enum TlsVerdict {
     Reject,
 }
 impl TlsIdentity {
+    pub(super) fn server_name(&self) -> &str {
+        &self.sni
+    }
     pub(super) fn resumable_for(&self, chain_hash: &[u8; 32]) -> bool {
         self.chain_hash == *chain_hash && self.leaf.admission().allow_certificate
     }

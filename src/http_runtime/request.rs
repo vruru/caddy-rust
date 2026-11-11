@@ -193,6 +193,25 @@ impl Context {
         })
     }
 }
+// Match Caddy's SplitHostPort fallback: an absent or malformed port leaves
+// the original authority intact, and valid bracketed hosts lose the brackets.
+fn strict_host_matches(authority: &str, sni: &str) -> bool {
+    let host = if let Some((host_port, port)) = authority.rsplit_once(':') {
+        let host = if let Some(bracketed) = host_port.strip_prefix('[') {
+            bracketed.strip_suffix(']')
+        } else if !host_port.contains(':') {
+            Some(host_port)
+        } else {
+            None
+        };
+        host.filter(|host| !host.contains(['[', ']']) && !port.contains(['[', ']']))
+            .unwrap_or(authority)
+    } else {
+        authority
+    };
+    host.eq_ignore_ascii_case(sni)
+}
+
 fn request_authority<B>(request: &Request<B>) -> Result<String, ()> {
     let authority = request
         .uri()
@@ -246,17 +265,18 @@ fn proof_for_authority<B>(
     }
     None
 }
-pub(super) struct RequestOrigin {
+pub(super) struct RequestOrigin<'a> {
     pub peer: SocketAddr,
     pub local: SocketAddr,
     pub tls: bool,
+    pub sni: Option<&'a str>,
 }
 
 pub(super) async fn handle_business<B>(
     inner: Arc<Inner>,
     server: Arc<ActiveServer>,
     mut request: Request<B>,
-    origin: RequestOrigin,
+    origin: RequestOrigin<'_>,
     business: Arc<BusinessGuard>,
     informational: Option<InformationalOutput>,
 ) -> Response<Body>
@@ -264,7 +284,7 @@ where
     B: hyper::body::Body<Data=Bytes> + Unpin + Send + 'static,
     B::Error: Into<BoxError>,
 {
-    let RequestOrigin {peer,local,tls}=origin;
+    let RequestOrigin { peer, local, tls, sni } = origin;
     let authority = match request_authority(&request) {
         Ok(authority) => authority,
         Err(()) => return simple(StatusCode::BAD_REQUEST, "Bad Request\n"),
@@ -343,7 +363,15 @@ where
         groups: HashSet::new(),
         maps: Vec::new(),
     };
-    let result = routes(&server.plan.routes, &mut ctx, &inner, &server).await;
+    let result = if tls
+        && server.plan.strict_sni_host
+        && !strict_host_matches(&ctx.authority, sni.unwrap_or_default())
+    {
+        ctx.close_after_response = true;
+        Err(failure(StatusCode::MISDIRECTED_REQUEST))
+    } else {
+        routes(&server.plan.routes, &mut ctx, &inner, &server).await
+    };
     let (mut response, explicit_headers) = match result {
         Ok(Flow::Response(response)) => (response, true),
         Ok(Flow::ImplicitResponse(response)) => (response, false),
@@ -1182,7 +1210,7 @@ fn static_informational<'a>(
 
 fn static_head_length(ctx: &Context, body: &str) -> Option<StaticHeadLength> {
     (ctx.req().method() == Method::HEAD && !body.is_empty())
-        .then(|| StaticHeadLength(body.len()))
+        .then_some(StaticHeadLength(body.len()))
 }
 
 #[inline]

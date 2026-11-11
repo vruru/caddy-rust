@@ -482,6 +482,13 @@ async fn serve_connection(
     activity: Arc<BusinessGeneration>,
     leaf: Arc<LeafState>,
 ) {
+    let sni: Option<Arc<str>> = if server.plan.strict_sni_host {
+        quic.handshake_data()
+            .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+            .and_then(|data| data.server_name.map(Arc::from))
+    } else {
+        None
+    };
     let mut builder = ::h3::server::builder();
     builder.max_field_section_size(16 * 1024);
     let mut connection = tokio::select! {
@@ -536,6 +543,7 @@ async fn serve_connection(
                 let server=server.clone();
                 let activity=activity.clone();
                 let leaf=leaf.clone();
+                let sni = sni.clone();
                 streams.spawn(async move {
                     let _stream_slot=stream_slot;
                     let Ok(Ok((mut request,wire)))=tokio::time::timeout(server.plan.read_header_timeout,resolver.resolve_request()).await else{return;};
@@ -550,7 +558,7 @@ async fn serve_connection(
                     let Ok((request,wire))=stream::start(request,wire) else{return;};
                     let task=async move {
                         let (interim, receiver) = stream::interim_channel();
-                        let response = request::handle_business(runtime,server,request,request::RequestOrigin { peer:canonical(peer.peer), local:canonical(peer.local), tls:true },business.clone(),Some(request::InformationalOutput::Quic(interim)));
+                        let response = request::handle_business(runtime,server,request,request::RequestOrigin { peer:canonical(peer.peer), local:canonical(peer.local), tls:true, sni:sni.as_deref() },business.clone(),Some(request::InformationalOutput::Quic(interim)));
                         let _=stream::drive(wire,receiver,response,head).await;
                         drop(business);
                     };

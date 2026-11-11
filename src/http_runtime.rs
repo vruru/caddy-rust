@@ -692,6 +692,7 @@ async fn prepare_servers(
                 routes,
                 errors: Vec::new(),
                 tls: false,
+                strict_sni_host: false,
                 certificate_tags: Vec::new(),
                 trusted_proxies: Vec::new(),
                 trusted_strict: false,
@@ -1114,7 +1115,7 @@ async fn serve_connection<I>(
                     else {
                         let mut request=request;
                         let informational=hyper::ext::InformationalSender::take(&mut request).map(request::InformationalOutput::Http);
-                        request::handle_business(inner,current,request,request::RequestOrigin { peer,local,tls },business.clone(),informational).await
+                        request::handle_business(inner,current,request,request::RequestOrigin { peer, local, tls, sni: identity.as_deref().map(TlsIdentity::server_name) },business.clone(),informational).await
                     }
                 } => response,
             };

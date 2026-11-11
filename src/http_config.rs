@@ -40,6 +40,7 @@ pub(crate) struct ServerConfig {
     pub(crate) routes: Vec<Route>,
     pub(crate) errors: Vec<Route>,
     pub(crate) tls: bool,
+    pub(crate) strict_sni_host: bool,
     pub(crate) certificate_tags: Vec<String>,
     pub(crate) trusted_proxies: Vec<ipnet::IpNet>,
     pub(crate) trusted_strict: bool,
@@ -283,6 +284,7 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
             "automatic_https",
             "listener_wrappers",
             "tls_connection_policies",
+            "strict_sni_host",
             "trusted_proxies",
             "trusted_proxies_strict",
             "client_ip_headers",
@@ -491,6 +493,7 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
             vec![]
         },
         tls,
+        strict_sni_host: boolean(m.get("strict_sni_host"), false, path)?,
         certificate_tags: tags,
         trusted_proxies,
         trusted_strict,
