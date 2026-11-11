@@ -663,6 +663,7 @@ async fn prepare_servers(
         } else {
             let plan = ServerConfig {
                 access_logs: None,
+                header_aliases: Default::default(),
                 listen: vec![address],
                 routes,
                 errors: Vec::new(),

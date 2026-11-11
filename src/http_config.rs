@@ -28,9 +28,14 @@ impl PreparedConfig {
         self.shutdown_policy
     }
 }
+#[path = "http_config/header_alias.rs"]
+mod header_alias;
+pub(crate) use header_alias::HeaderAliases;
+
 #[derive(Clone)]
 pub(crate) struct ServerConfig {
     pub(crate) access_logs: Option<AccessLogConfig>,
+    pub(crate) header_aliases: HeaderAliases,
     pub(crate) listen: Vec<SocketAddr>,
     pub(crate) routes: Vec<Route>,
     pub(crate) errors: Vec<Route>,
@@ -281,6 +286,8 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
             "trusted_proxies",
             "trusted_proxies_strict",
             "client_ip_headers",
+            "expected_underscore_headers",
+            "expected_dot_headers",
             "read_header_timeout",
             "read_idle_timeout",
             "idle_timeout",
@@ -463,8 +470,20 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
         })
         .transpose()?
         .unwrap_or(false);
+    let expected = |name: &str| {
+        m.get(name)
+            .filter(|value| !value.is_null())
+            .map(|value| strings(value, path))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    };
+    let header_aliases = HeaderAliases::provision(
+        expected("expected_underscore_headers")?,
+        expected("expected_dot_headers")?,
+    )?;
     Ok(ServerConfig {
         access_logs,
+        header_aliases,
         listen,
         routes,
         errors: if let Some(v) = m.get("errors") {

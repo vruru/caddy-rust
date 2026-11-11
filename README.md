@@ -439,3 +439,9 @@ does not delay a completed response. The capture marks truncated data and
 limits stderr to 16 KiB. Under pressure the separate reduced access-log
 budget retains status and a shortened request without its headers. Regular-expression filters, handler tracing, and complete
 module-level log integration remain separate compatibility work.
+
+Before dispatch, business requests drop ambiguous underscore and dot header
+spellings by default. Per-server exact and prefix allowlists preserve the
+chosen spelling, remove competing hyphenated variants, and reject repeated
+values for an allowed alias. Mixed underscore/dot spellings require an exact
+entry. This applies before proxying to HTTP or FastCGI backends.

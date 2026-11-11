@@ -242,7 +242,7 @@ fn proof_for_authority<B>(
 pub(super) async fn handle_business(
     inner: Arc<Inner>,
     server: Arc<ActiveServer>,
-    request: Request<Incoming>,
+    mut request: Request<Incoming>,
     peer: SocketAddr,
     local: SocketAddr,
     tls: bool,
@@ -275,6 +275,7 @@ pub(super) async fn handle_business(
             )
         })
         .map(Box::new);
+    server.plan.header_aliases.sanitize(request.headers_mut());
     let original_uri = request.uri().clone();
     let trailer_metadata = request
         .extensions()
