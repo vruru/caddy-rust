@@ -13,6 +13,10 @@ pub(crate) mod auth_cache;
 #[path = "http_runtime/certificate_provider.rs"]
 mod certificate_provider;
 pub use certificate_provider::ScopedCertificateProvider;
+#[path = "http_runtime/http_redirect.rs"]
+mod http_redirect;
+#[path = "http_runtime/tls_first_record.rs"]
+mod tls_first_record;
 #[path = "http_runtime/connection_identity.rs"]
 mod connection_identity;
 #[path = "http_runtime/connection_sessions.rs"]
@@ -186,6 +190,7 @@ struct ActiveServer {
     tls: Option<Arc<rustls::ServerConfig>>,
     resolver: Option<Arc<CandidateResolver>>,
     sessions: Arc<connection_sessions::SharedSessions>,
+    tickets: crate::stek::TicketRuntime,
     clients: Arc<HashMap<usize, proxy::ProxyClient>>,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -476,6 +481,7 @@ struct ServingMaterial<'a> {
     manual: Option<&'a ManualCertificates>,
     provider: Option<&'a Arc<dyn ScopedCertificateProvider>>,
     logging: Option<&'a Arc<crate::logging::Logging>>,
+    tickets: Option<&'a crate::stek::TicketRuntime>,
     validate_only: bool,
 }
 
@@ -487,7 +493,7 @@ async fn prepare_servers(
     material: ServingMaterial<'_>,
     resources: &Arc<resource_budget::Resources>,
 ) -> Result<(HashMap<SocketAddr, Arc<ActiveServer>>, Vec<Vec<String>>)> {
-    let ServingMaterial { manual, provider, logging, validate_only } = material;
+    let ServingMaterial { manual, provider, logging, tickets, validate_only } = material;
     let logging_available = logging.is_some() || validate_only;
     let standalone;
     let manual = if let Some(manual) = manual {
@@ -646,6 +652,7 @@ async fn prepare_servers(
             tls,
             resolver,
             sessions: Arc::new(connection_sessions::SharedSessions::new()),
+            tickets: tickets.cloned().unwrap_or_default(),
             clients: Arc::new(clients),
         };
         for addr in &server.listen {
@@ -690,6 +697,7 @@ async fn prepare_servers(
                     tls: None,
                     resolver: None,
                     sessions: Arc::new(connection_sessions::SharedSessions::new()),
+                    tickets: crate::stek::TicketRuntime::RuntimeDefault,
                     clients: Arc::new(clients),
                 }),
             );
@@ -701,6 +709,8 @@ async fn prepare_servers(
                 routes,
                 errors: Vec::new(),
                 tls: false,
+                redirect_before_tls: None,
+                redirect_after_tls: None,
                 strict_sni_host: false,
                 certificate_tags: Vec::new(),
                 trusted_proxies: Vec::new(),
@@ -723,6 +733,7 @@ async fn prepare_servers(
                     tls: None,
                     resolver: None,
                     sessions: Arc::new(connection_sessions::SharedSessions::new()),
+                    tickets: crate::stek::TicketRuntime::RuntimeDefault,
                     clients: Arc::new(HashMap::new()),
                 }),
             );
@@ -878,10 +889,15 @@ async fn accept_loop(
         let eviction=stream.eviction_token();
         if let Some(server) = server {
             spawn_admitted(&inner,eviction,async move {
+                let Some(deadline) = tokio::time::Instant::now().checked_add(server.plan.read_header_timeout) else { return; };
+                let stream = match http_redirect::prepare(
+                    stream, server.plan.redirect_before_tls, deadline, task_inner.stopped.child_token()
+                ).await {
+                    Ok(stream) => stream,
+                    Err(_) => return,
+                };
                 if server.tls.is_some() {
-                    let deadline=tokio::time::Instant::now().checked_add(server.plan.read_header_timeout);
-                    let Some(deadline)=deadline else { return; };
-                    let handshake = connection_identity::accept(&task_inner, stream, key,Some(deadline));
+                    let handshake = connection_identity::accept(&task_inner, stream, admission.clone(), key,Some(deadline),server.plan.redirect_after_tls.is_none());
                     let accepted = tokio::select! {
                         biased;
                         _ = task_inner.stopped.cancelled() => return,
@@ -894,11 +910,24 @@ async fn accept_loop(
                     let tls_details = fastcgi::TlsDetails::of(accepted.stream.get_ref().1);
                     let tls_log = Some(Arc::new(access_log::Tls::of(accepted.stream.get_ref().1)));
 
-                    serve_connection(task_inner, TokioIo::new(accepted.stream), peer, local, ConnectionView {
+                    let Some(deadline) = tokio::time::Instant::now().checked_add(server.plan.read_header_timeout) else { return; };
+                    let stream = match http_redirect::prepare(
+                        accepted.stream, server.plan.redirect_after_tls, deadline, task_inner.stopped.child_token()
+                    ).await {
+                        Ok(stream) => stream,
+                        Err(_) => return,
+                    };
+                    serve_connection(task_inner, TokioIo::new(stream), peer, local, ConnectionView {
                         key, server: accepted.server, admission,
                         negotiated_tls_h2: Some(negotiated_h2), identity: Some(accepted.identity), tls_log, tls_details: Some(tls_details),
                     }).await;
                 } else {
+                    let stream = match http_redirect::prepare(
+                        stream, server.plan.redirect_after_tls, deadline, task_inner.stopped.child_token()
+                    ).await {
+                        Ok(stream) => stream,
+                        Err(_) => return,
+                    };
                     serve_connection(task_inner, TokioIo::new(stream), peer, local, ConnectionView { key, server, admission, negotiated_tls_h2: None, identity: None, tls_log: None, tls_details: None }).await;
                 }
             });
@@ -911,6 +940,16 @@ async fn accept_loop(
                     return;
                 }
                 if let Some(tls) = proof.tls.clone() {
+                    // Prefix classification is I/O, not TLS CPU work. The dedicated
+                    // proof listener has no server read_header_timeout to inherit.
+                    const PROOF_TLS_PREFIX_TIMEOUT: Duration = Duration::from_secs(10);
+                    let stream = tokio::select! { biased;
+                        _ = proof.cancel.cancelled() => return,
+                        _ = task_inner.stopped.cancelled() => return,
+                        result = tokio::time::timeout(PROOF_TLS_PREFIX_TIMEOUT, tls_first_record::prepare(stream, false)) => {
+                            match result { Ok(Ok(stream)) => stream, _ => return }
+                        }
+                    };
                     let Some(executor)=task_inner.tls_executor.get() else { return; };
                     let handshake=executor.execute_proof(async move {
                         let stream=tokio_rustls::TlsAcceptor::from(tls).accept(stream).await?;

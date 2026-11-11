@@ -1,4 +1,6 @@
 use crate::cert_status::OcspResources;
+#[cfg(feature = "native-run")]
+use crate::stek::TicketOwners;
 use crate::{cert_automation::AutomationResources, certstore::FsStore};
 use anyhow::{Result, anyhow, ensure};
 use sha2::{Digest, Sha256};
@@ -22,6 +24,8 @@ pub struct CertificatePaths {
 
 pub(super) struct Store {
     pub fs: FsStore,
+    #[cfg(feature = "native-run")]
+    pub(super) root: PathBuf,
     state: PathBuf,
 }
 
@@ -29,6 +33,8 @@ pub(super) struct Store {
 /// Storage and issuance pools are bounded independently of the runtime CPU count.
 pub struct CertificateResources {
     stores: Mutex<HashMap<PathBuf, Arc<Store>>>,
+    #[cfg(feature = "native-run")]
+    pub(super) ticket_owners: TicketOwners,
     pub(super) resident_cache: Arc<super::resident_cache::ResidentCache>,
     pub(super) issuance: Arc<AutomationResources>,
     pub(super) ocsp: Arc<OcspResources>,
@@ -49,6 +55,8 @@ impl CertificateResources {
     ) -> Result<Self> {
         Ok(Self {
             stores: Mutex::new(HashMap::new()),
+            #[cfg(feature = "native-run")]
+            ticket_owners: TicketOwners::new(),
             resident_cache: Arc::new(super::resident_cache::ResidentCache::new()),
             cpu: issuance.cpu_slots(),
             issuance,
@@ -141,7 +149,12 @@ impl CertificateResources {
                 (state_metadata.dev(), state_metadata.ino()) == fs.state_identity(),
                 "certificate storage state root changed during preparation"
             );
-            let store = Arc::new(Store { fs, state });
+            let store = Arc::new(Store {
+                fs,
+                #[cfg(feature = "native-run")]
+                root: actual.clone(),
+                state,
+            });
             let mut stores = this
                 .stores
                 .lock()

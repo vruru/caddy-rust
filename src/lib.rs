@@ -13,6 +13,7 @@ pub mod http_config;
 pub mod http_runtime;
 pub mod leaf_guard;
 pub mod surface;
+pub mod stek;
 pub mod tls_resolver;
 
 pub mod duration;

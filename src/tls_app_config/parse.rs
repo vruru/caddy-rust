@@ -9,7 +9,10 @@ use super::{
     pki_parse,
     schema::ObjectKind,
 };
-use crate::acme_wire::KeyType;
+use crate::{
+    acme_wire::KeyType,
+    stek::{Provider as TicketProvider, Settings as TicketSettings, TicketMode},
+};
 use serde_json::Value;
 use std::{collections::BTreeMap, time::Duration};
 use zeroize::Zeroizing;
@@ -38,28 +41,7 @@ pub(super) fn parse(views: CertificateViews<'_>) -> Result<CertificatePlan> {
         ));
     }
     if let Some(tickets) = tls.value("session_tickets") {
-        let tickets = Object::new(
-            Some(tickets),
-            ObjectKind::Tickets,
-            &tls.at("session_tickets"),
-        )?;
-        tickets.duration_ns("rotation_interval")?;
-        tickets.integer("max_keys")?;
-        tickets.boolean("disable_rotation")?;
-        tickets.boolean("disabled")?;
-        if let Some(source) = tickets.value("key_source")
-            && discriminator(source, "provider", &tickets.at("key_source"))? == "standard"
-        {
-            Object::new(
-                Some(source),
-                ObjectKind::StekStandard,
-                &tickets.at("key_source"),
-            )?;
-        }
-        return Err(ConfigError::unsupported(
-            tls.at("session_tickets"),
-            "configured_session_tickets",
-        ));
+        plan.ticket_mode = parse_ticket_mode(tickets, &tls.at("session_tickets"))?;
     }
     let cache = Object::new(tls.value("cache"), ObjectKind::Cache, &tls.at("cache"))?;
     if let Some(value) = cache.integer("capacity")? {
@@ -365,4 +347,38 @@ fn policy(value: &Value, path: &str) -> Result<Policy> {
         policy.ocsp_overrides = values;
     }
     Ok(policy)
+}
+
+fn parse_ticket_mode(value: &Value, path: &str) -> Result<TicketMode> {
+    let tickets = Object::new(Some(value), ObjectKind::Tickets, path)?;
+    let provider = if let Some(source) = tickets.raw_value("key_source") {
+        let path = tickets.at("key_source");
+        match discriminator(source, "provider", &path)? {
+            "standard" => {
+                Object::new(Some(source), ObjectKind::StekStandard, &path)?;
+                TicketProvider::Standard
+            }
+            "distributed" => {
+                let source = Object::new(Some(source), ObjectKind::StekDistributed, &path)?;
+                let storage = source.raw_value("storage");
+                if storage.is_some_and(Value::is_null) {
+                    return Err(ConfigError::invalid(source.at("storage")));
+                }
+                TicketProvider::Distributed {
+                    storage: pki_parse::parse_storage(storage, &source.at("storage"))?,
+                }
+            }
+            _ => return Err(ConfigError::unsupported(path, "session_ticket_key_source")),
+        }
+    } else {
+        TicketProvider::Standard
+    };
+    TicketSettings::explicit(
+        provider,
+        tickets.duration_ns("rotation_interval")?,
+        tickets.integer("max_keys")?,
+        tickets.boolean("disable_rotation")?.unwrap_or(false),
+        tickets.boolean("disabled")?.unwrap_or(false),
+    )
+    .map_err(|_| ConfigError::invalid(path.into()))
 }

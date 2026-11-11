@@ -27,6 +27,10 @@ src/logging follows Go 1.27.3 net/dial.go, net/url/url.go,
 net/http/cookie.go and time/format.go for selected network, URL, cookie and
 time-format behaviors (The Go Authors).
 
+The HTTP redirect listener request and URL parser follows Go 1.27.3 net/http,
+net/textproto and net/url. Initial TLS record handling follows crypto/tls/conn.go
+and net/http/server.go (The Go Authors, BSD-3-Clause).
+
 These portions retain their source notices and the following BSD license:
 
 Copyright 2009 The Go Authors.

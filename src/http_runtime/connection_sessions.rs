@@ -1,11 +1,54 @@
 use super::TlsIdentity;
+use crate::stek::{TicketRuntime, ticket::ConnectionTickets};
+#[cfg(feature = "native-run")]
+use rustls::server::NoServerSessionStorage;
 use rustls::server::StoresServerSessions;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 const CACHE_CAPACITY: usize = 256;
+const SESSION_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// The TLS config passed here is cloned per ordinary TCP handshake. Rotating
+/// and disabled configurations never fall through to the session-ID cache.
+pub(super) fn configure(
+    config: &mut rustls::ServerConfig,
+    runtime: &TicketRuntime,
+    sessions: &Arc<SharedSessions>,
+    state: &Arc<HandshakeState>,
+) -> Option<Arc<ConnectionTickets>> {
+    match runtime {
+        TicketRuntime::RuntimeDefault => {
+            config.send_tls13_tickets = 1;
+            config.max_tls13_tickets = 0;
+            config.max_early_data_size = 0;
+            config.session_storage =
+                Arc::new(PerConnectionSessions::new(sessions.clone(), state.clone()));
+            None
+        }
+        #[cfg(feature = "native-run")]
+        TicketRuntime::Disabled => {
+            config.session_storage = Arc::new(NoServerSessionStorage {});
+            config.send_tls13_tickets = 0;
+            config.max_tls13_tickets = 0;
+            config.max_early_data_size = 0;
+            None
+        }
+        #[cfg(feature = "native-run")]
+        TicketRuntime::Rotating { owner, realm, .. } => {
+            let tickets = Arc::new(ConnectionTickets::new(owner.clone(), *realm));
+            config.ticketer = tickets.clone();
+            config.session_storage = Arc::new(NoServerSessionStorage {});
+            config.send_tls13_tickets = 1;
+            config.max_tls13_tickets = 0;
+            config.max_early_data_size = 0;
+            Some(tickets)
+        }
+    }
+}
 
 pub(super) struct HandshakeState {
     pub identity: OnceLock<Arc<TlsIdentity>>,
@@ -39,6 +82,12 @@ impl fmt::Debug for HandshakeState {
 struct Entry {
     secret: Zeroizing<Vec<u8>>,
     owner: Arc<HandshakeState>,
+    inserted: Instant,
+}
+impl Entry {
+    fn expired_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.inserted) >= SESSION_LIFETIME
+    }
 }
 
 struct Cache {
@@ -98,8 +147,15 @@ impl PerConnectionSessions {
             let entry = cache.entries.get(key)?;
             // An unfinished handshake has not established an identity yet.
             // Leave its entry intact and safely fall back to a full handshake.
-            let identity = entry.owner.identity.get()?.clone();
-            if !identity.resumable_for(current_chain) {
+            let identity = if entry.expired_at(Instant::now()) {
+                None
+            } else {
+                Some(entry.owner.identity.get()?.clone())
+            };
+            if identity
+                .as_ref()
+                .is_none_or(|identity| !identity.resumable_for(current_chain))
+            {
                 cache.order.retain(|k| k.as_slice() != key);
                 (None, cache.entries.remove(key))
             } else {
@@ -110,7 +166,7 @@ impl PerConnectionSessions {
                 } else {
                     None
                 };
-                (Some((value, identity)), discarded)
+                (Some((value, identity?)), discarded)
             }
         };
         drop(discarded);
@@ -137,6 +193,19 @@ impl StoresServerSessions for PerConnectionSessions {
     fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
         let mut abandoned: Vec<Entry> = Vec::with_capacity(2);
         let mut guard = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        // Insertion order is also age order, including replacement. Retire
+        // stale secrets during activity without a task per server/connection;
+        // zeroize their bytes only after releasing the cache mutex.
+        while let Some(oldest) = guard.order.front() {
+            if guard.entries.get(oldest).is_some_and(|entry| !entry.expired_at(now)) {
+                break;
+            }
+            let oldest = guard.order.pop_front().expect("front checked");
+            if let Some(removed) = guard.entries.remove(&oldest) {
+                abandoned.push(removed);
+            }
+        }
 
         if guard.entries.contains_key(&key) {
             guard.order.retain(|k| k != &key);
@@ -145,6 +214,7 @@ impl StoresServerSessions for PerConnectionSessions {
         let entry = Entry {
             secret: Zeroizing::new(value),
             owner: Arc::clone(&self.handshake),
+            inserted: now,
         };
 
         if let Some(replaced) = guard.entries.insert(key.clone(), entry) {

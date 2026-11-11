@@ -74,6 +74,10 @@ impl<'a> Object<'a> {
     pub(super) fn value(&self, key: &'static str) -> Option<&'a Value> {
         self.fields.get(key).copied().filter(|v| !v.is_null())
     }
+    /// RawMessage fields distinguish explicit null from an absent value.
+    pub(super) fn raw_value(&self, key: &'static str) -> Option<&'a Value> {
+        self.fields.get(key).copied()
+    }
     pub(super) fn at(&self, key: &str) -> String {
         pointer(&self.path, key)
     }

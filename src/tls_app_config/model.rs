@@ -2,6 +2,7 @@ use crate::{
     acme_wire::KeyType,
     cert_automation::AcmeIssuerConfig,
     local_pki::{CaConfig, InternalIssuerOptions},
+    stek::TicketMode,
 };
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use zeroize::Zeroizing;
@@ -95,6 +96,7 @@ pub(super) struct Identity {
 #[derive(Clone)]
 pub struct CertificatePlan {
     pub(super) storage: Option<PathBuf>,
+    pub(super) ticket_mode: TicketMode,
     pub(super) policies: Vec<Policy>,
     pub(super) authorities: BTreeMap<String, Authority>,
     pub(super) identity: Option<Identity>,
@@ -114,6 +116,7 @@ impl Default for CertificatePlan {
     fn default() -> Self {
         Self {
             storage: None,
+            ticket_mode: TicketMode::RuntimeDefault,
             policies: Vec::new(),
             authorities: BTreeMap::new(),
             identity: None,
@@ -132,6 +135,12 @@ impl Default for CertificatePlan {
 }
 
 impl CertificatePlan {
+    /// Typed configuration, available to provisioning/inspection callers.
+    /// The actual native process activates it only after Root publication.
+    pub fn session_tickets(&self) -> &TicketMode {
+        &self.ticket_mode
+    }
+
     pub fn automated_names(&self) -> &[String] {
         &self.automate
     }

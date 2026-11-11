@@ -40,6 +40,8 @@ pub(crate) struct ServerConfig {
     pub(crate) routes: Vec<Route>,
     pub(crate) errors: Vec<Route>,
     pub(crate) tls: bool,
+    pub(crate) redirect_before_tls: Option<i64>,
+    pub(crate) redirect_after_tls: Option<i64>,
     pub(crate) strict_sni_host: bool,
     pub(crate) certificate_tags: Vec<String>,
     pub(crate) trusted_proxies: Vec<ipnet::IpNet>,
@@ -355,22 +357,44 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
             }
         }
     }
-    let mut wrapper_tls = false;
-    if let Some(wrappers) = m.get("listener_wrappers") {
+    let mut tls_wrapper = None;
+    let mut redirects = Vec::new();
+    if let Some(wrappers) = m.get("listener_wrappers").filter(|v| !v.is_null()) {
         let wrappers = wrappers
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("listener wrappers array required"))?;
-        for wrapper in wrappers {
-            let wrapper = object(wrapper, path)?;
-            deny_unknown(wrapper, &["wrapper"], path)?;
-            ensure!(
-                wrapper.get("wrapper").and_then(Value::as_str) == Some("tls"),
-                "unsupported listener wrapper"
-            );
-            ensure!(!wrapper_tls, "duplicate TLS listener wrapper");
-            wrapper_tls = true;
+        for (index, value) in wrappers.iter().enumerate() {
+            let normalized = crate::module_json::inline(value, "wrapper", false)?;
+            let wrapper = object(&normalized, path)?;
+            match wrapper.get("wrapper").and_then(Value::as_str) {
+                Some("tls") => {
+                    deny_unknown(wrapper, &["wrapper"], path)?;
+                    ensure!(index != 0, "TLS listener wrapper cannot be first");
+                    ensure!(tls_wrapper.is_none(), "duplicate TLS listener wrapper");
+                    tls_wrapper = Some(index);
+                }
+                Some("http_redirect") => {
+                    deny_unknown(wrapper, &["wrapper", "max_header_bytes"], path)?;
+                    let maximum = wrapper.get("max_header_bytes")
+                        .filter(|v| !v.is_null())
+                        .map(|v| v.as_number().and_then(serde_json::Number::as_go_i64)
+                            .ok_or_else(|| anyhow::anyhow!("integer redirect header limit required")))
+                        .transpose()?.unwrap_or(0);
+                    redirects.push((index, maximum));
+                }
+                _ => return Err(unsupported("listener wrapper")),
+            }
         }
     }
+    // The original app inserts a leading TLS placeholder when none is explicit.
+    // Repeated redirect wrappers first see identical five bytes at the innermost
+    // wrapper, which either redirects or replays them for the outer layers.
+    let redirect_before_tls = redirects.iter()
+        .find(|(index, _)| tls_wrapper.is_some_and(|tls| *index < tls))
+        .map(|(_, limit)| *limit);
+    let redirect_after_tls = redirects.iter()
+        .find(|(index, _)| tls_wrapper.is_none_or(|tls| *index > tls))
+        .map(|(_, limit)| *limit);
     let mut disabled = false;
     let mut redirect_http = true;
     let mut manage_certificates = true;
@@ -420,8 +444,7 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
         && route_names(&routes)
             .iter()
             .any(|n| !skip_redirect.iter().any(|s| s.eq_ignore_ascii_case(n)));
-    let tls = wrapper_tls
-        || policies.is_some()
+    let tls = policies.is_some_and(|policies| !policies.is_empty())
         || (!disabled && listen.iter().any(|a| a.port() == 443))
         || inferred;
     let protocols = m
@@ -493,6 +516,8 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
             vec![]
         },
         tls,
+        redirect_before_tls,
+        redirect_after_tls,
         strict_sni_host: boolean(m.get("strict_sni_host"), false, path)?,
         certificate_tags: tags,
         trusted_proxies,

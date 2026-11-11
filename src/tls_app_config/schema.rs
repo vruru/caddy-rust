@@ -27,6 +27,7 @@ pub(super) enum ObjectKind {
     Tailscale,
     ZeroSsl,
     StekStandard,
+    StekDistributed,
 }
 
 impl ObjectKind {
@@ -139,6 +140,7 @@ impl ObjectKind {
                 "cname_validation",
             ],
             Self::StekStandard => &["provider"],
+            Self::StekDistributed => &["provider", "storage"],
         }
     }
 }

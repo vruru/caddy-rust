@@ -2,6 +2,7 @@
 //! operation is admitted against the currently published route/TLS policy.
 use super::*;
 use crate::leaf_guard::{LeafState, leaf_id};
+use crate::stek::ticket::ConnectionTickets;
 use crate::tls_resolver::CertificateSelection;
 use rustls::{ProtocolVersion, SignatureScheme};
 use sha2::{Digest, Sha256};
@@ -88,10 +89,19 @@ impl TlsIdentity {
         }
     }
 }
+struct FixedSelection {
+    version: ProtocolVersion,
+    certificate: CertificateSelection,
+    origin: CertificateOrigin,
+    chain_hash: [u8; 32],
+    not_after: i64,
+    leaf: Arc<LeafState>,
+}
 struct FixedResolver {
     resolver: Arc<CandidateResolver>,
     state: Arc<connection_sessions::HandshakeState>,
-    selection: OnceLock<(ProtocolVersion, CertificateSelection, CertificateOrigin)>,
+    selection: OnceLock<FixedSelection>,
+    tickets: Option<Arc<ConnectionTickets>>,
     sni: String,
     acme: bool,
     offered_alpn: Vec<Vec<u8>>,
@@ -139,26 +149,70 @@ impl ResolvesServerCert for FixedResolver {
             if !selection.signature_compatibility.allows(version) {
                 return None;
             }
-            let _ = self.selection.set((version, selection, origin));
+            // This is the authoritative selection. Parse the same leaf once,
+            // before either resumption lookup, and retain it for final HTTP
+            // identity instead of recomputing from a later resolver view.
+            let leaf_certificate = selection.key.cert.first()?;
+            let (_, parsed) =
+                x509_parser::parse_x509_certificate(leaf_certificate.as_ref()).ok()?;
+            let not_after = parsed.validity().not_after.timestamp();
+            let leaf = self
+                .resolver
+                .managed
+                .leaf_guard()
+                .intern(leaf_id(leaf_certificate.as_ref()), not_after)
+                .ok()?;
+            let hash = chain_hash(&selection.key);
+            self.selection
+                .set(FixedSelection {
+                    version,
+                    certificate: selection,
+                    origin,
+                    chain_hash: hash,
+                    not_after,
+                    leaf,
+                })
+                .ok()?;
         }
-        let (selected_version, selection, _) = self.selection.get()?;
-        if *selected_version != version || !selection.signature_compatibility.allows(version) {
+        let selection = self.selection.get()?;
+        if selection.version != version
+            || !selection
+                .certificate
+                .signature_compatibility
+                .allows(version)
+            || !selection.leaf.admission().allow_certificate
+        {
             return None;
         }
-        selection.key.key.choose_scheme(hello.signature_schemes())?;
-        let hash = chain_hash(&selection.key);
-        if let Some(previous) = self.state.selected_chain.get() {
-            if previous != &hash {
-                return None;
-            }
-        } else if self.state.selected_chain.set(hash).is_err() {
+        selection
+            .certificate
+            .key
+            .key
+            .choose_scheme(hello.signature_schemes())?;
+        if *self
+            .state
+            .selected_chain
+            .get_or_init(|| selection.chain_hash)
+            != selection.chain_hash
+        {
             return None;
         }
-        Some(selection.key.clone())
+        if let Some(tickets) = &self.tickets
+            && !tickets.select(
+                &self.sni,
+                version,
+                selection.chain_hash,
+                selection.leaf.clone(),
+                selection.not_after,
+            )
+        {
+            return None;
+        }
+        Some(selection.certificate.key.clone())
     }
 }
-pub(super) struct AcceptedTls {
-    pub stream: tokio_rustls::server::TlsStream<connection_budget::AdmittedIo<tokio::net::TcpStream>>,
+pub(super) struct AcceptedTls<I> {
+    pub stream: tokio_rustls::server::TlsStream<I>,
     pub identity: Arc<TlsIdentity>,
     pub server: Arc<ActiveServer>,
 }
@@ -262,14 +316,19 @@ async fn tls_io_deadline<T>(
         None => future.await,
     }
 }
-pub(super) async fn accept(
+pub(super) async fn accept<I>(
     inner: &Arc<Inner>,
-    stream: connection_budget::AdmittedIo<tokio::net::TcpStream>,
+    stream: I,
+    admission: std::sync::Weak<connection_budget::Admission>,
     address: SocketAddr,
     deadline: Option<tokio::time::Instant>,
-) -> Result<AcceptedTls> {
-    let admission=stream.admission();
+    reply_http: bool,
+) -> Result<AcceptedTls<http_redirect::ReplayIo<I>>>
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let start = tls_io_deadline(deadline, async move {
+        let stream = tls_first_record::prepare(stream, reply_http).await?;
         Ok(
             tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream)
                 .await?,
@@ -335,19 +394,18 @@ pub(super) async fn accept(
         .ok_or_else(|| anyhow::anyhow!("TLS listener policy changed"))?)
     .clone();
     let state = Arc::new(connection_sessions::HandshakeState::new());
+    let tickets =
+        connection_sessions::configure(&mut config, &server.tickets, &server.sessions, &state);
     let fixed = Arc::new(FixedResolver {
         resolver: resolver.clone(),
         state: state.clone(),
         selection: OnceLock::new(),
+        tickets: tickets.clone(),
         sni: sni.clone(),
         acme: false,
         offered_alpn: protocols.iter().map(|p| p.to_vec()).collect(),
     });
     config.cert_resolver = fixed.clone();
-    config.session_storage = Arc::new(connection_sessions::PerConnectionSessions::new(
-        server.sessions.clone(),
-        state.clone(),
-    ));
     let offered_alpn = protocols.iter().map(|p| p.to_vec()).collect();
     let resolver = resolver.clone();
     let Some(executor) = inner.tls_executor.get() else {
@@ -355,49 +413,41 @@ pub(super) async fn accept(
     };
     let handshake = async move {
         let stream = start.into_stream(Arc::new(config)).await?;
-        let (version, selection, origin) = fixed
+        let selection = fixed
             .selection
             .get()
             .ok_or_else(|| anyhow::anyhow!("TLS actual selection unavailable"))?;
         ensure!(
-            stream.get_ref().1.protocol_version() == Some(*version),
-            "TLS selection version mismatch"
+            stream.get_ref().1.protocol_version() == Some(selection.version)
+                && selection.leaf.admission().allow_certificate,
+            "TLS selection identity changed"
         );
-        let key = &selection.key;
-        let leaf_certificate = key
-            .cert
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("TLS identity has no certificate"))?;
-        let (_, parsed) = x509_parser::parse_x509_certificate(leaf_certificate.as_ref())
-            .map_err(|_| anyhow::anyhow!("TLS identity certificate invalid"))?;
-        let leaf = resolver.managed.leaf_guard().intern(
-            leaf_id(leaf_certificate.as_ref()),
-            parsed.validity().not_after.timestamp(),
-        )?;
-        let full_identity = Arc::new(TlsIdentity {
+        let identity = Arc::new(TlsIdentity {
             sni: sni.clone(),
             offered_alpn,
             schemes,
-            chain_hash: chain_hash(key),
-            not_after: parsed.validity().not_after.timestamp(),
-            version: *version,
-            leaf,
+            chain_hash: selection.chain_hash,
+            not_after: selection.not_after,
+            version: selection.version,
+            leaf: selection.leaf.clone(),
             scope: Arc::downgrade(&resolver),
-            origin: *origin,
+            origin: selection.origin,
         });
         if stream.get_ref().1.handshake_kind() == Some(rustls::HandshakeKind::Resumed) {
-            let resumed = state
-                .resumed()
-                .ok_or_else(|| anyhow::anyhow!("TLS resumption identity unavailable"))?;
-            // The cache admitted this exact certificate chain, not just a resolver
-            // pointer. ALPN/signature capabilities belong to the current hello,
-            // including a resumed hello, rather than the previous connection.
-            ensure!(
-                resumed.chain_hash == full_identity.chain_hash && resumed.sni == sni,
-                "TLS resumption identity mismatch"
-            );
+            if let Some(tickets) = &tickets {
+                ensure!(tickets.authenticated(), "TLS ticket identity unavailable");
+            } else {
+                let resumed = state
+                    .resumed()
+                    .ok_or_else(|| anyhow::anyhow!("TLS resumption identity unavailable"))?;
+                // ALPN and signature capabilities belong to the current
+                // hello, including a resumed hello.
+                ensure!(
+                    resumed.chain_hash == identity.chain_hash && resumed.sni == sni,
+                    "TLS resumption identity mismatch"
+                );
+            }
         }
-        let identity = full_identity;
         state
             .identity
             .set(identity.clone())

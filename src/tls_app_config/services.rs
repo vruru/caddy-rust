@@ -4,6 +4,8 @@ use super::{
     model::{Issuer, PermissionSetting, Policy},
     storage::{CertificatePaths, CertificateResources, Store},
 };
+#[cfg(feature = "native-run")]
+use crate::stek::{Provider as TicketProvider, TicketMode, TicketRuntime};
 use crate::{
     cert_automation::{self, AutomationOptions, CertificateManager},
     cert_status::{OcspConfig, OcspManager, OcspOptions, OcspState},
@@ -282,6 +284,71 @@ impl CertificateServices {
     }
     pub fn cancellation(&self) -> CancellationToken {
         self.context.cancel.child_token()
+    }
+
+    #[cfg(feature = "native-run")]
+    pub(crate) async fn prepare_tcp_tickets(
+        &self,
+        cancel: CancellationToken,
+    ) -> Result<TicketRuntime> {
+        match &self.plan.ticket_mode {
+            TicketMode::RuntimeDefault => Ok(TicketRuntime::RuntimeDefault),
+            TicketMode::Disabled => Ok(TicketRuntime::Disabled),
+            TicketMode::Rotating(settings) => match settings.provider() {
+                TicketProvider::Standard => Ok(self
+                    .context
+                    .resources
+                    .ticket_owners
+                    .standard(settings.clone())),
+                TicketProvider::Distributed { storage } => {
+                    let namespace = storage
+                        .as_ref()
+                        .or(self.plan.storage.as_ref())
+                        .unwrap_or(&self.context.paths.default_storage);
+                    let store = self
+                        .context
+                        .resources
+                        .store(namespace.clone(), &self.context.paths, cancel)
+                        .await?;
+                    self.context.resources.ticket_owners.distributed(
+                        &store.fs,
+                        &store.root,
+                        settings.clone(),
+                    )
+                }
+            },
+        }
+    }
+
+    /// Reserve an owned worker before publication. An abandoned candidate
+    /// drops the signal and cannot initialize or rotate a shared store.
+    #[cfg(feature = "native-run")]
+    pub(crate) fn stage_ticket_worker(
+        &self,
+        tickets: &TicketRuntime,
+        generation: u64,
+    ) -> Result<Option<oneshot::Sender<()>>> {
+        let TicketRuntime::Rotating { owner, .. } = tickets else {
+            return Ok(None);
+        };
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let token = self.context.cancel.child_token();
+        ensure!(
+            !token.is_cancelled() && !self.tasks.is_closed(),
+            "certificate service stopped"
+        );
+        let owner = owner.clone();
+        let (activate, signal) = oneshot::channel();
+        self.tasks.spawn(async move {
+            tokio::select! { biased;
+                _=token.cancelled()=>{},
+                ready=signal=>{ if ready.is_ok() { owner.run(generation, token).await; } },
+            }
+        });
+        Ok(Some(activate))
     }
 
     /// All fallible preparation/ensure work precedes this synchronous signal.

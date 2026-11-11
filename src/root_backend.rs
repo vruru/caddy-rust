@@ -10,6 +10,7 @@ use crate::{
     http_runtime::{CommitOutcome, HttpRuntime},
     leaf_guard::LeafGuard,
     local_pki::TrustInstaller,
+    stek::TicketRuntime,
     logging::{self, Event, Field, FieldValue, Level, Logging, LoggingRegistry, Origin},
     tls_app_config::{
         CertificatePaths, CertificatePlan, CertificateResources, CertificateServices,
@@ -68,6 +69,7 @@ struct Active {
     generation: u64,
     digest: [u8; 32],
     services: Arc<CertificateServices>,
+    tickets: TicketRuntime,
     client: Option<ClientIdentity>,
     logging: Arc<Logging>,
 }
@@ -75,6 +77,7 @@ struct Active {
 struct Predecessor {
     digest: [u8; 32],
     material: RetainedCertificates,
+    tickets: TicketRuntime,
 }
 struct Prepared {
     digest: [u8; 32],
@@ -224,6 +227,25 @@ impl NativeBackend {
                 .ensure_business(&names, &bound, root.candidates.child_token())
                 .await
                 .map_err(|_| failed("business_certificate_preparation_failed"))?;
+            let tickets = services
+                .prepare_tcp_tickets(root.candidates.child_token())
+                .await
+                .map_err(|_| failed("session_ticket_storage_preparation_failed"))?;
+            let epoch = root
+                .active
+                .load()
+                .as_ref()
+                .map_or(0, |active| active.generation)
+                .checked_add(1)
+                .ok_or_else(|| AdminError::new(500, "root_generation_exhausted"))?;
+            // Provision a read-only candidate only. Validate neither creates
+            // a first ticket key nor rotates an already shared file.
+            drop(
+                tickets
+                    .reserve(epoch, false, root.candidates.child_token())
+                    .await
+                    .map_err(|_| failed("session_ticket_key_preparation_failed"))?,
+            );
             Ok(())
         }
         .await;
@@ -276,8 +298,9 @@ impl Root {
         {
             return Err(AdminError::new(409, "backend_generation_fenced"));
         }
+        let restore_only = transaction.restore_only;
         let prepared = self.offload(move || prepare(transaction.config)).await?;
-        let mode = if transaction.restore_only {
+        let (mode, restore_tickets) = if restore_only {
             let old = self
                 .retained
                 .lock()
@@ -285,11 +308,14 @@ impl Root {
                 .clone()
                 .filter(|old| old.digest == prepared.digest)
                 .ok_or_else(|| failed("retained_configuration_unavailable"))?;
-            PrepareMode::RestoreOnly {
-                retained: old.material,
-            }
+            (
+                PrepareMode::RestoreOnly {
+                    retained: old.material,
+                },
+                Some(old.tickets),
+            )
         } else {
-            PrepareMode::Normal
+            (PrepareMode::Normal, None)
         };
         // Bound retirement ownership before starting another candidate. Existing
         // request/renewal workers do not acquire this transaction admission slot.
@@ -342,14 +368,22 @@ impl Root {
             let manual = services
                 .manual_certificates()
                 .map_err(|_| failed("manual_certificate_inventory_failed"))?;
+            let tickets = match restore_tickets {
+                Some(tickets) => tickets,
+                None => services
+                    .prepare_tcp_tickets(self.candidates.child_token())
+                    .await
+                    .map_err(|_| failed("session_ticket_storage_preparation_failed"))?,
+            };
             let stage = self
                 .http
-                .stage_with_generation_resources(
+                .stage_with_native_tickets(
                     prepared.http,
                     services.business_resolver(),
                     manual,
                     services.certificate_provider(),
                     logging.clone(),
+                    tickets.clone(),
                 )
                 .await
                 .map_err(|_| failed("http_candidate_staging_failed"))?;
@@ -378,6 +412,7 @@ impl Root {
             let retained = match &previous {
                 Some(previous) => Some(Predecessor {
                     digest: previous.digest,
+                    tickets: previous.tickets.clone(),
                     material: previous.services.retained().await.map_err(|_| {
                         AdminError::new(500, "predecessor_certificate_snapshot_failed")
                     })?,
@@ -387,12 +422,23 @@ impl Root {
             let finished = finish(owner.handle()).await;
             drop(owner);
             finished?;
+            let epoch = generation
+                .checked_add(1)
+                .ok_or_else(|| AdminError::new(500, "root_generation_exhausted"))?;
+            // No unrelated preparation follows reservation of the same
+            // namespace's old writer. Discard drops this memory-only permit.
+            let ticket_activation = tickets
+                .reserve(epoch, restore_only, self.candidates.child_token())
+                .await
+                .map_err(|_| failed("session_ticket_key_preparation_failed"))?;
+            let ticket_worker = services
+                .stage_ticket_worker(&tickets, epoch)
+                .map_err(|_| failed("session_ticket_worker_preparation_failed"))?;
             let next = Arc::new(Active {
-                generation: generation
-                    .checked_add(1)
-                    .ok_or_else(|| AdminError::new(500, "root_generation_exhausted"))?,
+                generation: epoch,
                 digest: prepared.digest,
                 services: services.clone(),
+                tickets,
                 client: client.lock().unwrap_or_else(|e| e.into_inner()).clone(),
                 logging: logging.clone(),
             });
@@ -401,7 +447,9 @@ impl Root {
             }
             let retirement = stage.retirement();
             cleanup.publication_started = true;
-            let CommitOutcome::Published { generation } = stage.commit() else {
+            let CommitOutcome::Published { generation } =
+                stage.commit_with_tickets(ticket_activation)
+            else {
                 return Err(AdminError::new(503, "backend_commit_discarded"));
             };
             // No await, fallible allocation or external call follows publication.
@@ -412,6 +460,9 @@ impl Root {
             let retired = self.active.swap(Some(next));
             *self.retained.lock().unwrap_or_else(|e| e.into_inner()) = retained;
             services.activate();
+            if let Some(worker) = ticket_worker {
+                let _ = worker.send(());
+            }
             cleanup.armed = false;
             if let Ok(mut event) = Event::new(Origin::Core, "", Level::Info, "serving configuration") {
                 event.fields.push(Field::new("generation", FieldValue::U64(generation)));

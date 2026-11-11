@@ -278,7 +278,13 @@ impl HttpStage {
     }
     /// Every fallible preparation and task spawn completed in stage. Neither a
     /// client disconnect nor an async cancellation can interrupt this commit.
-    pub fn commit(mut self) -> CommitOutcome {
+    pub fn commit(self) -> CommitOutcome {
+        self.commit_with_tickets(None)
+    }
+    pub(crate) fn commit_with_tickets(
+        mut self,
+        tickets: Option<crate::stek::Activation>,
+    ) -> CommitOutcome {
         // A destroyed executor also destroys its accept tasks. Publishing a
         // ready ticket on another executor must not resurrect dead listeners.
         if self.guard.retirement.is_aborted() {
@@ -296,6 +302,9 @@ impl HttpStage {
             return CommitOutcome::Discarded;
         };
         let generation = next.id;
+        if tickets.as_ref().is_some_and(|activation| activation.generation() != generation) {
+            return CommitOutcome::Discarded;
+        }
         let (previous, old_listeners) = {
             let mut control = self.guard.control.lock();
             if !control
@@ -314,6 +323,12 @@ impl HttpStage {
                 }
                 .force_shutdown();
                 return CommitOutcome::Discarded;
+            }
+            // Every discard check has passed, and the exact generation is
+            // about to become eligible for TCP handshakes. Publish the
+            // precomputed ticket view here; this operation is memory only.
+            if let Some(tickets) = tickets {
+                tickets.commit();
             }
             let previous = self.inner.current.swap(next);
             let old_listeners = std::mem::replace(&mut control.listeners, listeners);
@@ -352,7 +367,7 @@ impl HttpRuntime {
             &self.inner.registry,
             &self.inner.managed,
             &self.inner.challenge_resolver,
-            ServingMaterial{manual:None,provider:None,logging:None,validate_only:true},
+            ServingMaterial{manual:None,provider:None,logging:None,tickets:None,validate_only:true},
             &self.inner.resources,
         );
         tokio::select! {
@@ -390,7 +405,7 @@ impl HttpRuntime {
             &self.inner.registry,
             managed,
             &self.inner.challenge_resolver,
-            ServingMaterial{manual:Some(manual),provider:None,logging:None,validate_only:true},
+            ServingMaterial{manual:Some(manual),provider:None,logging:None,tickets:None,validate_only:true},
             &self.inner.resources,
         );
         tokio::select! {
@@ -416,7 +431,8 @@ impl HttpRuntime {
         config: PreparedConfig,
         managed: Arc<HotCertificateResolver>,
     ) -> Result<HttpStage> {
-        self.stage_inner(config, managed, None, None, None).await
+        self.stage_inner(config, managed, None, None, None, None)
+            .await
     }
     /// The supplied inventory is already provisioned by the TLS app. Raw
     /// load_files must have been consumed there, not silently ignored here.
@@ -429,7 +445,8 @@ impl HttpRuntime {
         managed: Arc<HotCertificateResolver>,
         manual: ManualCertificates,
     ) -> Result<HttpStage> {
-        self.stage_inner(config, managed, Some(manual), None, None).await
+        self.stage_inner(config, managed, Some(manual), None, None, None)
+            .await
     }
     /// Attach this generation's immutable automation-policy capability. It is
     /// never consulted by tagged manual selection or ACME proof handshakes.
@@ -440,7 +457,7 @@ impl HttpRuntime {
         manual: ManualCertificates,
         provider: Arc<dyn ScopedCertificateProvider>,
     ) -> Result<HttpStage> {
-        self.stage_inner(config, managed, Some(manual), Some(provider), None)
+        self.stage_inner(config, managed, Some(manual), Some(provider), None, None)
             .await
     }
     pub async fn stage_with_generation_resources(
@@ -451,7 +468,35 @@ impl HttpRuntime {
         provider: Arc<dyn ScopedCertificateProvider>,
         logging: Arc<crate::logging::Logging>,
     ) -> Result<HttpStage> {
-        self.stage_inner(config,managed,Some(manual),Some(provider),Some(logging)).await
+        self.stage_inner(
+            config,
+            managed,
+            Some(manual),
+            Some(provider),
+            Some(logging),
+            None,
+        )
+        .await
+    }
+    #[cfg(feature = "native-run")]
+    pub(crate) async fn stage_with_native_tickets(
+        &self,
+        config: PreparedConfig,
+        managed: Arc<HotCertificateResolver>,
+        manual: ManualCertificates,
+        provider: Arc<dyn ScopedCertificateProvider>,
+        logging: Arc<crate::logging::Logging>,
+        tickets: crate::stek::TicketRuntime,
+    ) -> Result<HttpStage> {
+        self.stage_inner(
+            config,
+            managed,
+            Some(manual),
+            Some(provider),
+            Some(logging),
+            Some(tickets),
+        )
+        .await
     }
     async fn stage_inner(
         &self,
@@ -460,6 +505,7 @@ impl HttpRuntime {
         manual: Option<ManualCertificates>,
         provider: Option<Arc<dyn ScopedCertificateProvider>>,
         logging: Option<Arc<crate::logging::Logging>>,
+        tickets: Option<crate::stek::TicketRuntime>,
     ) -> Result<HttpStage> {
         ensure!(
             Arc::ptr_eq(&self.inner.managed.leaf_guard(), &managed.leaf_guard()),
@@ -506,7 +552,7 @@ impl HttpRuntime {
             &self.inner.registry,
             &managed,
             &self.inner.challenge_resolver,
-            ServingMaterial { manual: manual.as_ref(), provider: provider.as_ref(), logging: logging.as_ref(), validate_only:false },
+            ServingMaterial { manual: manual.as_ref(), provider: provider.as_ref(), logging: logging.as_ref(), tickets: tickets.as_ref(), validate_only:false },
             &self.inner.resources,
         );
         let (servers, managed_names) = tokio::select! {

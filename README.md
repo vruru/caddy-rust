@@ -523,3 +523,15 @@ compatibility work.
 HTTP/3 observes peer stream cancellation while a route or upstream body is
 pending. Cancelling a request releases its resources without closing sibling
 streams; normal FIN acknowledgement does not cancel application cleanup.
+
+TLS listeners support `http_redirect` in its configured wrapper order. The
+redirect accepts bounded HTTP headers and replays untouched TLS bytes. Invalid
+initial TLS record headers follow the original server's early responses;
+Rustls may reject some malformed records more strictly. Proof-only prefix
+reads have a separate ten-second deadline.
+
+TCP TLS session tickets support the default local cache and the standard or
+file-storage distributed rotating providers. Reload and retained rollback
+keep ticket publication tied to the admitted configuration generation. See
+[session ticket behavior](docs/SESSION-TICKETS.md). QUIC ticket integration
+remains a separate compatibility item.
