@@ -85,6 +85,8 @@ pub(crate) enum Handler {
         hide: Vec<String>,
         index_names: Vec<String>,
         pass_thru: bool,
+        canonical_uris: bool,
+        sidecars: crate::http_runtime::file_sidecars::SidecarPlan,
     },
     Encode(std::sync::Arc<crate::http_runtime::encode_response::EncodePlan>),
     ReverseProxy(Box<ProxyConfig>),

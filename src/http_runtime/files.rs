@@ -1,3 +1,4 @@
+use super::file_sidecars::{OpenError, SidecarPlan};
 use super::request::{Context, decoded_path, failure, safe_join};
 use super::*;
 use futures_util::stream;
@@ -14,6 +15,8 @@ pub(super) async fn serve(
     root: Option<&str>,
     hide: &[String],
     indices: &[String],
+    canonical_uris: bool,
+    sidecars: &SidecarPlan,
 ) -> Result<Option<Response<Body>>> {
     let root = ctx.expand(root.unwrap_or("{http.vars.root}"))?;
     let decoded = decoded_path(ctx.req().uri().path())?;
@@ -77,7 +80,7 @@ pub(super) async fn serve(
             .unwrap_or("")
             .to_owned()
     };
-    if base(&original) == base(&current) {
+    if canonical_uris && base(&original) == base(&current) {
         if implicit_index && !original.ends_with('/') {
             return Ok(Some(redirect(ctx, &format!("{original}/"))?));
         } else if !implicit_index && original.ends_with('/') {
@@ -102,18 +105,46 @@ pub(super) async fn serve(
     );
     let open_admission = admission.clone();
     let opened_path = path.clone();
-    let (file, opened_metadata, admission) = ctx
+    let choices = super::accepted_encodings::sidecar_choices(
+        ctx.req().headers(),
+        &sidecars.order,
+        &sidecars.encodings,
+    );
+    let original_etag = ctx
+        .immediate
+        .get(http::header::ETAG)
+        .filter(|tag| !tag.is_empty())
+        .cloned();
+    let suffixes = original_etag
+        .is_none()
+        .then(|| sidecars.etag_suffixes.clone());
+    let (representation, admission) = ctx
         .resources
         .metadata
         .run(move || {
-            let file = crate::http_config::helpers::open_regular_file(opened_path)?;
-            let metadata = file.metadata()?;
-            Ok::<_, io::Error>((file, metadata, open_admission))
+            let representation = super::file_sidecars::open(
+                &opened_path,
+                &choices,
+                suffixes.as_deref().unwrap_or_default(),
+            )?;
+            Ok::<_, OpenError>((representation, open_admission))
         })
         .await
         .map_err(|error| super::request::budget_failure(ctx, error))?
-        .map_err(|error| super::request::file_io_failure(ctx, &error))?;
-    let file = Arc::new(file);
+        .map_err(|error| match error {
+            OpenError::Body(error) => super::request::file_io_failure(ctx, &error),
+            OpenError::Etag(error) if super::request::descriptor_exhausted(&error) => {
+                super::request::file_io_failure(ctx, &error)
+            }
+            OpenError::Etag(_) => failure(StatusCode::INTERNAL_SERVER_ERROR),
+        })?;
+    let file = Arc::new(representation.file);
+    if let Some(coding) = representation.coding {
+        ctx.immediate.insert(
+            http::header::CONTENT_ENCODING,
+            HeaderValue::from_static(coding.as_str()),
+        );
+    }
     if !matches!(*ctx.req().method(), Method::GET | Method::HEAD)
         && !ctx.values.contains_key("http.error.status_code")
     {
@@ -121,75 +152,95 @@ pub(super) async fn serve(
             .insert(http::header::ALLOW, HeaderValue::from_static("GET, HEAD"));
         return Err(failure(StatusCode::METHOD_NOT_ALLOWED));
     }
-    // Use fstat after opening. A rename between metadata and open must not give
-    // a new representation the old file's ETag/length.
-    metadata = opened_metadata;
-    let size = metadata.len();
-    let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
-    let nanos = match modified.duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_nanos() as i128,
-        Err(e) => -(e.duration().as_nanos() as i128),
+    // fstat pins the actual representation size and validator; sidecars
+    // are transparent to Last-Modified and use the source file's time.
+    let size = representation.metadata.len();
+    let representation_time = representation.metadata.modified().unwrap_or(UNIX_EPOCH);
+    let modified = if representation.coding.is_some() {
+        metadata.modified().unwrap_or(UNIX_EPOCH)
+    } else {
+        representation_time
     };
     let useful = !matches!(seconds(modified), 0 | 1);
-    let etag = if !useful {
-        String::new()
-    } else {
-        format!(
-            "\"{}-{}\"",
-            base36(nanos as i64 as i128),
-            base36(size as i128)
-        )
-    };
-    let last_modified = http_date(modified);
+    let etag = original_etag
+        .as_ref()
+        .map(|v| v.as_bytes().to_vec())
+        .or(representation.explicit_etag)
+        .unwrap_or_else(|| calculated_etag(representation_time, size).into_bytes());
     let mut common = http::HeaderMap::new();
-    if !etag.is_empty() {
-        common.insert(http::header::ETAG, HeaderValue::from_str(&etag)?);
+    if !etag.is_empty() && original_etag.is_none() {
+        let mut field = etag.clone();
+        for b in &mut field {
+            if *b == b'\r' {
+                *b = b' ';
+            }
+        }
+        common.insert(
+            http::header::ETAG,
+            HeaderValue::from_bytes(field.trim_ascii())?,
+        );
     }
-    if useful && let Some(last_modified) = last_modified {
+    if useful && let Some(last_modified) = http_date(modified) {
+        ctx.immediate.remove(http::header::LAST_MODIFIED);
         common.insert(
             http::header::LAST_MODIFIED,
             HeaderValue::from_str(&last_modified)?,
         );
     }
-    if let Some(status) = preconditions(ctx, &etag, modified) {
+    let content_type = if let Some(existing) = ctx
+        .immediate
+        .get(http::header::CONTENT_TYPE)
+        .filter(|v| !v.is_empty())
+    {
+        existing.to_str().unwrap_or_default().to_owned()
+    } else {
+        let inferred = super::mime::by_extension(&path).unwrap_or_default();
+        if !inferred.is_empty() {
+            ctx.immediate.remove(http::header::CONTENT_TYPE);
+            common.insert(
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_str(&inferred)?,
+            );
+        }
+        inferred
+    };
+    if let Some(status) = super::file_preconditions::evaluate(
+        ctx.req().headers(),
+        ctx.req().method(),
+        &etag,
+        modified,
+        useful,
+    ) {
         let mut r = simple(status, Bytes::new());
         *r.headers_mut() = common;
-        if status == StatusCode::NOT_MODIFIED && !etag.is_empty() {
-            r.headers_mut().remove(http::header::LAST_MODIFIED);
+        if status == StatusCode::NOT_MODIFIED {
+            for name in [
+                http::header::CONTENT_TYPE,
+                http::header::CONTENT_LENGTH,
+                http::header::CONTENT_ENCODING,
+            ] {
+                ctx.immediate.remove(&name);
+                r.headers_mut().remove(name);
+            }
+            if !etag.is_empty() {
+                ctx.immediate.remove(http::header::LAST_MODIFIED);
+                r.headers_mut().remove(http::header::LAST_MODIFIED);
+            }
         }
         return Ok(Some(r));
     }
-    let content_type = super::mime::by_extension(&path).unwrap_or_default();
-    if !content_type.is_empty() {
-        common.insert(
-            http::header::CONTENT_TYPE,
-            HeaderValue::from_str(&content_type)?,
-        );
-    }
     let mut ranges = None;
     let mut range_selected = false;
-    if let Some(value) = ctx
-        .req()
-        .headers()
-        .get(http::header::RANGE)
-        .and_then(|v| v.to_str().ok())
-    {
-        let allow = ctx
-            .req()
-            .headers()
-            .get(http::header::IF_RANGE)
-            .and_then(|v| v.to_str().ok())
-            .is_none_or(|v| {
-                if v.starts_with('"') {
-                    v == etag
-                } else {
-                    useful
-                        && httpdate::parse_http_date(v)
-                            .is_ok_and(|t| seconds(modified) == seconds(t))
-                }
-            });
+    if let Some(value) = ctx.req().headers().get(http::header::RANGE) {
+        let allow = super::file_preconditions::range_allowed(
+            ctx.req().headers(),
+            ctx.req().method(),
+            &etag,
+            modified,
+            useful,
+        );
         if allow {
-            match parse_ranges(value, size) {
+            match parse_ranges(&String::from_utf8_lossy(value.as_bytes()), size) {
                 Ok(list) => {
                     if list
                         .iter()
@@ -200,11 +251,24 @@ pub(super) async fn serve(
                         range_selected = true;
                     }
                 }
+                Err("invalid range: failed to overlap") if size == 0 => {
+                    // Go ServeContent treats an empty representation as an
+                    // empty successful response, even for a non-overlap range.
+                }
                 Err(message) => {
                     let mut r = simple(StatusCode::RANGE_NOT_SATISFIABLE, format!("{message}\n"));
                     *r.headers_mut() = common;
-                    r.headers_mut().remove(http::header::ETAG);
-                    r.headers_mut().remove(http::header::LAST_MODIFIED);
+                    for name in [
+                        http::header::ETAG,
+                        http::header::LAST_MODIFIED,
+                        http::header::CONTENT_ENCODING,
+                        http::header::CONTENT_TYPE,
+                        http::header::CONTENT_LENGTH,
+                        http::header::CACHE_CONTROL,
+                    ] {
+                        ctx.immediate.remove(&name);
+                        r.headers_mut().remove(name);
+                    }
                     r.headers_mut().insert(
                         http::header::CONTENT_TYPE,
                         HeaderValue::from_static("text/plain; charset=utf-8"),
@@ -281,6 +345,7 @@ pub(super) async fn serve(
         StatusCode::OK
     });
     if multipart {
+        ctx.immediate.remove(http::header::CONTENT_TYPE);
         common.insert(
             http::header::CONTENT_TYPE,
             HeaderValue::from_str(&format!("multipart/byteranges; boundary={boundary}"))?,
@@ -295,6 +360,7 @@ pub(super) async fn serve(
             ))?,
         );
     }
+    ctx.immediate.remove(http::header::CONTENT_LENGTH);
     common.insert(
         http::header::CONTENT_LENGTH,
         HeaderValue::from_str(&length.to_string())?,
@@ -505,7 +571,7 @@ fn redirect(ctx: &Context, path: &str) -> Result<Response<Body>> {
     }
     Ok(response)
 }
-fn seconds(time: SystemTime) -> i64 {
+pub(super) fn seconds(time: SystemTime) -> i64 {
     let seconds = match time.duration_since(UNIX_EPOCH) {
         Ok(d) => i128::from(d.as_secs()),
         Err(e) => {
@@ -525,47 +591,19 @@ fn http_date(time: SystemTime) -> Option<String> {
         .ok()
 }
 
-fn preconditions(ctx: &Context, etag: &str, modified: SystemTime) -> Option<StatusCode> {
-    let headers = ctx.req().headers();
-    if let Some(value) = headers
-        .get(http::header::IF_MATCH)
-        .and_then(|v| v.to_str().ok())
-    {
-        if value != "*"
-            && !value
-                .split(',')
-                .any(|v| v.trim() == etag && !etag.is_empty())
-        {
-            return Some(StatusCode::PRECONDITION_FAILED);
-        }
-    } else if let Some(value) = headers
-        .get(http::header::IF_UNMODIFIED_SINCE)
-        .and_then(|v| v.to_str().ok())
-        && !matches!(seconds(modified), 0 | 1)
-        && httpdate::parse_http_date(value).is_ok_and(|t| seconds(modified) > seconds(t))
-    {
-        return Some(StatusCode::PRECONDITION_FAILED);
+fn calculated_etag(modified: SystemTime, size: u64) -> String {
+    if matches!(seconds(modified), 0 | 1) {
+        return String::new();
     }
-    if let Some(value) = headers
-        .get(http::header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-    {
-        if value == "*"
-            || value.split(',').any(|v| {
-                v.trim().strip_prefix("W/").unwrap_or(v.trim()) == etag && !etag.is_empty()
-            })
-        {
-            return Some(StatusCode::NOT_MODIFIED);
-        }
-    } else if let Some(value) = headers
-        .get(http::header::IF_MODIFIED_SINCE)
-        .and_then(|v| v.to_str().ok())
-        && !matches!(seconds(modified), 0 | 1)
-        && httpdate::parse_http_date(value).is_ok_and(|t| seconds(modified) <= seconds(t))
-    {
-        return Some(StatusCode::NOT_MODIFIED);
-    }
-    None
+    let nanos = match modified.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as i128,
+        Err(e) => -(e.duration().as_nanos() as i128),
+    };
+    format!(
+        "\"{}-{}\"",
+        base36(nanos as i64 as i128),
+        base36(size as i128)
+    )
 }
 fn parse_ranges(
     value: &str,

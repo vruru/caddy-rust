@@ -920,7 +920,9 @@ fn handlers<'a>(
                     hide,
                     index_names,
                     pass_thru,
-                } => match super::files::serve(ctx, root.as_deref(), hide, index_names).await? {
+                    canonical_uris,
+                    sidecars,
+                } => match super::files::serve(ctx, root.as_deref(), hide, index_names, *canonical_uris, sidecars).await? {
                     Some(response) => return Ok(Flow::Response(response)),
                     None if *pass_thru => {}
                     None => return Err(failure(StatusCode::NOT_FOUND)),

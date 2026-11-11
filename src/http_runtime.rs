@@ -19,6 +19,10 @@ mod connection_identity;
 mod connection_sessions;
 #[path = "http_runtime/files.rs"]
 mod files;
+#[path = "http_runtime/file_preconditions.rs"]
+mod file_preconditions;
+#[path = "http_runtime/file_sidecars.rs"]
+pub(crate) mod file_sidecars;
 
 #[path = "http_runtime/fastcgi/mod.rs"]
 mod fastcgi;

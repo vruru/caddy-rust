@@ -969,7 +969,10 @@ fn parse_handler(value: &Value, depth: usize, normalized: bool) -> Result<Handle
         "file_server" => {
             deny_unknown(
                 m,
-                &["handler", "root", "hide", "index_names", "pass_thru"],
+                &[
+                    "handler", "root", "hide", "index_names", "pass_thru", "canonical_uris",
+                    "precompressed", "precompressed_order", "etag_file_extensions",
+                ],
                 path,
             )?;
             Handler::FileServer {
@@ -985,6 +988,8 @@ fn parse_handler(value: &Value, depth: usize, normalized: bool) -> Result<Handle
                     .transpose()?
                     .unwrap_or_else(|| vec!["index.html".into(), "index.txt".into()]),
                 pass_thru: boolean(m.get("pass_thru"), false, path)?,
+                canonical_uris: boolean(m.get("canonical_uris").filter(|v| !v.is_null()), true, path)?,
+                sidecars: parse_file_sidecars(m, path)?,
             }
         }
         "reverse_proxy" => Handler::ReverseProxy(Box::new(parse_proxy(m, path)?)),
@@ -1534,4 +1539,30 @@ fn parse_encode(m: &serde_json::Map<String, Value>, path: &str) -> Result<crate:
     let minimum_length = if minimum_length == 0 {512} else {minimum_length};
     let matcher = m.get("match").filter(|v| !v.is_null()).map(|v| parse_response_matcher(v,path)).transpose()?;
     Ok(EncodePlan {encodings,prefer,minimum_length,matcher})
+}
+
+
+fn parse_file_sidecars(m: &serde_json::Map<String, Value>, path: &str) -> Result<crate::http_runtime::file_sidecars::SidecarPlan> {
+    use crate::http_runtime::{accepted_encodings::Coding, file_sidecars::SidecarPlan};
+    let mut encodings = Vec::new();
+    if let Some(raw) = m.get("precompressed").filter(|v| !v.is_null()) {
+        for (module, settings) in object(raw, path)? {
+            let encoding = Coding::parse(module).ok_or_else(|| unsupported("/file_server/precompressed/module"))?;
+            deny_unknown(object(settings, path)?, &[], path)?;
+            encodings.push(encoding);
+        }
+    }
+    let strings_or_default = |name| -> Result<Vec<String>> {
+        let Some(raw) = m.get(name).filter(|v| !v.is_null()) else { return Ok(Vec::new()); };
+        raw.as_array().ok_or_else(|| anyhow::anyhow!("invalid file server array"))?
+            .iter().map(|v| if v.is_null() { Ok(String::new()) } else { string(v, path) }).collect()
+    };
+    let order = strings_or_default("precompressed_order")?;
+    let suffixes = strings_or_default("etag_file_extensions")?;
+    ensure!(order.len() <= 64 && suffixes.len() <= 64, "file representation configuration limit exceeded");
+    Ok(SidecarPlan {
+        encodings,
+        order,
+        etag_suffixes: suffixes.into(),
+    })
 }

@@ -5,6 +5,8 @@ Go standard library behavioral ports
 ------------------------------------
 
 src/http_runtime/mime.rs follows Go mime/type.go (Copyright 2010 The Go Authors).
+src/http_runtime/file_preconditions.rs follows Go 1.27.3 net/http/fs.go
+(Copyright 2009 The Go Authors).
 src/http_runtime/sniff.rs follows Go net/http/sniff.go (Copyright 2011 The Go Authors).
 The optional trailer continuation normalizer in vendor/hyper-1.12.0 follows
 Go 1.27.3 src/net/textproto/reader.go (Copyright 2010 The Go Authors).

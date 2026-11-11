@@ -493,7 +493,7 @@ can send identity; a stream already compressed must finish correctly or
 fail. The response matcher is also available for deferred header rules.
 For an upstream response without a declared length, the minimum-length
 decision can differ when the first data chunk is split differently by the
-transport. Precompressed file sidecars remain separate work.
+transport. Built-in precompressed file sidecars use the same negotiation order.
 
 The `strict_sni_host` server option checks each HTTPS authority against the
 actual TLS SNI, including on existing HTTP/1.1 and HTTP/2 connections after a
@@ -502,3 +502,11 @@ HTTP remains unaffected. HTTP/3 applies the same check per request.
 
 A negative server `read_idle_timeout` disables the per-read upload idle
 timer, as in Caddy. Omitted or zero values retain the one-minute default.
+
+Native file serving supports gzip, Zstandard and Brotli sidecars, configured
+preference order and ETag files. Validators and ranges apply to the selected
+representation while Last-Modified retains the original file time. A broken
+optional encoding falls back to another representation. Named pipes are
+never opened in blocking mode, and ETag files are limited to 64 KiB. The
+encoding-order and ETag-extension lists are each limited to 64 entries.
+These safety bounds intentionally reject pathological configurations.

@@ -38,7 +38,10 @@ struct Preference {
     rank: usize,
 }
 
-fn parse_preference(accepted: &str, preferred: &[Coding]) -> Option<Preference> {
+fn parse_preference(
+    accepted: &str,
+    rank: impl Fn(&str, Option<Coding>) -> usize,
+) -> Option<Preference> {
     let (name, parameters) = accepted.split_once(';').unwrap_or((accepted, ""));
     let name = name.trim();
     let q = parameters.split(';').next().unwrap_or_default().trim();
@@ -56,9 +59,7 @@ fn parse_preference(accepted: &str, preferred: &[Coding]) -> Option<Preference> 
     let coding = [Coding::Gzip, Coding::Zstd, Coding::Brotli]
         .into_iter()
         .find(|coding| name.eq_ignore_ascii_case(coding.as_str()));
-    let rank = coding
-        .and_then(|coding| preferred.iter().position(|preferred| *preferred == coding))
-        .map_or(0, |at| preferred.len() - at);
+    let rank = rank(name, coding);
     Some(Preference {
         coding,
         quality,
@@ -77,12 +78,12 @@ fn header_text(headers: &HeaderMap) -> Option<std::borrow::Cow<'_, str>> {
     (!value.is_empty()).then(|| String::from_utf8_lossy(value.as_bytes()))
 }
 
-fn ranked(text: &str, preferred: &[Coding]) -> Vec<Preference> {
+fn ranked(text: &str, rank: impl Fn(&str, Option<Coding>) -> usize) -> Vec<Preference> {
     // Keep unknown encodings in the sort: the epsilon comparator is not
     // transitive, so even a skipped token can affect the stable ordering.
     let mut choices: Vec<_> = text
         .split(',')
-        .filter_map(|accepted| parse_preference(accepted, preferred))
+        .filter_map(|accepted| parse_preference(accepted, &rank))
         .collect();
     stable_sort(&mut choices, |a, b| {
         if (a.quality - b.quality).abs() < QUALITY_EPSILON {
@@ -100,11 +101,59 @@ pub(super) fn choose(
     enabled: impl Fn(Coding) -> bool,
 ) -> Option<Coding> {
     let text = header_text(headers)?;
+    let rank = |_: &str, coding: Option<Coding>| {
+        coding
+            .and_then(|c| preferred.iter().position(|&p| p == c))
+            .map_or(0, |at| preferred.len() - at)
+    };
     if !text.contains(',') {
-        return parse_preference(&text, preferred)?.coding.filter(|c| enabled(*c));
+        return parse_preference(&text, rank)?
+            .coding
+            .filter(|c| enabled(*c));
     }
-    ranked(&text, preferred)
+    ranked(&text, rank)
         .into_iter()
         .filter_map(|value| value.coding)
         .find(|coding| enabled(*coding))
+}
+
+pub(super) fn sidecar_choices(
+    headers: &HeaderMap,
+    preferred: &[String],
+    enabled: &[Coding],
+) -> Vec<Coding> {
+    if enabled.is_empty() {
+        return Vec::new();
+    }
+    let Some(text) = header_text(headers) else {
+        return Vec::new();
+    };
+    let rank = |name: &str, _: Option<Coding>| {
+        // Go strings.ToLower uses simple case mapping, even for unrecognized
+        // names which can affect the epsilon stable ordering of known ones.
+        let at = if preferred.is_empty() {
+            None
+        } else if name.is_ascii() {
+            preferred.iter().position(|p| {
+                p.eq_ignore_ascii_case(name) && !p.bytes().any(|c| c.is_ascii_uppercase())
+            })
+        } else {
+            let lower: String = name
+                .chars()
+                .map(|c| c.to_lowercase().next().unwrap_or(c))
+                .collect();
+            preferred.iter().position(|p| p == &lower)
+        };
+        at.map_or(0, |at| preferred.len() - at)
+    };
+    let mut out = Vec::new();
+    for c in ranked(&text, rank)
+        .into_iter()
+        .filter_map(|entry| entry.coding)
+    {
+        if enabled.contains(&c) && !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
 }
