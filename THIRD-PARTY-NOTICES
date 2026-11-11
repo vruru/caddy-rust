@@ -237,3 +237,9 @@ http and reqwest
 The http 1.5.0 and reqwest 0.12.28 permission transport sources are
 distributed with the original Apache-2.0 and MIT license texts in
 vendor/http-1.5.0 and vendor/reqwest-0.12.28.
+
+Quinn
+-----
+
+The quinn 0.11.12 and quinn-proto 0.11.19 source copies retain their
+original Apache-2.0 and MIT license texts.

@@ -434,7 +434,7 @@ file and disk budgets. Per-target socket admission leaves capacity for
 unrelated upstreams. An interrupted upstream response is not reported as
 complete; conflicting Content-Length fields are rejected. An already
 consumed request is not replayed as an empty request through error routes.
-General proxy retry, response buffering and HTTP/3 remain separate gates.
+General proxy retry and response buffering remain separate gates.
 
 The native root stages a logging generation with its server configuration.
 An already admitted request retains that generation through body delivery;
@@ -463,8 +463,18 @@ can still serve one managed certificate. Count limits do not replace the
 separate certificate-material byte limits. Exact rollback history includes
 only displaced, configured entries from the retained generation.
 
-Native HTTP/1.1 and HTTP/2 can forward upstream informational responses
-and emit configured informational responses such as 103 Early Hints. The
-bounded queue preserves order and does not buffer a body or retry a request.
-A request with no interim headers allocates no queue slots. HTTP/3 and
-FastCGI interim responses remain separate compatibility work.
+Native HTTP/1.1, HTTP/2 and HTTP/3 can forward upstream informational
+responses and emit configured responses such as 103 Early Hints. Per-stream
+bounds preserve order without buffering or replaying the request. FastCGI
+interim responses remain a separate compatibility item.
+
+The native HTTP/3 listener provisions UDP transactionally, uses TLS 1.3,
+and advertises its live port over HTTPS. It streams requests and responses
+under flow control and drains active streams when a generation retires.
+A cold on-demand handshake validates the peer's address with QUIC Retry
+before requesting a certificate. ClientHello inspection and issuance run
+outside the endpoint lock, with separate capacity for fragmented flights
+and issuance so ordinary connections can continue. This covers server
+HTTP/3 with the currently supported TLS policies. Outgoing HTTP/3,
+extended CONNECT/datagrams, early data and full production compatibility
+are separate work.

@@ -77,3 +77,15 @@ representation is not enabled or supported in this patched copy.
 
 The opt-in permission transport uses patched http 1.5.0 and reqwest 0.12.28.
 See their VENDOR.md files for exact release hashes, scope, and licenses.
+
+## HTTP/3 initial flight inspection
+
+Quinn 0.11.12 and quinn-proto 0.11.19 retain their original MIT and
+Apache-2.0 licenses. The upstream registry SHA-256 hashes are
+`4051e23e9185c255a7e33ef59cdbca87a22d359052eecd22fc6b901fb37d9d11` and
+`0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe`,
+respectively. Their opt-in Initial snapshot copies a bounded amount of pending
+packet data without consuming it. The caller decrypts and validates outside
+the endpoint lock, and uses QUIC address validation before doing certificate
+work. Ordinary Quinn acceptance and transport limits are unchanged. External
+upstream test modules are omitted.

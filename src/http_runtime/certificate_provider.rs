@@ -13,6 +13,14 @@ pub trait ScopedCertificateProvider: Send + Sync {
     /// request may run here: existing connections call this on each new request.
     fn cached_name(&self, normalized_name: &str) -> bool;
 
+    /// Whether QUIC needs to read the client name before accepting the handshake.
+    /// No network or storage access may run here.
+    fn needs_quic_preflight(&self) -> bool { true }
+
+    /// Whether the selected policy permits attempting acquisition for this name.
+    /// The real permission endpoint still decides at acquisition time.
+    fn can_acquire_quic_name(&self, _normalized_name: &str) -> bool { true }
+
     /// Called before the synchronous TLS resolver for an ordinary, non-tagged
     /// handshake. A valid resident hit is an immediate path; bounded maintenance
     /// may be scheduled when due. A genuine miss owns permission/storage/issuance

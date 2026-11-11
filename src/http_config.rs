@@ -435,11 +435,8 @@ fn parse_server(value: &Value) -> Result<ServerConfig> {
         });
     ensure!(!protocols.is_empty(), "empty protocol list");
     for protocol in &protocols {
-        if protocol == "h3" {
-            return Err(unsupported("/apps/http/servers/*/protocols/h3"));
-        }
         ensure!(
-            matches!(protocol.as_str(), "h1" | "h2" | "h2c"),
+            matches!(protocol.as_str(), "h1" | "h2" | "h2c" | "h3"),
             "unsupported HTTP protocol"
         );
     }

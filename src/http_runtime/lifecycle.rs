@@ -77,6 +77,7 @@ struct Control {
     generation: u64,
     listeners: HashMap<SocketAddr, Arc<ListenerControl>>,
     pool: HashMap<SocketAddr, PoolSlot>,
+    quic_pool: h3::Pool,
     leases: Vec<LeaseRecord>,
     retirements: HashMap<u64, Arc<RetirementOwner>>,
     stop: Option<HttpRetirement>,
@@ -94,6 +95,7 @@ impl Lifecycle {
                 generation: 0,
                 listeners: HashMap::new(),
                 pool: HashMap::new(),
+                quic_pool: HashMap::new(),
                 leases: Vec::new(),
                 retirements: HashMap::new(),
                 stop: None,
@@ -521,9 +523,10 @@ impl HttpRuntime {
         let proof_tls = proof_tls_config(self.inner.challenge_resolver.clone())?;
         let bindings = servers
             .iter()
+            .filter(|(_,server)|h3::tcp_enabled(server))
             .map(|(address, server)| (*address, ListenerKind::of(server)))
             .collect::<HashMap<_, _>>();
-        let (listeners, addresses) = loop {
+        let (listeners, mut addresses) = loop {
             let waiting = {
                 let mut control = self.control.lock();
                 ensure!(
@@ -595,6 +598,21 @@ impl HttpRuntime {
                 }
             }
         };
+        let quic = {
+            let mut state=self.control.lock();
+            ensure!(!guard.cancel.is_cancelled(), "HTTP candidate was stopped");
+            h3::stage(&self.inner,&mut state.quic_pool,&servers,&addresses)?
+        };
+        for (&declared, listener) in &quic {
+            if !bindings.contains_key(&declared) {
+                addresses.push(StagedAddress {
+                    declared, actual: listener.binding.actual,
+                    reused: self.inner.current.load().quic.get(&declared)
+                        .is_some_and(|old|Arc::ptr_eq(&old.binding,&listener.binding)),
+                    http01:false,tls_alpn01:false,
+                });
+            }
+        }
         let activity = BusinessGeneration::new(generation, config.shutdown_policy());
         let current = self.inner.current.load_full();
         let (retirement, retiring, overridden) = {
@@ -614,7 +632,7 @@ impl HttpRuntime {
             let removed = state
                 .listeners
                 .iter()
-                .filter(|(addr, _)| !servers.contains_key(addr))
+                .filter(|(addr, _)| !bindings.contains_key(addr))
                 .collect::<Vec<_>>();
             let group = retirement::AdmissionGroup::new(
                 guard.retirement.clone(),
@@ -652,6 +670,7 @@ impl HttpRuntime {
                 id: generation,
                 activity: activity.clone(),
                 servers,
+                quic,
                 retiring,
                 drain: activity.drain.clone(),
                 managed_names,

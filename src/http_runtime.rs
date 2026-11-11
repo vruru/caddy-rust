@@ -31,6 +31,7 @@ pub use tls_executor::TlsHandshakeDiagnostics;
 use connection_identity::{TlsIdentity, TlsVerdict};
 #[path = "http_runtime/lifecycle.rs"]
 mod lifecycle;
+mod h3;
 #[path = "http_runtime/manual_certificates.rs"]
 mod manual_certificates;
 pub use lifecycle::{CommitOutcome, HttpStage, StagedAddress};
@@ -129,6 +130,7 @@ struct Inner {
     tls_executor_failure: std::sync::atomic::AtomicU8,
     tls_executor_attempts: std::sync::atomic::AtomicU64,
     current: ArcSwap<Generation>,
+    quic_limits: h3::Limits,
     registry: ChallengeRegistry,
     managed: Arc<HotCertificateResolver>,
     challenge_resolver: Arc<HotCertificateResolver>,
@@ -141,6 +143,7 @@ struct Generation {
     id: u64,
     activity: Arc<BusinessGeneration>,
     servers: HashMap<SocketAddr, Arc<ActiveServer>>,
+    quic: HashMap<SocketAddr, h3::Listener>,
     retiring: HashMap<SocketAddr, std::sync::Weak<lifecycle::RetiringBinding>>,
     drain: CancellationToken,
     managed_names: Vec<Vec<String>>,
@@ -294,6 +297,7 @@ impl HttpRuntime {
             id: 0,
             activity: activity.clone(),
             servers: HashMap::new(),
+            quic: HashMap::new(),
             retiring: HashMap::new(),
             drain: activity.drain.clone(),
             managed_names: Vec::new(),
@@ -305,6 +309,7 @@ impl HttpRuntime {
         Self {
             inner: Arc::new(Inner {
                 current: ArcSwap::from_pointee(initial),
+            quic_limits: h3::Limits::new(),
                 tls_executor: std::sync::OnceLock::new(),
                 tls_executor_init: std::sync::Mutex::new(()),
                 tls_executor_failure: std::sync::atomic::AtomicU8::new(0),
@@ -830,7 +835,8 @@ async fn accept_loop(
             .current
             .load()
             .business(&key)
-            .map(|(server, _)| server);
+            .map(|(server, _)| server)
+            .filter(|server|h3::tcp_enabled(server));
         let canonical =
             |address: SocketAddr| SocketAddr::new(address.ip().to_canonical(), address.port());
         let peer = canonical(peer);
@@ -975,10 +981,10 @@ async fn serve_connection<I>(
             // current. A retire/join cannot observe zero and later miss a live
             // request admitted against a superseded snapshot.
             let mut view_retries = 0usize;
-            let (current, business) = loop {
+            let (current, business, alt_svc) = loop {
                 let snapshot = inner.current.load_full();
                 let Some((current, activity)) = snapshot.business(&key) else {
-                    break (None, None);
+                    break (None, None, None);
                 };
                 let business = activity.begin();
                 let latest = inner.current.load_full();
@@ -995,9 +1001,11 @@ async fn serve_connection<I>(
                     continue;
                 }
                 let Ok(business) = business else {
-                    break (None, None);
+                    break (None, None, None);
                 };
-                break (Some(current), Some(business));
+                let alt_svc = tls.then(||snapshot.quic.get(&key)).flatten()
+                    .map(|entry|entry.binding.advertisement.clone());
+                break (Some(current), Some(business), alt_svc);
             };
             let verdict = match (identity.as_ref(), current.as_ref()) {
                 (Some(identity), Some(current)) => {
@@ -1073,6 +1081,9 @@ async fn serve_connection<I>(
             if let Some(details)=tls_details {
                 request.extensions_mut().insert(details);
             }
+            if let Some(alt_svc)=alt_svc {
+                request.extensions_mut().insert(alt_svc);
+            }
             let fault = metadata.fault.clone();
             if !metadata.is_empty() {
                 request.extensions_mut().insert(metadata);
@@ -1086,7 +1097,11 @@ async fn serve_connection<I>(
                 },
                 response = async {
                     if let Some(proof)=proof { proof }
-                    else { request::handle_business(inner,current,request,peer,local,tls,business.clone()).await }
+                    else {
+                        let mut request=request;
+                        let informational=hyper::ext::InformationalSender::take(&mut request).map(request::InformationalOutput::Http);
+                        request::handle_business(inner,current,request,request::RequestOrigin { peer,local,tls },business.clone(),informational).await
+                    }
                 } => response,
             };
             if close_after {

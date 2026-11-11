@@ -1,7 +1,8 @@
 use super::*;
 use crate::http_config::{helpers::replace, types::*};
 use base64::Engine;
-use http::{HeaderMap, HeaderName, HeaderValue, Method, Uri, Version};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, Uri, Version, header};
+use hyper::body::Body as _;
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
@@ -33,7 +34,7 @@ pub(super) struct Context {
     pub original_uri: Uri,
     pub values: HashMap<String, String>,
     pub immediate: HeaderMap,
-    informational: Option<hyper::ext::InformationalSender>,
+    informational: Option<InformationalOutput>,
     wrote_interim: bool,
     close_after_response: bool,
     deferred: Vec<HeaderOps>,
@@ -242,15 +243,25 @@ fn proof_for_authority<B>(
     }
     None
 }
-pub(super) async fn handle_business(
+pub(super) struct RequestOrigin {
+    pub peer: SocketAddr,
+    pub local: SocketAddr,
+    pub tls: bool,
+}
+
+pub(super) async fn handle_business<B>(
     inner: Arc<Inner>,
     server: Arc<ActiveServer>,
-    mut request: Request<Incoming>,
-    peer: SocketAddr,
-    local: SocketAddr,
-    tls: bool,
+    mut request: Request<B>,
+    origin: RequestOrigin,
     business: Arc<BusinessGuard>,
-) -> Response<Body> {
+    informational: Option<InformationalOutput>,
+) -> Response<Body>
+where
+    B: hyper::body::Body<Data=Bytes> + Unpin + Send + 'static,
+    B::Error: Into<BoxError>,
+{
+    let RequestOrigin {peer,local,tls}=origin;
     let authority = match request_authority(&request) {
         Ok(authority) => authority,
         Err(()) => return simple(StatusCode::BAD_REQUEST, "Bad Request\n"),
@@ -285,7 +296,8 @@ pub(super) async fn handle_business(
         .get::<super::trailer_policy::RequestMetadata>()
         .cloned()
         .unwrap_or_default();
-    let informational = hyper::ext::InformationalSender::take(&mut request);
+    let http3 = request.version() == Version::HTTP_3;
+    let alt_svc = request.extensions().get::<super::h3::AltSvc>().cloned();
     let (parts, body) = request.into_parts();
     let body = super::trailer_policy::validate_incoming(body, &trailer_metadata);
     let body = IdleBody::new(body, server.plan.read_idle_timeout);
@@ -317,6 +329,9 @@ pub(super) async fn handle_business(
         immediate: {
             let mut h = HeaderMap::new();
             h.insert(http::header::SERVER, HeaderValue::from_static("Caddy"));
+            if let Some(alt_svc) = alt_svc {
+                h.insert(http::header::ALT_SVC,alt_svc.0);
+            }
             h
         },
         informational,
@@ -371,6 +386,14 @@ pub(super) async fn handle_business(
         .as_ref()
         .is_some_and(|r| r.method() == Method::HEAD)
     {
+        if http3
+            && !response.headers().contains_key(header::CONTENT_LENGTH)
+            && !matches!(response.status(),StatusCode::NO_CONTENT|StatusCode::NOT_MODIFIED)
+            && let Some(length)=response.body().size_hint().exact()
+            && let Ok(value)=HeaderValue::from_str(&length.to_string())
+        {
+            response.headers_mut().insert(header::CONTENT_LENGTH,value);
+        }
         *response.body_mut() = full(Bytes::new());
     }
     if let Some(access) = access.filter(|_| !ctx.skip_access) {
@@ -1192,6 +1215,11 @@ pub(super) fn record_suppressed_informational() {
     SUPPRESSED_INFORMATIONAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+pub(super) enum InformationalOutput {
+    Http(hyper::ext::InformationalSender),
+    Quic(super::h3::stream::InterimWriter),
+}
+
 pub(super) fn accepts_informational(ctx: &Context) -> bool {
     ctx.informational.is_some()
 }
@@ -1234,13 +1262,16 @@ async fn write_informational(
     let mut response = Response::new(());
     *response.status_mut() = status;
     *response.headers_mut() = fields;
-    if let Err(error) = sender.send(response).await {
-        if error.is_limit() {
-            // No header values or user input belong in this diagnostic.
-            record_suppressed_informational();
-        } else {
-            return Err(error.into());
-        }
+    let suppressed = match sender {
+        InformationalOutput::Http(sender) => match sender.send(response).await {
+            Ok(()) => false,
+            Err(error) if error.is_limit() => true,
+            Err(error) => return Err(error.into()),
+        },
+        InformationalOutput::Quic(sender) => sender.send(response).await?,
+    };
+    if suppressed {
+        record_suppressed_informational();
     }
     Ok(())
 }

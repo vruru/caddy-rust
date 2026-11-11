@@ -103,6 +103,7 @@ impl SignatureCompatibility {
 #[derive(Clone)]
 pub struct CertificateSelection {
     pub key: Arc<CertifiedKey>,
+    pub(crate) leaf_state: Option<Arc<LeafState>>,
     pub signature_compatibility: SignatureCompatibility,
 }
 
@@ -972,6 +973,7 @@ impl HotCertificateResolver {
             return Some(CertificateSelection {
                 key,
                 signature_compatibility: SignatureCompatibility::Tls12Or13,
+                leaf_state: None,
             });
         }
         let snapshot = self.certificates.read().ok()?.clone();
@@ -1004,6 +1006,7 @@ impl HotCertificateResolver {
                 key.key.choose_scheme(signature_schemes)?;
                 Some(CertificateSelection {
                     key,
+                    leaf_state: Some(entry.leaf_state.clone()),
                     signature_compatibility: if entry.tls13_key.is_some() {
                         SignatureCompatibility::Tls12Or13
                     } else {

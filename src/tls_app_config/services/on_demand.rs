@@ -296,6 +296,16 @@ struct Provider {
     state: Arc<OnDemand>,
 }
 impl ScopedCertificateProvider for Provider {
+    fn needs_quic_preflight(&self) -> bool {
+        self.service.upgrade().is_some_and(|service| {
+            service.plan.policies.iter().any(|policy| policy.on_demand)
+        })
+    }
+    fn can_acquire_quic_name(&self, name: &str) -> bool {
+        self.service.upgrade().is_some_and(|service| {
+            service.policy_index(name).is_some_and(|index| service.plan.policies[index].on_demand)
+        })
+    }
     fn cached_name(&self, name: &str) -> bool {
         self.state.cached(name)
     }
