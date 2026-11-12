@@ -22,7 +22,7 @@ Remaining standard modules/fields, remaining listener/address combinations, dist
 
 ## Build
 
-Use the official stable Rust toolchain (currently pinned to 1.99.1). GitHub Actions are not currently configured for this project.
+Use the official stable Rust toolchain (currently pinned to 1.100.0). GitHub Actions are not currently configured for this project.
 
 ```bash
 cargo build --locked --release --features native-run
