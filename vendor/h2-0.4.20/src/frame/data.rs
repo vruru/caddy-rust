@@ -8,12 +8,13 @@ use std::fmt;
 /// Data frames convey arbitrary, variable-length sequences of octets associated
 /// with a stream. One or more DATA frames are used, for instance, to carry HTTP
 /// request or response payloads.
-#[derive(Eq, PartialEq)]
 pub struct Data<T = Bytes> {
     stream_id: StreamId,
     data: T,
     flags: DataFlags,
     pad_len: Option<u8>,
+    receipt: Option<crate::data_receipt::QueuedDataOwner>,
+    source_owner: Option<crate::data_receipt::SourceDataOwner>,
 }
 
 #[derive(Copy, Clone, Default, Eq, PartialEq)]
@@ -33,7 +34,24 @@ impl<T> Data<T> {
             data: payload,
             flags: DataFlags::default(),
             pad_len: None,
+            receipt: None,
+            source_owner: None,
         }
+    }
+
+    pub(crate) fn set_receipt(
+        &mut self,
+        receipt: crate::data_receipt::QueuedDataOwner,
+        source: crate::data_receipt::SourceDataOwner,
+    ) {
+        self.receipt = Some(receipt);
+        self.source_owner = Some(source);
+    }
+    pub(crate) fn receipt(&self) -> Option<&crate::data_receipt::QueuedDataOwner> {
+        self.receipt.as_ref()
+    }
+    pub(crate) fn take_receipt(&mut self) -> Option<crate::data_receipt::QueuedDataOwner> {
+        self.receipt.take()
     }
 
     /// Returns the stream identifier that this frame is associated with.
@@ -112,6 +130,8 @@ impl<T> Data<T> {
             data: f(self.data),
             flags: self.flags,
             pad_len: self.pad_len,
+            receipt: self.receipt,
+            source_owner: self.source_owner,
         }
     }
 }
@@ -137,6 +157,8 @@ impl Data<Bytes> {
             data: payload,
             flags,
             pad_len,
+            receipt: None,
+            source_owner: None,
         })
     }
 
@@ -149,8 +171,6 @@ impl Data<Bytes> {
         }
     }
 }
-
-
 
 impl<T: Buf> Data<T> {
     /// Encode the data frame into the `dst` buffer.
@@ -236,3 +256,13 @@ impl fmt::Debug for DataFlags {
             .finish()
     }
 }
+
+impl<T: PartialEq> PartialEq for Data<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.stream_id == other.stream_id
+            && self.data == other.data
+            && self.flags == other.flags
+            && self.pad_len == other.pad_len
+    }
+}
+impl<T: Eq> Eq for Data<T> {}

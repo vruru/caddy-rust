@@ -29,6 +29,9 @@ pub(crate) mod go;
 mod go_string;
 mod go_write;
 mod go_buffer;
+#[cfg(feature="std")]mod formatter_scope;
+#[cfg(feature="std")]pub use formatter_scope::{FormatterScope,OwnedFormatterScope,FormatHostGuard};
+#[cfg(feature="std")]pub use go::sprintf_with_scope as go_sprintf_with_scope;
 mod go_print;
 mod go_unquote;
 mod go_unicode;
@@ -172,6 +175,8 @@ pub struct Template {
     tree: Option<ListNode>,
     defines: BTreeMap<GoKey, Arc<ListNode>>,
     funcs: Arc<BTreeMap<String, ValueFunc>>,
+    printf_identity:Option<ValueFunc>,
+    #[cfg(feature="std")]formatter_scope:Option<Arc<FormatterScope>>,
     left_delim: String,
     right_delim: String,
     missing_key: MissingKey,
@@ -227,11 +232,13 @@ impl Template {
     /// The name is used in error messages and when invoking templates via
     /// `{{template "name"}}`. Built-in functions are registered automatically.
     pub fn new(name: &str) -> Self {
+        let funcs=shared_builtins();let printf_identity=funcs.get("printf").cloned();
         Template {
             name: name.to_string(),
             tree: None,
             defines: BTreeMap::new(),
-            funcs: shared_builtins(),
+            funcs,printf_identity,
+            #[cfg(feature="std")]formatter_scope:None,
             left_delim: "{{".to_string(),
             right_delim: "}}".to_string(),
             missing_key: MissingKey::default(),
@@ -264,6 +271,25 @@ impl Template {
     /// Attach Go argument kinds without changing the function-map API.
     pub fn function_signatures(mut self,signatures:BTreeMap<String,Signature>)->Self {
         self.function_signatures=signatures;self
+    }
+
+    /// Bind only the library's current printf registration. Custom overrides,
+    /// before or after this call, retain their original identity and behavior.
+    #[cfg(feature="std")]
+    pub fn with_formatter_scope(mut self,scope:Arc<FormatterScope>)->Result<Self>{
+        self.formatter_scope=Some(scope.clone());
+        let original=self.printf_identity.as_ref().is_some_and(|id|self.funcs.get("printf").is_some_and(|current|Arc::ptr_eq(id,current)));
+        if original{
+            scope.metadata(self.funcs.iter().try_fold(256usize,|n,(key,_)|n.checked_add(key.len()+160)).ok_or_else(||TemplateError::Exec("formatter registration size overflow".into()))?)?;
+            let limit=self.value_limit;
+            let function:ValueFunc=Arc::new(move|args|{
+                funcs::check_min_args("printf",args,1)?;
+                let format=args[0].as_go_bytes().ok_or_else(||TemplateError::Exec("printf: first argument must be string".into()))?;
+                let bytes=go::sprintf_with_scope(format,&args[1..],scope.clone())?;
+                scope.value(bytes,limit)
+            });
+            Arc::make_mut(&mut self.funcs).insert("printf".into(),function.clone());self.printf_identity=Some(function);
+        }Ok(self)
     }
 
     /// Set a request-local dynamic namespace. The callback must release any
@@ -354,6 +380,7 @@ impl Template {
         name: &str,
         f: impl Fn(&[Value]) -> Result<Value> + Send + Sync + 'static,
     ) -> Self {
+        if name=="printf"{self.printf_identity=None;}
         Arc::make_mut(&mut self.funcs).insert(name.to_string(), Arc::new(f));
         self
     }
@@ -384,6 +411,7 @@ impl Template {
     /// ```
     #[must_use]
     pub fn funcs(mut self, func_map: FuncMap) -> Self {
+        if func_map.contains_key("printf"){self.printf_identity=None;}
         Arc::make_mut(&mut self.funcs).extend(func_map);
         self
     }
@@ -811,6 +839,7 @@ impl Template {
         executor.set_missing_key(self.missing_key);
         executor.set_max_range_iters(self.max_range_iters);
         executor.execution_charge = self.execution_charge.clone();
+        #[cfg(feature="std")] {executor.formatter_scope=self.formatter_scope.clone();}
         executor.value_limit=self.value_limit;executor.output_limit=self.output_limit;
         executor.function_signatures=self.function_signatures.clone();
         #[cfg(not(feature = "html"))]
@@ -1093,7 +1122,8 @@ impl Clone for Template {
             name: self.name.clone(),
             tree: self.tree.clone(),
             defines: self.defines.clone(),
-            funcs: self.funcs.clone(),
+            funcs: self.funcs.clone(),printf_identity:self.printf_identity.clone(),
+            #[cfg(feature="std")]formatter_scope:self.formatter_scope.clone(),
             left_delim: self.left_delim.clone(),
             right_delim: self.right_delim.clone(),
             missing_key: self.missing_key,

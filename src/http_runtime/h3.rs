@@ -10,6 +10,7 @@ use std::{net::UdpSocket, sync::Weak};
 use tokio::{sync::Semaphore, task::JoinSet, time::Instant};
 
 mod hello;
+mod write_control;
 mod sessions;
 pub(super) mod stream;
 pub(super) type Pool = HashMap<SocketAddr, Weak<Binding>>;
@@ -558,7 +559,7 @@ async fn accept_loop(
         let runtime = inner.clone();
         inner.tasks.spawn(async move {
             let _connection_slot=(connection_slot,process_connection);
-            let budget = server.plan.read_header_timeout.min(Duration::from_secs(15));
+            let budget = server.plan.read_header_timeout.unwrap_or(Duration::from_secs(15)).min(Duration::from_secs(15));
             let deadline = Instant::now() + budget;
             let Some(first) = server.tls_policies.first() else { return; };
             let certificate_ip = if local.ip().is_unspecified() { String::new() }
@@ -841,7 +842,7 @@ async fn serve_connection(
         _=activity.superseded.cancelled()=>return,
         _=activity.drain.cancelled()=>return,
         value=tokio::time::timeout(
-            server.plan.read_header_timeout.min(Duration::from_secs(5)),
+            server.plan.read_header_timeout.unwrap_or(Duration::from_secs(5)).min(Duration::from_secs(5)),
             builder.build(h3_quinn::Connection::new(quic.clone()))
         )=>match value {Ok(Ok(value))=>value,_=>return},
     };
@@ -907,7 +908,18 @@ async fn serve_connection(
                 let quic_for_stream=quic.clone();
                 streams.spawn(async move {
                     let _stream_slot=stream_slot;
-                    let Ok(Ok((mut request,wire)))=tokio::time::timeout(server.plan.read_header_timeout,resolver.resolve_request()).await else{return;};
+                    let head = async {
+                        match server.plan.read_header_timeout {
+                            Some(timeout) => tokio::time::timeout(timeout, resolver.resolve_request()).await.ok()?.ok(),
+                            None => resolver.resolve_request().await.ok(),
+                        }
+                    };
+                    let Some((mut request,wire)) = (tokio::select! { biased;
+                        _=activity.hard_stop.cancelled()=>None,
+                        _=activity.superseded.cancelled()=>None,
+                        _=activity.drain.cancelled()=>None,
+                        value=head=>value,
+                    }) else { return; };
                     let Ok(business)=activity.begin() else {return;};
                     if !runtime.current.load().business(&peer.key)
                         .is_some_and(|(s,a)|Arc::ptr_eq(&s,&server)&&Arc::ptr_eq(&a,&activity))
@@ -929,7 +941,7 @@ async fn serve_connection(
                     let task=async move {
                         let (interim, receiver) = stream::interim_channel();
                         let response = request::handle_business(runtime,server,request,request::RequestOrigin { peer:crate::net_address::NetAddress::udp(canonical(peer.peer)), local:crate::net_address::NetAddress::udp(canonical(peer.local)), tls:true, sni:sni.as_deref() },business.clone(),Some(request::InformationalOutput::Quic(interim)));
-                        let _=stream::drive(wire,receiver,response,head).await;
+                        let _=stream::drive(wire,receiver,response,head,quic_for_stream).await;
                         drop(business);
                     };
                     tokio::select! { biased;

@@ -123,6 +123,13 @@ pub(super) fn response_header(headers:Arc<Mutex<HeaderMap>>)->Value{
     let Value::Object(inner)=&wrapped else{return Value::Nil;};
     object(Fields::from([("Header".into(),header)]),inner.methods.clone())
 }
+pub(super) fn header_format_cost(value:&Value)->RenderResult<Option<usize>>{
+    let Value::Object(object)=value else{return Ok(None);};
+    let Some(headers)=object.data.as_ref().and_then(|data|data.downcast_ref::<Mutex<HeaderMap>>())else{return Ok(None);};
+    let headers=lock(headers)?;let mut bytes=4096usize;
+    for name in headers.keys(){bytes=bytes.checked_add(name.as_str().len()*4+512).ok_or_else(||error("header formatting size overflow"))?;for value in headers.get_all(name){bytes=bytes.checked_add(value.as_bytes().len()*4+256).ok_or_else(||error("header formatting size overflow"))?;}}
+    Ok(Some(bytes))
+}
 pub(super) fn header_value(headers:Arc<Mutex<HeaderMap>>,writable:bool)->Value{
     let mut methods=BTreeMap::<Arc<str>,ValueFunc>::new();
     let names=if writable{vec!["Get","Values","Set","Add","Del"]}else{vec!["Get","Values"]};
@@ -131,26 +138,28 @@ pub(super) fn header_value(headers:Arc<Mutex<HeaderMap>>,writable:bool)->Value{
         let field=match HeaderName::from_bytes(text(args,0)?.as_bytes()){
             Ok(field)=>field,
             Err(_)if name=="Get"=>return Ok(string("")),
-            Err(_)if name=="Values"=>return Ok(Value::List(Vec::new().into())),
+            Err(_)if name=="Values"=>return Ok(Value::Slice(gotmpl::TypedSlice::nil("[]string"))),
             Err(_)if name=="Del"=>return Ok(string("")),
             Err(_)=>return Err(error("invalid template response header name")),
         };
         let mut headers=lock(&headers)?;
         match name{
-            "Get"=>Ok(string(headers.get(field).and_then(|v|v.to_str().ok()).unwrap_or_default())),
-            "Values"=>Ok(Value::List(headers.get_all(field).iter().map(|v|string(v.to_str().unwrap_or_default())).collect::<Vec<_>>().into())),
-            "Set"|"Add"=>{let value=HeaderValue::from_str(text(args,1)?).map_err(|_|error("invalid template response header value"))?;if name=="Set"{headers.insert(field,value);}else{headers.append(field,value);}Ok(string(""))}
+            "Get"=>Ok(Value::from_go_bytes(headers.get(field).map_or(b"".as_slice(),|v|v.as_bytes()))),
+            "Values"=>{let values=headers.get_all(field).iter().map(|v|Value::from_go_bytes(v.as_bytes())).collect::<Vec<_>>();Ok(Value::Slice(gotmpl::TypedSlice::values("[]string",(!values.is_empty()).then(||values.into()))?))},
+            "Set"|"Add"=>{let value=HeaderValue::from_bytes(args.get(1).and_then(Value::as_go_bytes).ok_or_else(||error("template host requires string argument"))?).map_err(|_|error("invalid template response header value"))?;if name=="Set"{headers.insert(field,value);}else{headers.append(field,value);}Ok(string(""))}
             "Del"=>{headers.remove(field);Ok(string(""))}
             _=>Err(error("unknown header method")),
         }
     }));}
+    // Reuse the existing HeaderMap Arc as the preflight payload: no tag allocation.
+    let format_data=headers.clone();
     let snapshot=Arc::new(move||{
         let headers=lock(&headers)?;
         let mut fields=Fields::new();
-        for name in headers.keys(){let values=headers.get_all(name).iter().map(|v|string(v.to_str().unwrap_or_default())).collect::<Vec<_>>();fields.insert(canonical(name.as_str()).into(),Value::List(values.into()));}
+        for name in headers.keys(){let values=headers.get_all(name).iter().map(|v|Value::from_go_bytes(v.as_bytes())).collect::<Vec<_>>();fields.insert(canonical(name.as_str()).into(),Value::Slice(gotmpl::TypedSlice::values("[]string",Some(values.into()))?));}
         Ok(gotmpl::GoMapSnapshot::Utf8(Arc::new(fields)))
     });
-    Value::Object(Arc::new(Object{fields:Fields::new(),methods,map_view:Some(MapView{is_nil:Arc::new(||false),type_name:"http.Header",snapshot,zero:Value::List(Vec::new().into())}),..Object::default()}))
+    Value::Object(Arc::new(Object{data:Some(format_data),fields:Fields::new(),methods,map_view:Some(MapView{is_nil:Arc::new(||false),type_name:"http.Header",snapshot,zero:Value::Slice(gotmpl::TypedSlice::nil("[]string"))}),..Object::default()}))
 }
 fn decode(input:&str)->RenderResult<String>{percent_encoding::percent_decode_str(input).decode_utf8().map(|s|s.into_owned()).map_err(|_|error("URL contains unrepresentable byte string"))}
 fn url_value(uri:&Uri,control:&Arc<super::Control>)->RenderResult<Value>{

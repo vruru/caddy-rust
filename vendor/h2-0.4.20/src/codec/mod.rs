@@ -161,6 +161,19 @@ where
             .buffer_with_send_completion(item, completion)
     }
 
+    pub(crate) fn buffer_with_receipts(
+        &mut self,
+        item: Frame<B>,
+        completion: Option<crate::ext::SendCompletionOwner>,
+        data: Option<crate::data_receipt::DataFragmentOwner>,
+    ) -> Result<(), UserError> {
+        if data.is_none() {
+            return self.buffer_with_send_completion(item, completion);
+        }
+        self.framed_write()
+            .buffer_with_receipts(item, completion, data)
+    }
+
     pub fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
         self.framed_write().buffer(item)
     }
@@ -223,3 +236,5 @@ where
         Self::new(src)
     }
 }
+
+pub(crate) mod wire_progress;

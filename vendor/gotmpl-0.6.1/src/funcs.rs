@@ -309,7 +309,7 @@ fn check_args(name: &str, args: &[Value], expected: usize) -> Result<()> {
     Ok(())
 }
 
-fn check_min_args(name: &str, args: &[Value], min: usize) -> Result<()> {
+pub(crate) fn check_min_args(name: &str, args: &[Value], min: usize) -> Result<()> {
     if args.len() < min {
         return Err(TemplateError::ArgCount {
             name: name.to_string(),

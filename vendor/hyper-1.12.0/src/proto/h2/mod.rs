@@ -14,7 +14,13 @@ use pin_project_lite::pin_project;
 use crate::body::Body;
 
 pub(crate) mod ping;
+#[cfg(feature = "server")]
+mod response_write;
 pub(crate) mod upgrade;
+#[cfg(feature = "server")]
+type OptControlled<D> = Option<Box<response_write::Controlled<D>>>;
+#[cfg(not(feature = "server"))]
+type OptControlled<D> = std::marker::PhantomData<D>;
 
 cfg_client! {
     pub(crate) mod client;
@@ -103,6 +109,7 @@ pin_project! {
         // it survives across `Poll::Pending` returns from `poll_capacity`; if
         // we left the chunk in a local, it would be dropped on every repoll.
         buffered_data: Option<Peeked<S::Data>>,
+        controlled: OptControlled<S::Data>,
         #[pin]
         stream: S,
     }
@@ -122,10 +129,29 @@ where
             body_tx: tx,
             data_done: false,
             buffered_data: None,
+            controlled: Default::default(),
             stream,
         }
     }
 
+    #[cfg(feature = "server")]
+    fn new_controlled(
+        stream: S,
+        tx: SendStream<SendBuf<S::Data>>,
+        owner: crate::ext::ResponseWriteOwner,
+        timer: crate::common::time::Time,
+        head: h2::ext::DataWriteReceipt<SendBuf<S::Data>>,
+        ended: bool,
+    ) -> Self
+    where
+        S::Data: 'static,
+    {
+        let mut pipe = Self::new(stream, tx);
+        pipe.controlled = Some(Box::new(response_write::Controlled::new(
+            owner, timer, head, ended,
+        )));
+        pipe
+    }
     #[cfg(feature = "client")]
     fn send_reset(self: Pin<&mut Self>, reason: h2::Reason) {
         self.project().body_tx.send_reset(reason);
@@ -141,6 +167,10 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut me = self.project();
+        #[cfg(feature = "server")]
+        if let Some(controlled) = me.controlled.as_mut() {
+            return controlled.poll(me.stream.as_mut(), me.body_tx, cx);
+        }
         loop {
             // Register for RST_STREAM notification while we wait for the next
             // body chunk or for send capacity, so the task wakes up if the
@@ -287,6 +317,8 @@ impl<B: Buf> SendStreamExt for SendStream<SendBuf<B>> {
 #[repr(usize)]
 enum SendBuf<B> {
     Buf(B),
+    #[cfg(feature = "server")]
+    Observed(bytes::Bytes),
     Cursor(Cursor<Box<[u8]>>),
     None,
 }
@@ -296,6 +328,8 @@ impl<B: Buf> Buf for SendBuf<B> {
     fn remaining(&self) -> usize {
         match self {
             Self::Buf(b) => b.remaining(),
+            #[cfg(feature = "server")]
+            Self::Observed(b) => b.remaining(),
             Self::Cursor(c) => Buf::remaining(c),
             Self::None => 0,
         }
@@ -305,6 +339,8 @@ impl<B: Buf> Buf for SendBuf<B> {
     fn chunk(&self) -> &[u8] {
         match self {
             Self::Buf(b) => b.chunk(),
+            #[cfg(feature = "server")]
+            Self::Observed(b) => b.chunk(),
             Self::Cursor(c) => c.chunk(),
             Self::None => &[],
         }
@@ -314,6 +350,8 @@ impl<B: Buf> Buf for SendBuf<B> {
     fn advance(&mut self, cnt: usize) {
         match self {
             Self::Buf(b) => b.advance(cnt),
+            #[cfg(feature = "server")]
+            Self::Observed(b) => b.advance(cnt),
             Self::Cursor(c) => c.advance(cnt),
             Self::None => {}
         }
@@ -322,6 +360,8 @@ impl<B: Buf> Buf for SendBuf<B> {
     fn chunks_vectored<'data>(&'data self, dst: &mut [IoSlice<'data>]) -> usize {
         match self {
             Self::Buf(b) => b.chunks_vectored(dst),
+            #[cfg(feature = "server")]
+            Self::Observed(b) => b.chunks_vectored(dst),
             Self::Cursor(c) => c.chunks_vectored(dst),
             Self::None => 0,
         }

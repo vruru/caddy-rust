@@ -19,7 +19,6 @@ const MAX_HEADER_LIST_ABUSE_MULTIPLIER: usize = 4;
 /// Header frame
 ///
 /// This could be either a request or a response.
-#[derive(Eq, PartialEq)]
 pub struct Headers {
     /// The ID of the stream with which this frame is associated.
     stream_id: StreamId,
@@ -32,6 +31,8 @@ pub struct Headers {
 
     /// The associated flags
     flags: HeadersFlag,
+    receipt: Option<crate::data_receipt::QueuedDataOwner>,
+    source_owner: Option<crate::data_receipt::SourceDataOwner>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -115,7 +116,27 @@ const ALL: u8 = END_STREAM | END_HEADERS | PADDED | PRIORITY;
 
 // ===== impl Headers =====
 
+impl PartialEq for Headers {
+    fn eq(&self, other: &Self) -> bool {
+        self.stream_id == other.stream_id
+            && self.stream_dep == other.stream_dep
+            && self.header_block == other.header_block
+            && self.flags == other.flags
+    }
+}
+impl Eq for Headers {}
 impl Headers {
+    pub(crate) fn set_receipt(
+        &mut self,
+        receipt: crate::data_receipt::QueuedDataOwner,
+        source: crate::data_receipt::SourceDataOwner,
+    ) {
+        self.receipt = Some(receipt);
+        self.source_owner = Some(source);
+    }
+    pub(crate) fn take_receipt(&mut self) -> Option<crate::data_receipt::QueuedDataOwner> {
+        self.receipt.take()
+    }
     /// Create a new HEADERS frame
     pub fn new(stream_id: StreamId, pseudo: Pseudo, fields: HeaderMap) -> Self {
         Headers {
@@ -128,6 +149,8 @@ impl Headers {
                 pseudo,
             },
             flags: HeadersFlag::default(),
+            receipt: None,
+            source_owner: None,
         }
     }
 
@@ -145,6 +168,8 @@ impl Headers {
                 pseudo: Pseudo::default(),
             },
             flags,
+            receipt: None,
+            source_owner: None,
         }
     }
 
@@ -210,6 +235,8 @@ impl Headers {
                 pseudo: Pseudo::default(),
             },
             flags,
+            receipt: None,
+            source_owner: None,
         };
 
         Ok((headers, src))
@@ -1038,5 +1065,3 @@ fn calculate_headermap_size(map: &HeaderMap) -> usize {
 fn decoded_header_size(name: usize, value: usize) -> usize {
     name + value + 32
 }
-
-

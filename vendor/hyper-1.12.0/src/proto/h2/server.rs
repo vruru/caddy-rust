@@ -21,7 +21,7 @@ use crate::headers;
 use crate::proto::h2::ping::Recorder;
 use crate::proto::Dispatched;
 use crate::rt::bounds::{Http2ServerConnExec, Http2UpgradedExec};
-use crate::rt::{Read, Write, Sleep};
+use crate::rt::{Read, Sleep, Write};
 use crate::service::HttpService;
 
 use crate::upgrade::{OnUpgrade, Pending, Upgraded};
@@ -275,8 +275,13 @@ where
         E: Http2ServerConnExec<S::Future, B>,
     {
         if let Some(closing) = &mut self.idle_closing {
-            if self.conn.poll_closed(cx).map_err(crate::Error::new_h2)?.is_ready()
-                || closing.as_mut().poll(cx).is_ready() {
+            if self
+                .conn
+                .poll_closed(cx)
+                .map_err(crate::Error::new_h2)?
+                .is_ready()
+                || closing.as_mut().poll(cx).is_ready()
+            {
                 return Poll::Ready(Ok(()));
             }
             return Poll::Pending;
@@ -286,10 +291,14 @@ where
                 self.poll_ping(cx);
 
                 let next = match self.conn.poll_accept(cx) {
-                    Poll::Ready(next) => { self.idle = None; next },
+                    Poll::Ready(next) => {
+                        self.idle = None;
+                        next
+                    }
                     Poll::Pending => {
-                        if self.conn.has_active_streams() { self.idle = None; }
-                        else if let Some(duration) = self.idle_timeout {
+                        if self.conn.has_active_streams() {
+                            self.idle = None;
+                        } else if let Some(duration) = self.idle_timeout {
                             let sleep = self.idle.get_or_insert_with(|| self.timer.sleep(duration));
                             if sleep.as_mut().poll(cx).is_ready() {
                                 self.conn.graceful_shutdown();
@@ -302,7 +311,7 @@ where
                             }
                         }
                         return Poll::Pending;
-                    },
+                    }
                 };
                 match next {
                     Some(Ok((req, mut respond))) => {
@@ -322,7 +331,10 @@ where
                             let expects_continue = self.informational.is_some()
                                 && !stream.is_end_stream()
                                 && content_length != Some(0)
-                                && parts.headers.get_all(::http::header::EXPECT).iter()
+                                && parts
+                                    .headers
+                                    .get_all(::http::header::EXPECT)
+                                    .iter()
                                     .filter_map(|value| value.to_str().ok())
                                     .flat_map(|value| value.split(','))
                                     .any(|token| token.trim().eq_ignore_ascii_case("100-continue"));
@@ -359,9 +371,9 @@ where
                             req.extensions_mut().insert(Protocol::from_inner(protocol));
                         }
 
-                        let informational = self
-                            .informational
-                            .map(|limits| crate::ext::install_informational(&mut req, limits, None));
+                        let informational = self.informational.map(|limits| {
+                            crate::ext::install_informational(&mut req, limits, None)
+                        });
                         let fut = H2Stream::new(
                             service.call(req),
                             connect_parts,
@@ -370,6 +382,7 @@ where
                             exec.clone(),
                             informational,
                             ContinueOnRead::new(continue_demand),
+                            self.timer.clone(),
                         );
 
                         exec.execute_h2stream(fut);
@@ -427,6 +440,7 @@ pin_project! {
         #[pin]
         state: H2StreamState<F, B>,
         response_head: Option<h2::ext::SendCompletion>,
+        write_timer: Time,
         date_header: bool,
         exec: E,
     }
@@ -471,6 +485,7 @@ where
         exec: E,
         informational: Option<crate::ext::InformationalReceiver>,
         continue_on_read: ContinueOnRead,
+        write_timer: Time,
     ) -> H2Stream<F, B, E> {
         H2Stream {
             reply: respond,
@@ -481,6 +496,7 @@ where
                 continue_on_read,
             },
             response_head: None,
+            write_timer,
             date_header,
             exec,
         }
@@ -516,7 +532,9 @@ impl ContinueOnRead {
             if result.is_ok() && !self.sent {
                 let mut response = Response::new(());
                 *response.status_mut() = ::http::StatusCode::CONTINUE;
-                reply.send_informational(response).map_err(crate::Error::new_h2)?;
+                reply
+                    .send_informational(response)
+                    .map_err(crate::Error::new_h2)?;
                 self.sent = true;
             }
         }
@@ -682,6 +700,53 @@ where
                         }
                     }
 
+                    if let Some(control) = res
+                        .extensions_mut()
+                        .remove::<crate::ext::ResponseWriteControl>()
+                    {
+                        let owner = match control.claim() {
+                            Ok(owner) => owner,
+                            Err(e) => {
+                                me.reply.send_reset(Reason::CANCEL);
+                                return Poll::Ready(Err(crate::Error::new_body_write(e)));
+                            }
+                        };
+                        if std::any::TypeId::of::<B::Data>() != std::any::TypeId::of::<Bytes>() {
+                            me.reply.send_reset(Reason::CANCEL);
+                            return Poll::Ready(Err(crate::Error::new_body_write(
+                                "HTTP/2 controlled response requires Bytes data",
+                            )));
+                        }
+                        let ended = body.is_end_stream();
+                        if !ended {
+                            if let Some(len) = body.size_hint().exact() {
+                                headers::set_content_length_if_missing(res.headers_mut(), len);
+                            }
+                        }
+                        owner
+                            .start_boundary(0, me.write_timer.now())
+                            .map_err(crate::Error::new_body_write)?;
+                        let (body_tx, head) = me
+                            .reply
+                            .send_response_observed_with_policy(
+                                res,
+                                ended,
+                                owner.retention(),
+                                Some(super::response_write::compiled_policy(&owner).map_err(crate::Error::new_body_write)?),
+                            )
+                            .map_err(crate::Error::new_h2)?;
+                        me.state.set(H2StreamState::Body {
+                            pipe: PipeToSendStream::new_controlled(
+                                body,
+                                body_tx,
+                                owner,
+                                me.write_timer.clone(),
+                                head,
+                                ended,
+                            ),
+                        });
+                        continue;
+                    }
                     if !res.status().is_informational()
                         && res
                             .extensions_mut()

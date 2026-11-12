@@ -202,6 +202,15 @@ pub struct SendStream<'a> {
 
 #[allow(clippy::needless_lifetimes)] // Needed for cfg(fuzzing)
 impl<'a> SendStream<'a> {
+    /// Cumulative bytes accepted from this stream's writer. This is neither
+    /// transmission nor acknowledgement; it only scopes application framing.
+    pub fn written_offset(&self) -> Result<u64, ClosedStream> {
+        match self.state.send.get(&self.id) {
+            Some(Some(stream)) => Ok(stream.offset()),
+            Some(None) => Ok(0),
+            None => Err(ClosedStream { _private: () }),
+        }
+    }
     #[cfg(fuzzing)]
     pub fn new(
         id: StreamId,

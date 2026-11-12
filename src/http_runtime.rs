@@ -799,7 +799,7 @@ async fn prepare_servers(
                 trusted_proxies: Vec::new(),
                 trusted_strict: false,
                 client_ip_headers: vec!["X-Forwarded-For".into()],
-                read_header_timeout: Duration::from_secs(60),
+                read_header_timeout: Some(Duration::from_secs(60)),
                 listener_stack:Arc::new(listener_stack::Stack::default()),
                 read_idle_timeout: Duration::from_secs(60),
                 idle_timeout: Some(Duration::from_secs(300)),
@@ -975,13 +975,15 @@ async fn accept_loop(
         let admission = stream.admission();
         let eviction = stream.eviction_token();
         if let Some(server) = server {
-            spawn_admitted(&inner, eviction, async move {
+            spawn_admitted(&inner, eviction, Some((cancel.clone(), admission.clone())), async move {
                 let (mut peer,mut local)=(crate::net_address::NetAddress::from(peer),crate::net_address::NetAddress::from(local));
                 let accepted_listener_stack=server.plan.listener_stack.clone();
-                let Some(deadline) =
-                    tokio::time::Instant::now().checked_add(server.plan.read_header_timeout)
-                else {
-                    return;
+                let deadline = match server.plan.read_header_timeout {
+                    Some(timeout) => match tokio::time::Instant::now().checked_add(timeout) {
+                        Some(deadline) => Some(deadline),
+                        None => return,
+                    },
+                    None => None,
                 };
                 let stream = match listener_stack::prepare(
                     stream,&accepted_listener_stack.before,&mut peer,&mut local,deadline,
@@ -998,7 +1000,7 @@ async fn accept_loop(
                         stream,
                         admission.clone(),
                         key,
-                        Some(deadline),
+                        deadline,
                         server.plan.redirect_after_tls.is_none(),
                         (peer.clone(), local.clone()),
                     );
@@ -1017,10 +1019,12 @@ async fn accept_loop(
                         accepted.identity.server_name(),
                     )));
 
-                    let Some(deadline) =
-                        tokio::time::Instant::now().checked_add(server.plan.read_header_timeout)
-                    else {
-                        return;
+                    let deadline = match server.plan.read_header_timeout {
+                        Some(timeout) => match tokio::time::Instant::now().checked_add(timeout) {
+                            Some(deadline) => Some(deadline),
+                            None => return,
+                        },
+                        None => None,
                     };
                     let stream = match listener_stack::prepare(
                         accepted.stream,&accepted_listener_stack.after,&mut peer,&mut local,deadline,
@@ -1083,13 +1087,13 @@ async fn accept_loop(
             let proof = fallback.load_full();
             // A proof connection accepted before commit cannot turn into a
             // business connection after commit, even if it delays its headers.
-            spawn_admitted(&inner, eviction, async move {
+            spawn_admitted(&inner, eviction, None, async move {
                 if proof.cancel.is_cancelled() {
                     return;
                 }
                 let (mut peer,mut local)=(crate::net_address::NetAddress::from(peer),crate::net_address::NetAddress::from(local));
                 let deadline=tokio::time::Instant::now()+Duration::from_secs(10);
-                let stream=match listener_stack::prepare(stream,&proof.listener_stack.before,&mut peer,&mut local,deadline,proof.cancel.child_token()).await{
+                let stream=match listener_stack::prepare(stream,&proof.listener_stack.before,&mut peer,&mut local,Some(deadline),proof.cancel.child_token()).await{
                     Ok(stream)=>stream,Err(_)=>return,
                 };
                 if let Some(tls) = proof.tls.clone() {
@@ -1112,7 +1116,7 @@ async fn accept_loop(
                     }
                     // ACME ALPN never speaks HTTP after its handshake.
                 } else {
-                    let stream=match listener_stack::prepare(stream,&proof.listener_stack.after,&mut peer,&mut local,deadline,proof.cancel.child_token()).await{
+                    let stream=match listener_stack::prepare(stream,&proof.listener_stack.after,&mut peer,&mut local,Some(deadline),proof.cancel.child_token()).await{
                         Ok(stream)=>stream,Err(_)=>return,
                     };
                     serve_proof_connection(task_inner, TokioIo::new(stream), proof.cancel.clone()).await;
@@ -1124,10 +1128,20 @@ async fn accept_loop(
 fn spawn_admitted(
     inner: &Arc<Inner>,
     eviction: CancellationToken,
+    removed_listener: Option<(CancellationToken, std::sync::Weak<connection_budget::Admission>)>,
     future: impl std::future::Future<Output = ()> + Send + 'static,
 ) {
     inner.tasks.spawn(async move {
-        tokio::select! {biased;_=eviction.cancelled()=>{},_=future=>{}}
+        let removed = async move {
+            if let Some((removed, admission)) = removed_listener {
+                removed.cancelled().await;
+                if let Some(admission) = admission.upgrade() {
+                    admission.cancel_before_service();
+                }
+            }
+            std::future::pending::<()>().await
+        };
+        tokio::select! {biased;_=eviction.cancelled()=>{},_=removed=>{},_=future=>{}}
     });
 }
 async fn serve_proof_connection<I>(inner: Arc<Inner>, io: I, cancel: CancellationToken)
@@ -1195,6 +1209,7 @@ async fn serve_connection<I>(
     let requested_drain = CancellationToken::new();
     let service_drain = requested_drain.clone();
     let service = service_fn(move |mut request: Request<Incoming>| {
+        let service_entered = admission.upgrade().is_some_and(|owner| owner.enter_service());
         let inner = svc_inner.clone();
         let accepted_server = svc_server.clone();
         let identity = identity.clone();
@@ -1205,6 +1220,9 @@ async fn serve_connection<I>(
         let peer=peer.clone();let local=local.clone();let listener_stack=listener_stack.clone();
         let admission = admission.clone();
         async move {
+            if !service_entered {
+                return Err(h2::Error::from(h2::Reason::CANCEL));
+            }
             // Count admission before confirming that this exact view is still
             // current. A retire/join cannot observe zero and later miss a live
             // request admitted against a superseded snapshot.
@@ -1380,9 +1398,11 @@ async fn serve_connection<I>(
     // A negotiated H2 connection has the protocol's 10s preface window;
     // ReadHeaderTimeout is an HTTP/1 head deadline, not an H2 idle deadline.
     let protocol_timeout = if negotiated_tls_h2 == Some(true) {
-        Duration::from_secs(10)
+        Some(Duration::from_secs(10))
     } else { server.plan.read_header_timeout };
-    builder.protocol_read_timeout(protocol_timeout, TokioTimer::new());
+    if let Some(timeout) = protocol_timeout {
+        builder.protocol_read_timeout(timeout, TokioTimer::new());
+    }
     // The original HTTP/2 sender queues informational headers separately
     // from DATA flow control. Limit their aggregate per request/stream.
     builder.http2().timer(TokioTimer::new()).idle_timeout(server.plan.idle_timeout).informational_responses(

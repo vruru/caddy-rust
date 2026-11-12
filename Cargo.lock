@@ -1122,6 +1122,7 @@ dependencies = [
  "futures-sink",
  "http",
  "indexmap",
+ "native-write-policy",
  "slab",
  "tokio",
  "tokio-util",
@@ -1322,6 +1323,7 @@ dependencies = [
  "httparse",
  "httpdate",
  "itoa",
+ "native-write-policy",
  "pin-project-lite",
  "smallvec",
  "tokio",
@@ -1783,6 +1785,10 @@ checksum = "a198f9589efc03f544388dfc4a19fe8af4323662b62f598b8dcfdac62c14771c"
 dependencies = [
  "byteorder",
 ]
+
+[[package]]
+name = "native-write-policy"
+version = "0.1.0"
 
 [[package]]
 name = "ndk-context"
@@ -2327,6 +2333,7 @@ dependencies = [
  "bytes",
  "cfg_aliases",
  "futures-io",
+ "native-write-policy",
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",

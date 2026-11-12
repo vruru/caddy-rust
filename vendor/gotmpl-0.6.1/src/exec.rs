@@ -239,6 +239,7 @@ pub struct Executor<'a> {
     missing_key: MissingKey,
     range_iters_remaining: u64,
     pub(crate) execution_charge: Option<crate::ExecutionCharge>,
+    #[cfg(feature="std")]pub(crate) formatter_scope:Option<alloc::sync::Arc<crate::FormatterScope>>,
     pub(crate) value_limit:usize,pub(crate) output_limit:usize,
     pub(crate) function_signatures:BTreeMap<String,crate::Signature>,
     #[cfg(not(feature = "html"))]
@@ -347,6 +348,7 @@ impl<'a> Executor<'a> {
             missing_key: MissingKey::default(),
             range_iters_remaining: DEFAULT_MAX_RANGE_ITERS,
             execution_charge: None,
+            #[cfg(feature="std")]formatter_scope:None,
             value_limit:1<<20,output_limit:1<<20,
             function_signatures:BTreeMap::new(),
             #[cfg(not(feature = "html"))]
@@ -983,7 +985,8 @@ impl<'a> Executor<'a> {
         if self.execution_charge.is_none() {
             return Ok(());
         }
-        let bytes=measured_values(values,self.value_limit)?;
+        #[cfg(feature="std")]let bytes=if let Some(scope)=&self.formatter_scope{measured_values_scoped(values,self.value_limit,scope)?}else{measured_values(values,self.value_limit)?};
+        #[cfg(not(feature="std"))]let bytes=measured_values(values,self.value_limit)?;
         self.charge(1+bytes.div_ceil(128))
     }
 
@@ -1054,10 +1057,17 @@ impl<'a> Executor<'a> {
     }
 }
 
+struct MeasureContext<'a>{#[cfg(feature="std")]scope:Option<&'a crate::FormatterScope>,_marker:core::marker::PhantomData<&'a ()>}
 pub(crate) fn measured_values(values:&[Value],limit:usize)->Result<usize>{
-    let mut remaining=limit;let mut nodes=16_384usize;for value in values.iter(){measure_value(value,&mut remaining,&mut nodes,0)?;}Ok(limit-remaining)
+    let context=MeasureContext{#[cfg(feature="std")]scope:None,_marker:core::marker::PhantomData};
+    let mut remaining=limit;let mut nodes=16_384usize;for value in values{measure_value(value,&mut remaining,&mut nodes,0,&context)?;}Ok(limit-remaining)
 }
-fn measure_value(value: &Value, remaining: &mut usize, nodes:&mut usize, depth: usize) -> Result<()> {
+#[cfg(feature="std")]
+fn measured_values_scoped(values:&[Value],limit:usize,scope:&crate::FormatterScope)->Result<usize>{
+    let context=MeasureContext{scope:Some(scope),_marker:core::marker::PhantomData};
+    let mut remaining=limit;let mut nodes=16_384usize;for value in values{measure_value(value,&mut remaining,&mut nodes,0,&context)?;}Ok(limit-remaining)
+}
+fn measure_value(value: &Value, remaining: &mut usize, nodes:&mut usize, depth: usize, context:&MeasureContext<'_>) -> Result<()> {
     fn limit() -> TemplateError {
         TemplateError::Exec("template value exceeds execution limits".into())
     }
@@ -1066,23 +1076,25 @@ fn measure_value(value: &Value, remaining: &mut usize, nodes:&mut usize, depth: 
     }
     *nodes=nodes.checked_sub(1).ok_or_else(limit)?;
     *remaining = remaining.checked_sub(core::mem::size_of::<Value>().max(32)).ok_or_else(limit)?;
+    #[cfg(feature="std")]
+    let _host_guard=if let Some(scope)=context.scope{if matches!(value,Value::Object(object)if object.map_view.is_some()||(!object.lazy_fields&&object.dynamic_fields.is_some()&&!object.fields.is_empty())){scope.host(value)?}else{None}}else{None};
     match value {
         Value::ByteString(bytes)=>*remaining=remaining.checked_sub(bytes.as_bytes().len()).ok_or_else(limit)?,
         Value::String(text) => *remaining = remaining.checked_sub(text.len()).ok_or_else(limit)?,
-        Value::Slice(slice)=>{if let Some(values)=slice.retained_values(){for value in values.iter(){measure_value(value,remaining,nodes,depth+1)?;}}else{*remaining=remaining.checked_sub(slice.retained_len()).ok_or_else(limit)?;}},
+        Value::Slice(slice)=>{if let Some(values)=slice.retained_values(){for value in values.iter(){measure_value(value,remaining,nodes,depth+1,context)?;}}else{*remaining=remaining.checked_sub(slice.retained_len()).ok_or_else(limit)?;}},
         Value::List(values) => {
             for value in values.iter() {
-                measure_value(value, remaining,nodes, depth + 1)?;
+                measure_value(value, remaining,nodes,depth + 1,context)?;
             }
         }
         #[cfg(feature="std")] Value::GenericMap(map)=>{
             map.ensure_depth(depth)?;
-            for(key,value)in map.snapshot()?.iter(){measure_value(key,remaining,nodes,depth+1)?;measure_value(value,remaining,nodes,depth+1)?;}
+            for(key,value)in map.snapshot()?.iter(){measure_value(key,remaining,nodes,depth+1,context)?;measure_value(value,remaining,nodes,depth+1,context)?;}
         }
         Value::Map(values) => {
             for (key, value) in values.iter() {
                 *remaining = remaining.checked_sub(key.len()).ok_or_else(limit)?;
-                measure_value(value, remaining,nodes, depth + 1)?;
+                measure_value(value, remaining,nodes,depth + 1,context)?;
             }
         }
         #[cfg(feature = "std")]
@@ -1091,7 +1103,7 @@ fn measure_value(value: &Value, remaining: &mut usize, nodes:&mut usize, depth: 
             let snapshot=map.snapshot_go()?;
             for (key,value) in snapshot.iter() {
                 *remaining=remaining.checked_sub(key.len()).ok_or_else(limit)?;
-                measure_value(value,remaining,nodes,depth+1)?;
+                measure_value(value,remaining,nodes,depth+1,context)?;
             }
         }
         Value::NamedInt64(_,kind)=>{
@@ -1107,11 +1119,11 @@ fn measure_value(value: &Value, remaining: &mut usize, nodes:&mut usize, depth: 
             if let Some(display)=&object.display{*remaining=remaining.checked_sub(display.len()).ok_or_else(limit)?;}
             if let Some(view)=&object.map_view {
                 let snapshot=(view.snapshot)()?;
-                for(key,value)in snapshot.iter(){*remaining=remaining.checked_sub(key.as_bytes().len()).ok_or_else(limit)?;measure_value(value,remaining,nodes,depth+1)?;}
+                for(key,value)in snapshot.iter(){*remaining=remaining.checked_sub(key.as_bytes().len()).ok_or_else(limit)?;measure_value(value,remaining,nodes,depth+1,context)?;}
             }
             for (key, value) in &object.fields {
                 *remaining = remaining.checked_sub(key.len()).ok_or_else(limit)?;
-                if !object.lazy_fields&&object.dynamic_fields.is_some()&&!object.is_nil_pointer(){if let Some(value)=object.field_value(key)?{measure_value(&value,remaining,nodes,depth+1)?;}}else{measure_value(value, remaining,nodes, depth + 1)?;}
+                if !object.lazy_fields&&object.dynamic_fields.is_some()&&!object.is_nil_pointer(){if let Some(value)=object.field_value(key)?{measure_value(&value,remaining,nodes,depth+1,context)?;}}else{measure_value(value, remaining,nodes,depth + 1,context)?;}
             }
             for key in object.methods.keys() {
                 *remaining = remaining.checked_sub(key.len() + 32).ok_or_else(limit)?;

@@ -88,7 +88,6 @@
 // uncomment me to run benchmarks
 //#![cfg_attr(test, feature(test))]
 
-
 macro_rules! proto_err {
     (conn: $($msg:tt)+) => {
         tracing::debug!("connection error PROTOCOL_ERROR -- {};", format_args!($($msg)+))
@@ -127,6 +126,7 @@ mod frame;
 pub mod frame;
 
 pub mod client;
+mod data_receipt;
 pub mod ext;
 mod send_completion;
 pub mod server;

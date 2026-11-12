@@ -37,6 +37,13 @@ pub(crate) struct Buffered<T, B> {
     read_buf: BytesMut,
     read_buf_strategy: ReadStrategy,
     write_buf: WriteBuf<B>,
+    #[cfg(feature="server")]
+    pub(super) response_write:Option<Box<super::response_write::ObservedWrite>>,
+    // The first opted-in credit also covers reusable encoding capacity. Keep
+    // its concrete loan after response completion, until the real IO buffer
+    // and protocol owner fields above have actually been destroyed.
+    #[cfg(feature="server")]
+    pub(super) response_write_retention:Option<Bytes>,
 }
 
 impl<T, B> fmt::Debug for Buffered<T, B>
@@ -71,6 +78,10 @@ where
             read_buf: BytesMut::with_capacity(0),
             read_buf_strategy: ReadStrategy::default(),
             write_buf,
+            #[cfg(feature="server")]
+            response_write:None,
+            #[cfg(feature="server")]
+            response_write_retention:None,
         }
     }
 
@@ -281,6 +292,9 @@ where
     }
 
     fn poll_flush_inner(&mut self, cx: &mut Context<'_>, force: bool) -> Poll<io::Result<()>> {
+        #[cfg(feature="server")]
+        if self.response_write.is_some(){return self.poll_flush_observed(cx);}
+
         if !force && self.flush_pipeline && !self.read_buf.is_empty() {
             Poll::Ready(Ok(()))
         } else if self.write_buf.remaining() == 0 {
@@ -313,6 +327,28 @@ where
                 }
             }
             Pin::new(&mut self.io).poll_flush(cx)
+        }
+    }
+
+    // This is opted in only: every accepted wire segment is followed by a
+    // real underlying flush before another segment can extend idle/rate credit.
+    #[cfg(feature="server")]
+    fn poll_flush_observed(&mut self,cx:&mut Context<'_>)->Poll<io::Result<()>>{
+        loop {
+            if self.response_write.as_ref().expect("installed observer").needs_flush {
+                ready!(Pin::new(&mut self.io).poll_flush(cx))?;
+                self.response_write.as_mut().expect("installed observer").flushed()?;
+            }
+            if self.write_buf.remaining()==0{return Poll::Ready(Ok(()))}
+            let n=if let WriteStrategy::Flatten=self.write_buf.strategy {
+                ready!(Pin::new(&mut self.io).poll_write(cx,self.write_buf.headers.chunk()))?
+            }else{
+                let mut iovs=[IoSlice::new(&[]);64];let len=self.write_buf.chunks_vectored(&mut iovs);
+                ready!(Pin::new(&mut self.io).poll_write_vectored(cx,&iovs[..len]))?
+            };
+            if n==0{return Poll::Ready(Err(io::ErrorKind::WriteZero.into()))}
+            self.response_write.as_mut().expect("installed observer").accepted(n)?;
+            self.write_buf.advance(n);
         }
     }
 

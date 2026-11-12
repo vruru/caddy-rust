@@ -475,7 +475,113 @@ compares the complete original SPKI after strict X.509/duplicate-extension
 checks, avoiding an unrelated WebPKI whole-certificate size limit while still
 rejecting mismatched keys and malformed DER.
 
-Alternate-chain traversal currently remains sequential, including optional
-alternatives not needed by the default preference. Bounded concurrent optional
-fetching and recovery through a complete matching alternate when mandatory
-primary-chain `up` links fail remain separate compatibility work.
+Certificate-chain graphs fetch independent branches concurrently, with at
+most four certificate HTTP requests in flight. The slot covers HTTP send and
+body collection, not signing, parsing or recursion. Raw URL results share one
+fetch within a graph; recursion uses branch-local paths. Candidate order follows
+link declaration order regardless of completion timing, and size ranking keeps
+stable ties. Existing bounds remain 32 distinct endpoint retrievals, 128 visits,
+16 candidates and depth eight. Each endpoint retains the wire's bounded three
+badNonce attempts, so certificate POSTs can reach 96; nonce and order control
+requests are separate from that endpoint count.
+
+Two intentional native improvements are retained: a complete primary chain
+with no configured preference skips optional alternatives, and a failed mandatory
+primary `up` path can recover through a complete, verified same-leaf alternative.
+A bad optional branch cannot discard an intact primary. Delegated URL, signature,
+leaf identity, proxy and memory-admission checks apply equally to concurrent
+branches. Waiting for shared input credit requires an already-admitted operation
+in the same graph that can progress; otherwise admission returns a transient
+resource error instead of waiting indefinitely.
+
+Active graphs and abandoned-task joins register with both their manager's local
+tracker and the native certificate group's existing tracker. Outer cancellation
+and cancellation during final joins transfer real task ownership before active
+graph registration is released; native group retirement waits for those tasks.
+Standalone library callers cancel and join their issuance calls before awaiting
+`CertificateManager::drain_chain_cleanup`. Running CPU workers and their actual
+input/scratch owners remain charged until those workers and results are destroyed.
+These named limits retain the memory scope described above, not a whole-process
+RSS guarantee.
+
+
+## Internal physical-output deadline plumbing
+
+Native response controls now distinguish payload production, protocol buffering,
+local transport output and actual allocation ownership. HTTP/1 retains encoding
+credit through the real reusable connection buffer, observes interim and automatic
+100 responses, and defers a ready final response until that earlier boundary has
+flushed. HTTP/2 tracks bounded wire spans through HEADERS/CONTINUATION and DATA;
+progress on one stream does not extend another stream's deadline. HTTP/3 observes
+successful local UDP output, rather than treating QUIC queue acceptance or FIN
+submission as transmission. This is local output, not peer acknowledgement.
+
+The internal `native-write-policy` crate preserves the minimum of independently
+anchored server/route constraints, including rate/grace clauses whose deadlines
+cross. Concrete prepaid policy ownership follows the actual protocol boundary;
+logical completion, cancellation and the last allocation owner are separate facts.
+The pool accounts for its named Rust policy allocations, not whole-process RSS,
+existing HTTP headers, payload producers or QUIC retransmission storage. Native
+HTTP/1 and HTTP/2 metadata allowances are exposed separately; callers supplying
+retention guards must not make them refer back to their response control.
+
+These are internal, opt-in transport primitives. The Caddy `timeouts` route handler
+and the remaining server read/write timeout settings are still rejected until
+configuration, interim responses on all protocols, native admission, error paths,
+reload and combined runtime acceptance are complete. This plumbing alone does
+not mark that configuration feature as implemented.
+
+
+## Scoped builtin formatter ownership
+
+Builtin printf now uses an explicitly owned rendering scope. Its shared formatter buffer and temporary numeric buffers reserve capacity before allocation, including old/new growth and Vec-to-Arc conversion peaks. Formatted string/byte results retain refundable loans while any real Arc alias remains. A pressure sweep drops dead Weak backing allocations before refunding their loans, reuses registration slots and charges bounded traversal work.
+
+The actual admitted Tree owns the scope before its Control and memory token fields. Child Frames and httpInclude share that scope. Final response bytes retain Tree ownership through the actual transport owner; cancellation does not retire scope or memory credits while the OS renderer still runs. Dedicated meter callbacks capture only Weak<Control>, with no strong cycle; refunds do nothing after Control destruction. Scope and registration metadata have explicit loans; no permanent-debit orphan strategy is used.
+
+Public bounded formatting scopes reject unknown callback-based hosts by default. The online Frame uses its closed native factory/function set (CustomFuncs remains nil); existing TLS/BigInt/network factories retain their own prepayment contracts. Header map snapshots receive a scoped temporary peak reservation before both execution-argument measurement and formatting. Their preflight reuses the original HeaderMap Arc without allocating another metadata tag. Header snapshots and Values return actual []string (including typed nil missing values), and header byte strings preserve invalid UTF-8.
+
+This is a formatter allocation boundary, not a 64 MiB whole-engine heap guarantee. Parser/AST, namespace and arbitrary host-function allocations, Sprig transformations, container constructors/copies, final Template output and external host retention require independent gates. Allocating a new substring/copy is a new allocation family, not a tracked alias. Arbitrary Rust callbacks that store raw Values beyond the admitted graph are unsupported by this owner contract. The new registry is std-only; old no_std formatting APIs still compile and run, without an implicit unbudgeted online fallback.
+
+`%p` uses actual map identity, pointer pointees and the visible slice backing,
+including nil and non-nil empty slices. It bypasses Formatter/Stringer dispatch,
+as does Go. Width, precision and flags apply to pointer and invalid-verb output.
+A Rust closure's data pointer cannot establish a Go function code address; that
+public-library case is explicitly unsupported. Opaque host values without a
+native underlying representation also fail explicitly instead of invoking a
+formatter to invent an invalid-verb diagnostic. These boundaries and remaining
+Go fmt edge cases are not covered by old-formatter regression equality.
+
+
+## Optional request-header deadlines
+
+`read_header_timeout` accepts signed durations: missing, null and zero retain
+60 seconds; a positive duration sets that limit and a negative duration disables
+it. No zero-duration Tokio timeout substitutes for the disabled state. HTTP/1
+head parsing, initial protocol detection and before/after TLS listener wrappers
+propagate that option. PROXY wrappers retain their independently configured
+limits; proof listeners retain their separate admission deadlines. TLS admission
+still uses its existing CPU, queue, proof, pressure and connection budgets.
+
+HTTP/3 retains its independent handshake/control setup limits while allowing the
+request-header resolver limit to be disabled. Pending resolver futures also end
+on the actual generation's cancellation signals. Native continues to enforce a
+positive HTTP/3 header limit even though the pinned original ignores that setting
+there. The existing native negative-PROXY disable behavior is also retained;
+the original's immediate rejection is not copied. A genuinely removed listener
+cancels admitted non-proof connections that have not entered their first HTTP
+service call, including partial PROXY/TLS wrappers. The service-entry decision
+and removal cancellation serialize under the admission state lock; cancellation
+wakes outside that lock, and descriptor credit remains owned until actual IO
+destruction. Existing active requests/bodies and same-endpoint generation reuse
+retain their original retirement paths. This does not shorten a later keepalive
+request's disabled header timer.
+
+
+Template response-header bytes
+------------------------------
+
+Template RespHeader.Set/Add validate the actual string bytes before mutating
+the header map. Valid non-UTF-8 bytes and HTAB are preserved, including Add order.
+CR, LF and NUL are rejected without partial mutation. This intentionally differs
+from the baseline's H1 CR/LF rewriting and invalid NUL emission; accepting a
+malformed response field is not treated as additional useful compatibility.

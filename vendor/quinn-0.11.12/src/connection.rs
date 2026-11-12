@@ -49,6 +49,136 @@ impl Drop for SendStopObservation {
     }
 }
 
+/// Cumulative stream offsets accepted by this connection's actual UDP socket.
+/// This is local transmission, not peer acknowledgement or an allocation fence.
+#[cfg(feature = "native-stream-observer")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StreamTransmitSnapshot {
+    /// Greatest observed stream offset. Arm before the stream's first write;
+    /// callers must map HTTP/3 framing offsets to their own logical payload.
+    pub end: u64,
+    /// Whether a FIN-containing packet was locally transmitted.
+    pub fin: bool,
+    /// Monotonic local time of the latest new offset or FIN progress.
+    pub last_transmit: Option<Instant>,
+    /// Current concrete HTTP writer boundary, if one is armed.
+    pub operation: Option<crate::StreamWriteSnapshot>,
+}
+#[cfg(feature = "native-stream-observer")]
+#[derive(Debug, Default)]
+struct StreamTransmitState {
+    snapshot: StreamTransmitSnapshot,
+    operation: Option<crate::transmit_operation::Operation>,
+    waiter: Option<Waker>,
+}
+/// Read-only, bounded observation for a peer bidirectional server stream.
+/// It never keeps a connection alive or waits in Drop. Dead weak cache entries
+/// are pruned by the driver or the next registration, and bounded to 128.
+#[cfg(feature = "native-stream-observer")]
+#[derive(Debug)]
+pub struct StreamTransmitObservation {
+    state: Arc<std::sync::Mutex<StreamTransmitState>>,
+}
+#[cfg(feature = "native-stream-observer")]
+impl StreamTransmitObservation {
+    /// Read only already accepted UDP progress. This is not a completion future;
+    /// connection failure/stream reset remains the caller's independent signal.
+    pub fn snapshot(&self) -> StreamTransmitSnapshot {
+        let state=self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut snapshot=state.snapshot;
+        snapshot.operation=state.operation.as_ref().map(|op|op.snapshot());
+        snapshot
+    }
+    /// Register a single progress waiter without calling or dropping a foreign
+    /// Waker inside the observation/connection locks. Connection failure and
+    /// STOP_SENDING remain separate signals, as with snapshot-only observation.
+    pub fn poll_progress(&self,cx:&mut Context<'_>,end:u64,fin:bool)->Poll<StreamTransmitSnapshot> {
+        let mut incoming=Some(cx.waker().clone());
+        let (old,result)={
+            let mut state=self.state.lock().unwrap_or_else(|e|e.into_inner());
+            let mut snapshot=state.snapshot;
+            snapshot.operation=state.operation.as_ref().map(|op|op.snapshot());
+            if snapshot.end!=end || snapshot.fin!=fin {
+                (state.waiter.take(),Poll::Ready(snapshot))
+            } else {
+                (std::mem::replace(&mut state.waiter,incoming.take()),Poll::Pending)
+            }
+        };
+        drop(old);drop(incoming);result
+    }
+    /// Conservative scalar cell allowance; connection map storage is separate.
+    pub const ALLOCATION_UPPER_BYTES: usize = 2 * (
+        std::mem::size_of::<std::sync::Mutex<StreamTransmitState>>()
+        + 2 * std::mem::size_of::<usize>()
+        + std::mem::align_of::<std::sync::Mutex<StreamTransmitState>>()) + 128;
+    fn begin(&self, policy: crate::StreamWritePolicy, payload: Option<(u64,usize)>, scoped:Option<native_write_policy::Boundary>) -> Result<(), io::Error> {
+        let mut state=self.state.lock().unwrap_or_else(|error|error.into_inner());
+        if state.operation.as_ref().is_some_and(|op| {let s=op.snapshot(); !s.completed || s.expired}) {
+            return Err(io::Error::other("previous transmit boundary incomplete or expired"));
+        }
+        let before=state.snapshot.end;
+        let operation=match (payload,scoped) {
+            (None,None)=>crate::transmit_operation::Operation::wire(before,policy),
+            (None,Some(scope))=>crate::transmit_operation::Operation::wire_scoped(before,policy,scope),
+            (Some((start,length)),None)=>crate::transmit_operation::Operation::data(start,length,before,policy)
+                .map_err(|_|io::Error::new(io::ErrorKind::InvalidInput,"invalid payload transmit boundary"))?,
+            (Some((start,length)),Some(scope))=>crate::transmit_operation::Operation::data_scoped(start,length,before,policy,scope)
+                .map_err(|_|io::Error::new(io::ErrorKind::InvalidInput,"invalid payload transmit boundary"))?,
+        };
+        state.operation=Some(operation);Ok(())
+    }
+    /// Arm before handing encoded headers/trailers/FIN to the transport.
+    pub fn begin_wire(&self, policy: crate::StreamWritePolicy)->Result<(),io::Error> {
+        self.begin(policy,None,None)
+    }
+    /// Arm before DATA acceptance. `start` excludes the HTTP frame header.
+    pub fn begin_data(&self,start:u64,length:usize,policy:crate::StreamWritePolicy)->Result<(),io::Error> {
+        self.begin(policy,Some((start,length)),None)
+    }
+    /// Arm exact server/route constraints with their actual prepaid owner.
+    pub fn begin_wire_scoped(&self,policy:crate::StreamWritePolicy,scope:native_write_policy::Boundary)->Result<(),io::Error> {
+        self.begin(policy,None,Some(scope))
+    }
+    /// Arm DATA with the same exact, independently anchored constraints.
+    pub fn begin_data_scoped(&self,start:u64,length:usize,policy:crate::StreamWritePolicy,scope:native_write_policy::Boundary)->Result<(),io::Error> {
+        self.begin(policy,Some((start,length)),Some(scope))
+    }
+    /// Accepted offsets identify the boundary only; this earns no progress.
+    pub fn seal_wire(&self,end:u64,fin:bool)->Result<(),io::Error> {
+        let mut state=self.state.lock().unwrap_or_else(|error|error.into_inner());
+        state.operation.as_mut().ok_or_else(||io::Error::other("no transmit boundary armed"))?
+            .seal_wire(end,fin).map_err(|_|io::Error::new(io::ErrorKind::InvalidInput,"invalid wire transmit boundary"))
+    }
+}
+
+#[cfg(feature = "native-stream-observer")]
+impl Drop for StreamTransmitObservation {
+    fn drop(&mut self) {
+        // The receiver keeps its Arc alive until the last foreign waiter has
+        // left the cell. A driver's temporary Arc can then only drop scalars.
+        let waiter=self.state.lock().unwrap_or_else(|e|e.into_inner()).waiter.take();
+        drop(waiter);
+    }
+}
+#[cfg(feature = "native-stream-observer")]
+struct TransmitWakeBatch { wakes:[Option<Waker>;128],len:usize }
+#[cfg(feature = "native-stream-observer")]
+impl TransmitWakeBatch {
+    fn new()->Self {Self{wakes:std::array::from_fn(|_|None),len:0}}
+    fn push(&mut self,waker:Waker) {
+        assert!(self.len<self.wakes.len(),"one bounded observer pass");
+        self.wakes[self.len]=Some(waker);self.len+=1;
+    }
+}
+#[cfg(feature = "native-stream-observer")]
+impl Drop for TransmitWakeBatch {
+    fn drop(&mut self) {
+        for wake in self.wakes.iter_mut().take(self.len) {
+            if let Some(wake)=wake.take(){wake.wake()}
+        }
+    }
+}
+
 /// In-progress connection attempt future
 #[derive(Debug)]
 pub struct Connecting {
@@ -274,6 +404,10 @@ impl Future for ConnectionDriver {
     type Output = Result<(), io::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        // Declared before the connection guard: callbacks run after that
+        // guard has dropped on every return, including errors/unwinding.
+        #[cfg(feature = "native-stream-observer")]
+        let mut transmit_wakes=TransmitWakeBatch::new();
         let conn = &mut *self.conn.state.lock("poll");
         let _guard = self.span.enter();
 
@@ -281,7 +415,8 @@ impl Future for ConnectionDriver {
             conn.terminate(e, &self.conn.shared);
             return Poll::Ready(Ok(()));
         }
-        let mut keep_going = conn.drive_transmit(cx)?;
+        let mut keep_going = conn.drive_transmit(cx,
+            #[cfg(feature = "native-stream-observer")] &mut transmit_wakes)?;
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
         keep_going |= conn.drive_timer(cx);
@@ -454,6 +589,64 @@ impl Connection {
                 }.await
             }
         })
+    }
+
+    /// Observe actual UDP transmission for one established peer-bidi stream.
+    /// Arm before writing its response. This opt-in prototype exposes snapshots
+    /// only; it does not claim logical HTTP payload progress, ACK or ownership
+    /// release. At most 128 live stream observations are admitted per connection.
+    #[cfg(feature = "native-stream-observer")]
+    pub fn observe_stream_transmit(
+        &self,
+        stream: StreamId,
+    ) -> Result<StreamTransmitObservation, io::Error> {
+        let mut connection = self.0.state.lock("observe_stream_transmit");
+        if !connection.connected || connection.inner.side() != Side::Server
+            || stream.dir() != Dir::Bi || stream.initiator() != Side::Client
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "transmit observation requires an established server peer-bidi stream"));
+        }
+        connection.transmit_observers.retain(|_, weak| weak.strong_count() != 0);
+        if connection.transmit_observers.contains_key(&stream) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "stream transmit observation occupied"));
+        }
+        if connection.transmit_observers.len() == 128 {
+            return Err(io::Error::other("stream transmit observation limit"));
+        }
+        let observation = Arc::new(std::sync::Mutex::new(StreamTransmitState::default()));
+        connection.transmit_observers.insert(stream, Arc::downgrade(&observation));
+        Ok(StreamTransmitObservation { state: observation })
+    }
+
+    /// Accepted writer offset, used only to map application framing to the
+    /// independently observed socket-transmission offsets. No progress or
+    /// ownership release is implied by this value.
+    #[cfg(feature = "native-stream-observer")]
+    pub fn stream_written_offset(&self, stream: StreamId) -> Result<u64, io::Error> {
+        let mut connection = self.0.state.lock("stream_written_offset");
+        if stream.dir() != Dir::Bi && stream.initiator() != connection.inner.side() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "receive-only stream"));
+        }
+        connection.inner.send_stream(stream).written_offset()
+            .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "closed send stream"))
+    }
+
+    /// Cancel an observed server response without manufacturing a new stream
+    /// owner. Only an established peer-bidi response can be addressed here.
+    #[cfg(feature = "native-stream-observer")]
+    pub fn reset_observed_stream(&self,stream:StreamId,code:VarInt)->Result<(),io::Error> {
+        let (wake,result)={
+            let mut state=self.0.state.lock("reset_observed_stream");
+            if !state.connected || state.inner.side()!=Side::Server || stream.dir()!=Dir::Bi || stream.initiator()!=Side::Client {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput,"not a server response stream"));
+            }
+            let result=state.inner.send_stream(stream).reset(code)
+                .map_err(|_|io::Error::new(io::ErrorKind::NotFound,"closed send stream"));
+            (state.driver.take(),result)
+        };
+        if let Some(wake)=wake{wake.wake()}
+        result
     }
 
     /// If the connection is closed, the reason why.
@@ -988,6 +1181,10 @@ impl ConnectionRef {
                 runtime,
                 send_buffer: Vec::new(),
                 buffered_transmit: None,
+                #[cfg(feature = "native-stream-observer")]
+                transmit_observers: std::collections::BTreeMap::new(),
+                #[cfg(feature = "native-stream-observer")]
+                buffered_progress: Vec::new(),
             }),
             shared: Shared::default(),
         }))
@@ -1072,10 +1269,47 @@ pub(crate) struct State {
     send_buffer: Vec<u8>,
     /// We buffer a transmit when the underlying I/O would block
     buffered_transmit: Option<proto::Transmit>,
+    #[cfg(feature = "native-stream-observer")]
+    transmit_observers: std::collections::BTreeMap<StreamId, std::sync::Weak<std::sync::Mutex<StreamTransmitState>>>,
+    #[cfg(feature = "native-stream-observer")]
+    buffered_progress: Vec<proto::StreamTransmitProgress>,
 }
 
 impl State {
-    fn drive_transmit(&mut self, cx: &mut Context) -> io::Result<bool> {
+    fn next_transmit(&mut self, now: Instant, max_datagrams: usize) -> io::Result<Option<proto::Transmit>> {
+        #[cfg(feature = "native-stream-observer")]
+        {
+            self.transmit_observers.retain(|_, weak| weak.strong_count() != 0);
+            self.buffered_progress.clear();
+            self.buffered_progress.extend(self.transmit_observers.keys().map(|id| proto::StreamTransmitProgress { id: *id, end: 0, fin: false }));
+            return self.inner.poll_transmit_observed(now, max_datagrams, &mut self.send_buffer, &mut self.buffered_progress)
+                .map_err(|_| io::Error::other("invalid transmit observation shape"));
+        }
+        #[cfg(not(feature = "native-stream-observer"))]
+        Ok(self.inner.poll_transmit(now, max_datagrams, &mut self.send_buffer))
+    }
+    #[cfg(feature = "native-stream-observer")]
+    fn publish_transmit_progress(&mut self,wakes:&mut TransmitWakeBatch) {
+        let now = Instant::now();
+        for progress in &self.buffered_progress {
+            let Some(owner) = self.transmit_observers.get(&progress.id).and_then(std::sync::Weak::upgrade) else { continue; };
+            let mut state = owner.lock().unwrap_or_else(|error| error.into_inner());
+            if progress.end > state.snapshot.end || (progress.fin && !state.snapshot.fin) {
+                if let Some(operation)=&mut state.operation {
+                    operation.report(progress.end,progress.fin,now);
+                }
+                state.snapshot.end = state.snapshot.end.max(progress.end);
+                state.snapshot.fin |= progress.fin;
+                state.snapshot.last_transmit = Some(now);
+                if let Some(waiter)=state.waiter.take() {wakes.push(waiter);}
+            }
+            // Wakers are moved, never invoked/dropped here. The receiver's
+            // Drop clears its waiter before its Arc can become last-owned.
+        }
+    }
+    fn drive_transmit(&mut self, cx: &mut Context,
+        #[cfg(feature = "native-stream-observer")] wakes:&mut TransmitWakeBatch,
+    ) -> io::Result<bool> {
         let now = self.runtime.now();
         let mut transmits = 0;
 
@@ -1091,10 +1325,7 @@ impl State {
                 None => {
                     self.send_buffer.clear();
                     self.send_buffer.reserve(self.inner.current_mtu() as usize);
-                    match self
-                        .inner
-                        .poll_transmit(now, max_datagrams, &mut self.send_buffer)
-                    {
+                    match self.next_transmit(now, max_datagrams)? {
                         Some(t) => {
                             transmits += match t.segment_size {
                                 None => 1,
@@ -1129,6 +1360,17 @@ impl State {
                 // transient failure.
                 self.buffered_transmit = Some(t);
                 continue;
+            }
+
+            // Packetization is not a successful send. Retain the exact slots
+            // through both poll_writable Pending and try_send WouldBlock above.
+            #[cfg(feature = "native-stream-observer")]
+            {
+                self.publish_transmit_progress(wakes);
+                // One snapshot pass has at most128 observers. Return before a
+                // second pass can encounter newly registered foreign waiters;
+                // callbacks run outside the connection lock, then poll again.
+                if wakes.len!=0 {return Ok(true)}
             }
 
             if transmits >= MAX_TRANSMIT_DATAGRAMS {

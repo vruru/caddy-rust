@@ -1,218 +1,102 @@
-// go_buffer.rs — Go-formatter migration buffer (no_std + alloc, forbid unsafe)
-//
-// ByteBuffer: the single output buffer for top-level format emission.
-//   Other user Values are NOT stringified into this buffer.
-// FmtCursor: a byte-position cursor over the format string, replacing
-//   Peekable<&[u8]-iter> from the original Go formatter.
-
-
-use alloc::vec::Vec;
-use core::fmt;
-
-// ---------------------------------------------------------------------------
-// ByteBuffer
-// ---------------------------------------------------------------------------
-
-/// Maximum byte length of the format-output buffer (1 MiB).
-const MAX: usize = 1 << 20;
-
-/// Accumulates formatted output as raw bytes.
-///
-/// Every mutating method sets `failed = true` on capacity overflow and
-/// silently becomes a no-op thereafter, so callers never need to check
-/// an error at each call-site.  Call [`check`](Self::check) once at the
-/// end to propagate the single possible error.
-pub(crate) struct ByteBuffer {
-    bytes: Vec<u8>,
-    failed: bool,
+//! One formatting buffer implementation with typed allocation ownership.
+use alloc::{vec::Vec,string::{String,ToString}};
+use core::{fmt,ops::{Deref,DerefMut}};
+#[cfg(feature="std")]use alloc::sync::Arc;
+use crate::{Result,TemplateError};
+const MAX:usize=1<<20;
+pub(crate) trait Mode{
+ fn room(&mut self,bytes:&mut Vec<u8>,required:usize)->Result<()>;
+ fn release(&mut self);
+ fn temporary(&self,capacity:usize)->Scratch;
+ fn check(&self)->Result<()>{Ok(())}
+ fn host(&self,_value:&crate::Value)->Result<Option<crate::ByteLease>>{Ok(None)}
 }
-
-impl ByteBuffer {
-    // ---- construction -----------------------------------------------------
-
-    /// Create an empty buffer with no pre-allocated capacity.
-    pub(crate) fn new() -> Self {
-        Self {
-            bytes: Vec::new(),
-            failed: false,
-        }
-    }
-
-    /// Create a buffer with initial capacity clamped to [`MAX`].
-    ///
-    /// A requested capacity larger than MAX is silently reduced to MAX;
-    /// the buffer is NOT marked `failed`.
-    pub(crate) fn with_capacity(cap: usize) -> Self {
-        let cap = core::cmp::min(cap, MAX);
-        Self {
-            bytes: Vec::with_capacity(cap),
-            failed: false,
-        }
-    }
-
-    // ---- accessors --------------------------------------------------------
-
-    /// View the accumulated bytes.
-    #[inline]
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    /// Current number of bytes in the buffer.
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    /// True when the buffer contains zero bytes.
-    #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
-    /// Consume the buffer and hand back the underlying `Vec<u8>`.
-    #[inline]
-    pub(crate) fn repeat_ascii(&mut self,pos:usize,byte:u8,count:usize){
-        if self.failed{return;}if pos>self.bytes.len()||self.overflows(count){self.failed=true;return;}
-        let old=self.bytes.len();self.bytes.resize(old+count,0);self.bytes.copy_within(pos..old,pos+count);self.bytes[pos..pos+count].fill(byte);
-    }
-    pub(crate) fn into_vec(self) -> Vec<u8> {
-        self.bytes
-    }
-
-    /// Return `Ok(())` if no overflow occurred, otherwise a single
-    /// `Err` with the canonical message.
-    pub(crate) fn reject_size(&mut self){self.failed=true;}
-    pub(crate) fn check(&self) -> crate::Result<()> {
-        if self.failed {
-            Err(crate::TemplateError::OutputTooLarge)
-        } else {
-            Ok(())
-        }
-    }
-
-    // ---- private size guard -----------------------------------------------
-
-    /// Returns `true` (and marks `failed`) when appending `additional`
-    /// bytes would exceed [`MAX`] or overflow `usize`.
-    #[inline]
-    fn overflows(&mut self, additional: usize) -> bool {
-        match self.bytes.len().checked_add(additional) {
-            Some(n) if n <= MAX => false,
-            _ => {
-                self.failed = true;
-                true
-            }
-        }
-    }
-
-    // ---- push / append (void, no-op after failure) ------------------------
-
-    /// Append a single `char` (UTF-8 encoded) to the buffer.
-    pub(crate) fn push(&mut self, ch: char) {
-        if self.failed {
-            return;
-        }
-        // A char encodes to at most 4 UTF-8 bytes.
-        if self.overflows(ch.len_utf8()) {
-            return;
-        }
-        let mut buf = [0u8; 4];
-        self.bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-    }
-
-    /// Append an entire `&str`.
-    pub(crate) fn push_str(&mut self, s: &str) {
-        if self.failed {
-            return;
-        }
-        if self.overflows(s.len()) {
-            return;
-        }
-        self.bytes.extend_from_slice(s.as_bytes());
-    }
-
-    /// Append raw bytes (already valid in the output encoding).
-    pub(crate) fn push_bytes(&mut self, b: &[u8]) {
-        if self.failed {
-            return;
-        }
-        if self.overflows(b.len()) {
-            return;
-        }
-        self.bytes.extend_from_slice(b);
-    }
-
-    // ---- insert (void, no-op after failure) -------------------------------
-
-    /// Insert a single `char` at byte position `pos`.
-    ///
-    /// No UTF-8 boundary check is performed: `bytes` is a raw byte Vec,
-    /// matching the original Go formatter's byte-level semantics.
-    pub(crate) fn insert(&mut self, pos: usize, ch: char) {
-        if self.failed {
-            return;
-        }
-        // A char is at most 4 bytes, so pos must not exceed len.
-        if pos > self.bytes.len() {
-            self.failed = true;
-            return;
-        }
-        if self.overflows(ch.len_utf8()) {
-            return;
-        }
-        let mut buf = [0u8; 4];
-        let encoded = ch.encode_utf8(&mut buf).as_bytes();
-        self.bytes.splice(pos..pos, encoded.iter().copied());
-    }
-
-    /// Insert a `&str` at byte position `pos`.
-    pub(crate) fn insert_str(&mut self, pos: usize, s: &str) {
-        if self.failed {
-            return;
-        }
-        if pos > self.bytes.len() {
-            self.failed = true;
-            return;
-        }
-        if self.overflows(s.len()) {
-            return;
-        }
-        self.bytes.splice(pos..pos, s.bytes());
-    }
-
-    // ---- reserve ----------------------------------------------------------
-
-    /// Hint that at least `additional` more bytes will be appended.
-    ///
-    /// Performs no allocation when the buffer has already `failed`
-    /// or when the hint would push past [`MAX`].
-    pub(crate) fn reserve(&mut self, additional: usize) {
-        if self.failed {
-            return;
-        }
-        match self.bytes.len().checked_add(additional) {
-            Some(n) if n <= MAX => self.bytes.reserve(additional),
-            _ => self.failed = true,
-        }
-    }
+pub(crate) struct Unmetered;
+impl Mode for Unmetered{
+ fn room(&mut self,bytes:&mut Vec<u8>,required:usize)->Result<()>{if required>bytes.capacity(){bytes.reserve(required-bytes.len());}Ok(())}
+ fn release(&mut self){}
+ fn temporary(&self,capacity:usize)->Scratch{Scratch::Plain(ByteBuffer::with_capacity(capacity))}
 }
-
-// ---- core::fmt::Write ----------------------------------------------------
-
-impl fmt::Write for ByteBuffer {
-    #[inline]
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.push_str(s);
-        if self.failed {
-            Err(fmt::Error)
-        } else {
-            Ok(())
-        }
-    }
+#[cfg(feature="std")]
+pub(crate) struct Metered{account:crate::BudgetAccount,scope:Arc<crate::FormatterScope>,held:usize}
+#[cfg(feature="std")]
+impl Mode for Metered{
+ fn room(&mut self,bytes:&mut Vec<u8>,required:usize)->Result<()>{
+  self.scope.check()?;if required<=bytes.capacity(){return Ok(());}
+  let capacity=crate::go_slice_capacity(bytes.capacity(),required,1,false).ok_or_else(||TemplateError::Exec("formatter capacity overflow".into()))?.min(MAX);
+  let total=self.held.checked_add(capacity).ok_or_else(||TemplateError::Exec("formatter loan overflow".into()))?;
+  self.scope.work(1+bytes.len().div_ceil(1024))?;
+  self.scope.reserve(&self.account,capacity)?;self.held=total;
+  let mut next=Vec::new();
+  if next.try_reserve_exact(capacity).is_err(){drop(next);self.account.release(capacity)?;self.held-=capacity;return Err(TemplateError::Exec("formatter allocation failed".into()));}
+  if next.capacity()!=capacity{drop(next);self.account.release(capacity)?;self.held-=capacity;return Err(TemplateError::Exec("formatter allocator capacity mismatch".into()));}
+  next.extend_from_slice(bytes);drop(core::mem::replace(bytes,next));
+  let retired=total-capacity;self.account.release(retired)?;self.held=capacity;Ok(())
+ }
+ fn release(&mut self){let held=core::mem::take(&mut self.held);let result=self.account.release(held);debug_assert!(result.is_ok());}
+ fn temporary(&self,capacity:usize)->Scratch{Scratch::Bounded(ByteBuffer::bounded(self.account.clone(),self.scope.clone(),capacity))}
+ fn check(&self)->Result<()>{self.scope.check()}
+ fn host(&self,value:&crate::Value)->Result<Option<crate::ByteLease>>{self.scope.host(value)}
 }
-
-impl crate::go_write::GoWrite for ByteBuffer {fn write_bytes(&mut self,b:&[u8])->fmt::Result{self.push_bytes(b);if self.failed{Err(fmt::Error)}else{Ok(())}}}
+enum Failure{Size,Budget(String)}
+pub(crate) struct ByteBuffer<M:Mode=Unmetered>{bytes:Vec<u8>,failure:Option<Failure>,mode:M}
+impl ByteBuffer<Unmetered>{
+ pub(crate) fn new()->Self{Self{bytes:Vec::new(),failure:None,mode:Unmetered}}
+ pub(crate) fn with_capacity(capacity:usize)->Self{let mut out=Self::new();out.reserve(capacity.min(MAX));out}
+ pub(crate) fn into_vec(mut self)->Vec<u8>{core::mem::take(&mut self.bytes)}
+}
+#[cfg(feature="std")]
+impl ByteBuffer<Metered>{
+ pub(crate) fn bounded(account:crate::BudgetAccount,scope:Arc<crate::FormatterScope>,capacity:usize)->Self{let mut out=Self{bytes:Vec::new(),failure:None,mode:Metered{account,scope,held:0}};out.reserve(capacity.min(MAX));out}
+ pub(crate) fn into_budgeted_bytes(mut self)->Result<crate::BudgetedBytes>{self.check()?;let bytes=core::mem::take(&mut self.bytes);self.mode.held=0;crate::BudgetedBytes::from_account(bytes,&self.mode.account)}
+}
+impl<M:Mode> ByteBuffer<M>{
+ pub(crate) fn len(&self)->usize{self.bytes.len()}
+ pub(crate) fn as_bytes(&self)->&[u8]{&self.bytes}
+ pub(crate) fn is_empty(&self)->bool{self.bytes.is_empty()}
+ pub(crate) fn reject_size(&mut self){if self.failure.is_none(){self.failure=Some(Failure::Size);}}
+ pub(crate) fn fail_scratch(&mut self,other:&dyn FormatBuffer){if let Err(error)=other.check(){self.fail(error);}}
+ fn fail(&mut self,error:TemplateError){if self.failure.is_none(){self.failure=Some(Failure::Budget(error.to_string()));}}
+ pub(crate) fn check(&self)->Result<()>{match &self.failure{Some(Failure::Size)=>Err(TemplateError::OutputTooLarge),Some(Failure::Budget(message))=>Err(TemplateError::Exec(message.clone())),None=>self.mode.check()}}
+ fn room(&mut self,additional:usize)->bool{
+  if self.failure.is_some(){return false;}
+  let Some(required)=self.bytes.len().checked_add(additional).filter(|n|*n<=MAX)else{self.reject_size();return false;};
+  match self.mode.room(&mut self.bytes,required){Ok(())=>true,Err(error)=>{self.fail(error);false}}
+ }
+ pub(crate) fn push(&mut self,ch:char){let mut data=[0;4];self.push_bytes(ch.encode_utf8(&mut data).as_bytes());}
+ pub(crate) fn push_str(&mut self,text:&str){self.push_bytes(text.as_bytes());}
+ pub(crate) fn push_bytes(&mut self,data:&[u8]){if self.room(data.len()){self.bytes.extend_from_slice(data);}}
+ pub(crate) fn repeat_ascii(&mut self,pos:usize,byte:u8,count:usize){
+  if pos>self.bytes.len(){self.reject_size();return;}if !self.room(count){return;}let old=self.bytes.len();self.bytes.resize(old+count,0);self.bytes.copy_within(pos..old,pos+count);self.bytes[pos..pos+count].fill(byte);
+ }
+ pub(crate) fn insert(&mut self,pos:usize,ch:char){let mut data=[0;4];self.insert_bytes(pos,ch.encode_utf8(&mut data).as_bytes());}
+ pub(crate) fn insert_str(&mut self,pos:usize,text:&str){self.insert_bytes(pos,text.as_bytes());}
+ fn insert_bytes(&mut self,pos:usize,data:&[u8]){if pos>self.bytes.len(){self.reject_size();return;}if !self.room(data.len()){return;}let old=self.bytes.len();self.bytes.resize(old+data.len(),0);self.bytes.copy_within(pos..old,pos+data.len());self.bytes[pos..pos+data.len()].copy_from_slice(data);}
+ pub(crate) fn reserve(&mut self,additional:usize){let _=self.room(additional);}
+ pub(crate) fn truncate(&mut self,length:usize){self.bytes.truncate(length);}
+ pub(crate) fn temporary(&self,capacity:usize)->Scratch{self.mode.temporary(capacity)}
+ pub(crate) fn host(&self,value:&crate::Value)->Result<Option<crate::ByteLease>>{self.mode.host(value)}
+}
+impl<M:Mode> Drop for ByteBuffer<M>{fn drop(&mut self){drop(core::mem::take(&mut self.bytes));self.mode.release();}}
+impl<M:Mode> fmt::Write for ByteBuffer<M>{fn write_str(&mut self,text:&str)->fmt::Result{self.push_str(text);if self.failure.is_some(){Err(fmt::Error)}else{Ok(())}}}
+impl<M:Mode> crate::go_write::GoWrite for ByteBuffer<M>{fn write_bytes(&mut self,data:&[u8])->fmt::Result{self.push_bytes(data);if self.failure.is_some(){Err(fmt::Error)}else{Ok(())}}fn host(&self,value:&crate::Value)->Result<Option<crate::ByteLease>>{self.mode.host(value)}}
+pub(crate) trait FormatBuffer:fmt::Write+crate::go_write::GoWrite{
+ fn len(&self)->usize;fn as_bytes(&self)->&[u8];fn check(&self)->Result<()>;fn reject_size(&mut self);
+ fn push(&mut self,ch:char);fn push_str(&mut self,text:&str);fn push_bytes(&mut self,data:&[u8]);
+ fn repeat_ascii(&mut self,pos:usize,byte:u8,count:usize);fn insert(&mut self,pos:usize,ch:char);fn insert_str(&mut self,pos:usize,text:&str);
+ fn reserve(&mut self,n:usize);fn truncate(&mut self,length:usize);fn temporary(&self,capacity:usize)->Scratch;fn fail_scratch(&mut self,other:&dyn FormatBuffer);
+}
+impl<M:Mode> FormatBuffer for ByteBuffer<M>{
+ fn len(&self)->usize{self.len()}fn as_bytes(&self)->&[u8]{self.as_bytes()}fn check(&self)->Result<()>{self.check()}fn reject_size(&mut self){self.reject_size()}
+ fn push(&mut self,ch:char){self.push(ch)}fn push_str(&mut self,text:&str){self.push_str(text)}fn push_bytes(&mut self,data:&[u8]){self.push_bytes(data)}
+ fn repeat_ascii(&mut self,pos:usize,byte:u8,count:usize){self.repeat_ascii(pos,byte,count)}fn insert(&mut self,pos:usize,ch:char){self.insert(pos,ch)}fn insert_str(&mut self,pos:usize,text:&str){self.insert_str(pos,text)}
+ fn reserve(&mut self,n:usize){self.reserve(n)}fn truncate(&mut self,length:usize){self.truncate(length)}fn temporary(&self,capacity:usize)->Scratch{self.temporary(capacity)}fn fail_scratch(&mut self,other:&dyn FormatBuffer){self.fail_scratch(other)}
+}
+pub(crate) enum Scratch{Plain(ByteBuffer),#[cfg(feature="std")]Bounded(ByteBuffer<Metered>)}
+impl Deref for Scratch{type Target=dyn FormatBuffer;fn deref(&self)->&Self::Target{match self{Self::Plain(out)=>out,#[cfg(feature="std")]Self::Bounded(out)=>out}}}
+impl DerefMut for Scratch{fn deref_mut(&mut self)->&mut Self::Target{match self{Self::Plain(out)=>out,#[cfg(feature="std")]Self::Bounded(out)=>out}}}
+impl fmt::Write for Scratch{fn write_str(&mut self,text:&str)->fmt::Result{(**self).write_str(text)}}
+impl crate::go_write::GoWrite for Scratch{fn write_bytes(&mut self,data:&[u8])->fmt::Result{(**self).write_bytes(data)}}
 
 // ---------------------------------------------------------------------------
 // FmtCursor

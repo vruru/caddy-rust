@@ -333,6 +333,7 @@ impl CertificateServices {
             self.context.resolver.clone()
         };
         let mut solver = None;
+        let group_tasks=TaskTracker::new();
         let issuer = if policy
             .issuers
             .iter()
@@ -398,6 +399,7 @@ impl CertificateServices {
             // tlsApp.onEvent; only business certificates join the TLS app.
             .with_events((!identity).then(|| self.context.events.clone()).flatten())?
             .with_csr_options(policy.must_staple,policy.reuse_private_keys)?
+            .with_chain_tasks(group_tasks.clone())?
             .storage_only()?;
             solver = Some(broker);
             GroupIssuer::Acme(manager)
@@ -471,7 +473,7 @@ impl CertificateServices {
             restoring: AtomicBool::new(restoring),
             cache_event_emitted: AtomicBool::new(restoring || imported.is_some()),
             cancel: self.context.cancel.child_token(),
-            tasks: TaskTracker::new(),
+            tasks: group_tasks,
             started: Mutex::new(false),
             _admission: group_admission,
         });

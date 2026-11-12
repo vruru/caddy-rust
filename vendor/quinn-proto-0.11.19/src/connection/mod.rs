@@ -447,6 +447,46 @@ impl Connection {
         }
     }
 
+    /// Builds a transmit with bounded, caller-owned stream-offset observations.
+    ///
+    /// No callback or extra observation allocation runs here. Only application
+    /// packets produced by this invocation contribute. The caller retains these
+    /// packet-construction facts through UDP WouldBlock and publishes them only
+    /// after the corresponding socket send succeeds. They are neither ACKs nor
+    /// an allocation-release fence. At most 128 strictly ordered slots are
+    /// accepted; invalid input leaves the connection and packet buffer untouched.
+    pub fn poll_transmit_observed(
+        &mut self,
+        now: Instant,
+        max_datagrams: usize,
+        buf: &mut Vec<u8>,
+        observed: &mut [crate::StreamTransmitProgress],
+    ) -> Result<Option<Transmit>, crate::InvalidTransmitObservation> {
+        if observed.len() > 128
+            || observed.windows(2).any(|pair| pair[0].id >= pair[1].id)
+        {
+            return Err(crate::InvalidTransmitObservation);
+        }
+        if observed.is_empty() {
+            return Ok(self.poll_transmit(now, max_datagrams, buf));
+        }
+        let first = self.spaces[SpaceId::Data].next_packet_number;
+        let transmit = self.poll_transmit(now, max_datagrams, buf);
+        let end = self.spaces[SpaceId::Data].next_packet_number;
+        if transmit.is_some() {
+            for (_, packet) in self.spaces[SpaceId::Data].sent_packets.range(first..end) {
+                for frame in &packet.stream_frames {
+                    if let Ok(index) = observed.binary_search_by_key(&frame.id, |slot| slot.id) {
+                        let slot = &mut observed[index];
+                        slot.end = slot.end.max(frame.offsets.end);
+                        slot.fin |= frame.fin;
+                    }
+                }
+            }
+        }
+        Ok(transmit)
+    }
+
     /// Returns packets to transmit
     ///
     /// Connections should be polled for transmit after:

@@ -55,6 +55,12 @@ enum BufKind<B> {
     Chunked(Chain<Chain<ChunkSize, B>, StaticBuf>),
     ChunkedEnd(StaticBuf),
     Trailers(Chain<Chain<StaticBuf, Bytes>, StaticBuf>),
+    #[cfg(feature="server")]
+    BytesExact(Bytes),
+    #[cfg(feature="server")]
+    BytesLimited(Take<Bytes>),
+    #[cfg(feature="server")]
+    BytesChunked(Chain<Chain<ChunkSize,Bytes>,StaticBuf>),
 }
 
 impl Encoder {
@@ -173,6 +179,18 @@ impl Encoder {
             }
         };
         EncodedBuf { kind }
+    }
+
+    /// Encodes the opted-in concrete byte chunk while preserving the original
+    /// generic encoder/default pipeline. The returned range is payload only.
+    #[cfg(feature="server")]
+    pub(crate) fn encode_bytes<B>(&mut self,msg:Bytes)->(EncodedBuf<B>,usize,usize){
+        let len=msg.len();
+        let(kind,start,payload)=match &mut self.kind {
+            Kind::Chunked(_)=>{let prefix=ChunkSize::new(len).remaining();let buf=ChunkSize::new(len).chain(msg).chain(b"\r\n" as &'static[u8]);(BufKind::BytesChunked(buf),prefix,len)},
+            Kind::Length(remaining)=>{let limit=usize::try_from(*remaining).unwrap_or(usize::MAX);let actual=limit.min(len);if actual<len{*remaining=0;(BufKind::BytesLimited(msg.take(actual)),0,actual)}else{*remaining-=actual as u64;(BufKind::BytesExact(msg),0,actual)}},
+            Kind::CloseDelimited=>(BufKind::BytesExact(msg),0,len),
+        };(EncodedBuf{kind},start,payload)
     }
 
     // The compatibility path deliberately does not weaken the default encoder.
@@ -357,6 +375,12 @@ where
             BufKind::Chunked(b) => b.remaining(),
             BufKind::ChunkedEnd(b) => b.remaining(),
             BufKind::Trailers(b) => b.remaining(),
+            #[cfg(feature="server")]
+            BufKind::BytesExact(b) => b.remaining(),
+            #[cfg(feature="server")]
+            BufKind::BytesLimited(b) => b.remaining(),
+            #[cfg(feature="server")]
+            BufKind::BytesChunked(b) => b.remaining(),
         }
     }
 
@@ -368,6 +392,12 @@ where
             BufKind::Chunked(b) => b.chunk(),
             BufKind::ChunkedEnd(b) => b.chunk(),
             BufKind::Trailers(b) => b.chunk(),
+            #[cfg(feature="server")]
+            BufKind::BytesExact(b) => b.chunk(),
+            #[cfg(feature="server")]
+            BufKind::BytesLimited(b) => b.chunk(),
+            #[cfg(feature="server")]
+            BufKind::BytesChunked(b) => b.chunk(),
         }
     }
 
@@ -379,6 +409,12 @@ where
             BufKind::Chunked(b) => b.advance(cnt),
             BufKind::ChunkedEnd(b) => b.advance(cnt),
             BufKind::Trailers(b) => b.advance(cnt),
+            #[cfg(feature="server")]
+            BufKind::BytesExact(b) => b.advance(cnt),
+            #[cfg(feature="server")]
+            BufKind::BytesLimited(b) => b.advance(cnt),
+            #[cfg(feature="server")]
+            BufKind::BytesChunked(b) => b.advance(cnt),
         }
     }
 
@@ -390,6 +426,12 @@ where
             BufKind::Chunked(b) => b.chunks_vectored(dst),
             BufKind::ChunkedEnd(b) => b.chunks_vectored(dst),
             BufKind::Trailers(b) => b.chunks_vectored(dst),
+            #[cfg(feature="server")]
+            BufKind::BytesExact(b) => b.chunks_vectored(dst),
+            #[cfg(feature="server")]
+            BufKind::BytesLimited(b) => b.chunks_vectored(dst),
+            #[cfg(feature="server")]
+            BufKind::BytesChunked(b) => b.chunks_vectored(dst),
         }
     }
 }

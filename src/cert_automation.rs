@@ -230,6 +230,7 @@ pub struct CertificateManager {
 }
 struct ManagerInner {
     chain_memory:Arc<crate::acme_wire::ChainMemoryPools>,
+    chain_cleanup:Arc<crate::acme_wire::ChainCleanup>,
     must_staple: bool,
     reuse_private_keys: bool,
     lifecycle_events: Option<Arc<crate::events::EventsApp>>,
@@ -628,6 +629,14 @@ struct Replacement {
 }
 
 impl CertificateManager {
+    /// Native service groups adopt cancelled graph cleanup in their own tracker.
+    pub(crate) fn with_chain_tasks(mut self,parent:tokio_util::task::TaskTracker)->Result<Self>{
+        let inner=Arc::get_mut(&mut self.inner).ok_or_else(||anyhow!("certificate manager is already shared"))?;
+        inner.chain_cleanup=Arc::new(crate::acme_wire::ChainCleanup::with_parent(parent));Ok(self)
+    }
+    /// After cancelling/joining callers, wait for graph cleanup transferred by
+    /// dropped ensure futures. This does not cancel independent issuance work.
+    pub async fn drain_chain_cleanup(&self){self.inner.chain_cleanup.drain().await;}
     async fn net_permit<'a>(
         &'a self,
         issuer: &'a IssuerState,
@@ -776,6 +785,7 @@ impl CertificateManager {
         Ok(Self {
             inner: Arc::new(ManagerInner {
                 chain_memory:resources.chain_memory.clone(),
+                chain_cleanup:Arc::new(crate::acme_wire::ChainCleanup::default()),
                 must_staple:false,
                 reuse_private_keys:false,
                 lifecycle_events: None,
@@ -2677,7 +2687,7 @@ impl CertificateManager {
             ensure!(resource.value.status=="valid","ACME certificate polling deadline exceeded");
             job.certificate_url=resource.value.certificate;
             if job.downloaded_pem.is_none() {
-                let chains=account.download_order_chains(&url,issuer.config.preferred_chains.wants_names(),cancel).await?;
+                let chains=account.download_order_chains(&url,issuer.config.preferred_chains.wants_names(),issuer.config.preferred_chains.wants_alternates(),self.inner.chain_cleanup.clone(),cancel).await?;
                 let preference=issuer.config.preferred_chains.clone();
                 let selection_credit=crate::acme_wire::chain_memory::scratch(65536,cancel.clone()).await?;
                 let selected=self.cpu(cancel,move||{let _credit=selection_credit;preference.select(chains)}).await?;

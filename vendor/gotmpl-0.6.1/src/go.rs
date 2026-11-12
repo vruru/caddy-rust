@@ -20,13 +20,13 @@
 //! | URL encode | [`url_encode`] | `template.URLQueryEscaper` |
 //! | Hex float parse | [`parse_hex_float`] | Hex float literal `0x1.Fp10` |
 
-use alloc::format;
+use alloc::sync::Arc;
 use alloc::string::String;
 use core::fmt::Write;
 
 use crate::error::{Result, TemplateError};
 use crate::value::Value;
-use crate::go_buffer::{ByteBuffer,FmtCursor};
+use crate::go_buffer::{ByteBuffer,FmtCursor,FormatBuffer};
 
 // fmt.Sprint spacing
 /// Returns `true` when Go's `fmt.Sprint` would insert a space between two
@@ -131,7 +131,7 @@ impl FmtSpec {
     /// `start` must sit on a char boundary in `out`. Callers always invoke
     /// at `out.len()` taken before the verb's content was pushed, which
     /// trivially satisfies that requirement.
-    fn pad_in_place(&self, out: &mut ByteBuffer, start: usize, is_numeric: bool) {
+    fn pad_in_place(&self, out: &mut dyn FormatBuffer, start: usize, is_numeric: bool) {
         let Some(width) = self.width else {
             return;
         };
@@ -158,7 +158,7 @@ impl FmtSpec {
     }
 
     /// Write a signed integer with sign flags (`+`, ` `) applied into `out`.
-    fn write_signed(&self, out: &mut ByteBuffer, n: i64) {
+    fn write_signed(&self, out: &mut dyn FormatBuffer, n: i64) {
         if n >= 0 {
             if self.plus {
                 out.push('+');
@@ -173,7 +173,7 @@ impl FmtSpec {
     ///
     /// Unsigned values are always non-negative, so a `-` is never emitted; Go
     /// still honors the `+` / space flags, prepending the requested sign.
-    fn write_unsigned(&self, out: &mut ByteBuffer, n: u64) {
+    fn write_unsigned(&self, out: &mut dyn FormatBuffer, n: u64) {
         if self.plus {
             out.push('+');
         } else if self.space {
@@ -188,7 +188,7 @@ impl FmtSpec {
 /// One allocation for the pad buffer (via `str::repeat`), then a single
 /// `insert_str` memmove. Callers pass ASCII characters, so `pos` is
 /// guaranteed to sit on a char boundary.
-fn insert_repeated(out:&mut ByteBuffer,pos:usize,ch:char,count:usize){
+fn insert_repeated(out:&mut dyn FormatBuffer,pos:usize,ch:char,count:usize){
     debug_assert!(ch.is_ascii());out.repeat_ascii(pos,ch as u8,count);
 }
 
@@ -209,6 +209,15 @@ pub(crate) fn sprintf(fmt_str:&str,args:&[Value])->Result<String>{
 pub fn sprintf_bytes(fmt_str:&[u8],args:&[Value])->Result<alloc::vec::Vec<u8>>{
     let mut out=ByteBuffer::with_capacity(fmt_str.len().saturating_add(16usize.saturating_mul(args.len())));
     let result=sprintf_into(&mut out,fmt_str,args);out.check()?;result?;Ok(out.into_vec())
+}
+
+/// Budgeted printf output for an explicitly owned rendering scope. The caller
+/// retains the scope/Tree for all use of the resulting registered Values.
+#[cfg(feature="std")]
+pub fn sprintf_with_scope(fmt_str:&[u8],args:&[Value],scope:alloc::sync::Arc<crate::FormatterScope>)->Result<crate::BudgetedBytes>{
+    let account=scope.account()?;
+    let mut out=ByteBuffer::bounded(account,scope,fmt_str.len().saturating_add(16usize.saturating_mul(args.len())));
+    let result=sprintf_into(&mut out,fmt_str,args);out.check()?;result?;out.into_budgeted_bytes()
 }
 
 /// Read a run of ASCII digits as a `usize` (saturating on overflow).
@@ -277,7 +286,7 @@ fn try_parse_index(chars: &mut FmtCursor<'_>) -> ParsedIndex {
 /// over an unconsumed arg), and returns `Bad` for the caller to `continue`.
 fn consume_index(
     chars: &mut FmtCursor<'_>,
-    out: &mut ByteBuffer,
+    out: &mut dyn FormatBuffer,
     arg_idx: &mut usize,
     reordered: &mut bool,
     args_len: usize,
@@ -345,7 +354,7 @@ fn skip_to_verb(chars: &mut FmtCursor<'_>) -> char {
 /// Format directly into `out`. Each verb writes its value at `out.len()`,
 /// then pads in place. Supports Go's `[N]` argument indexing and `*` /
 /// `.*` dynamic width/precision.
-fn sprintf_into(out: &mut ByteBuffer, fmt_str: &[u8], args: &[Value]) -> Result<()> {
+fn sprintf_into(out: &mut dyn FormatBuffer, fmt_str: &[u8], args: &[Value]) -> Result<()> {
     let mut chars = FmtCursor::new(fmt_str);
     let mut arg_idx: usize = 0;
     let mut reordered = false;
@@ -472,47 +481,72 @@ fn sprintf_into(out: &mut ByteBuffer, fmt_str: &[u8], args: &[Value]) -> Result<
     out.check()
 }
 
-fn format_value(out:&mut ByteBuffer,arg:&Value,verb:char,mut spec:FmtSpec,depth:usize)->Result<()>{
+fn format_value(out:&mut dyn FormatBuffer,arg:&Value,verb:char,spec:FmtSpec,depth:usize)->Result<()>{
+    format_value_inner(out,arg,verb,spec,depth,false)
+}
+fn format_value_inner(out:&mut dyn FormatBuffer,arg:&Value,verb:char,mut spec:FmtSpec,depth:usize,erroring:bool)->Result<()>{
     out.check()?;if depth>32{return Err(TemplateError::Exec("formatted value exceeds nesting limit".into()));}
-    if !matches!(verb,'T'|'p') && let Value::Object(object)=arg && let Some(formatter)=object.formatter {
-        let formatted=formatter(object,verb,&spec)?;
+    if erroring && verb=='v' {
+        // badVerb prints the underlying value with the original flags; it
+        // does not apply ordinary %v's plusV/sharpV conversion or Stringer.
+        let start=out.len();
+        if let Some(bytes)=arg.as_go_bytes(){
+            out.push_bytes(truncate_runes(bytes,spec.precision));
+            pad_error_text(out,start,&spec);return out.check();
+        }
+        if let Value::Bool(value)=arg {out.push_str(if *value{"true"}else{"false"});pad_error_text(out,start,&spec);return out.check();}
+        if let Some(number)=arg.as_go_integer() {
+            let negative=number<0;
+            let magnitude=if negative{(-number) as u64}else{number as u64};
+            let sign=if negative{Some('-')}else if spec.plus{Some('+')}else if spec.space{Some(' ')}else{None};
+            spec.hash=false;format_magnitude_base_into(out,magnitude,sign,'d',&spec);spec.pad_in_place(out,start,false);return out.check();
+        }
+        if matches!(arg,Value::Float(_)){return format_value_inner(out,arg,'g',spec,depth,true);}
+    }
+    if verb=='p' {return format_pointer(out,arg,spec,depth);}
+    if !erroring && !matches!(verb,'T'|'p') && let Value::Object(object)=arg && let Some(formatter)=object.formatter {
+        let _host_guard=out.host(arg)?;let formatted=formatter(object,verb,&spec)?;
         let bytes=formatted.as_go_bytes().ok_or_else(||TemplateError::Exec("host formatter must return string".into()))?;
         crate::go_write::GoWrite::write_bytes(out,bytes)?;return out.check();
     }
-    if depth>0&&matches!(arg,Value::Nil|Value::NilError){out.push_str(if verb=='v'&&spec.hash{"interface {}(nil)"}else{"<nil>"});return out.check();}
-    if (matches!(verb,'s'|'q'|'x'|'X') || (verb=='v'&&!spec.hash)) && let Value::Slice(slice)=arg {
-        if let Some(display)=slice.string_value()? { return format_value(out,&display,verb,spec,depth+1); }
+    if depth>0&&matches!(arg,Value::Nil|Value::NilError){out.push_str(if verb=='v'&&spec.hash&&!erroring{"interface {}(nil)"}else{"<nil>"});return out.check();}
+    if !erroring && (matches!(verb,'s'|'q'|'x'|'X') || (verb=='v'&&!spec.hash)) && let Value::Slice(slice)=arg {
+        let _host_guard=if slice.named_type().is_some_and(|kind|kind.stringer.is_some()){out.host(arg)?}else{None};
+        if let Some(display)=slice.string_value()? { return format_value_inner(out,&display,verb,spec,depth+1,erroring); }
     }
     if verb!='T'{
         #[cfg(feature="std")] if let Value::GenericMap(map)=arg{
-            let sharp=verb=='v'&&spec.hash;
+            let sharp=verb=='v'&&spec.hash&&!erroring;
             if sharp{out.push_str("map[interface {}]interface {}{");}else{out.push_str("map[");}
-            for(index,(key,value))in map.snapshot()?.iter().enumerate(){out.check()?;if index>0{out.push_str(if sharp{", "}else{" "});}format_value(out,key,verb,spec,depth+1)?;out.push(':');format_value(out,value,verb,spec,depth+1)?;}
+            for(index,(key,value))in map.snapshot()?.iter().enumerate(){out.check()?;if index>0{out.push_str(if sharp{", "}else{" "});}format_value_inner(out,key,verb,spec,depth+1,erroring)?;out.push(':');format_value_inner(out,value,verb,spec,depth+1,erroring)?;}
             out.push(if sharp{'}'}else{']'});return out.check();
         }
+        let _map_host=if matches!(arg,Value::Object(o)if o.map_view.is_some()){out.host(arg)?}else{None};
         if let Some(map)=arg.map_snapshot()?{
-            let sharp=verb=='v'&&spec.hash;
+            let sharp=verb=='v'&&spec.hash&&!erroring;
             if sharp{out.push_str(arg.type_name());out.push('{');}else{out.push_str("map[");}
             for(index,(key,value))in map.iter().enumerate(){
                 out.check()?;if index>0{out.push_str(if sharp{", "}else{" "});}
-                format_value(out,&key.to_value(),verb,spec,depth+1)?;out.push(':');format_value(out,value,verb,spec,depth+1)?;
+                format_value_inner(out,&key.to_value(),verb,spec,depth+1,erroring)?;out.push(':');format_value_inner(out,value,verb,spec,depth+1,erroring)?;
             }out.push(if sharp{'}'}else{']'});return out.check();
         }
         if let Some(values)=arg.as_sequence(){
-            if matches!(verb,'s'|'q'|'x'|'X'){if let Some(bytes)=values.visible_bytes(){return format_value(out,&Value::from_go_bytes(bytes),verb,spec,depth+1);}}
-            let sharp=verb=='v'&&spec.hash;
+            if matches!(verb,'s'|'q'|'x'|'X'){if let Some(bytes)=values.visible_bytes(){return format_bytes_value(out,&bytes,verb,&spec);}}
+            let sharp=verb=='v'&&spec.hash&&!erroring;
             if sharp && values.is_nil(){out.push_str(values.go_type());out.push_str("(nil)");return out.check();}
             if sharp{out.push_str(values.go_type());out.push('{');}else{out.push('[');}
-            for(index,value)in values.iter().enumerate(){out.check()?;if index>0{out.push_str(if sharp{", "}else{" "});}format_value(out,&value,verb,spec,depth+1)?;}
+            for(index,value)in values.iter().enumerate(){out.check()?;if index>0{out.push_str(if sharp{", "}else{" "});}format_value_inner(out,&value,verb,spec,depth+1,erroring)?;}
             out.push(if sharp{'}'}else{']'});return out.check();
         }
-        if verb=='v'&&spec.hash{if let Some(bytes)=arg.as_go_bytes(){let start=out.len();quote_bytes(out,bytes,false);spec.pad_in_place(out,start,false);return out.check();}}
+        if verb=='v'&&spec.hash&&!erroring{if let Some(bytes)=arg.as_go_bytes(){let start=out.len();quote_bytes(out,bytes,false);spec.pad_in_place(out,start,false);return out.check();}}
     }
+        let _named_host=if (matches!(verb,'s'|'q'|'x'|'X')||(verb=='v'&&!spec.hash))&&matches!(arg,Value::NamedInt64(_,kind)if kind.stringer.is_some()){out.host(arg)?}else{None};
         let displayed=match arg {
-            Value::NamedInt64(n,kind)if kind.stringer.is_some()&&(matches!(verb,'s'|'q'|'x'|'X')||(verb=='v'&&!spec.hash))=>kind.stringer.map(|stringer|Value::String(stringer(*n).into())),
+            Value::NamedInt64(n,kind)if !erroring&&kind.stringer.is_some()&&(matches!(verb,'s'|'q'|'x'|'X')||(verb=='v'&&!spec.hash))=>kind.stringer.map(|stringer|Value::String(stringer(*n).into())),
             Value::NamedInt64(n,kind)if kind.kind.starts_with("uint")&&matches!(verb,'v'|'b'|'c'|'d'|'o'|'O'|'q'|'x'|'X'|'U')=>Some(Value::Uint(*n as u64)),
             Value::NamedInt64(n,kind)if verb=='v'&&spec.hash=>Some(if matches!(kind.kind,"uint"|"uint8"|"uint16"|"uint32"|"uint64"|"uintptr"){Value::Uint(*n as u64)}else{Value::Int64(*n)}),
-            Value::Object(object) if matches!(verb,'s'|'q'|'x'|'X')||(verb=='v'&&!spec.hash)=>object.display.as_ref().map(|text|Value::String(text.clone())),
+            Value::Object(object) if !erroring&&(matches!(verb,'s'|'q'|'x'|'X')||(verb=='v'&&!spec.hash))=>object.display.as_ref().map(|text|Value::String(text.clone())),
+            Value::NamedInt64(n,kind)if erroring=>Some(if kind.kind.starts_with("uint"){Value::Uint(*n as u64)}else{Value::Int64(*n)}),
             _=>None,
         };
         let arg=displayed.as_ref().unwrap_or(arg);
@@ -527,6 +561,7 @@ fn format_value(out:&mut ByteBuffer,arg:&Value,verb:char,mut spec:FmtSpec,depth:
         // includes the Go type. Preserve actual field order and recurse with
         // the current flags instead of discarding them in the plain printer.
         if verb=='v' && let Value::Object(object)=arg {
+            let _nil_guard=if object.nil_pointer.is_some(){out.host(arg)?}else{None};
             if object.is_nil_pointer(){
                 if spec.hash && let Some(ty)=object.go_type {let _=write!(out,"({ty})(nil)");}
                 else{out.push_str("<nil>");}
@@ -541,18 +576,20 @@ fn format_value(out:&mut ByteBuffer,arg:&Value,verb:char,mut spec:FmtSpec,depth:
                     return out.check();
                 }
                 if pointer{out.push('&');}
-                if spec.hash{out.push_str(object.go_type.ok_or_else(||TemplateError::Exec("host struct has no Go type".into()))?.trim_start_matches('*'));}
+                if spec.hash&&!erroring{out.push_str(object.go_type.ok_or_else(||TemplateError::Exec("host struct has no Go type".into()))?.trim_start_matches('*'));}
                 out.push('{');
                 for(index,name)in fields.iter().enumerate(){
                     out.check()?;
-                    if index>0{out.push_str(if spec.hash{", "}else{" "});}
-                    if spec.plus||spec.hash{out.push_str(name);out.push(':');}
-                    let value=object.field_value(name)?.ok_or_else(||TemplateError::Exec("host struct field unavailable".into()))?;
-                    format_value(out,&value,verb,spec,depth+1)?;
+                    if index>0{out.push_str(if spec.hash&&!erroring{", "}else{" "});}
+                    if !erroring&&(spec.plus||spec.hash){out.push_str(name);out.push(':');}
+                    let _field_host=if object.dynamic_fields.is_some(){out.host(arg)?}else{None};let value=object.field_value(name)?.ok_or_else(||TemplateError::Exec("host struct field unavailable".into()))?;
+                    format_value_inner(out,&value,verb,spec,depth+1,erroring)?;
                 }
                 out.push('}');return out.check();
             }
+            if erroring{return Err(TemplateError::Exec("host underlying representation unavailable for invalid %p".into()));}
         }
+        if matches!(verb,'s'|'q'|'x'|'X'){if let Some(bytes)=arg.as_go_bytes(){return format_bytes_value(out,bytes,verb,&spec);}}
         let start = out.len();
         match verb {
             'T' => out.push_str(match arg {Value::Nil|Value::NilError=>"<nil>",Value::List(_)=>"[]interface {}",Value::Map(_)=>"map[string]interface {}",#[cfg(feature="std")]Value::SharedMap(_)=>"map[string]interface {}",#[cfg(feature="std")]Value::GenericMap(_)=>"map[interface {}]interface {}",value=>value.type_name()}),
@@ -594,9 +631,9 @@ fn format_value(out:&mut ByteBuffer,arg:&Value,verb:char,mut spec:FmtSpec,depth:
             'e' | 'E' => match match arg { Value::Float(f)=>Some(*f),_=>None } {
                 Some(f) => {
                     let prec = spec.precision.unwrap_or(6);
-                    let base=prec.min(1074);let mut raw=if verb=='e'{format!("{:.base$e}",f)}else{format!("{:.base$E}",f)};
-                    if spec.hash&&prec==0{if let Some(exponent)=raw.find(['e','E']){raw.insert(exponent,'.');}}
-                    write_normalized_sci(out,&raw,verb=='E',false);
+                    let base=prec.min(1074);let mut raw=out.temporary(32);if verb=='e'{let _=write!(raw,"{:.base$e}",f);}else{let _=write!(raw,"{:.base$E}",f);}
+                    if spec.hash&&prec==0{if let Some(exponent)=raw.as_bytes().iter().position(|b|matches!(*b,b'e'|b'E')){raw.insert(exponent,'.');}}
+                    out.fail_scratch(&*raw);if let Ok(text)=core::str::from_utf8(raw.as_bytes()){write_normalized_sci(out,text,verb=='E',false);}else{out.reject_size();}
                     if prec>base{let exponent=out.as_bytes()[start..].iter().position(|byte|matches!(*byte,b'e'|b'E')).map_or(out.len(),|index|start+index);out.repeat_ascii(exponent,b'0',prec-base);}
                     apply_float_sign_in_place(out, start, f, &spec);
                     spec.pad_in_place(out, start, true);
@@ -716,7 +753,15 @@ fn format_value(out:&mut ByteBuffer,arg:&Value,verb:char,mut spec:FmtSpec,depth:
 
 /// Prepend a `+` or space sign to a formatted float at `out[start..]`
 /// when the sign flag demands it and the number isn't already negative.
-fn apply_float_sign_in_place(out: &mut ByteBuffer, start: usize, f: f64, spec: &FmtSpec) {
+fn format_bytes_value(out:&mut dyn FormatBuffer,bytes:&[u8],verb:char,spec:&FmtSpec)->Result<()>{
+    let start=out.len();match verb{
+        's'=>out.push_bytes(truncate_runes(bytes,spec.precision)),
+        'q'=>{let bytes=truncate_runes(bytes,spec.precision);if !(spec.hash&&core::str::from_utf8(bytes).is_ok_and(|s|try_backquote_into(out,s))){quote_bytes(out,bytes,spec.plus);}},
+        'x'|'X'=>format_string_hex_into(out,bytes,verb=='X',spec),_=>return Err(TemplateError::Exec("invalid internal bytes format".into())),
+    }spec.pad_in_place(out,start,false);out.check()
+}
+
+fn apply_float_sign_in_place(out: &mut dyn FormatBuffer, start: usize, f: f64, spec: &FmtSpec) {
     // `f >= 0.0` is false for NaN, matching the semantics of the previous
     // allocating `apply_float_sign` helper (NaN never gets a synthesized sign).
     if f < 0.0 || f.is_nan() {
@@ -732,10 +777,56 @@ fn apply_float_sign_in_place(out: &mut ByteBuffer, start: usize, f: f64, spec: &
     }
 }
 
+
+fn pad_error_text(out:&mut dyn FormatBuffer,start:usize,spec:&FmtSpec){
+    if let Some(width)=spec.width {
+        let count=width.saturating_sub(crate::go_runes(&out.as_bytes()[start..]).count());
+        out.repeat_ascii(if spec.left_align{out.len()}else{start},if spec.zero&&!spec.left_align{b'0'}else{b' '},count);
+    }
+}
+
+// %p and %T precede method dispatch in Go. A pointer is the actual pointee,
+// maps use their stable cell identity, and slices use the visible backing.
+fn format_pointer(out:&mut dyn FormatBuffer,arg:&Value,mut spec:FmtSpec,depth:usize)->Result<()> {
+    let address=match arg {
+        Value::Map(map)=>Some(Arc::as_ptr(map) as usize),
+        #[cfg(feature="std")]
+        Value::SharedMap(map)=>Some(if map.is_nil(){0}else{Arc::as_ptr(map) as usize}),
+        #[cfg(feature="std")]
+        Value::GenericMap(map)=>Some(Arc::as_ptr(map) as usize),
+        Value::List(values)=>Some(values.as_ptr() as usize),
+        Value::Slice(slice)=>Some(slice.data_address()?),
+        Value::Object(object) if object.map_view.is_some()=>{
+            let _guard=out.host(arg)?;
+            let view=object.map_view.as_ref().unwrap();
+            Some(if (view.is_nil)(){0}else{object.pointer_identity.unwrap_or_else(||object.data.as_ref().map_or(Arc::as_ptr(object) as usize,|data|Arc::as_ptr(data) as *const () as usize))})
+        }
+        Value::Object(object) if object.go_type.is_some_and(|ty|ty.starts_with('*'))=>{
+            let _guard=if object.nil_pointer.is_some(){out.host(arg)?}else{None};
+            Some(if object.is_nil_pointer(){0}else{object.pointer_identity.unwrap_or(Arc::as_ptr(object) as usize)})
+        }
+        // Rust's dyn Fn data pointer is not a function code pointer. The host
+        // Value API has no code-address descriptor, so do not invent one.
+        Value::Function(_)=>return Err(TemplateError::Exec("Go function code pointer unavailable for native closure".into())),
+        _=>None,
+    };
+    if let Some(address)=address {
+        let start=out.len();spec.hash=!spec.hash;
+        format_uint_base_into(out,address as u64,'x',&spec);
+        spec.pad_in_place(out,start,false);
+    }else{
+        out.push_str("%!p(");
+        if matches!(arg,Value::Nil|Value::NilError){out.push_str("<nil>");}
+        else{out.push_str(arg.type_name());out.push('=');format_value_inner(out,arg,'v',spec,depth+1,true)?;}
+        out.push(')');
+    }
+    out.check()
+}
+
 /// Emit Go's `%!verb(type=value)` marker for a type-mismatched or unknown verb.
 ///
 /// Nil is a special case: Go emits `%!verb(<nil>)` without the `nil=` prefix.
-fn write_bad_verb(out: &mut ByteBuffer, verb: char, arg: &Value) {
+fn write_bad_verb(out: &mut dyn FormatBuffer, verb: char, arg: &Value) {
     out.push_str("%!");
     out.push(verb);
     out.push('(');
@@ -745,7 +836,7 @@ fn write_bad_verb(out: &mut ByteBuffer, verb: char, arg: &Value) {
 
 /// Emit the `type=value` (or bare `<nil>`) form used inside `%!verb(...)`
 /// and `%!(EXTRA …)` markers.
-fn write_bad_arg(out: &mut ByteBuffer, arg: &Value) {
+fn write_bad_arg(out: &mut dyn FormatBuffer, arg: &Value) {
     if matches!(arg, Value::Nil) {
         out.push_str("<nil>");
         return;
@@ -761,7 +852,7 @@ fn write_bad_arg(out: &mut ByteBuffer, arg: &Value) {
 ///
 /// Go's precision on `%.Nx` for strings limits the number of *input bytes*
 /// consumed, yielding `2 * N` hex characters, not `N`.
-fn format_string_hex_into(out: &mut ByteBuffer, bytes: &[u8], upper: bool, spec: &FmtSpec) {
+fn format_string_hex_into(out: &mut dyn FormatBuffer, bytes: &[u8], upper: bool, spec: &FmtSpec) {
     let take = spec
         .precision
         .map(|p| p.min(bytes.len()))
@@ -783,7 +874,7 @@ fn format_string_hex_into(out: &mut ByteBuffer, bytes: &[u8], upper: bool, spec:
 /// Returns `false` if the string contains backticks or non-printable
 /// characters; in that case `out` is left unchanged and the caller should
 /// fall back to [`go_quote_into`].
-fn try_backquote_into(out: &mut ByteBuffer, s: &str) -> bool {
+fn try_backquote_into(out: &mut dyn FormatBuffer, s: &str) -> bool {
     if s.contains('`') {
         return false;
     }
@@ -818,7 +909,7 @@ fn try_backquote_into(out: &mut ByteBuffer, s: &str) -> bool {
 ///
 /// Writes directly into `out`: no intermediate `String` allocation, in
 /// contrast to the previous `go_normalize_sci` + `replace` + `strip` chain.
-fn write_normalized_sci(out: &mut ByteBuffer, raw: &str, upper: bool, strip_zeros: bool) {
+fn write_normalized_sci(out: &mut dyn FormatBuffer, raw: &str, upper: bool, strip_zeros: bool) {
     let e_pos = raw.bytes().position(|b| b == b'e' || b == b'E');
     let Some(e_pos) = e_pos else {
         // No exponent: emit the mantissa-only form, optionally stripped.
@@ -866,11 +957,10 @@ fn trim_trailing_zeros_view(s: &str) -> &str {
 ///
 /// Avoids the `log10().floor()` round-off that misclassifies values right at
 /// a power-of-ten boundary (e.g. `999999.999…` rounding up to `1e6`).
-fn decimal_exp(f: f64) -> i32 {
-    let s = format!("{:e}", f.abs());
-    s.find('e')
-        .and_then(|i| s[i + 1..].parse::<i32>().ok())
-        .unwrap_or(0)
+fn decimal_exp(out:&mut dyn FormatBuffer,f:f64)->i32{
+    let mut raw=out.temporary(32);let _=write!(raw,"{:e}",f.abs());out.fail_scratch(&*raw);
+    let Ok(text)=core::str::from_utf8(raw.as_bytes())else{out.reject_size();return 0;};
+    text.find('e').and_then(|i|text[i+1..].parse::<i32>().ok()).unwrap_or(0)
 }
 
 /// Conversion used by the pinned Go amd64 reference for runtime float-to-int64.
@@ -891,15 +981,15 @@ pub fn format_float_shortest(value:f64)->String{
 }
 
 /// Go shortest g/G notation uses an exponent below -4 or at least 6.
-fn write_g_default(out: &mut ByteBuffer, f: f64, upper: bool) {
+fn write_g_default(out: &mut dyn FormatBuffer, f: f64, upper: bool) {
     if f == 0.0 {
         out.push_str(if f.is_sign_negative() { "-0" } else { "0" });
         return;
     }
-    let exp = decimal_exp(f);
+    let exp = decimal_exp(out,f);
     if !(-4..6).contains(&exp) {
-        let raw = format!("{:e}", f);
-        write_normalized_sci(out, &raw, upper, false);
+        let mut raw=out.temporary(32);let _=write!(raw,"{:e}",f);out.fail_scratch(&*raw);
+        if let Ok(text)=core::str::from_utf8(raw.as_bytes()){write_normalized_sci(out,text,upper,false);}else{out.reject_size();}
     } else {
         let _ = write!(out, "{}", f);
     }
@@ -908,30 +998,30 @@ fn write_g_default(out: &mut ByteBuffer, f: f64, upper: bool) {
 /// Write a float into `out` using Go's `%g` with an explicit precision
 /// (significant digits). Uses `%e` notation when the exponent is < −4 or
 /// ≥ `prec`, then strips trailing zeros.
-fn write_g_with_precision(out: &mut ByteBuffer, f: f64, prec: usize, upper: bool) {
+fn write_g_with_precision(out: &mut dyn FormatBuffer, f: f64, prec: usize, upper: bool) {
     let prec=prec.min(1074);
     if f == 0.0 {
         out.push_str(if f.is_sign_negative() { "-0" } else { "0" });
         return;
     }
-    let exp = decimal_exp(f);
+    let exp = decimal_exp(out,f);
     if exp < -4 || exp >= prec as i32 {
         let e_prec = prec.saturating_sub(1);
-        let raw = format!("{:.prec$e}", f, prec = e_prec);
-        write_normalized_sci(out, &raw, upper, true);
+        let mut raw=out.temporary(32);let _=write!(raw,"{:.prec$e}",f,prec=e_prec);out.fail_scratch(&*raw);
+        if let Ok(text)=core::str::from_utf8(raw.as_bytes()){write_normalized_sci(out,text,upper,true);}else{out.reject_size();}
     } else {
         let f_prec = if prec as i32 > exp + 1 {
             (prec as i32 - exp - 1) as usize
         } else {
             0
         };
-        let raw = format!("{:.prec$}", f, prec = f_prec);
-        out.push_str(trim_trailing_zeros_view(&raw));
+        let mut raw=out.temporary(32);let _=write!(raw,"{:.prec$}",f,prec=f_prec);out.fail_scratch(&*raw);
+        if let Ok(text)=core::str::from_utf8(raw.as_bytes()){out.push_str(trim_trailing_zeros_view(text));}else{out.reject_size();}
     }
 }
 
 // The sharp g/G form retains precision significant digits and a decimal point.
-fn retain_g_zeros(out:&mut ByteBuffer,start:usize,precision:usize){
+fn retain_g_zeros(out:&mut dyn FormatBuffer,start:usize,precision:usize){
     let end=out.as_bytes()[start..].iter().copied().position(|byte|matches!(byte,b'e'|b'E')).map_or(out.len(),|offset|start+offset);
     let mut significant=0usize;let mut nonzero=false;
     for byte in out.as_bytes()[start..end].iter().copied(){if byte.is_ascii_digit(){if byte!=b'0'{nonzero=true;}if nonzero{significant+=1;}}}
@@ -951,7 +1041,7 @@ fn retain_g_zeros(out:&mut ByteBuffer,start:usize,precision:usize){
 /// 255 yields `0x000000ff` (the `0x` sits outside the padded digit count),
 /// and `%#08o` of 255 yields `00000377` (Go's formatter omits the bare-`0`
 /// octal prefix when the padded digits already start with `0`).
-fn format_int_base_into(out: &mut ByteBuffer, n: i64, base: char, spec: &FmtSpec) {
+fn format_int_base_into(out: &mut dyn FormatBuffer, n: i64, base: char, spec: &FmtSpec) {
     let sign = if n < 0 {
         Some('-')
     } else if spec.plus {
@@ -970,7 +1060,7 @@ fn format_int_base_into(out: &mut ByteBuffer, n: i64, base: char, spec: &FmtSpec
 /// Identical to [`format_int_base_into`] except the value has no inherent
 /// sign: only the `+` / space flags can introduce a leading sign character,
 /// never `-`. Go applies the `+` / space flags to unsigned values too.
-fn format_uint_base_into(out: &mut ByteBuffer, u: u64, base: char, spec: &FmtSpec) {
+fn format_uint_base_into(out: &mut dyn FormatBuffer, u: u64, base: char, spec: &FmtSpec) {
     let sign = if spec.plus {
         Some('+')
     } else if spec.space {
@@ -984,74 +1074,15 @@ fn format_uint_base_into(out: &mut ByteBuffer, u: u64, base: char, spec: &FmtSpe
 /// Shared core for the signed and unsigned base formatters: writes `mag`'s
 /// digits in `base` with `sign` prepended, applying Go's zero-pad / precision /
 /// `#`-prefix rules described on [`format_int_base_into`].
-fn format_magnitude_base_into(
-    out: &mut ByteBuffer,
-    mag: u64,
-    sign: Option<char>,
-    base: char,
-    spec: &FmtSpec,
-) {
-    let mut digits = String::new();
-    let _ = match base {
-        'x' => write!(digits, "{:x}", mag),
-        'X' => write!(digits, "{:X}", mag),
-        'o' | 'O' => write!(digits, "{:o}", mag),
-        'b' => write!(digits, "{:b}", mag),
-        #[allow(
-            clippy::unreachable,
-            reason = "private helper; callers only pass 'x', 'X', 'o', 'O', 'b'"
-        )]
-        _ => unreachable!(),
-    };
-
-    if mag==0 && spec.precision==Some(0){return;}
-
-    // Go's rule: `0` flag without `-` and without explicit precision turns
-    // into "pad digits up to width − sign_len". An explicit precision wins
-    // over the zero flag.
-    let digit_target = match spec.precision {
-        Some(p) => p,
-        None if spec.zero && !spec.left_align => spec
-            .width
-            .map(|w| w.saturating_sub(sign.is_some() as usize))
-            .unwrap_or(0),
-        None => 0,
-    };
-    if digit_target>(1<<20){out.reject_size();return;}
-    if digits.len() < digit_target {
-        let pad = digit_target - digits.len();
-        let mut padded = String::with_capacity(digit_target);
-        for _ in 0..pad {
-            padded.push('0');
-        }
-        padded.push_str(&digits);
-        digits = padded;
-    }
-
-    if let Some(s) = sign {
-        out.push(s);
-    }
-    if base=='O'{out.push_str("0o");}
-    if spec.hash {
-        match base {
-            'x' => out.push_str("0x"),
-            'X' => out.push_str("0X"),
-            'b' => out.push_str("0b"),
-            'o' | 'O' => {
-                // Go skips the `0` octal prefix when the first digit is
-                // already `0` — which happens naturally after zero-padding.
-                if !digits.starts_with('0') {
-                    out.push('0');
-                }
-            }
-            #[allow(
-                clippy::unreachable,
-                reason = "private helper; callers only pass 'x', 'X', 'o', 'O', 'b'"
-            )]
-            _ => unreachable!(),
-        }
-    }
-    out.push_str(&digits);
+fn format_magnitude_base_into(out:&mut dyn FormatBuffer,mag:u64,sign:Option<char>,base:char,spec:&FmtSpec){
+    let mut digits=out.temporary(64);
+    let _=match base{'x'=>write!(digits,"{:x}",mag),'X'=>write!(digits,"{:X}",mag),'o'|'O'=>write!(digits,"{:o}",mag),'b'=>write!(digits,"{:b}",mag),'d'=>write!(digits,"{}",mag),_=>return};
+    out.fail_scratch(&*digits);if mag==0&&spec.precision==Some(0){return;}
+    let target=match spec.precision{Some(p)=>p,None if spec.zero&&!spec.left_align=>spec.width.map(|w|w.saturating_sub(usize::from(sign.is_some()))).unwrap_or(0),None=>0};
+    if target>(1<<20){out.reject_size();return;}let padding=target.saturating_sub(digits.len());
+    if let Some(sign)=sign{out.push(sign);}if base=='O'{out.push_str("0o");}
+    if spec.hash{match base{'x'=>out.push_str("0x"),'X'=>out.push_str("0X"),'b'=>out.push_str("0b"),'o'|'O'=>{if padding==0&&!digits.as_bytes().starts_with(b"0"){out.push('0');}},_=>{}}}
+    out.repeat_ascii(out.len(),b'0',padding);out.push_bytes(digits.as_bytes());
 }
 
 // Escaping functions
@@ -1174,7 +1205,7 @@ pub(crate) fn parse_hex_float(s: &str) -> Option<f64> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Derived from Go internal/strconv fmtB/fmtX (BSD-3-Clause, Go Authors).
-fn write_float_binary_hex(out:&mut ByteBuffer,value:f64,verb:char,spec:&FmtSpec){
+fn write_float_binary_hex(out:&mut dyn FormatBuffer,value:f64,verb:char,spec:&FmtSpec){
     let start=out.len();
     if !value.is_finite(){
         if value.is_nan(){if spec.plus{out.push('+');}else if spec.space{out.push(' ');}out.push_str("NaN");}
@@ -1185,7 +1216,7 @@ fn write_float_binary_hex(out:&mut ByteBuffer,value:f64,verb:char,spec:&FmtSpec)
     let bits=value.to_bits();let negative=bits>>63!=0;
     let mut exponent=((bits>>52)&0x7ff)as i32;let mut mantissa=bits&((1u64<<52)-1);
     if exponent==0{exponent=1;}else{mantissa|=1<<52;}exponent-=1023;
-    let mut text=String::new();text.push(if negative{'-'}else{'+'});
+    let mut text=out.temporary(32);text.push(if negative{'-'}else{'+'});
     if verb=='b'{let _=write!(text,"{mantissa}p{:+}",exponent-52);}
     else{
         if mantissa==0{exponent=0;}mantissa<<=8;
@@ -1203,13 +1234,15 @@ fn write_float_binary_hex(out:&mut ByteBuffer,value:f64,verb:char,spec:&FmtSpec)
         }
         let _=write!(text,"{}{:+03}",if upper{'P'}else{'p'},exponent);
         if spec.hash{
-            let split=text.find(['p','P']).unwrap_or(text.len());let tail=text.split_off(split);let(mut point,mut nonzero)=(false,false);
+            let split=text.as_bytes().iter().position(|b|matches!(*b,b'p'|b'P')).unwrap_or(text.len());let mut tail=[0u8;8];let tail_len=text.len()-split;
+            if tail_len>tail.len(){out.reject_size();return;}tail[..tail_len].copy_from_slice(&text.as_bytes()[split..]);text.truncate(split);let(mut point,mut nonzero)=(false,false);
             let mut digits=if verb=='x'{spec.precision.unwrap_or(6)as isize}else{0};
             for byte in text.as_bytes().iter().skip(1){if *byte==b'.'{point=true;}else{if *byte!=b'0'{nonzero=true;}if nonzero{digits-=1;}}}
-            if !point{text.push('.');}while digits>0{text.push('0');digits-=1;}text.push_str(&tail);
+            if !point{text.push('.');}while digits>0{text.push('0');digits-=1;}text.push_bytes(&tail[..tail_len]);
         }
     }
-    if negative||spec.plus{out.push_str(&text);}else if spec.space{out.push(' ');out.push_str(&text[1..]);}else{out.push_str(&text[1..]);}
+    out.fail_scratch(&*text);if text.check().is_err(){return;}
+    if negative||spec.plus{out.push_bytes(text.as_bytes());}else if spec.space{out.push(' ');out.push_bytes(&text.as_bytes()[1..]);}else{out.push_bytes(&text.as_bytes()[1..]);}
     spec.pad_in_place(out,start,true);
 }
 
@@ -1217,8 +1250,8 @@ fn truncate_runes(bytes:&[u8],precision:Option<usize>)->&[u8]{
     let Some(precision)=precision else{return bytes;};
     let end=crate::go_runes(bytes).take(precision).map(|(_,width)|width).sum();&bytes[..end]
 }
-fn quote_bytes(out:&mut ByteBuffer,bytes:&[u8],ascii:bool){quote_with_delimiter(out,bytes,ascii,'"')}
-fn quote_with_delimiter(out:&mut ByteBuffer,bytes:&[u8],ascii:bool,delimiter:char){
+fn quote_bytes(out:&mut dyn FormatBuffer,bytes:&[u8],ascii:bool){quote_with_delimiter(out,bytes,ascii,'"')}
+fn quote_with_delimiter(out:&mut dyn FormatBuffer,bytes:&[u8],ascii:bool,delimiter:char){
     out.push(delimiter);let mut offset=0;
     for(rune,width)in crate::go_runes(bytes){
         if rune=='\u{fffd}'&&width==1{let _=write!(out,"\\x{:02x}",bytes[offset]);}

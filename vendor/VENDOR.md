@@ -113,3 +113,10 @@ opt-in Go-compatible parameter handling are documented in
 [argon2-0.5.3/VENDOR.md](argon2-0.5.3/VENDOR.md). The host reserves scratch
 memory before block allocation and uses the existing bounded authentication
 worker and per-generation HMAC/single-flight cache.
+
+
+`native-write-policy` is an Apache-2.0 component maintained in this repository.
+It contains checked write-deadline arithmetic and concrete atomic allocation
+ownership shared by the native Hyper, h2 and Quinn extensions; it is not an
+upstream third-party crate release. Configuration activation is tracked in
+COMPATIBILITY.md separately from these opt-in protocol primitives.

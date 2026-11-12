@@ -13,6 +13,8 @@ const DONE:usize=1<<(usize::BITS-1);
 pub(super) struct RootTree(Arc<Tree>);
 impl RootTree{pub(super) fn tree(&self)->Arc<Tree>{self.0.clone()} pub(super) fn finish(&self){let previous=self.0.state.fetch_or(DONE,Ordering::AcqRel);self.0.done.cancel();if previous==0{self.0.release_cpu();}}}
 pub(super) struct Tree {
+    // Scope and backing allocations retire before Control and memory credit.
+    formatter_scope:std::sync::OnceLock<gotmpl::OwnedFormatterScope>,
     pub control:Arc<Control>,
     cpu:Mutex<Cpu>,_memory:OwnedSemaphorePermit,
     roots:Arc<Semaphore>,numeric:Arc<Semaphore>,runtime:tokio::runtime::Handle,
@@ -59,7 +61,7 @@ impl Budget {
         };
         if self.closed.load(Ordering::Acquire)||control.cancel.is_cancelled(){return Err(BudgetError::WorkerFailed);}
         let runtime=tokio::runtime::Handle::try_current().map_err(|_|BudgetError::WorkerFailed)?;
-        let tree=Arc::new(Tree{control,cpu:Mutex::new(Cpu{permit:Some(root),numeric_active:false}),roots:self.roots.clone(),numeric:self.numeric.clone(),runtime,shutdown:self.shutdown.clone(),done:tokio_util::sync::CancellationToken::new(),_memory:memory,state:AtomicUsize::new(0),_admission:admission});
+        let tree=Arc::new(Tree{formatter_scope:std::sync::OnceLock::new(),control,cpu:Mutex::new(Cpu{permit:Some(root),numeric_active:false}),roots:self.roots.clone(),numeric:self.numeric.clone(),runtime,shutdown:self.shutdown.clone(),done:tokio_util::sync::CancellationToken::new(),_memory:memory,state:AtomicUsize::new(0),_admission:admission});
         tree.control.bind_worker(Binding{tree:Arc::downgrade(&tree),shutdown:tree.shutdown.clone(),done:tree.done.clone()})?;
         Ok(RootTree(tree))
     }
@@ -113,7 +115,24 @@ impl WorkerScope {
 impl Drop for WorkerScope{fn drop(&mut self){WORKER_TREE.with(|current|current.set(self.0));}}
 /// The backlink is weak. Tokens do not own the Tree or Control.
 pub(super) struct Binding {tree:Weak<Tree>,shutdown:tokio_util::sync::CancellationToken,done:tokio_util::sync::CancellationToken}
-impl Binding {pub(super) fn stopped(&self)->bool{self.shutdown.is_cancelled()||self.done.is_cancelled()}}
+impl Binding {
+ pub(super) fn stopped(&self)->bool{self.shutdown.is_cancelled()||self.done.is_cancelled()}
+ pub(super) fn formatter(&self,control:&Arc<Control>)->gotmpl::Result<Arc<gotmpl::FormatterScope>>{
+  let tree=self.tree.upgrade().ok_or_else(||gotmpl::TemplateError::Exec("formatter worker owner retired".into()))?;
+  if !Arc::ptr_eq(&tree.control,control)||!WORKER_TREE.with(|current|current.get()==Some(Arc::as_ptr(&tree)as usize)){return Err(gotmpl::TemplateError::Exec("formatter requires its admitted worker".into()));}
+  control.check()?;
+  if let Some(owner)=tree.formatter_scope.get(){return Ok(owner.scope());}
+  let meter=control.formatting_meter()?;
+  control.reserve_host_bytes(128)?;let weak=Arc::downgrade(control);
+  // This is the closed Frame function/factory set. User template/JSON values
+  // cannot construct Objects/NamedTypes and CustomFuncs is nil. Public scopes
+  // default to rejecting opaque callback formatting paths.
+  let host:gotmpl::FormatHostGuard=Arc::new(move|value|{weak.upgrade().ok_or_else(||gotmpl::TemplateError::Exec("formatter host owner retired".into()))?.check()?;super::render::formatting_host_cost(value)});
+  let owner=gotmpl::FormatterScope::new(meter,Some(host))?;
+  let unused=tree.formatter_scope.set(owner);drop(unused);
+  tree.formatter_scope.get().map(|owner|owner.scope()).ok_or_else(||gotmpl::TemplateError::Exec("formatter scope unavailable".into()))
+ }
+}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub(super) enum NumericError {Unbound,NotWorker,Overloaded,Stopped,Poisoned,AlreadyActive,AlreadyResumed}
 impl NumericError {pub(super) fn message(self)->&'static str{match self{

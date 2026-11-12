@@ -30,6 +30,8 @@ pub struct FramedWrite<T, B> {
 
     encoder: Encoder<B>,
     send_completions: Vec<crate::ext::SendCompletionOwner>,
+    wire_progress: Option<Box<super::wire_progress::WireProgress>>,
+    retirement_queue: Option<std::sync::Arc<crate::data_receipt::DeferredData>>,
 }
 
 #[derive(Debug)]
@@ -97,6 +99,8 @@ where
             final_flush_done: false,
             stream_output_pending: false,
             send_completions: Vec::new(),
+            wire_progress: None,
+            retirement_queue: None,
             encoder: Encoder {
                 hpack: hpack::Encoder::default(),
                 buf: Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY)),
@@ -130,7 +134,8 @@ where
     /// underlying I/O object.
     pub(crate) fn has_capacity(&self) -> bool {
         self.encoder.has_capacity()
-            && self.send_completions.len() < MAX_PENDING_SEND_OBSERVATIONS
+            && self.send_completions.len() + self.wire_progress.as_ref().map_or(0, |w| w.len())
+                < MAX_PENDING_SEND_OBSERVATIONS
     }
 
     /// Buffer a frame.
@@ -138,8 +143,44 @@ where
     /// `poll_ready` must be called first to ensure that a frame may be
     /// accepted.
     pub fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
-        let stream_output = matches!(&item, Frame::Data(_) | Frame::Headers(_) | Frame::PushPromise(_));
+        self.buffer_observed(item, None)
+    }
+    fn buffer_observed(
+        &mut self,
+        item: Frame<B>,
+        owner: Option<crate::data_receipt::DataFragmentOwner>,
+    ) -> Result<(), UserError> {
+        if let Some(owner) = owner.as_ref() {
+            if self.retirement_queue.is_none() {
+                self.retirement_queue = Some(owner.retirement_queue());
+            }
+            if self.wire_progress.is_none() {
+                self.wire_progress = Some(Box::new(super::wire_progress::WireProgress::new(
+                    self.encoder.buf.remaining(),
+                )));
+            }
+        }
+        let stream_output = matches!(
+            &item,
+            Frame::Data(_) | Frame::Headers(_) | Frame::PushPromise(_)
+        );
+        let data_len = match &item {
+            Frame::Data(frame) => Some(frame.payload().remaining()),
+            _ => None,
+        };
+        let before = self.encoder.buf.get_ref().len();
         self.encoder.buffer(item)?;
+        if let Some(w) = self.wire_progress.as_mut() {
+            let bytes = data_len.map_or(self.encoder.buf.get_ref().len() - before, |n| {
+                n + frame::HEADER_LEN
+            });
+            w.buffered(
+                bytes,
+                owner,
+                data_len,
+                matches!(self.encoder.next, Some(Next::Continuation(_))),
+            )?;
+        }
         self.stream_output_pending |= stream_output;
         Ok(())
     }
@@ -160,10 +201,28 @@ where
         Ok(())
     }
 
+    pub(crate) fn buffer_with_receipts(
+        &mut self,
+        item: Frame<B>,
+        completion: Option<crate::ext::SendCompletionOwner>,
+        data: Option<crate::data_receipt::DataFragmentOwner>,
+    ) -> Result<(), UserError> {
+        self.buffer_observed(item, data)?;
+        if let Some(completion) = completion {
+            self.send_completions.push(completion);
+        }
+        Ok(())
+    }
+
     /// Flush buffered data to the wire
     pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         let result = self.flush_frames(cx);
-        if matches!(&result, Poll::Ready(Ok(()))) { self.stream_output_pending = false; }
+        if matches!(&result, Poll::Ready(Ok(()))) {
+            self.stream_output_pending = false;
+        }
+        if matches!(&result, Poll::Ready(Err(_))) {
+            self.wire_progress = None;
+        }
         match &result {
             Poll::Ready(Ok(())) if !self.send_completions.is_empty() => {
                 let now = std::time::Instant::now();
@@ -178,6 +237,10 @@ where
     }
 
     fn flush_frames(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        if self.wire_progress.is_some() {
+            return self.flush_observed(cx);
+        }
+
         let span = tracing::trace_span!("FramedWrite::flush");
         let _e = span.enter();
 
@@ -215,6 +278,62 @@ where
         // Flush the upstream
         ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
         Poll::Ready(Ok(()))
+    }
+
+    fn flush_observed(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut flushed_here = false;
+        loop {
+            if self
+                .wire_progress
+                .as_ref()
+                .expect("opted-in wire state")
+                .needs_flush
+            {
+                ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
+                self.wire_progress
+                    .as_mut()
+                    .expect("opted-in wire state")
+                    .flushed(std::time::Instant::now());
+                flushed_here = true;
+            }
+            if self.encoder.is_empty() {
+                match self.encoder.unset_frame() {
+                    ControlFlow::Continue => {
+                        let bytes = self.encoder.buf.remaining();
+                        let open = matches!(self.encoder.next, Some(Next::Continuation(_)));
+                        self.wire_progress
+                            .as_mut()
+                            .expect("opted-in wire state")
+                            .continuation(bytes, open)?;
+                    }
+                    ControlFlow::Break => {
+                        if !flushed_here {
+                            ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
+                        }
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                continue;
+            }
+            let n = match self.encoder.next {
+                Some(Next::Data(ref mut frame)) => {
+                    let mut buf = (&mut self.encoder.buf).chain(frame.payload_mut());
+                    ready!(poll_write_buf(Pin::new(&mut self.inner), cx, &mut buf))?
+                }
+                _ => ready!(poll_write_buf(
+                    Pin::new(&mut self.inner),
+                    cx,
+                    &mut self.encoder.buf
+                ))?,
+            };
+            if n == 0 {
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+            self.wire_progress
+                .as_mut()
+                .expect("opted-in wire state")
+                .wrote(n)?;
+        }
     }
 
     /// Close the codec
@@ -414,6 +533,19 @@ mod unstable {
     impl<T, B> FramedWrite<T, B> {
         pub fn get_ref(&self) -> &T {
             &self.inner
+        }
+    }
+}
+
+impl<T, B> Drop for FramedWrite<T, B> {
+    fn drop(&mut self) {
+        // Final source Buf and codec receipt destruction happens outside the
+        // stream store. Then release any queued byte owners and wake receivers.
+        drop(self.encoder.next.take());
+        drop(self.encoder.last_data_frame.take());
+        self.wire_progress = None;
+        if let Some(queue) = self.retirement_queue.take() {
+            queue.drain();
         }
     }
 }

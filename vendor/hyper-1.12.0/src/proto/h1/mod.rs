@@ -18,6 +18,8 @@ pub(crate) mod dispatch;
 mod encode;
 mod io;
 mod role;
+#[cfg(feature="server")]
+mod response_write;
 
 cfg_client! {
     pub(crate) type ClientTransaction = role::Client;

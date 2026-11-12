@@ -1269,6 +1269,36 @@ impl<B: Buf> SendResponse<B> {
     /// [`SendResponse`]: #
     /// [`SendStream`]: ../struct.SendStream.html
     /// [`send_reset`]: #method.send_reset
+    /// Observe final response HEADERS and every CONTINUATION through actual flush.
+    #[doc(hidden)]
+    pub fn send_response_observed(
+        &mut self,
+        response: Response<()>,
+        end_of_stream: bool,
+        credit: Option<bytes::Bytes>,
+    ) -> Result<(SendStream<B>, crate::ext::DataWriteReceipt<B>), crate::Error> {
+        self.inner
+            .send_response_observed(response, end_of_stream, credit, None)
+            .map(|receipt| (SendStream::new(self.inner.clone()), receipt))
+            .map_err(Into::into)
+    }
+    /// Supplies a concrete deadline before final response headers reach the codec.
+    #[doc(hidden)]
+    pub fn send_response_observed_with_deadline(
+        &mut self,
+        response: Response<()>,
+        end_of_stream: bool,
+        credit: Option<bytes::Bytes>,
+        deadline: Option<crate::ext::DataWriteDeadline>,
+    ) -> Result<(SendStream<B>, crate::ext::DataWriteReceipt<B>), crate::Error> {
+        self.send_response_observed_with_policy(response,end_of_stream,credit,deadline.map(Into::into))
+    }
+    /// Supplies exact constraints before final HEADERS/CONTINUATION encoding.
+    #[doc(hidden)]
+    pub fn send_response_observed_with_policy(&mut self,response:Response<()>,end_of_stream:bool,credit:Option<bytes::Bytes>,policy:Option<crate::ext::DataWritePolicy>)->Result<(SendStream<B>,crate::ext::DataWriteReceipt<B>),crate::Error>{
+        self.inner.send_response_observed(response,end_of_stream,credit,policy).map(|receipt|(SendStream::new(self.inner.clone()),receipt)).map_err(Into::into)
+    }
+    /// Sends final response headers on this stream.
     pub fn send_response(
         &mut self,
         response: Response<()>,

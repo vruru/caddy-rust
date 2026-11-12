@@ -95,6 +95,9 @@ pub(crate) struct Lease {
 }
 
 impl Lease {
+    pub(super) fn covers(&self,pool:&Arc<Pool>,bytes:usize)->bool {
+        Arc::ptr_eq(&self.pool,pool)&&self.bytes>=bytes
+    }
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }

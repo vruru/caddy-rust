@@ -99,7 +99,7 @@ pub(super) async fn prepare<I: Stream + 'static>(
     operations: &[Operation],
     peer: &mut NetAddress,
     local: &mut NetAddress,
-    deadline: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
     cancel: CancellationToken,
 ) -> anyhow::Result<Prepared<I>> {
     if operations.is_empty() {
@@ -110,15 +110,17 @@ pub(super) async fn prepare<I: Stream + 'static>(
         match operation {
             Operation::Proxy(config) => {
                 let policy = config.policy(peer)?;
-                let limit = match config.timeout {
-                    Some(duration) => tokio::time::Instant::now()
-                        .checked_add(duration)
-                        .ok_or_else(|| anyhow::anyhow!("PROXY timeout overflow"))?
-                        .min(deadline),
-                    None => deadline,
+                let own_deadline = config.timeout
+                    .map(|duration| tokio::time::Instant::now().checked_add(duration)
+                        .ok_or_else(|| anyhow::anyhow!("PROXY timeout overflow")))
+                    .transpose()?;
+                let limit = match (own_deadline, deadline) {
+                    (Some(own), Some(outer)) => Some(own.min(outer)),
+                    (Some(own), None) => Some(own),
+                    (None, outer) => outer,
                 };
                 let prepared =
-                    proxy_protocol::io::prepare(io, policy, Some(limit), cancel.clone()).await?;
+                    proxy_protocol::io::prepare(io, policy, limit, cancel.clone()).await?;
                 if let Some(header) = prepared.header {
                     if let Some(source) = header.source {
                         *peer = source.into();

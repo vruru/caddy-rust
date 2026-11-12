@@ -9,6 +9,7 @@ mod order_parameters;
 mod chain_preference;
 mod certificate_links;
 mod certificate_chains;
+pub(crate) use certificate_chains::Cleanup as ChainCleanup;
 pub(crate) mod chain_memory;
 pub(crate) mod chain_deep_shape;
 pub(crate) mod chain_validation;
@@ -478,17 +479,20 @@ impl AcmeWire {
         &self, signer:&Arc<AccountSigner>, kid:Option<&str>, url:Url,
         payload:Option<&Value>, cancel:&CancellationToken,
     )->Result<WireResponse> {
-        self.signed_url_with_memory(signer,kid,url,payload,None,cancel).await
+        self.signed_url_with_memory(signer,kid,url,payload,None,None,None,cancel).await
     }
-    async fn signed_certificate_url(&self,signer:&Arc<AccountSigner>,kid:&str,url:Url,cancel:&CancellationToken)->Result<WireResponse> {
-        self.signed_url_with_memory(signer,Some(kid),url,None,Some(self.inner.chain_memory.clone()),cancel).await
+    async fn signed_certificate_url(&self,signer:&Arc<AccountSigner>,kid:&str,url:Url,
+        credit:ChainMemoryLease,http_slots:Arc<Semaphore>,cancel:&CancellationToken)->Result<WireResponse> {
+        ensure!(credit.covers(&self.inner.chain_memory.payload,MAX_BODY),"invalid ACME certificate body admission");
+        self.signed_url_with_memory(signer,Some(kid),url,None,Some(self.inner.chain_memory.clone()),Some(credit),Some(http_slots),cancel).await
     }
-    async fn signed_url_with_memory(&self,signer:&Arc<AccountSigner>,kid:Option<&str>,url:Url,payload:Option<&Value>,memory:Option<Arc<ChainMemoryPools>>,cancel:&CancellationToken)->Result<WireResponse> {
+    async fn signed_url_with_memory(&self,signer:&Arc<AccountSigner>,kid:Option<&str>,url:Url,payload:Option<&Value>,memory:Option<Arc<ChainMemoryPools>>,
+        mut first_credit:Option<ChainMemoryLease>,http_slots:Option<Arc<Semaphore>>,cancel:&CancellationToken)->Result<WireResponse> {
         if let Some(kid) = kid {
             self.endpoint(kid)?;
         }
         for attempt in 0..3 {
-            let body_credit=memory.as_ref().map(|p|p.payload.reserve(MAX_BODY)).transpose()?;
+            let body_credit=match first_credit.take(){Some(credit)=>Some(credit),None=>memory.as_ref().map(|p|p.payload.reserve(MAX_BODY)).transpose()?};
             let nonce = self.nonce(cancel).await?;
             let mut protected = json!({"alg":signer.algorithm(),"nonce":nonce,"url":url.as_str()});
             if let Some(kid) = kid {
@@ -518,6 +522,7 @@ impl AcmeWire {
                 "application/jose+json",
                 memory.clone(),
                 body_credit,
+                http_slots.clone(),
                 cancel,
             )
             .await?;
@@ -1001,9 +1006,9 @@ async fn send_with_type(
     content_type: &str,
     cancel: &CancellationToken,
 ) -> Result<WireResponse> {
-    send_with_memory(client,method,url,body,content_type,None,None,cancel).await
+    send_with_memory(client,method,url,body,content_type,None,None,None,cancel).await
 }
-async fn send_with_memory(client:&reqwest::Client,method:Method,url:Url,body:Option<Vec<u8>>,content_type:&str,memory:Option<Arc<ChainMemoryPools>>,body_credit:Option<ChainMemoryLease>,cancel:&CancellationToken)->Result<WireResponse> {
+async fn send_with_memory(client:&reqwest::Client,method:Method,url:Url,body:Option<Vec<u8>>,content_type:&str,memory:Option<Arc<ChainMemoryPools>>,body_credit:Option<ChainMemoryLease>,http_slots:Option<Arc<Semaphore>>,cancel:&CancellationToken)->Result<WireResponse> {
     let is_post = method == Method::POST;
     if cancel.is_cancelled() {
         return Err(ProtocolError {
@@ -1014,6 +1019,14 @@ async fn send_with_memory(client:&reqwest::Client,method:Method,url:Url,body:Opt
         }
         .into());
     }
+    // Certificate concurrency covers only actual HTTP send/body collection.
+    // JWS signing has already finished; no HTTP slot crosses CPU or recursion.
+    let _http_slot=if let Some(slots)=http_slots {
+        Some(tokio::select!{biased;
+            _=cancel.cancelled()=>return Err(ProtocolError{status:0,kind:"cancelledBeforeSend".into(),uncertain:false,retry_after:None}.into()),
+            permit=slots.acquire_owned()=>permit.map_err(|_|anyhow!("ACME certificate HTTP scheduling stopped"))?,
+        })
+    }else{None};
     let mut request = client.request(method, url);
     if let Some(body) = body {
         request = request

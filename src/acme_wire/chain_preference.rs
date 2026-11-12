@@ -100,6 +100,9 @@ impl ChainPreference {
         }
         Ok(chains.remove(0))
     }
+    pub(crate) fn wants_alternates(&self)->bool {
+        self.smallest.is_some() || self.wants_names()
+    }
     pub(crate) fn wants_names(&self)->bool {
         !self.any_common_name.is_empty() || !self.root_common_name.is_empty()
     }

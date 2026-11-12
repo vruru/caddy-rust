@@ -255,6 +255,7 @@ pub async fn drive<B>(
     mut interim: tokio::sync::mpsc::Receiver<Interim>,
     response: impl std::future::Future<Output = Response<B>>,
     head: bool,
+    connection: quinn::Connection,
 ) -> Result<(), Failure>
 where
     B: Body<Data = Bytes, Error = Failure> + Unpin,
@@ -276,16 +277,19 @@ where
                 Some(_)=>{},
                 None=>open=false,
             },
-            response=&mut response=>return send(stream,response,head).await,
+            response=&mut response=>return send(stream,response,head,connection).await,
         }
     }
 }
 
-pub async fn send<B>(mut stream: Sending, response: Response<B>, head: bool) -> Result<(), Failure>
+pub async fn send<B>(mut stream: Sending, response: Response<B>, head: bool, connection:quinn::Connection) -> Result<(), Failure>
 where
     B: Body<Data = Bytes, Error = Failure> + Unpin,
 {
     let (mut parts, mut body) = response.into_parts();
+    let control=parts.extensions.remove::<hyper::ext::ResponseWriteControl>();
+    let id=quinn::StreamId::from(quinn::VarInt::from_u64(stream.send_id().into_inner())?);
+    let mut writer=control.map(|control|super::write_control::Writer::new(connection,id,control)).transpose()?;
     let no_payload = head
         || parts.status == StatusCode::NO_CONTENT
         || parts.status == StatusCode::NOT_MODIFIED
@@ -310,12 +314,18 @@ where
         );
     }
     let mut remaining = content_length(&parts.headers)?;
-    stream
-        .send_response(Response::from_parts(parts, ()))
-        .await?;
+    if let Some(writer)=&mut writer {
+        writer.begin_wire()?;
+        writer.action(stream.send_response(Response::from_parts(parts, ()))).await??;
+        writer.seal_wire(false)?;writer.boundary().await?;
+    } else {
+        stream.send_response(Response::from_parts(parts, ())).await?;
+    }
     if !no_payload {
         let mut trailers_sent = false;
-        while let Some(next) = body.frame().await {
+        loop {
+            let next=if let Some(writer)=&mut writer {writer.action(body.frame()).await?}else{body.frame().await};
+            let Some(next)=next else{break};
             let result: Result<(), Failure> = match next {
                 Ok(frame) => match frame.into_data() {
                     Ok(data) => {
@@ -323,7 +333,20 @@ where
                             Err(malformed("HTTP/3 response body violated framing"))
                         } else {
                             remaining = remaining.map(|n| n - data.len() as u64);
-                            stream.send_data(data).await.map_err(Into::into)
+                            if let Some(writer)=&mut writer {
+                                let mut data=data;
+                                while !data.is_empty() {
+                                    let chunk=data.split_to(data.len().min(16<<10));
+                                    // Retain the actual source through local output. Quinn's
+                                    // independently bounded copied/retransmit storage is separate.
+                                    let retained=chunk.clone();
+                                    writer.begin_data(chunk.len())?;
+                                    writer.action(stream.send_data(chunk)).await??;
+                                    writer.boundary().await?;
+                                    drop(retained);
+                                }
+                                Ok(())
+                            }else{stream.send_data(data).await.map_err(Into::into)}
                         }
                     }
                     Err(frame) => match frame.into_trailers() {
@@ -332,7 +355,11 @@ where
                             fields.remove(header::CONTENT_LENGTH);
                             fields.remove(header::TRAILER);
                             trailers_sent = true;
-                            stream.send_trailers(fields).await.map_err(Into::into)
+                            if let Some(writer)=&mut writer {
+                                writer.begin_wire()?;
+                                writer.action(stream.send_trailers(fields)).await??;
+                                writer.seal_wire(false)?;writer.boundary().await?;Ok(())
+                            }else{stream.send_trailers(fields).await.map_err(Into::into)}
                         }
                         _ => Err(malformed("invalid HTTP/3 response trailers")),
                     },
@@ -349,6 +376,9 @@ where
             return Err(malformed("HTTP/3 response ended before content-length"));
         }
     }
-    stream.finish().await?;
+    if let Some(writer)=&mut writer {
+        writer.begin_wire()?;writer.action(stream.finish()).await??;
+        writer.seal_wire(true)?;writer.boundary().await?;writer.finish()?;
+    }else{stream.finish().await?;}
     Ok(())
 }

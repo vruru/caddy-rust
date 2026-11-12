@@ -19,18 +19,23 @@ fn invalid() -> io::Error {
 pub(super) async fn prepare<I: AsyncRead + AsyncWrite + Unpin>(
     io: I,
     maximum: Option<i64>,
-    deadline: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
     cancel: CancellationToken,
 ) -> io::Result<ReplayIo<I>> {
     let Some(maximum) = maximum else {
         return Ok(ReplayIo::plain(io));
     };
+    let inspection = async {
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, inspect(io, maximum)).await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "listener header timeout"))?,
+            None => inspect(io, maximum).await,
+        }
+    };
     tokio::select! {
         biased;
         _ = cancel.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "listener stopped")),
-        output = tokio::time::timeout_at(deadline, inspect(io, maximum)) => {
-            output.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "listener header timeout"))?
-        }
+        output = inspection => output,
     }
 }
 

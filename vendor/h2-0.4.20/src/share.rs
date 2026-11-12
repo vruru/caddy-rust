@@ -337,10 +337,68 @@ impl<B: Buf> SendStream<B> {
             .map_err(Into::into)
     }
 
+    /// Observes one opt-in DATA boundary of at most 16 KiB. `retained` must
+    /// share the actual payload owner; Native Hyper supplies a Bytes clone.
+    /// Keep driving reset notification while polling fragment flush progress.
+    #[doc(hidden)]
+    pub fn send_data_observed(
+        &mut self,
+        data: B,
+        end_of_stream: bool,
+        retained: Bytes,
+        credit: Option<Bytes>,
+    ) -> Result<crate::ext::DataWriteReceipt<B>, crate::Error> {
+        self.send_data_observed_with_deadline(data, end_of_stream, retained, credit, None)
+    }
+    /// Supplies a concrete deadline before the DATA owner can reach the codec.
+    #[doc(hidden)]
+    pub fn send_data_observed_with_deadline(
+        &mut self,
+        data: B,
+        end_of_stream: bool,
+        retained: Bytes,
+        credit: Option<Bytes>,
+        deadline: Option<crate::ext::DataWriteDeadline>,
+    ) -> Result<crate::ext::DataWriteReceipt<B>, crate::Error> {
+        self.send_data_observed_with_policy(data,end_of_stream,retained,credit,deadline.map(Into::into))
+    }
+    /// Supplies exact, allocation-prepaid server and route constraints.
+    #[doc(hidden)]
+    pub fn send_data_observed_with_policy(&mut self,data:B,end_of_stream:bool,retained:Bytes,credit:Option<Bytes>,policy:Option<crate::ext::DataWritePolicy>)->Result<crate::ext::DataWriteReceipt<B>,crate::Error>{
+        self.inner.send_data_observed(data,end_of_stream,retained,credit,policy).map_err(Into::into)
+    }
+
     /// Sends trailers to the remote peer.
     ///
     /// Sending trailers implicitly closes the send stream. Once the send stream
     /// is closed, no more data can be sent.
+    /// Observe the actual trailer/CONTINUATION flush with concrete retention.
+    #[doc(hidden)]
+    pub fn send_trailers_observed(
+        &mut self,
+        trailers: HeaderMap,
+        credit: Option<bytes::Bytes>,
+    ) -> Result<crate::ext::DataWriteReceipt<B>, crate::Error> {
+        self.inner
+            .send_trailers_observed(trailers, credit, None)
+            .map_err(Into::into)
+    }
+    /// Supplies a concrete deadline before trailer encoding starts.
+    #[doc(hidden)]
+    pub fn send_trailers_observed_with_deadline(
+        &mut self,
+        trailers: HeaderMap,
+        credit: Option<Bytes>,
+        deadline: Option<crate::ext::DataWriteDeadline>,
+    ) -> Result<crate::ext::DataWriteReceipt<B>, crate::Error> {
+        self.send_trailers_observed_with_policy(trailers,credit,deadline.map(Into::into))
+    }
+    /// Supplies exact constraints before trailer/CONTINUATION encoding.
+    #[doc(hidden)]
+    pub fn send_trailers_observed_with_policy(&mut self,trailers:HeaderMap,credit:Option<Bytes>,policy:Option<crate::ext::DataWritePolicy>)->Result<crate::ext::DataWriteReceipt<B>,crate::Error>{
+        self.inner.send_trailers_observed(trailers,credit,policy).map_err(Into::into)
+    }
+    /// Sends the final trailer header block and ends this stream.
     pub fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), crate::Error> {
         self.inner.send_trailers(trailers).map_err(Into::into)
     }

@@ -57,7 +57,7 @@ pub(crate) struct ServerConfig {
     pub(crate) trusted_proxies: Vec<ipnet::IpNet>,
     pub(crate) trusted_strict: bool,
     pub(crate) client_ip_headers: Vec<String>,
-    pub(crate) read_header_timeout: Duration,
+    pub(crate) read_header_timeout: Option<Duration>,
     pub(crate) read_idle_timeout: Duration,
     pub(crate) idle_timeout: Option<Duration>,
     pub(crate) protocols: Vec<String>,
@@ -623,12 +623,16 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
             .map(|v| strings(v, path))
             .transpose()?
             .unwrap_or_else(|| vec!["X-Forwarded-For".into()]),
-        read_header_timeout: m
+        read_header_timeout: match m
             .get("read_header_timeout")
-            .map(|v| duration(v, path))
+            .filter(|v| !v.is_null())
+            .map(|v| signed_duration(v, path))
             .transpose()?
-            .filter(|d| !d.is_zero())
-            .unwrap_or(Duration::from_secs(60)),
+        {
+            None | Some(0) => Some(Duration::from_secs(60)),
+            Some(nanos) if nanos > 0 => Some(Duration::from_nanos(nanos as u64)),
+            Some(_) => None,
+        },
         idle_timeout: match m.get("idle_timeout").map(|v| signed_duration(v, path)).transpose()? {
             None | Some(0) => Some(Duration::from_secs(300)),
             Some(nanos) if nanos > 0 => Some(Duration::from_nanos(nanos as u64)),

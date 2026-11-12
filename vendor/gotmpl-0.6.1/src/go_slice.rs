@@ -121,6 +121,29 @@ pub struct TypedSlice {
 }
 
 impl TypedSlice {
+    /// Address of the first visible element, as used by Go fmt's %p. This
+    /// reads the real backing (including a non-nil empty view); it does not
+    /// expose writable pointers or manufacture a cell/zero-sized sentinel.
+    pub(crate) fn data_address(&self) -> Result<usize> {
+        match &self.storage {
+            None => Ok(0),
+            Some(SliceData::Bytes(cell)) => {
+                #[cfg(feature="std")]
+                let data = cell.lock().map_err(|_| TemplateError::Exec("byte slice lock poisoned".into()))?;
+                #[cfg(not(feature="std"))]
+                let data = cell;
+                Ok(data.as_ptr().wrapping_add(self.start) as usize)
+            }
+            Some(SliceData::Values(cell)) => {
+                #[cfg(feature="std")]
+                let data = cell.lock().map_err(|_| TemplateError::Exec("value slice lock poisoned".into()))?;
+                #[cfg(not(feature="std"))]
+                let data = cell;
+                Ok(data.as_ptr().wrapping_add(self.start) as usize)
+            }
+        }
+    }
+
     // ── construction ──────────────────────────────────────────────────────────
 
     pub fn nil(go_type: &'static str) -> Self {

@@ -2,6 +2,9 @@
 
 use crate::hpack::BytesStr;
 
+pub use crate::data_receipt::{
+    DataWriteDeadline, DataWritePolicy, DataWriteReceipt, DataWriteSnapshot, DATA_WRITE_ALLOCATION_UPPER_BYTES,
+};
 pub use crate::send_completion::{SendCompletion, SendCompletionOwner, SendOutcome};
 
 use bytes::Bytes;

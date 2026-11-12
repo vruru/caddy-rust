@@ -301,6 +301,29 @@ impl coding::Codec for StreamId {
     }
 }
 
+/// A caller-owned observation slot for one application stream in a transmit.
+/// This describes packet construction only. The I/O owner must not publish it
+/// as progress until this exact transmit was successfully accepted by its UDP
+/// socket. A pending/retried datagram retains its original observation slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamTransmitProgress {
+    /// Stream to observe. Slots must be strictly increasing by stream ID.
+    pub id: StreamId,
+    /// Greatest stream offset included in the observed transmit(s).
+    pub end: u64,
+    /// Whether the stream FIN was included. This does not mean acknowledged.
+    pub fin: bool,
+}
+/// The optional, allocation-free observation slice has an invalid shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidTransmitObservation;
+impl fmt::Display for InvalidTransmitObservation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("transmit observation requires at most 128 strictly ordered stream slots")
+    }
+}
+impl std::error::Error for InvalidTransmitObservation {}
+
 /// An outgoing packet
 #[derive(Debug)]
 #[must_use]

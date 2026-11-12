@@ -36,21 +36,29 @@
 //!
 //! See the documentation on each item for details about its usage and requirements.
 
+#[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
+mod response_write;
+#[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
+pub use response_write::{
+    ResponseWriteControl, ResponseWriteOwner, WriteControlError, WritePolicy, WriteSnapshot,
+    WriteTerminal,
+};
+
 #[cfg(any(feature = "http2", all(feature = "http1", feature = "client")))]
 mod send_completion;
-#[cfg(any(feature = "http2", all(feature = "http1", feature = "client")))]
-pub use send_completion::{SendCompletion, SendOutcome};
 #[cfg(all(feature = "http1", feature = "client"))]
 pub(crate) use send_completion::SendCompletionOwner;
+#[cfg(any(feature = "http2", all(feature = "http1", feature = "client")))]
+pub use send_completion::{SendCompletion, SendOutcome};
 
 #[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
 mod server_informational;
 #[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
-pub use server_informational::{InformationalError, InformationalSender};
-#[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
 pub(crate) use server_informational::{
     install as install_informational, InformationalHead, InformationalLimits, InformationalReceiver,
 };
+#[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
+pub use server_informational::{InformationalError, InformationalSender};
 
 #[cfg(feature = "http1")]
 pub mod trailer_compat;

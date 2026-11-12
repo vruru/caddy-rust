@@ -12,7 +12,7 @@ use http::{HeaderMap, Request, Response};
 use std::task::{Context, Poll, Waker};
 use tokio::io::AsyncWrite;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::{fmt, io};
 
 #[derive(Debug)]
@@ -109,6 +109,7 @@ struct Actions {
 #[derive(Debug)]
 struct SendBuffer<B> {
     inner: Mutex<Buffer<Frame<B>>>,
+    data_receipts: OnceLock<Arc<crate::data_receipt::DeferredData>>,
 }
 
 // ===== impl Streams =====
@@ -184,6 +185,12 @@ where
         me.actions
             .recv
             .clear_expired_reset_streams(&mut me.store, &mut me.counts);
+    }
+
+    pub(crate) fn drain_data_receipts(&self) {
+        if let Some(queue) = self.send_buffer.data_receipts.get() {
+            queue.drain();
+        }
     }
 
     pub fn poll_complete<T>(
@@ -1210,6 +1217,54 @@ impl<B> StreamRef<B> {
     where
         B: Buf,
     {
+        self.send_data_with_receipt(data, end_stream, None)
+    }
+    pub fn send_data_observed(
+        &mut self,
+        data: B,
+        end_stream: bool,
+        retained: Bytes,
+        credit: Option<Bytes>,
+        deadline: Option<crate::ext::DataWritePolicy>,
+    ) -> Result<crate::ext::DataWriteReceipt<B>, UserError>
+    where
+        B: Buf,
+    {
+        if data.remaining() > crate::data_receipt::MAX_DATA_BOUNDARY
+            || data.remaining() != retained.len()
+        {
+            return Err(UserError::PayloadTooBig);
+        }
+        let queue = self
+            .send_buffer
+            .data_receipts
+            .get_or_init(|| crate::data_receipt::DeferredData::new(credit.clone()))
+            .clone();
+        let (receipt, owner, source) = crate::ext::DataWriteReceipt::new(
+            self.clone(),
+            retained,
+            credit,
+            queue.clone(),
+            deadline,
+        )
+        .ok_or(UserError::Rejected)?;
+        let result = self.send_data_with_receipt(data, end_stream, Some((owner, source)));
+        queue.drain();
+        result?;
+        Ok(receipt)
+    }
+    fn send_data_with_receipt(
+        &mut self,
+        data: B,
+        end_stream: bool,
+        receipt: Option<(
+            crate::data_receipt::QueuedDataOwner,
+            crate::data_receipt::SourceDataOwner,
+        )>,
+    ) -> Result<(), UserError>
+    where
+        B: Buf,
+    {
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;
 
@@ -1222,6 +1277,9 @@ impl<B> StreamRef<B> {
             // Create the data frame
             let mut frame = frame::Data::new(stream.id, data);
             frame.set_end_stream(end_stream);
+            if let Some((receipt, source)) = receipt {
+                frame.set_receipt(receipt, source);
+            }
 
             // Send the data frame
             actions
@@ -1231,6 +1289,43 @@ impl<B> StreamRef<B> {
     }
 
     pub fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), UserError> {
+        self.send_trailers_with_receipt(trailers, None)
+    }
+    pub fn send_trailers_observed(
+        &mut self,
+        trailers: HeaderMap,
+        credit: Option<bytes::Bytes>,
+        deadline: Option<crate::ext::DataWritePolicy>,
+    ) -> Result<crate::ext::DataWriteReceipt<B>, UserError>
+    where
+        B: Buf,
+    {
+        let queue = self
+            .send_buffer
+            .data_receipts
+            .get_or_init(|| crate::data_receipt::DeferredData::new(credit.clone()))
+            .clone();
+        let (receipt, owner, source) = crate::ext::DataWriteReceipt::new(
+            self.clone(),
+            bytes::Bytes::new(),
+            credit,
+            queue.clone(),
+            deadline,
+        )
+        .ok_or(UserError::Rejected)?;
+        let result = self.send_trailers_with_receipt(trailers, Some((owner, source)));
+        queue.drain();
+        result?;
+        Ok(receipt)
+    }
+    fn send_trailers_with_receipt(
+        &mut self,
+        trailers: HeaderMap,
+        receipt: Option<(
+            crate::data_receipt::QueuedDataOwner,
+            crate::data_receipt::SourceDataOwner,
+        )>,
+    ) -> Result<(), UserError> {
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;
 
@@ -1241,7 +1336,10 @@ impl<B> StreamRef<B> {
 
         me.counts.transition(stream, |counts, stream| {
             // Create the trailers frame
-            let frame = frame::Headers::trailers(stream.id, trailers);
+            let mut frame = frame::Headers::trailers(stream.id, trailers);
+            if let Some((owner, source)) = receipt {
+                frame.set_receipt(owner, source);
+            }
 
             // Send the trailers frame
             actions
@@ -1313,8 +1411,48 @@ impl<B> StreamRef<B> {
 
     pub fn send_response(
         &mut self,
+        response: Response<()>,
+        end_of_stream: bool,
+    ) -> Result<(), UserError> {
+        self.send_response_with_receipt(response, end_of_stream, None)
+    }
+    pub fn send_response_observed(
+        &mut self,
+        response: Response<()>,
+        end_of_stream: bool,
+        credit: Option<bytes::Bytes>,
+        deadline: Option<crate::ext::DataWritePolicy>,
+    ) -> Result<crate::ext::DataWriteReceipt<B>, UserError>
+    where
+        B: Buf,
+    {
+        let queue = self
+            .send_buffer
+            .data_receipts
+            .get_or_init(|| crate::data_receipt::DeferredData::new(credit.clone()))
+            .clone();
+        let (receipt, owner, source) = crate::ext::DataWriteReceipt::new(
+            self.clone(),
+            bytes::Bytes::new(),
+            credit,
+            queue.clone(),
+            deadline,
+        )
+        .ok_or(UserError::Rejected)?;
+        let result =
+            self.send_response_with_receipt(response, end_of_stream, Some((owner, source)));
+        queue.drain();
+        result?;
+        Ok(receipt)
+    }
+    fn send_response_with_receipt(
+        &mut self,
         mut response: Response<()>,
         end_of_stream: bool,
+        receipt: Option<(
+            crate::data_receipt::QueuedDataOwner,
+            crate::data_receipt::SourceDataOwner,
+        )>,
     ) -> Result<(), UserError> {
         let send_completion = response
             .extensions_mut()
@@ -1331,14 +1469,19 @@ impl<B> StreamRef<B> {
         let send_buffer = &mut *send_buffer;
 
         me.counts.transition(stream, |counts, stream| {
-            let frame = server::Peer::convert_send_message(stream.id, response, end_of_stream);
+            let mut frame = server::Peer::convert_send_message(stream.id, response, end_of_stream);
+            if let Some((owner, source)) = receipt {
+                frame.set_receipt(owner, source);
+            }
 
             actions
                 .send
                 .send_headers(frame, send_buffer, stream, counts, &mut actions.task)?;
             if let Some(completion) = send_completion {
-                stream.send_completion =
-                    Some((completion, super::stream::SendBoundary::FinalResponseHeaders));
+                stream.send_completion = Some((
+                    completion,
+                    super::stream::SendBoundary::FinalResponseHeaders,
+                ));
             }
             Ok(())
         })
@@ -1748,7 +1891,10 @@ fn maybe_cancel(stream: &mut store::Ptr, actions: &mut Actions, counts: &mut Cou
 impl<B> SendBuffer<B> {
     fn new() -> Self {
         let inner = Mutex::new(Buffer::new());
-        SendBuffer { inner }
+        SendBuffer {
+            inner,
+            data_receipts: OnceLock::new(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {

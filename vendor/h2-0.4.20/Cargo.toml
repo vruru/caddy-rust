@@ -102,3 +102,6 @@ default-features = false
 level = "warn"
 priority = 0
 check-cfg = ["cfg(fuzzing)"]
+
+[dependencies.native-write-policy]
+path = "../native-write-policy"

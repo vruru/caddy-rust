@@ -80,7 +80,11 @@ pub(crate) struct Prioritized<B> {
 
 // ===== impl Prioritize =====
 
-type ScheduledFrame<B> = (Frame<Prioritized<B>>, Option<crate::ext::SendCompletionOwner>);
+type ScheduledFrame<B> = (
+    Frame<Prioritized<B>>,
+    Option<crate::ext::SendCompletionOwner>,
+    Option<crate::data_receipt::DataFragmentOwner>,
+);
 
 impl Prioritize {
     pub fn new(config: &Config) -> Prioritize {
@@ -537,14 +541,14 @@ impl Prioritize {
             }
 
             match self.pop_frame(buffer, store, max_frame_len, counts) {
-                Some((frame, send_completion)) => {
+                Some((frame, send_completion, data_receipt)) => {
                     tracing::trace!(?frame, "writing");
 
                     debug_assert_eq!(self.in_flight_data_frame, InFlightData::Nothing);
                     if let Frame::Data(ref frame) = frame {
                         self.in_flight_data_frame = InFlightData::DataFrame(frame.payload().stream);
                     }
-                    dst.buffer_with_send_completion(frame, send_completion)
+                    dst.buffer_with_receipts(frame, send_completion, data_receipt)
                         .expect("invalid frame");
 
                     // Small DATA frames can be fully encoded by `buffer`,
@@ -733,7 +737,7 @@ impl Prioritize {
 
             tracing::trace!(is_pending_reset);
 
-            let frame = match stream.pending_send.pop_front(buffer) {
+            let mut frame = match stream.pending_send.pop_front(buffer) {
                 Some(Frame::Data(mut frame)) => {
                     if let Some(reason) = stream.state.get_scheduled_reset() {
                         // If a reset is scheduled due to cancellation or
@@ -900,26 +904,47 @@ impl Prioritize {
                 self.pending_send.push(&mut stream);
             }
 
+            // Every physical fragment retains its codec owner, including tiny
+            // copied prefixes. The queued owner stays on the unsent tail.
+            let data_receipt = if let Frame::Data(frame) = &mut frame {
+                let len = frame.payload().inner.remaining();
+                let last = frame.payload().inner.get_ref().remaining() == len;
+                if last {
+                    frame.take_receipt().map(|owner| owner.last(len))
+                } else {
+                    frame.receipt().map(|owner| owner.fork(len))
+                }
+            } else if let Frame::Headers(frame) = &mut frame {
+                frame.take_receipt().map(|owner| owner.last(0))
+            } else {
+                None
+            };
             // Inspect the frame after flow-control splitting. The observer
             // must leave the stream before transition_after can remove it.
-            let reached = stream.send_completion.as_ref().map_or(false, |(_, boundary)| {
-                use super::stream::SendBoundary::*;
-                match (&frame, boundary) {
-                    (Frame::Data(frame), RequestEnd) => frame.is_end_stream(),
-                    (Frame::Headers(frame), RequestEnd) => frame.is_end_stream(),
-                    (Frame::Headers(_), ConnectRequestHeaders) => true,
-                    (Frame::Headers(frame), FinalResponseHeaders) => !frame.is_informational(),
-                    _ => false,
-                }
-            });
+            let reached = stream
+                .send_completion
+                .as_ref()
+                .map_or(false, |(_, boundary)| {
+                    use super::stream::SendBoundary::*;
+                    match (&frame, boundary) {
+                        (Frame::Data(frame), RequestEnd) => frame.is_end_stream(),
+                        (Frame::Headers(frame), RequestEnd) => frame.is_end_stream(),
+                        (Frame::Headers(_), ConnectRequestHeaders) => true,
+                        (Frame::Headers(frame), FinalResponseHeaders) => !frame.is_informational(),
+                        _ => false,
+                    }
+                });
             let completion = if reached {
-                stream.send_completion.take().map(|(completion, _)| completion)
+                stream
+                    .send_completion
+                    .take()
+                    .map(|(completion, _)| completion)
             } else {
                 None
             };
             counts.transition_after(stream, is_pending_reset);
 
-            return Some((frame, completion));
+            return Some((frame, completion, data_receipt));
         }
     }
 

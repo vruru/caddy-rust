@@ -283,3 +283,6 @@ incremental = false
 [profile.release]
 codegen-units = 1
 incremental = false
+
+[dependencies.native-write-policy]
+path = "../native-write-policy"

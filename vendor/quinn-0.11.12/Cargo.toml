@@ -44,7 +44,7 @@ features = [
 
 [features]
 # Optional read-only observation of accepted request-stream cancellation.
-native-stream-observer = []
+native-stream-observer = ["dep:native-write-policy"]
 __rustls-post-quantum-test = [
     "rustls/prefer-post-quantum",
     "rustls-aws-lc-rs",
@@ -260,3 +260,7 @@ version = "1"
 
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies.socket2]
 version = ">=0.5, <0.7"
+
+[dependencies.native-write-policy]
+path = "../native-write-policy"
+optional = true

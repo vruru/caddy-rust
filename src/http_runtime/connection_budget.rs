@@ -264,6 +264,7 @@ impl ListenerBudget {
                 held: Some(held),
                 membership: None,
                 evicted: false,
+                service_entered: false,
             }),
         });
         let membership = admission.membership(class)?;
@@ -409,6 +410,9 @@ struct State {
     held: Option<Held>,
     membership: Option<Membership>,
     evicted: bool,
+    // Once a service call starts, listener removal must use the established
+    // request/body retirement policy, never this initial-head reclaim path.
+    service_entered: bool,
 }
 
 pub(crate) struct Admission {
@@ -451,6 +455,29 @@ impl super::pressure::Victim for SocketVictim {
     }
 }
 impl Admission {
+    /// Serialize the first service call against physical listener retirement.
+    /// This changes no class or permits; proof classification remains separate.
+    pub(crate) fn enter_service(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.evicted || state.held.is_none() { return false; }
+        state.service_entered = true;
+        true
+    }
+    /// Only a genuinely removed listener may call this. TLS can already hold
+    /// a Business slot before its first HTTP service call, so that class alone
+    /// is not evidence of an active request. Proof ownership remains separate.
+    /// Cancellation never refunds a still-owned descriptor permit.
+    pub(crate) fn cancel_before_service(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.evicted || state.held.is_none()
+            || state.class == ConnectionClass::Proof || state.service_entered {
+            return false;
+        }
+        state.evicted = true;
+        drop(state);
+        self.cancel.cancel();
+        true
+    }
     fn membership(&self, class: ConnectionClass) -> Result<Option<Membership>> {
         if class == ConnectionClass::Business {
             return Ok(None);

@@ -24,6 +24,7 @@ use gotmpl::{MapContext,MissingKey,Object,Template,TemplateError,Value,ValueFunc
 use http::{HeaderMap,StatusCode,header};
 use std::{collections::BTreeMap,io::Read,path::{Component,Path,PathBuf},sync::{Arc,Mutex,atomic::{AtomicU16,AtomicUsize,Ordering}},time::{Duration,Instant}};
 use tokio_util::sync::CancellationToken;
+pub(super) fn formatting_host_cost(value:&Value)->RenderResult<usize>{Ok(data::header_format_cost(value)?.unwrap_or(0))}
 type Fields=BTreeMap<Arc<str>,Value>;
 type RenderResult<T>=gotmpl::Result<T>;
 pub(super) type VirtualInclude=Arc<dyn Fn(&str,Arc<Control>)->RenderResult<Vec<u8>>+Send+Sync>;
@@ -70,6 +71,22 @@ impl Control {
             move|bytes|reserve.upgrade().ok_or_else(||error("template control retired"))?.charge_bytes(bytes),
             move|bytes|{if let Some(control)=refund.upgrade(){let _=control.allocation.try_update(Ordering::AcqRel,Ordering::Acquire,|left|left.checked_add(bytes).filter(|left|*left<=control.allocation_limit));}}
         )))
+    }
+
+    /// Weak callbacks only. The actual Tree/worker owns memory; a refund
+    /// after Control has retired does nothing and never wakes new work.
+    pub(super) fn formatting_meter(self:&Arc<Self>)->RenderResult<Arc<gotmpl::BudgetMeter>>{
+        self.charge_bytes(256)?;
+        let(check,work,reserve,refund)=(Arc::downgrade(self),Arc::downgrade(self),Arc::downgrade(self),Arc::downgrade(self));
+        Ok(Arc::new(gotmpl::BudgetMeter::new(
+            move||check.upgrade().ok_or_else(||error("formatter control retired"))?.check(),
+            move|n|work.upgrade().ok_or_else(||error("formatter control retired"))?.charge(n),
+            move|n|reserve.upgrade().ok_or_else(||error("formatter control retired"))?.charge_bytes(n),
+            move|n|{if let Some(control)=refund.upgrade(){let _=control.allocation.try_update(Ordering::AcqRel,Ordering::Acquire,|left|left.checked_add(n).filter(|left|*left<=control.allocation_limit));}}
+        )))
+    }
+    fn formatter_scope(self:&Arc<Self>)->RenderResult<Arc<gotmpl::FormatterScope>>{
+        self.check()?;self.worker.get().ok_or_else(||error("formatter requires admitted template worker"))?.formatter(self)
     }
 
     fn take(counter:&AtomicUsize,units:usize)->RenderResult<()> {counter.try_update(Ordering::AcqRel,Ordering::Acquire,|n|n.checked_sub(units)).map(|_|()).map_err(|_|error("template aggregate budget exhausted"))}
@@ -139,7 +156,7 @@ impl Frame {
         if depth>32{return Err(error("template include depth exceeded"));}
         Ok(Arc::new(Self{plan,root,request,headers,control,namespace:Mutex::new(None),args,depth,virtual_include,extra}))
     }
-    fn template(self:&Arc<Self>,name:&str)->Template {
+    fn template(self:&Arc<Self>,name:&str)->RenderResult<Template> {
         let control=self.control.clone();
         let mut functions=sprig::functions_with_maps(&self.control.maps);
         let derive=functions.remove("derivePassword");
@@ -154,12 +171,12 @@ impl Frame {
         for name in ["include","readFile","import","httpInclude","fileExists","fileStat","listFiles","placeholder","ph","httpError","maybe","stripHTML","pathEscape","markdown","splitFrontMatter","humanize"] {
             let weak=Arc::downgrade(self);template=template.func(name,move|args|weak.upgrade().ok_or_else(||error("template context retired"))?.host(name,args));
         }
-        template
+        template.with_formatter_scope(self.control.formatter_scope()?)
     }
     fn render(self:&Arc<Self>,name:&str,input:Vec<u8>)->RenderResult<Vec<u8>> {
         self.control.source(input.len())?;
         if !input.windows(self.plan.delimiters[0].len()).any(|part|part==self.plan.delimiters[0].as_bytes()) {return Ok(input);}
-        let template=self.template(name).parse_bytes(&input)?;
+        let template=self.template(name)?.parse_bytes(&input)?;
         *lock(&self.namespace)?=Some(template.clone());
         let weak=Arc::downgrade(self);
         let template=template.with_definition_lookup_go(Arc::new(move|name|{

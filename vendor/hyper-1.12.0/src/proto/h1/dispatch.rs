@@ -21,18 +21,24 @@ use crate::ext::{InformationalHead, InformationalLimits, InformationalReceiver};
 use crate::proto::{BodyLength, Conn, Dispatched, MessageHead, RequestHead};
 use crate::upgrade::OnUpgrade;
 
-pub(crate) struct Dispatcher<D, Bs: Body, I, T> {
+pub(crate) struct Dispatcher<D:Dispatch, Bs: Body, I, T> {
     conn: Conn<I, Bs::Data, T>,
     dispatch: D,
     body_tx: SenderDropGuard,
     body_rx: Pin<Box<Option<Bs>>>,
     is_closing: bool,
+    #[cfg(feature="server")]
+    response_body:Option<Box<super::response_write::BodyState<Bs::Data>>>,
     #[cfg(feature = "client")]
     send_completion: Option<crate::ext::SendCompletionOwner>,
     #[cfg(feature = "client")]
     request_ended: bool,
     #[cfg(feature = "server")]
     informational_flush: Option<tokio::sync::oneshot::Sender<()>>,
+    // The service can become Ready with a queued interim head. Keep that one
+    // actual response owner until the interim boundary has physically flushed.
+    #[cfg(feature="server")]
+    pending_final:Option<Box<(D::PollItem,Bs)>>,
 }
 
 pub(crate) trait Dispatch {
@@ -102,12 +108,16 @@ where
             body_tx: SenderDropGuard::none(),
             body_rx: Box::pin(None),
             is_closing: false,
+            #[cfg(feature="server")]
+            response_body:None,
             #[cfg(feature = "client")]
             send_completion: None,
             #[cfg(feature = "client")]
             request_ended: false,
             #[cfg(feature = "server")]
             informational_flush: None,
+            #[cfg(feature="server")]
+            pending_final:None,
         }
     }
 
@@ -155,6 +165,8 @@ where
             if let Some(mut body) = self.body_tx.take() {
                 body.send_error(crate::Error::new_body("connection error"));
             }
+            #[cfg(feature="server")]
+            {if self.response_body.is_some(){self.body_rx.set(None);self.response_body=None;self.conn.abandon_response_write();}}
             // An error means we're shutting down either way.
             // We just try to give the error to the user,
             // and close the connection with an Ok. If we
@@ -379,35 +391,57 @@ where
 
     fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         loop {
+            #[cfg(feature="server")]
+            if self.response_body.is_some(){
+                ready!(self.poll_controlled_response(cx))?;
+            }
+
             if self.is_closing {
                 return Poll::Ready(Ok(()));
             } else if self.body_rx.is_none()
                 && self.conn.can_write_head()
-                && self.dispatch.should_poll()
+                && (self.dispatch.should_poll() || {
+                    #[cfg(feature="server")]{self.pending_final.is_some()}
+                    #[cfg(not(feature="server"))]{false}
+                })
             {
                 #[cfg(feature = "server")]
                 if self.informational_flush.is_some() {
                     return Poll::Pending;
                 }
-                let msg = match Pin::new(&mut self.dispatch).poll_msg(cx) {
+                #[cfg(feature="server")]
+                let queued=self.pending_final.take();
+                #[cfg(not(feature="server"))]
+                let queued:Option<Box<(MessageHead<T::Outgoing>,Bs)>>=None;
+                let msg = if let Some(message)=queued{Some(Ok(*message))}else{match Pin::new(&mut self.dispatch).poll_msg(cx) {
                     Poll::Pending => {
                         #[cfg(feature = "server")]
                         if let Poll::Ready(head) = self.dispatch.poll_informational(cx) {
-                            self.write_informational(head);
+                            self.write_informational(head)?;
                         }
+                        #[cfg(feature="server")]
+                        if let Poll::Ready(result)=self.conn.poll_response_write_deadline(cx){result.map_err(crate::Error::new_body_write)?;}
                         return Poll::Pending;
                     }
                     Poll::Ready(msg) => msg,
-                };
+                }};
                 if let Some(msg) = msg {
-                    #[cfg(feature = "server")]
-                    if msg.is_ok() {
-                        if let Some(head) = self.dispatch.close_informational() {
-                            self.write_informational(head);
-                        }
-                    }
                     #[allow(unused_mut)]
                     let (mut head, body) = msg.map_err(crate::Error::new_user_service)?;
+                    #[cfg(feature = "server")]
+                    if let Some(interim)=self.dispatch.close_informational(){
+                        self.write_informational(interim)?;
+                        self.pending_final=Some(Box::new((head,body)));
+                        cx.waker().wake_by_ref();return Poll::Pending;
+                    }
+                    #[cfg(feature="server")]
+                    if self.conn.response_write_pending(){
+                        // Reading an Expect body can queue automatic 100 and
+                        // make the service Ready in the same poll. Preserve the
+                        // final response until that real boundary is flushed.
+                        self.pending_final=Some(Box::new((head,body)));
+                        return Poll::Pending;
+                    }
                     #[cfg(feature = "client")]
                     if T::is_client() {
                         self.send_completion = head
@@ -417,6 +451,11 @@ where
                         self.request_ended = false;
                     }
 
+                    #[cfg(feature="server")]
+                    if T::is_server(){
+                        if let Some(control)=head.extensions.remove::<crate::ext::ResponseWriteControl>(){self.conn.install_response_write(control).map_err(crate::Error::new_body_write)?;}
+                        if self.conn.response_write_active(){self.response_body=Some(Box::new(super::response_write::BodyState::new(self.conn.response_write_retention())));}
+                    }
                     let body_type = if body.is_end_stream() {
                         self.body_rx.set(None);
                         None
@@ -430,6 +469,12 @@ where
                         btype
                     };
                     self.conn.write_head(head, body_type);
+                    #[cfg(feature="server")]
+                    if let Some(controlled)=self.response_body.as_mut(){
+                        controlled.ended=self.body_rx.is_none();
+                        self.conn.response_write_begin(0,0,Bytes::new()).map_err(crate::Error::new_body_write)?;
+                    }
+
                     #[cfg(feature = "client")]
                     if self.send_completion.is_some() {
                         // A zero-length body can have a pending producer (for
@@ -525,11 +570,72 @@ where
         }
     }
 
+    #[cfg(feature="server")]
+    fn poll_controlled_response(&mut self,cx:&mut Context<'_>)->Poll<crate::Result<()>>{
+        // One pre-existing connection future drives bounded output. No per-frame
+        // task/queue, and no body polling while an actual IO boundary is pending.
+        for _ in 0..16 {
+            if self.conn.response_write_pending(){
+                let flushed=self.poll_flush(cx)?;
+                // Arm/poll the same existing connection future's deadline even
+                // when actual IO is Pending; body readiness is not a timer.
+                if let Poll::Ready(result)=self.conn.poll_response_write_deadline(cx){result.map_err(crate::Error::new_body_write)?;}
+                if flushed.is_pending(){return Poll::Pending;}
+            }
+            if self.conn.response_write_complete(){self.response_body=None;return Poll::Ready(Ok(()))}
+            if let Poll::Ready(result)=self.conn.poll_response_write_deadline(cx){result.map_err(crate::Error::new_body_write)?;}
+            let state=self.response_body.as_mut().expect("installed response body owner");
+            if !self.conn.can_write_body(){
+                // HEAD/204/304/Content-Length exhaustion must not read a
+                // producer that this protocol will never put on the wire.
+                self.body_rx.set(None);state.chunk=None;state.ended=true;
+            }
+            if state.ended {
+                if !state.end_queued{
+                    if self.conn.can_write_body(){self.conn.end_body()?;}
+                    self.conn.response_write_begin(0,0,Bytes::new()).map_err(crate::Error::new_body_write)?;
+                    self.conn.response_write_finish().map_err(crate::Error::new_body_write)?;
+                    state.end_queued=true;
+                    continue;
+                }
+                return Poll::Pending;
+            }
+            if let Some((data,eos))=state.chunk.as_mut(){
+                let n=data.remaining().min(16<<10);let end=*eos;
+                if n==0{state.chunk=None;if end{state.ended=true;}continue;}
+                // Bytes overrides copy_to_bytes with an ownership-preserving
+                // split. A generic Buf can copy at most this bounded chunk.
+                let bytes=data.copy_to_bytes(n);let consumed=data.remaining()==0;
+                if consumed{state.chunk=None;if end{state.ended=true;}}
+                self.conn.write_observed_bytes(bytes).map_err(crate::Error::new_body_write)?;
+                continue;
+            }
+            let Some(mut body)=self.body_rx.as_mut().as_pin_mut()else{state.ended=true;continue};
+            match ready!(body.as_mut().poll_frame(cx)){
+                Some(Ok(frame))=>{
+                    let eos=body.is_end_stream();
+                    match frame.into_data(){
+                        Ok(data)=>{state.chunk=Some((data,eos));if eos{self.body_rx.set(None);}},
+                        Err(frame)=>if let Ok(trailers)=frame.into_trailers(){
+                            self.body_rx.set(None);state.ended=true;state.end_queued=true;
+                            self.conn.write_trailers(trailers)?;
+                            self.conn.response_write_begin(0,0,Bytes::new()).map_err(crate::Error::new_body_write)?;
+                            self.conn.response_write_finish().map_err(crate::Error::new_body_write)?;
+                        }
+                    }
+                }
+                Some(Err(e))=>{self.body_rx.set(None);return Poll::Ready(Err(crate::Error::new_user_body(e)))}
+                None=>{self.body_rx.set(None);state.ended=true;}
+            }
+        }
+        cx.waker().wake_by_ref();Poll::Pending
+    }
+
     #[cfg(feature = "server")]
-    fn write_informational(&mut self, head: InformationalHead) {
+    fn write_informational(&mut self, head: InformationalHead)->crate::Result<()> {
         debug_assert!(self.informational_flush.is_none());
-        self.conn.write_informational(head.response);
-        self.informational_flush = Some(head.ack);
+        self.conn.write_informational(head.response).map_err(crate::Error::new_body_write)?;
+        self.informational_flush = Some(head.ack);Ok(())
     }
 
     fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
@@ -551,6 +657,8 @@ where
             debug!("error writing: {}", err);
             crate::Error::new_body_write(err)
         });
+        #[cfg(feature="server")]
+        if result.is_ready()&&self.pending_final.is_some(){cx.waker().wake_by_ref();}
         #[cfg(feature = "client")]
         {
             if matches!(&result, Poll::Ready(Err(_))) || self.conn.has_error() {
@@ -591,7 +699,10 @@ where
             true
         } else {
             let write_done = self.conn.is_write_closed()
-                || (!self.dispatch.should_poll() && self.body_rx.is_none());
+                || (!self.dispatch.should_poll() && self.body_rx.is_none() && {
+                    #[cfg(feature="server")]{self.pending_final.is_none()&&self.informational_flush.is_none()}
+                    #[cfg(not(feature="server"))]{true}
+                });
             read_done && write_done
         }
     }

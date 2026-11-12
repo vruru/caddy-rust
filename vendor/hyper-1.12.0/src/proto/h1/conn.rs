@@ -484,6 +484,8 @@ where
             }
             Reading::Continue(decoder) => {
                 // Write the 100 Continue if not already responded...
+                #[cfg(feature="server")]
+                let mut wrote_continue=false;
                 if let Writing::Init = self.state.writing {
                     trace!("automatically sending 100 Continue");
                     let cont = b"HTTP/1.1 100 Continue\r\n\r\n";
@@ -491,11 +493,14 @@ where
                     #[cfg(feature = "server")]
                     {
                         self.state.sent_continue = true;
+                        wrote_continue=true;
                     }
                 }
 
                 // And now recurse once in the Reading::Body state...
                 self.state.reading = Reading::Body(decoder.clone());
+                #[cfg(feature="server")]
+                if wrote_continue {if let Err(error)=self.response_write_begin(0,0,Bytes::new()){return Poll::Ready(Some(Err(error)))}}
                 return self.poll_read_body(cx);
             }
             _ => unreachable!("poll_read_body invalid state: {:?}", self.state.reading),
@@ -675,6 +680,45 @@ where
     /// Whether bytes are sitting in the write buffer waiting to be flushed.
     pub(crate) fn has_buffered_write(&self) -> bool {
         self.io.has_buffered_write()
+    }
+
+    #[cfg(feature="server")]
+    pub(crate) fn install_response_write(&mut self,control:crate::ext::ResponseWriteControl)->io::Result<()>{
+        if let Some(writer)=&self.io.response_write {if !writer.done(){
+            if writer.same_control(&control){return Ok(())}
+            return Err(io::Error::other("HTTP/1 response policy already active"))
+        }}
+        let observed=Box::new(super::response_write::ObservedWrite::new(control,self.state.timer.clone())?);
+        if self.io.response_write_retention.is_none(){self.io.response_write_retention=observed.retention();}
+        self.io.response_write=Some(observed);Ok(())
+    }
+    #[cfg(feature="server")]
+    pub(crate) fn response_write_retention(&self)->Option<Bytes>{self.io.response_write.as_ref().and_then(|w|w.retention())}
+    #[cfg(feature="server")]
+    pub(crate) fn response_write_active(&self)->bool{self.io.response_write.as_ref().is_some_and(|w|!w.done())}
+
+    #[cfg(feature="server")]
+    pub(crate) fn response_write_pending(&self)->bool{self.io.response_write.as_ref().is_some_and(|w|w.pending())}
+    #[cfg(feature="server")]
+    pub(crate) fn response_write_begin(&mut self,start:usize,payload:usize,raw:Bytes)->io::Result<()>{
+        let wire=self.io.write_buf().remaining();if let Some(w)=self.io.response_write.as_mut(){w.begin(start,payload,wire,raw)?;}Ok(())
+    }
+    #[cfg(feature="server")]
+    pub(crate) fn response_write_finish(&mut self)->io::Result<()>{if let Some(w)=self.io.response_write.as_mut(){w.finish()?;}Ok(())}
+    #[cfg(feature="server")]
+    pub(crate) fn poll_response_write_deadline(&mut self,cx:&mut Context<'_>)->Poll<io::Result<()>>{if let Some(w)=self.io.response_write.as_mut(){w.poll_deadline(cx)}else{Poll::Pending}}
+    #[cfg(feature="server")]
+    pub(crate) fn response_write_complete(&mut self)->bool{if self.io.response_write.as_ref().is_some_and(|w|w.done()){self.io.response_write=None;true}else{false}}
+    #[cfg(feature="server")]
+    pub(crate) fn abandon_response_write(&mut self){if let Some(w)=self.io.response_write.as_ref(){w.abandon();}}
+    #[cfg(feature="server")]
+    pub(crate) fn write_observed_bytes(&mut self,chunk:Bytes)->io::Result<()> {
+        let raw=chunk.clone();
+        let Writing::Body(encoder)=&mut self.state.writing else{return Err(io::Error::other("HTTP/1 response not writing body"))};
+        let (encoded,start,payload)=encoder.encode_bytes::<B>(chunk);if encoded.has_remaining(){self.io.buffer(encoded);}
+        self.response_write_begin(start,payload,raw)?;
+        if let Writing::Body(encoder)=&self.state.writing{if encoder.is_eof(){self.state.writing=if encoder.is_last(){Writing::Closed}else{Writing::KeepAlive};}}
+        Ok(())
     }
 
     pub(crate) fn write_head(&mut self, head: MessageHead<T::Outgoing>, body: Option<BodyLength>) {
@@ -942,15 +986,16 @@ where
     }
 
     #[cfg(feature = "server")]
-    pub(super) fn write_informational(&mut self, head: http::Response<()>) {
+    pub(super) fn write_informational(&mut self, mut head: http::Response<()>) -> io::Result<()> {
         debug_assert!(T::is_server() && self.can_write_head());
+        if let Some(control)=head.extensions_mut().remove::<crate::ext::ResponseWriteControl>(){self.install_response_write(control)?;}
         // Explicit 100 satisfies the expectation without a second automatic
         // 100 when the handler subsequently starts reading the request body.
         if head.status() == http::StatusCode::CONTINUE {
             if self.state.expects_continue && self.state.sent_continue {
                 // The dispatcher still flushes any already buffered 100
                 // before acknowledging the suppressed duplicate.
-                return;
+                return Ok(());
             }
             self.state.sent_continue = true;
             if let Reading::Continue(decoder) = &self.state.reading {
@@ -963,6 +1008,8 @@ where
             self.state.title_case_headers,
             self.io.headers_buf(),
         );
+        self.response_write_begin(0,0,Bytes::new())?;
+        Ok(())
     }
 
     #[cfg(feature = "server")]
@@ -970,7 +1017,9 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        ready!(self.io.poll_flush_forced(cx))?;
+        let flushed=self.io.poll_flush_forced(cx);
+        if flushed.is_pending(){if let Poll::Ready(result)=self.poll_response_write_deadline(cx){result?;}}
+        ready!(flushed)?;
         self.try_keep_alive(cx);
         Poll::Ready(Ok(()))
     }
