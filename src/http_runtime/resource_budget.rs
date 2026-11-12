@@ -219,6 +219,7 @@ pub struct ResourceDiagnostics {
 }
 
 pub(crate) struct Resources {
+    pub(super) transfer_deadlines: native_write_policy::Pool,
     pub(super) proxy_health_events_coalesced: Arc<AtomicU64>,
     pub(super) cel_body_bytes: Arc<Semaphore>,
     pub(crate) client_cert_bytes: Arc<Semaphore>,
@@ -354,6 +355,7 @@ impl Resources {
             Duration::from_secs(2),
         )?;
         Ok(Self {
+            transfer_deadlines: native_write_policy::Pool::new(cpu.saturating_mul(8<<20).clamp(32<<20,256<<20)),
             proxy_health_events_coalesced: Arc::new(AtomicU64::new(0)),
             cel_body_bytes: Arc::new(Semaphore::new(super::cel_body::POOL_UNITS)),
             tls_event_bytes:Arc::new(Semaphore::new(super::tls_events::POOL_UNITS)),

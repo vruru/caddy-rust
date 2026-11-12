@@ -945,3 +945,28 @@ versions; they are not an unimplemented baseline feature. TLS1.2 CBC suites,
 client renegotiation once/freely, automated client certificates and remaining
 issuer features remain separate unfinished work. PKI KeyPair formats other
 than empty/pem_file are likewise not implemented by the pinned baseline.
+
+CONNECT and WebSocket ownership
+------------------------------
+
+Ordinary successful CONNECT responses retain their handler body. HTTP/1 omits
+Content-Length/Transfer-Encoding and closes the opaque response at EOF instead
+of accepting another HTTP request on that connection. Application-requested
+upgrades remain distinct from these ordinary handler responses.
+
+HTTP/2 and HTTP/3 extended WebSocket CONNECT requests are translated to an
+upstream HTTP/1 GET/Upgrade handshake. The translated 200 is published only
+after validating the single matching upstream Accept against this actual
+attempt's final Key, including configured request-header replacements. Retries
+receive independent generated challenges. Invalid upstream handshakes fail the
+request with 502 before a raw bridge is started; unrelated streams continue.
+This validation repairs a pinned-reference defect and is not error-page parity.
+Ordinary HTTP/1 upgrades preserve transparent proxy behavior.
+
+The raw bridges retain per-session, DATA and concrete protocol-table allocation
+owners through cancellation and the real last IO owner. No-rule controls add no
+idle/rate/hard timeout. Completion means local transport write/flush (or UDP send
+for HTTP/3 source DATA), not remote acknowledgment or successful application
+consumption. Separately bounded QUIC transport/retransmission state is not
+represented as already-freed source payload or as a whole-process memory cap.
+These integrated paths still require the final combined release gates above.

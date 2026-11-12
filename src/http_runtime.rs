@@ -1406,7 +1406,7 @@ async fn serve_connection<I>(
     }
     // The original HTTP/2 sender queues informational headers separately
     // from DATA flow control. Limit their aggregate per request/stream.
-    builder.http2().timer(TokioTimer::new()).idle_timeout(server.plan.idle_timeout).informational_responses(
+    builder.http2().enable_connect_protocol().timer(TokioTimer::new()).idle_timeout(server.plan.idle_timeout).informational_responses(
         request::MAX_INFORMATIONAL_HEADS,
         request::MAX_INFORMATIONAL_BYTES,
     );

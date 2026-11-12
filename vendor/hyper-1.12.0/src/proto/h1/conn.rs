@@ -205,7 +205,13 @@ where
     }
 
     pub(crate) fn pending_upgrade(&mut self) -> Option<crate::upgrade::Pending> {
-        self.state.upgrade.take()
+        let pending = self.state.upgrade.take()?;
+        if T::is_server() && self.state.method == Some(http::Method::CONNECT) && !pending.was_requested() {
+            // A normal handler did not take over the connection. Complete its
+            // close-delimited output and perform normal transport shutdown.
+            drop(pending);
+            None
+        } else { Some(pending) }
     }
 
     pub(crate) fn is_read_closed(&self) -> bool {
@@ -762,6 +768,8 @@ where
                 body,
                 #[cfg(feature = "server")]
                 keep_alive: self.state.wants_keep_alive(),
+                #[cfg(feature = "server")]
+                upgrade_requested: self.state.upgrade.as_ref().is_some_and(|p|p.was_requested()),
                 req_method: &mut self.state.method,
                 title_case_headers: self.state.title_case_headers,
                 #[cfg(feature = "server")]

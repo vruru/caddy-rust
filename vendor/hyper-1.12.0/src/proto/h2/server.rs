@@ -757,11 +757,7 @@ where
                     }
 
                     if let Some(connect_parts) = connect_parts.take() {
-                        if res.status().is_success() {
-                            if me.interim_write.is_some() || res.extensions().get::<crate::ext::ResponseWriteControl>().is_some() {
-                                me.reply.send_reset(Reason::CANCEL);
-                                return Poll::Ready(Err(crate::Error::new_body_write("HTTP/2 controlled CONNECT tunnel is not supported")));
-                            }
+                        if res.status().is_success() && connect_parts.pending.was_requested() {
                             if headers::content_length_parse_all(res.headers())
                                 .map_or(false, |len| len != 0)
                             {
@@ -776,15 +772,38 @@ where
                             {
                                 warn!("successful response to CONNECT request disallows content-length header");
                             }
-                            let send_stream = reply!(me, res, false);
+                            if let Some(control) = res.extensions_mut().remove::<crate::ext::ResponseWriteControl>() {
+                                install_control(me.interim_write, control, me.write_timer, me.reply)?;
+                            }
+                            let allocation = res.extensions_mut().remove::<crate::ext::ConnectWriteAllocation>();
+                            if me.interim_write.is_none() {
+                                if let Some(allocation) = allocation {
+                                    let policies = native_write_policy::PolicySet::compile(&allocation.pool,&[])
+                                        .map_err(crate::Error::new_body_write)?;
+                                    let control = crate::ext::ResponseWriteControl::new_with_policies(
+                                        crate::ext::WritePolicy{installed:me.write_timer.now(),idle:None,minimum_rate:None,hard:None},policies,Some(allocation.retained));
+                                    install_control(me.interim_write,control,me.write_timer,me.reply)?;
+                                }
+                            }
+                            let (send_stream, controlled) = if let Some(mut writer) = me.interim_write.take() {
+                                let owner = writer.owner();
+                                owner.start_boundary(0, me.write_timer.now()).map_err(crate::Error::new_body_write)?;
+                                let (tx,receipt) = me.reply.send_response_observed_with_policy(res,false,owner.retention(),
+                                    Some(super::response_write::compiled_policy(owner).map_err(crate::Error::new_body_write)?)).map_err(crate::Error::new_h2)?;
+                                writer.set_header(receipt,false);
+                                (tx,Some(writer))
+                            } else { (reply!(me,res,false),None) };
                             let (h2_up, up_task) = super::upgrade::pair(
                                 send_stream,
                                 connect_parts.recv_stream,
                                 connect_parts.ping,
                             );
-                            connect_parts
-                                .pending
-                                .fulfill(Upgraded::new(h2_up, Bytes::new()));
+                            let up_task = if let Some(writer) = controlled {
+                                up_task.with_controlled(writer, connect_parts.pending, h2_up)
+                            } else {
+                                connect_parts.pending.fulfill(Upgraded::new(h2_up, Bytes::new()));
+                                up_task
+                            };
                             self.exec.execute_upgrade(up_task);
                             return Poll::Ready(Ok(()));
                         }

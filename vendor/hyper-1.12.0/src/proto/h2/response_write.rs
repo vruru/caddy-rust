@@ -207,31 +207,25 @@ impl<D: Buf> Controlled<D> {
         }
         result
     }
-    fn poll_inner<S>(
-        &mut self,
-        mut body: Pin<&mut S>,
-        tx: &mut h2::SendStream<SendBuf<D>>,
-        cx: &mut Context<'_>,
-    ) -> Poll<crate::Result<()>>
-    where
-        S: Body<Data = D>,
-        S::Error: Into<Box<dyn StdError + Send + Sync>>,
-    {
+    /// Poll the actual header/DATA/FIN owner without polling an application source.
+    /// Ready(false) permits one bounded source item; Ready(true) is a flushed FIN.
+    pub(super) fn poll_output(&mut self, tx: &mut h2::SendStream<SendBuf<D>>, cx: &mut Context<'_>) -> Poll<crate::Result<bool>> {
         loop {
             if let Poll::Ready(reset) = tx.poll_reset(cx).map_err(Self::error)? {
                 return Poll::Ready(Err(Self::error(h2::Error::from(reset))));
             }
             match self.poll_header(cx) {
                 Poll::Ready(Ok(())) => {},
-                result => return result,
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             }
             if self.ended {
                 self.owner.finish().map_err(Self::error)?;
-                return Poll::Ready(Ok(()));
+                return Poll::Ready(Ok(true));
             }
 
             if let Poll::Ready(result) = self.poll_deadline(cx) {
-                return Poll::Ready(result);
+                return Poll::Ready(result.map(|()| false));
             }
             if let Some((chunk, is_eos)) = self.chunk.as_mut() {
                 // A bounded DATA operation begins before flow-control wait. It
@@ -256,7 +250,7 @@ impl<D: Buf> Controlled<D> {
                             }
                             Poll::Pending => {
                                 if let Poll::Ready(result) = self.poll_deadline(cx) {
-                                    return Poll::Ready(result);
+                                    return Poll::Ready(result.map(|()| false));
                                 }
                                 return Poll::Pending;
                             }
@@ -281,6 +275,25 @@ impl<D: Buf> Controlled<D> {
                 self.ended = end;
                 continue;
             }
+            return Poll::Ready(Ok(false));
+        }
+    }
+    pub(super) fn queue_output(&mut self, bytes: Bytes, end: bool) {
+        debug_assert!(self.chunk.is_none() && !self.ended);
+        self.chunk = Some((bytes, end));
+    }
+    fn poll_inner<S>(
+        &mut self,
+        mut body: Pin<&mut S>,
+        tx: &mut h2::SendStream<SendBuf<D>>,
+        cx: &mut Context<'_>,
+    ) -> Poll<crate::Result<()>>
+    where
+        S: Body<Data = D>,
+        S::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        loop {
+            if std::task::ready!(self.poll_output(tx, cx))? { return Poll::Ready(Ok(())); }
             match body.as_mut().poll_frame(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(Err(e))) => {

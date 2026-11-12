@@ -14,6 +14,8 @@ use std::{
     },
 };
 use tokio::sync::Notify;
+#[path = "proxy_websocket.rs"]
+mod websocket;
 type HyperClient = Client<FixedDialConnector, Body>;
 #[derive(Clone)]
 pub(super) struct ProxyClient {
@@ -208,8 +210,10 @@ struct Upgrade {
     upstream: hyper::upgrade::OnUpgrade,
     downstream: Option<hyper::upgrade::OnUpgrade>,
     expected: Option<HeaderValue>,
+    expected_accept: Option<[u8;28]>,
     client: HyperClient,
     close_delay: Option<Duration>,
+    extended: Option<Arc<websocket::Prepared>>,
 }
 
 impl PreparedResponse {
@@ -265,6 +269,23 @@ impl PreparedResponse {
                         .eq_ignore_ascii_case(expected.as_bytes())),
                 "upstream upgrade protocol mismatch"
             );
+            if setup.extended.is_some() {
+                let expected=setup.expected_accept.as_ref().ok_or_else(||anyhow::anyhow!("missing extended WebSocket attempt challenge"))?;
+                websocket::validate_accept(self.response.headers(),expected)?;
+                *self.response.status_mut()=StatusCode::OK;
+                for name in [http::header::UPGRADE,http::header::CONNECTION,http::header::SEC_WEBSOCKET_ACCEPT] {self.response.headers_mut().remove(name);}
+            }
+            if ctx.req().version()==Version::HTTP_2 {
+                if let Some(prepared)=&setup.extended {
+                    self.response.extensions_mut().insert(websocket::write_allocation(prepared,&ctx.resources.transfer_deadlines));
+                }
+            }
+            if ctx.req().version()==Version::HTTP_3 {
+                let prepared=setup.extended.ok_or_else(||anyhow::anyhow!("HTTP/3 upgrade requires extended CONNECT"))?;
+                *self.response.body_mut()=websocket::h3_body(setup.upstream,prepared.clone(),ctx,inner,setup.client,
+                    self.lease.take().expect("HTTP upgrade lease"),setup.close_delay).await?;
+                self.response.extensions_mut().insert(websocket::write_allocation(&prepared,&ctx.resources.transfer_deadlines));
+            } else {
             let downstream = setup
                 .downstream
                 .ok_or_else(|| anyhow::anyhow!("missing downstream upgrade"))?;
@@ -274,6 +295,7 @@ impl PreparedResponse {
             let hard_stop = business.generation().hard_stop.clone();
             let admission = self.lease.take().expect("HTTP upgrade lease");
             inner.upgrades.spawn(async move {
+                let _extended = setup.extended;
                 let _admission = admission;
                 let _hold_client = setup.client;
                 let _business = business;
@@ -296,6 +318,7 @@ impl PreparedResponse {
                 };
                 tokio::select! { biased; _ = hard_stop.cancelled() => {}, _ = tunnel => {} }
             });
+            }
         }
 
         let content_type = self
@@ -415,7 +438,20 @@ pub(super) async fn serve(
             .request
             .take()
             .ok_or_else(|| anyhow::anyhow!("request body already consumed"))?;
-        let (parts, body) = request.into_parts();
+        let extended = websocket::is_extended(&request);
+        let (mut parts, mut body) = request.into_parts();
+        if extended {
+            let prepared = match websocket::prepare(body) {
+                Ok(prepared)=>prepared,
+                Err(error)=>{
+                    // Error routes still require the validated request metadata.
+                    ctx.request=Some(Request::from_parts(parts,full(Bytes::new())));
+                    return Err(error);
+                }
+            };
+            parts.extensions.insert(prepared);
+            body = full(Bytes::new());
+        }
         ctx.fastcgi_body_claimed = true;
         ctx.request = Some(Request::from_parts(parts, full(Bytes::new())));
         ctx.body_limit = None;
@@ -720,14 +756,15 @@ async fn serve_once(
     // URL scheme's implicit 80/443. The adapter supplies normal HTTP defaults.
     let connection_uri = format!("{scheme}://{uri_hostport}");
     let downstream_version = ctx.req().version();
-    let is_upgrade = ctx.req().version() == Version::HTTP_11
+    let extended = ctx.req().extensions().get::<Arc<websocket::Prepared>>().cloned();
+    let is_upgrade = extended.is_some() || ctx.req().version() == Version::HTTP_11
         && header_has_token(ctx.req().headers(), http::header::CONNECTION, "upgrade")
         && ctx
             .req()
             .headers()
             .get(http::header::UPGRADE)
             .is_some_and(|v| !v.is_empty());
-    let expected_upgrade = ctx.req().headers().get(http::header::UPGRADE).cloned();
+    let expected_upgrade = if extended.is_some(){Some(HeaderValue::from_static("websocket"))}else{ctx.req().headers().get(http::header::UPGRADE).cloned()};
     let server_name = if let Some(tls) = effective_tls {
         match tls.server_name.as_ref() {
             Some(template) => {
@@ -761,7 +798,18 @@ async fn serve_once(
     let unix_host = (unix_path.is_some() && config.tls.is_some())
         .then(|| super::http_dial::unix_tls_host(server_name.as_ref()));
     let client = state.client_for(&connection_uri, family, is_upgrade, server_name,unix_path)?;
-    let mut headers = proxy_headers(ctx, config, ctx.req().headers().clone(), is_upgrade, false, unix_host.as_deref())?;
+    let mut outgoing = ctx.req().headers().clone();
+    if extended.is_some() {
+        use base64::Engine;
+        let mut key = [0u8;16];
+        getrandom::fill(&mut key).map_err(|_|anyhow::anyhow!("WebSocket key entropy unavailable"))?;
+        outgoing.insert(http::header::CONNECTION,HeaderValue::from_static("Upgrade"));
+        outgoing.insert(http::header::UPGRADE,HeaderValue::from_static("websocket"));
+        outgoing.insert("sec-websocket-key",HeaderValue::from_str(&base64::engine::general_purpose::STANDARD.encode(key))?);
+        outgoing.remove(http::header::CONTENT_LENGTH);
+        outgoing.remove(http::header::TRANSFER_ENCODING);
+    }
+    let mut headers = proxy_headers(ctx, config, outgoing, is_upgrade, false, unix_host.as_deref())?;
     trailer_metadata.write_upstream_declaration(&mut headers);
     let replacement = ctx
         .req()
@@ -825,12 +873,15 @@ async fn serve_once(
     )
     .parse::<Uri>()
     .map_err(|_| anyhow::anyhow!("invalid expanded upstream authority"))?;
+    // Header operations may replace the generated nonce. Bind this attempt to
+    // exactly the one challenge that is actually serialized upstream.
+    let expected_accept=if extended.is_some(){Some(websocket::expected_accept(&headers)?)}else{None};
     let source = replay.ok_or_else(|| anyhow::anyhow!("HTTP replay source missing"))?;
     let attempt = source.begin()?;
     progress.observation = Some(attempt.observation.clone());
     progress.guard = Some(attempt.guard);
     let mut request = Request::new(attempt.body);
-    *request.method_mut() = ctx.req().method().clone();
+    *request.method_mut() = if extended.is_some(){http::Method::GET}else{ctx.req().method().clone()};
     *request.version_mut() = ctx.req().version();
     *request.extensions_mut() = ctx.req().extensions().clone();
     // The downstream upgrade belongs to the inbound request until an
@@ -897,10 +948,12 @@ async fn serve_once(
     let protocol = response.version();
     let upgrade = (status == StatusCode::SWITCHING_PROTOCOLS).then(|| Upgrade {
         upstream: hyper::upgrade::on(&mut response),
-        downstream: is_upgrade.then(|| hyper::upgrade::on(ctx.req_mut())),
+        downstream: (is_upgrade && ctx.req().version()!=Version::HTTP_3).then(|| hyper::upgrade::on(ctx.req_mut())),
         expected: expected_upgrade,
+        expected_accept,
         client: client.clone(),
         close_delay: config.stream_close_delay,
+        extended,
     });
     let has_body = !hyper::body::Body::is_end_stream(response.body())
         && response.status() != StatusCode::NO_CONTENT

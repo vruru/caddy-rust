@@ -606,10 +606,9 @@ where
     let is_connect=final_method==Method::CONNECT;
     if response.status().is_informational()
         || matches!(response.status(),StatusCode::NO_CONTENT|StatusCode::NOT_MODIFIED)
-        || (is_connect&&response.status().is_success())
     {
-        // Every transport must see a genuinely empty body. H2 otherwise sends
-        // the handler bytes and synthesizes their length after header cleanup.
+        // Entity-free statuses have no body. A successful CONNECT instead
+        // keeps handler output unless an application actually claims upgrade.
         *response.body_mut()=full(Bytes::new());
     }
     if is_head    {

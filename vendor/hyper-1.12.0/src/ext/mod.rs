@@ -40,7 +40,7 @@
 mod response_write;
 #[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
 pub use response_write::{
-    ResponseWriteControl, ResponseWriteOwner, WriteControlError, WritePolicy, WriteSnapshot,
+    ConnectWriteAllocation, ResponseWriteControl, ResponseWriteOwner, WriteControlError, WritePolicy, WriteSnapshot,
     WriteTerminal,
 };
 

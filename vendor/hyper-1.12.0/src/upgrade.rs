@@ -72,7 +72,12 @@ pub struct Upgraded {
 /// If no upgrade was available, or it doesn't succeed, yields an `Error`.
 #[derive(Clone)]
 pub struct OnUpgrade {
-    rx: Option<Arc<Mutex<oneshot::Receiver<crate::Result<Upgraded>>>>>,
+    rx: Option<Arc<Mutex<UpgradeReceiver>>>,
+}
+
+struct UpgradeReceiver {
+    rx: oneshot::Receiver<crate::Result<Upgraded>>,
+    requested: bool,
 }
 
 /// The deconstructed parts of an [`Upgraded`] type.
@@ -104,7 +109,9 @@ pub struct Parts<T> {
 /// - `&mut http::Request<B>`
 /// - `&mut http::Response<B>`
 pub fn on<T: sealed::CanUpgrade>(msg: T) -> OnUpgrade {
-    msg.on_upgrade()
+    let upgrade = msg.on_upgrade();
+    upgrade.request();
+    upgrade
 }
 
 #[cfg(all(
@@ -113,6 +120,7 @@ pub fn on<T: sealed::CanUpgrade>(msg: T) -> OnUpgrade {
 ))]
 pub(super) struct Pending {
     tx: oneshot::Sender<crate::Result<Upgraded>>,
+    _requested: std::sync::Weak<Mutex<UpgradeReceiver>>,
 }
 
 #[cfg(all(
@@ -121,12 +129,8 @@ pub(super) struct Pending {
 ))]
 pub(super) fn pending() -> (Pending, OnUpgrade) {
     let (tx, rx) = oneshot::channel();
-    (
-        Pending { tx },
-        OnUpgrade {
-            rx: Some(Arc::new(Mutex::new(rx))),
-        },
-    )
+    let rx = Arc::new(Mutex::new(UpgradeReceiver { rx, requested: false }));
+    (Pending { tx, _requested: Arc::downgrade(&rx) }, OnUpgrade { rx: Some(rx) })
 }
 
 // ===== impl Upgraded =====
@@ -214,6 +218,9 @@ impl fmt::Debug for Upgraded {
 // ===== impl OnUpgrade =====
 
 impl OnUpgrade {
+    fn request(&self) {
+        if let Some(rx) = &self.rx { rx.lock().panic_if_poisoned().requested = true; }
+    }
     pub(super) fn none() -> Self {
         OnUpgrade { rx: None }
     }
@@ -228,9 +235,10 @@ impl Future for OnUpgrade {
     type Output = Result<Upgraded, crate::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.request();
         match &self.rx {
             Some(rx) => {
-                Pin::new(&mut *rx.lock().panic_if_poisoned())
+                Pin::new(&mut rx.lock().panic_if_poisoned().rx)
                     .poll(cx)
                     .map(|res| match res {
                         Ok(Ok(upgraded)) => Ok(upgraded),
@@ -258,6 +266,14 @@ impl fmt::Debug for OnUpgrade {
     any(feature = "http1", feature = "http2")
 ))]
 impl Pending {
+    #[cfg(any(feature="server",feature="http1"))]
+    pub(super) fn was_requested(&self) -> bool {
+        self._requested.upgrade().is_some_and(|rx| rx.lock().panic_if_poisoned().requested)
+    }
+    #[cfg(all(feature="server",feature="http2"))]
+    pub(super) fn poll_closed(&mut self,cx:&mut Context<'_>)->Poll<()>{self.tx.poll_closed(cx)}
+    #[cfg(all(feature="server",feature="http2"))]
+    pub(super) fn fulfill_checked(self,upgraded:Upgraded)->bool{self.tx.send(Ok(upgraded)).is_ok()}
     pub(super) fn fulfill(self, upgraded: Upgraded) {
         trace!("pending upgrade fulfill");
         let _ = self.tx.send(Ok(upgraded));

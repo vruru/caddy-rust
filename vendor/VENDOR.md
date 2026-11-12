@@ -7,6 +7,7 @@ These are functional source copies of the versions locked by this project:
 | hyper | 1.12.0 | `2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c` |
 | hyper-util | 0.1.21 | `ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff` |
 | h2 | 0.4.20 | `7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118` |
+| h3 | 0.0.8 | `10872b55cfb02a821b69dc7cf8dc6a71d6af25eb9a79662bec4a9d016056b3be` |
 
 The original MIT licenses are retained in each crate. The trailer continuation
 normalizer follows Go 1.27.3 `src/net/textproto/reader.go`; its copyright notice
@@ -125,3 +126,20 @@ COMPATIBILITY.md separately from these opt-in protocol primitives.
 The existing http 1.5.0 source retains its upstream license and original public URI behavior. PathAndQuery now preserves an implicit-slash provenance bit when parsing an absolute URI whose source has no path. The read-only raw_path accessor distinguishes that source from an explicit slash; path/as_str/Display/equality/hashing retain the normalized data and prior behavior. Clones and Parts transfers retain provenance. This does not widen accepted authorities, add a dependency or change normal URI parser limits.
 
 The native rewrite path uses an explicit bounded PathAndQuery constructor that accepts relative URL.Path values, including a colon in the first segment and the empty path. It rejects fragments and invalid path/query bytes and retains the existing 4 MiB explicit-component bound. The normal URI/request-target parser remains unchanged. This avoids reinterpreting a rewrite path as a scheme or authority; connection authorities remain independently validated.
+
+## Extended CONNECT and WebSocket translation
+
+The h3 0.0.8 copy retains its original MIT license. Its functional change adds recognition and serialization of the `websocket` extended-CONNECT protocol. Test-only Rust items and external test modules, development-only dependencies and package-cache metadata are omitted from the published functional copy; mixed functional feature conditions and upstream licenses remain intact. The h3-quinn adapter is not locally modified by this change.
+
+The native HTTP/2 and HTTP/3 listeners advertise extended CONNECT. The HTTP runtime translates an extended WebSocket request into an upstream HTTP/1 GET/Upgrade handshake, and a verified upstream 101 into a frontend 200. The final actual upstream Key and single matching Accept are bound to one attempt; normal HTTP/1 proxy upgrades remain transparent. Failed upstream handshake verification is a native correctness enhancement, since the pinned Go reference accepts the tested invalid responses.
+
+Hyper distinguishes an application-requested upgrade from an ordinary successful CONNECT handler response. Ordinary CONNECT responses keep their body; HTTP/1 uses an opaque close-delimited response without Content-Length or Transfer-Encoding. Requested HTTP/2 upgrades transfer the same control owner only after physical HEADERS/CONTINUATION completion. A bounded raw actor serializes DATA/flush/FIN receipts and cancels only its own stream. Unconsumed upgrade results, completed futures and codec tails retain their actual owned allocations until their last owner drops.
+
+The HTTP/2 bridge reuses the existing locally modified h2 per-stream frame-span progress, completion/deadline and concrete allocation-credit interfaces; this WebSocket/Accept change does not add another h2 source patch or a new upstream h2 version. Progress is local transport write/flush, not peer acknowledgment, and one stream's progress does not credit its neighbors. Timeout configuration activation remains separately documented in COMPATIBILITY.md.
+
+Native WebSocket session admission has a 64 MiB metadata pool with 256 KiB reservations; its HTTP/3 source payload pool is a separate 64 MiB budget. Concrete protocol-table credit follows the shared transfer allocation pool through the real table/weak-owner lifetime. Without configured write rules a neutral control uses no idle/rate/hard deadline and only retains actual output ownership. HTTP/3 source-byte credit covers local UDP transmission, not the separately bounded Quinn acknowledgment/retransmission copies.
+
+
+The HTTP/3 application upload keeps its actual request body and write half in
+one owner whose session hold is dropped last. Cancellation does not refund that
+admission while the captured upload IO can still exist.

@@ -90,6 +90,8 @@ pub(crate) struct Encode<'encode, T> {
     body: Option<BodyLength>,
     #[cfg(feature = "server")]
     keep_alive: bool,
+    #[cfg(feature = "server")]
+    upgrade_requested: bool,
     req_method: &'encode mut Option<Method>,
     title_case_headers: bool,
     #[cfg(feature = "server")]

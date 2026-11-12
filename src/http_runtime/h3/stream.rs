@@ -379,7 +379,17 @@ where B:Body<Data=Bytes,Error=Failure>+Unpin {
 async fn send_with_writer<B>(mut stream:Sending,response:Response<B>,head:bool,connection:quinn::Connection,mut writer:Option<super::write_control::Writer>)->Result<(),Failure>
 where B:Body<Data=Bytes,Error=Failure>+Unpin {
     let (mut parts, mut body) = response.into_parts();
-    let control=parts.extensions.remove::<hyper::ext::ResponseWriteControl>();
+    let mut control=parts.extensions.remove::<hyper::ext::ResponseWriteControl>();
+    let allocation=parts.extensions.remove::<hyper::ext::ConnectWriteAllocation>();
+    if writer.is_none() && control.is_none() {
+        if let Some(allocation)=allocation {
+            // Native WS sources must retain their real credit through local
+            // UDP output even when no deadline rule was configured.
+            let policies=native_write_policy::PolicySet::compile(&allocation.pool,&[])?;
+            control=Some(hyper::ext::ResponseWriteControl::new_with_policies(
+                hyper::ext::WritePolicy{installed:std::time::Instant::now(),idle:None,minimum_rate:None,hard:None},policies,Some(allocation.retained)));
+        }
+    }
     let id=quinn::StreamId::from(quinn::VarInt::from_u64(stream.send_id().into_inner())?);
     bind_writer(&mut writer,control,&connection,id)?;
     let no_payload = head

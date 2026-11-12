@@ -49,6 +49,20 @@ pub struct WriteSnapshot {
     /// Logical outcome, without implying retained frame owners are gone.
     pub terminal: Option<WriteTerminal>,
 }
+/// Native-only prepaid ownership for a bounded successful CONNECT bridge.
+/// The bytes carry the actual allocation lease, not a placeholder allocation.
+/// When no response-write control is installed, the server uses receipts with
+/// no idle, hard or rate rule. An existing control is always reused unchanged.
+/// The retained token prepays the bounded raw bridge; concrete protocol
+/// tables independently retain allocation-pool credit through their last owner.
+#[derive(Clone,Debug)]
+pub struct ConnectWriteAllocation {
+    /// Actual native session metadata reservation; never a dummy payload buffer.
+    pub retained: Bytes,
+    /// The same process pool used by scoped route controls on this connection.
+    pub pool: native_write_policy::Pool,
+}
+
 /// Cloneable observation handle with a single claimable protocol producer.
 #[derive(Clone)]
 pub struct ResponseWriteControl(Arc<Mutex<State>>);
@@ -93,11 +107,15 @@ impl ResponseWriteControl {
     pub const H2_PROTOCOL_ALLOCATION_UPPER_BYTES: usize =
         h2::ext::DATA_WRITE_ALLOCATION_UPPER_BYTES + 4096;
     /// Native HTTP/2 allowance including its one bounded ready-final slot.
+    /// Also reserves 64KiB for a claimed CONNECT bridge: two queued 16KiB
+    /// payloads, one actor payload and one actual codec tail. Guards remain
+    /// retained until the actual last frame/bridge owner is released.
     /// The generic body is moved, never duplicated; its pre-existing payload
     /// and header allocations remain separately owned and prepaid by the caller.
     #[cfg(feature = "http2")]
     pub fn native_h2_protocol_allocation_upper_bytes<B: crate::body::Body<Data = Bytes>>() -> Option<usize> {
         Self::H2_PROTOCOL_ALLOCATION_UPPER_BYTES
+            .checked_add(64usize << 10)?
             .checked_add(std::mem::size_of::<http::Response<B>>())?
             .checked_add(std::mem::align_of::<http::Response<B>>())
     }

@@ -836,7 +836,7 @@ async fn serve_connection(
     let client_cert_cache = super::client_cert_facts::Cache::new(snapshot.clone());
     let sni = server.plan.strict_sni_host.then_some(sni);
     let mut builder = ::h3::server::builder();
-    builder.max_field_section_size(16 * 1024);
+    builder.max_field_section_size(16 * 1024).enable_extended_connect(true);
     let mut connection = tokio::select! {
         biased;
         _=activity.hard_stop.cancelled()=>return,

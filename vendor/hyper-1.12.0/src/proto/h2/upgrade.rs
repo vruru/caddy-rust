@@ -13,26 +13,33 @@ use super::ping::Recorder;
 use super::SendBuf;
 use crate::rt::{Read, ReadBufCursor, Write};
 
-pub(super) fn pair<B>(
+pub(super) fn pair<B: Buf>(
     send_stream: SendStream<SendBuf<B>>,
     recv_stream: RecvStream,
     ping: Recorder,
 ) -> (H2Upgraded, UpgradedSendStreamTask<B>) {
     let (tx, rx) = mpsc::channel(1);
     let (error_tx, error_rx) = oneshot::channel();
+    let (cancel_tx,cancel_rx) = oneshot::channel();
 
     (
         H2Upgraded {
-            send_stream: UpgradedSendStreamBridge { tx, error_rx },
+            send_stream: UpgradedSendStreamBridge { tx, error_rx: Some(error_rx), error: None, done: false, flush: None },
             recv_stream,
             ping,
             buf: Bytes::new(),
+            _retention: None,
+            cancel: Some(cancel_tx),
         },
         UpgradedSendStreamTask {
             h2_tx: send_stream,
             rx,
             buffered: None,
             error_tx: Some(error_tx),
+            controlled: Default::default(),
+            cancel_rx,
+            _retention: None,
+            upgrade: Default::default(),
         },
     )
 }
@@ -42,22 +49,61 @@ pub(super) struct H2Upgraded {
     send_stream: UpgradedSendStreamBridge,
     recv_stream: RecvStream,
     buf: Bytes,
+    _retention: Option<Bytes>,
+    cancel: Option<oneshot::Sender<()>>,
 }
 
-struct UpgradedSendStreamBridge {
-    tx: mpsc::Sender<Cursor<Box<[u8]>>>,
-    error_rx: oneshot::Receiver<crate::Error>,
+enum WriteItem { Data(Cursor<Box<[u8]>>), Flush(oneshot::Sender<()>) }
+impl Drop for H2Upgraded {
+    fn drop(&mut self) {
+        // An unfinished IO drop is cancellation, not an application half-close.
+        // The actor polls this concrete channel even while a receipt is blocked.
+        if let Some(cancel)=self.cancel.take(){let _=cancel.send(());}
+    }
 }
+struct UpgradedSendStreamBridge {
+    tx: mpsc::Sender<WriteItem>,
+    error_rx: Option<oneshot::Receiver<crate::Error>>,
+    error: Option<std::sync::Arc<crate::Error>>,
+    done: bool,
+    flush: Option<oneshot::Receiver<()>>,
+}
+impl UpgradedSendStreamBridge {
+    fn poll_error(&mut self, cx: &mut Context<'_>) -> Option<std::io::Error> {
+        if let Some(rx) = self.error_rx.as_mut() {
+            match Pin::new(rx).poll(cx) {
+                Poll::Ready(result) => {
+                    self.done = true;
+                    self.error_rx = None;
+                    self.error = result.ok().map(std::sync::Arc::new);
+                }
+                Poll::Pending => {}
+            }
+        }
+        self.error.as_ref().map(|e|std::io::Error::new(std::io::ErrorKind::Other,e.clone()))
+    }
+}
+
+#[cfg(feature="server")]
+type DeferredUpgrade = Option<(crate::upgrade::Pending,H2Upgraded)>;
+#[cfg(not(feature="server"))]
+type DeferredUpgrade = ();
 
 pin_project! {
     #[must_use = "futures do nothing unless polled"]
-    pub struct UpgradedSendStreamTask<B> {
+    pub struct UpgradedSendStreamTask<B>
+    where B: Buf,
+    {
         #[pin]
         h2_tx: SendStream<SendBuf<B>>,
         #[pin]
-        rx: mpsc::Receiver<Cursor<Box<[u8]>>>,
+        rx: mpsc::Receiver<WriteItem>,
         buffered: Option<Cursor<Box<[u8]>>>,
         error_tx: Option<oneshot::Sender<crate::Error>>,
+        controlled: super::OptControlled<B>,
+        cancel_rx: oneshot::Receiver<()>,
+        _retention: Option<Bytes>,
+        upgrade: DeferredUpgrade,
     }
 }
 
@@ -67,6 +113,15 @@ impl<B> UpgradedSendStreamTask<B>
 where
     B: Buf,
 {
+    #[cfg(feature="server")]
+    pub(super) fn with_controlled(mut self, controlled: Box<super::response_write::Controlled<B>>, pending: crate::upgrade::Pending, mut upgraded: H2Upgraded) -> Self {
+        let retention = controlled.owner().retention();
+        upgraded._retention = retention.clone();
+        self._retention = retention;
+        self.controlled = Some(controlled);
+        self.upgrade = Some((pending,upgraded));
+        self
+    }
     fn tick(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), crate::Error>> {
         let mut me = self.project();
 
@@ -75,6 +130,31 @@ where
         // one of the sides hanging up, so the task doesn't live around
         // longer than it's meant to.
         loop {
+            if Pin::new(&mut *me.cancel_rx).poll(cx).is_ready() {
+                me.h2_tx.send_reset(Reason::CANCEL);
+                return Poll::Ready(Err(crate::Error::new_body_write("CONNECT upgraded IO cancelled")));
+            }
+            #[cfg(feature="server")]
+            if let Some(writer) = me.controlled.as_mut() {
+                // Header and payload use the same unique owner. The existing
+                // upgrade actor is the only producer; no per-frame task exists.
+                if me.upgrade.as_mut().is_some_and(|(pending,_)|pending.poll_closed(cx).is_ready()) {
+                    return Poll::Ready(Err(crate::Error::new_body_write("CONNECT upgrade consumer cancelled")));
+                }
+                if ready!(writer.poll_output(&mut me.h2_tx, cx))? { return Poll::Ready(Ok(())); }
+                if let Some((pending,upgraded)) = me.upgrade.take() {
+                    if !pending.fulfill_checked(crate::upgrade::Upgraded::new(upgraded,Bytes::new())) {
+                        return Poll::Ready(Err(crate::Error::new_body_write("CONNECT upgrade consumer cancelled")));
+                    }
+                }
+                match me.rx.as_mut().poll_next(cx) {
+                    Poll::Ready(Some(WriteItem::Data(cursor))) => writer.queue_output(Bytes::from(cursor.into_inner()),false),
+                    Poll::Ready(Some(WriteItem::Flush(ack))) => { let _ = ack.send(()); },
+                    Poll::Ready(None) => writer.queue_output(Bytes::new(),true),
+                    Poll::Pending => return Poll::Pending,
+                }
+                continue;
+            }
             match me.h2_tx.poll_reset(cx) {
                 Poll::Ready(Ok(reason)) => {
                     trace!("stream received RST_STREAM: {:?}", reason);
@@ -117,7 +197,8 @@ where
             }
 
             match me.rx.as_mut().poll_next(cx) {
-                Poll::Ready(Some(cursor)) => {
+                Poll::Ready(Some(WriteItem::Flush(ack))) => { let _ = ack.send(()); }
+                Poll::Ready(Some(WriteItem::Data(cursor))) => {
                     // Only reserve capacity once there is something to send.
                     // Reserving while idle, even a single byte, pins that
                     // capacity on the connection-level window (#4003). As in
@@ -148,8 +229,21 @@ where
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.as_mut().tick(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(()),
+            Poll::Ready(Ok(())) => {
+                // Successful write-half completion is observable even if an
+                // executor retains the completed future and its allocation.
+                drop(self.error_tx.take());
+                Poll::Ready(())
+            },
             Poll::Ready(Err(err)) => {
+                #[cfg(feature="server")]
+                if self.controlled.is_some() {
+                    self.h2_tx.send_reset(Reason::CANCEL);
+                    // Receipt and payload guards are dropped after the store
+                    // operation returns; codec tails retain their own owners.
+                    self.controlled = None;
+                    self.upgrade = None;
+                }
                 if let Some(tx) = self.error_tx.take() {
                     let _oh_well = tx.send(err);
                 }
@@ -168,6 +262,7 @@ impl Read for H2Upgraded {
         cx: &mut Context<'_>,
         mut read_buf: ReadBufCursor<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
+        if let Some(error) = self.send_stream.poll_error(cx) { return Poll::Ready(Err(error)); }
         if self.buf.is_empty() {
             self.buf = loop {
                 match ready!(self.recv_stream.poll_data(cx)) {
@@ -198,82 +293,46 @@ impl Read for H2Upgraded {
 }
 
 impl Write for H2Upgraded {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize,std::io::Error>> {
+        if let Some(error) = self.send_stream.poll_error(cx) { return Poll::Ready(Err(error)); }
+        if buf.is_empty() { return Poll::Ready(Ok(0)); }
         match self.send_stream.tx.poll_ready(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(_task_dropped)) => {
-                // if the task dropped, check if there was an error
-                // otherwise i guess its a broken pipe
-                return match Pin::new(&mut self.send_stream.error_rx).poll(cx) {
-                    Poll::Ready(Ok(reason)) => Poll::Ready(Err(io_error(reason))),
-                    Poll::Ready(Err(_task_dropped)) => {
-                        Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
-                    }
-                    Poll::Pending => Poll::Pending,
-                };
-            }
+            Poll::Ready(Ok(())) => {},
+            Poll::Ready(Err(_)) => return Poll::Ready(Err(self.send_stream.poll_error(cx).unwrap_or_else(||std::io::ErrorKind::BrokenPipe.into()))),
             Poll::Pending => return Poll::Pending,
         }
-
-        let n = buf.len();
-        match self.send_stream.tx.start_send(Cursor::new(buf.into())) {
+        // AsyncWrite may return a partial write. This also bounds every raw
+        // mpsc payload; the one sender has at most two reserved queue slots.
+        let n = buf.len().min(16 << 10);
+        match self.send_stream.tx.start_send(WriteItem::Data(Cursor::new(buf[..n].into()))) {
             Ok(()) => Poll::Ready(Ok(n)),
-            Err(_task_dropped) => {
-                // if the task dropped, check if there was an error
-                // otherwise i guess its a broken pipe
-                match Pin::new(&mut self.send_stream.error_rx).poll(cx) {
-                    Poll::Ready(Ok(reason)) => Poll::Ready(Err(io_error(reason))),
-                    Poll::Ready(Err(_task_dropped)) => {
-                        Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
-                    }
-                    Poll::Pending => Poll::Pending,
-                }
-            }
+            Err(_) => Poll::Ready(Err(self.send_stream.poll_error(cx).unwrap_or_else(||std::io::ErrorKind::BrokenPipe.into()))),
         }
     }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        match self.send_stream.tx.poll_ready(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(_task_dropped)) => {
-                // if the task dropped, check if there was an error
-                // otherwise it was a clean close
-                match Pin::new(&mut self.send_stream.error_rx).poll(cx) {
-                    Poll::Ready(Ok(reason)) => Poll::Ready(Err(io_error(reason))),
-                    Poll::Ready(Err(_task_dropped)) => Poll::Ready(Ok(())),
-                    Poll::Pending => Poll::Pending,
-                }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(),std::io::Error>> {
+        if let Some(error) = self.send_stream.poll_error(cx) { return Poll::Ready(Err(error)); }
+        if self.send_stream.done { return Poll::Ready(Ok(())); }
+        if self.send_stream.flush.is_none() {
+            match self.send_stream.tx.poll_ready(cx) {
+                Poll::Ready(Ok(())) => {},
+                Poll::Ready(Err(_)) => return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into())),
+                Poll::Pending => return Poll::Pending,
             }
+            let (send,recv) = oneshot::channel();
+            if self.send_stream.tx.start_send(WriteItem::Flush(send)).is_err() { return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into())); }
+            self.send_stream.flush = Some(recv);
+        }
+        match Pin::new(self.send_stream.flush.as_mut().expect("flush installed")).poll(cx) {
+            Poll::Ready(Ok(())) => { self.send_stream.flush = None; Poll::Ready(Ok(())) },
+            Poll::Ready(Err(_)) => { self.send_stream.flush = None; Poll::Ready(Err(self.send_stream.poll_error(cx).unwrap_or_else(||std::io::ErrorKind::BrokenPipe.into()))) },
             Poll::Pending => Poll::Pending,
         }
     }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(),std::io::Error>> {
         self.send_stream.tx.close_channel();
-        match Pin::new(&mut self.send_stream.error_rx).poll(cx) {
-            Poll::Ready(Ok(reason)) => Poll::Ready(Err(io_error(reason))),
-            Poll::Ready(Err(_task_dropped)) => Poll::Ready(Ok(())),
-            Poll::Pending => Poll::Pending,
-        }
+        if let Some(error) = self.send_stream.poll_error(cx) { return Poll::Ready(Err(error)); }
+        if self.send_stream.done { Poll::Ready(Ok(())) } else { Poll::Pending }
     }
-}
-
-fn io_error(e: crate::Error) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, e)
 }
 
 fn h2_to_io_error(e: h2::Error) -> std::io::Error {

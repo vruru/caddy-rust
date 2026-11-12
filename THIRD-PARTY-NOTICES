@@ -61,7 +61,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-Hyper and hyper-util
+Hyper, hyper-util, h2 and h3
 --------------------
 
 The vendored crates retain their own MIT licenses. See vendor/VENDOR.md for

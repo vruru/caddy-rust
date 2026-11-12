@@ -16,13 +16,13 @@ mod h2_common {
     use crate::proto::h2::upgrade::UpgradedSendStreamTask;
     use crate::rt::Executor;
 
-    pub trait Http2UpgradedExec<B> {
+    pub trait Http2UpgradedExec<B: bytes::Buf> {
         #[doc(hidden)]
         fn execute_upgrade(&self, fut: UpgradedSendStreamTask<B>);
     }
 
     #[doc(hidden)]
-    impl<E, B> Http2UpgradedExec<B> for E
+    impl<E, B: bytes::Buf> Http2UpgradedExec<B> for E
     where
         E: Executor<UpgradedSendStreamTask<B>>,
     {

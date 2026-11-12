@@ -404,8 +404,11 @@ impl Http1Transaction for Server {
         let (ret, is_last) = if msg.head.subject == StatusCode::SWITCHING_PROTOCOLS {
             (Ok(()), true)
         } else if msg.req_method == &Some(Method::CONNECT) && msg.head.subject.is_success() {
-            // Sending content-length or transfer-encoding header on 2xx response
-            // to CONNECT is forbidden in RFC 7231.
+            // The actual CONNECT transport is an opaque, close-delimited
+            // stream. Ignore forbidden message-length headers even if a handler
+            // changed its logical method or supplied a representation length.
+            msg.head.headers.remove(header::CONTENT_LENGTH);
+            msg.head.headers.remove(header::TRANSFER_ENCODING);
             wrote_len = true;
             (Ok(()), true)
         } else if msg.head.subject.is_informational() {
@@ -714,7 +717,11 @@ impl Server {
             dst.truncate(orig_len);
         };
 
-        let mut encoder = Encoder::length(0);
+        // Plain CONNECT handlers may write an opaque, close-delimited
+        // response, while an application-requested upgrade owns its own bytes.
+        let plain_connect = msg.req_method == &Some(Method::CONNECT)
+            && msg.head.subject.is_success() && !msg.upgrade_requested;
+        let mut encoder = if plain_connect { Encoder::close_delimited() } else { Encoder::length(0) };
         let mut allowed_trailer_fields: Option<Vec<HeaderName>> = None;
         let mut wrote_date = false;
         let mut cur_name = None;
@@ -1008,7 +1015,7 @@ impl Server {
             };
         }
 
-        if !Server::can_have_body(msg.req_method.as_ref(), msg.head.subject) {
+        if !plain_connect && !Server::can_have_body(msg.req_method.as_ref(), msg.head.subject) {
             trace!(
                 "server body forced to 0; method={:?}, status={:?}",
                 msg.req_method,
