@@ -5,14 +5,16 @@ fn env_path(name: &str) -> Option<PathBuf> {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
 }
-fn absolute(cwd: &Path, path: PathBuf) -> PathBuf {
-    if path.is_absolute() {
+fn absolute(cwd: &Path, path: PathBuf) -> Result<PathBuf> {
+    let path = if path.is_absolute() {
         path
     } else {
         cwd.join(path)
-    }
+    };
+    caddy_compat_native::process_path::resolve_application_root(&path)
+        .context("resolving process application root")
 }
-pub fn data(cwd: &Path) -> PathBuf {
+pub fn data(cwd: &Path) -> Result<PathBuf> {
     if let Some(base) = env_path("XDG_DATA_HOME") {
         return absolute(cwd, base.join("caddy"));
     }
@@ -26,9 +28,9 @@ pub fn data(cwd: &Path) -> PathBuf {
         };
         return absolute(cwd, path);
     }
-    cwd.join("caddy")
+    absolute(cwd, PathBuf::from("caddy"))
 }
-pub fn config(cwd: &Path) -> PathBuf {
+pub fn config(cwd: &Path) -> Result<PathBuf> {
     if let Some(base) = env_path("XDG_CONFIG_HOME") {
         return absolute(cwd, base.join("caddy"));
     }
@@ -42,5 +44,5 @@ pub fn config(cwd: &Path) -> PathBuf {
             },
         );
     }
-    cwd.join("caddy")
+    absolute(cwd, PathBuf::from("caddy"))
 }

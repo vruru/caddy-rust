@@ -78,6 +78,69 @@ struct StreamTransmitState {
 #[derive(Debug)]
 pub struct StreamTransmitObservation {
     state: Arc<std::sync::Mutex<StreamTransmitState>>,
+    // Drop the actual strong cell before its concrete allocation credit. The
+    // cache independently retains the same credit through its last Weak tail.
+    _credit:Option<Arc<native_write_policy::Lease>>,
+}
+#[cfg(feature = "native-stream-observer")]
+struct TransmitEntry {
+    id:StreamId,
+    state:std::sync::Weak<std::sync::Mutex<StreamTransmitState>>,
+    _credit:Option<Arc<native_write_policy::Lease>>,
+}
+#[cfg(feature = "native-stream-observer")]
+#[derive(Default)]
+struct TransmitObservers {
+    entries:Vec<TransmitEntry>,
+    progress:Vec<proto::StreamTransmitProgress>,
+    pool:Option<native_write_policy::Pool>,
+    // Both actual Vec allocations are destroyed before this lease is retired.
+    _table_credit:Option<native_write_policy::Lease>,
+}
+#[cfg(feature = "native-stream-observer")]
+impl TransmitObservers {
+    const LIMIT:usize=128;
+    fn allocation_upper_bytes()->Option<usize>{
+        Some(StreamTransmitObservation::TABLE_ALLOCATION_UPPER_BYTES)
+    }
+    fn prepare(&mut self,pool:Option<&native_write_policy::Pool>)->Result<(),io::Error>{
+        if self.entries.capacity()!=0 {
+            if let Some(pool)=pool {
+                if !self.pool.as_ref().is_some_and(|existing|existing.same_owner(pool)) {
+                    return Err(io::Error::other("transmit observer allocation pool changed"));
+                }
+            }
+            return Ok(());
+        }
+        let credit=pool.map(|pool|pool.reserve(Self::allocation_upper_bytes().ok_or_else(||io::Error::other("transmit table layout overflow"))?)
+            .map_err(|_|io::Error::other("transmit observer allocation budget exhausted"))).transpose()?;
+        // Exact preallocation makes the named Rust Vec layouts measurable;
+        // neither packet transmission nor a later insert grows these buffers.
+        let mut entries=Vec::new();
+        let mut progress=Vec::new();
+        entries.try_reserve_exact(Self::LIMIT).map_err(|_|io::Error::other("transmit table allocation failed"))?;
+        progress.try_reserve_exact(Self::LIMIT).map_err(|_|io::Error::other("transmit progress allocation failed"))?;
+        if entries.capacity()!=Self::LIMIT||progress.capacity()!=Self::LIMIT {
+            return Err(io::Error::other("transmit table capacity exceeds prepaid layout"));
+        }
+        self.entries=entries;self.progress=progress;self.pool=pool.cloned();self._table_credit=credit;Ok(())
+    }
+    fn cell_credit(&self)->Result<Option<Arc<native_write_policy::Lease>>,io::Error>{
+        self.pool.as_ref().map(|pool|pool.reserve(StreamTransmitObservation::ALLOCATION_UPPER_BYTES)
+            .map(Arc::new).map_err(|_|io::Error::other("transmit cell allocation budget exhausted"))).transpose()
+    }
+    fn prune(&mut self){self.entries.retain(|entry|entry.state.strong_count()!=0);}
+    fn get(&self,id:&StreamId)->Option<&TransmitEntry>{self.entries.binary_search_by_key(id,|entry|entry.id).ok().map(|index|&self.entries[index])}
+    fn insert(&mut self,entry:TransmitEntry)->Result<(),io::Error>{
+        let index=match self.entries.binary_search_by_key(&entry.id,|entry|entry.id){Ok(_)=>return Err(io::Error::new(io::ErrorKind::AlreadyExists,"stream transmit observation occupied")),Err(index)=>index};
+        if self.entries.len()>=Self::LIMIT||self.entries.len()==self.entries.capacity(){return Err(io::Error::other("stream transmit observation limit"))}
+        self.entries.insert(index,entry);Ok(())
+    }
+    fn prepare_progress(&mut self)->Result<(),io::Error>{
+        if self.progress.capacity()<self.entries.len(){return Err(io::Error::other("transmit progress exceeded prepaid layout"))}
+        self.progress.clear();
+        self.progress.extend(self.entries.iter().map(|entry|proto::StreamTransmitProgress{id:entry.id,end:0,fin:false}));Ok(())
+    }
 }
 #[cfg(feature = "native-stream-observer")]
 impl StreamTransmitObservation {
@@ -106,7 +169,11 @@ impl StreamTransmitObservation {
         };
         drop(old);drop(incoming);result
     }
-    /// Conservative scalar cell allowance; connection map storage is separate.
+    /// Fixed sorted observation/progress Vec layouts, prepaid once for the real
+    /// connection. Scalar cells have their independent allowance below.
+    pub const TABLE_ALLOCATION_UPPER_BYTES:usize=128*(std::mem::size_of::<TransmitEntry>()+std::mem::size_of::<proto::StreamTransmitProgress>())+128;
+    /// Conservative cell, credit Arc and short teardown-overlap allowance;
+    /// fixed connection table storage is prepaid separately.
     pub const ALLOCATION_UPPER_BYTES: usize = 2 * (
         std::mem::size_of::<std::sync::Mutex<StreamTransmitState>>()
         + 2 * std::mem::size_of::<usize>()
@@ -142,6 +209,16 @@ impl StreamTransmitObservation {
     /// Arm DATA with the same exact, independently anchored constraints.
     pub fn begin_data_scoped(&self,start:u64,length:usize,policy:crate::StreamWritePolicy,scope:native_write_policy::Boundary)->Result<(),io::Error> {
         self.begin(policy,Some((start,length)),Some(scope))
+    }
+    /// Withdraw only a header encoding rejected before accepting any wire
+    /// bytes. The caller supplies the actual current accepted writer offset;
+    /// it must equal this unsealed operation's original observed boundary.
+    pub fn discard_unwritten_wire(&self,accepted:u64)->Result<(),io::Error>{
+        let mut state=self.state.lock().unwrap_or_else(|error|error.into_inner());
+        if !state.operation.as_ref().is_some_and(|op|op.is_unwritten_wire(accepted)) {
+            return Err(io::Error::other("transmit boundary already accepted or flushed"));
+        }
+        state.operation=None;Ok(())
     }
     /// Accepted offsets identify the boundary only; this earns no progress.
     pub fn seal_wire(&self,end:u64,fin:bool)->Result<(),io::Error> {
@@ -596,27 +673,33 @@ impl Connection {
     /// only; it does not claim logical HTTP payload progress, ACK or ownership
     /// release. At most 128 live stream observations are admitted per connection.
     #[cfg(feature = "native-stream-observer")]
-    pub fn observe_stream_transmit(
-        &self,
-        stream: StreamId,
-    ) -> Result<StreamTransmitObservation, io::Error> {
-        let mut connection = self.0.state.lock("observe_stream_transmit");
-        if !connection.connected || connection.inner.side() != Side::Server
-            || stream.dir() != Dir::Bi || stream.initiator() != Side::Client
-        {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                "transmit observation requires an established server peer-bidi stream"));
+    pub fn observe_stream_transmit(&self,stream:StreamId)->Result<StreamTransmitObservation,io::Error>{
+        self.observe_stream_transmit_owned(stream,None)
+    }
+
+    /// Prepay the exact fixed observation/progress Vec layouts and each live
+    /// scalar cell before allocation. A pool cannot replace one already bound
+    /// to this connection. Actual strong and Weak cell owners retain credits;
+    /// cancellation and wire completion are not allocation-release fences.
+    #[cfg(feature="native-stream-observer")]
+    pub fn observe_stream_transmit_with_budget(&self,stream:StreamId,pool:&native_write_policy::Pool)->Result<StreamTransmitObservation,io::Error>{
+        self.observe_stream_transmit_owned(stream,Some(pool))
+    }
+    #[cfg(feature="native-stream-observer")]
+    fn observe_stream_transmit_owned(&self,stream:StreamId,pool:Option<&native_write_policy::Pool>)->Result<StreamTransmitObservation,io::Error>{
+        let mut connection=self.0.state.lock("observe_stream_transmit");
+        if !connection.connected||connection.inner.side()!=Side::Server||stream.dir()!=Dir::Bi||stream.initiator()!=Side::Client {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,"transmit observation requires an established server peer-bidi stream"));
         }
-        connection.transmit_observers.retain(|_, weak| weak.strong_count() != 0);
-        if connection.transmit_observers.contains_key(&stream) {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "stream transmit observation occupied"));
-        }
-        if connection.transmit_observers.len() == 128 {
-            return Err(io::Error::other("stream transmit observation limit"));
-        }
-        let observation = Arc::new(std::sync::Mutex::new(StreamTransmitState::default()));
-        connection.transmit_observers.insert(stream, Arc::downgrade(&observation));
-        Ok(StreamTransmitObservation { state: observation })
+        let table=&mut connection.transmit_observers;
+        table.prune();
+        if table.get(&stream).is_some(){return Err(io::Error::new(io::ErrorKind::AlreadyExists,"stream transmit observation occupied"))}
+        if table.entries.len()==TransmitObservers::LIMIT{return Err(io::Error::other("stream transmit observation limit"))}
+        table.prepare(pool)?;
+        let credit=table.cell_credit()?;
+        let observation=Arc::new(std::sync::Mutex::new(StreamTransmitState::default()));
+        table.insert(TransmitEntry{id:stream,state:Arc::downgrade(&observation),_credit:credit.clone()})?;
+        Ok(StreamTransmitObservation{state:observation,_credit:credit})
     }
 
     /// Accepted writer offset, used only to map application framing to the
@@ -1182,9 +1265,7 @@ impl ConnectionRef {
                 send_buffer: Vec::new(),
                 buffered_transmit: None,
                 #[cfg(feature = "native-stream-observer")]
-                transmit_observers: std::collections::BTreeMap::new(),
-                #[cfg(feature = "native-stream-observer")]
-                buffered_progress: Vec::new(),
+                transmit_observers: TransmitObservers::default(),
             }),
             shared: Shared::default(),
         }))
@@ -1270,19 +1351,16 @@ pub(crate) struct State {
     /// We buffer a transmit when the underlying I/O would block
     buffered_transmit: Option<proto::Transmit>,
     #[cfg(feature = "native-stream-observer")]
-    transmit_observers: std::collections::BTreeMap<StreamId, std::sync::Weak<std::sync::Mutex<StreamTransmitState>>>,
-    #[cfg(feature = "native-stream-observer")]
-    buffered_progress: Vec<proto::StreamTransmitProgress>,
+    transmit_observers: TransmitObservers,
 }
 
 impl State {
     fn next_transmit(&mut self, now: Instant, max_datagrams: usize) -> io::Result<Option<proto::Transmit>> {
         #[cfg(feature = "native-stream-observer")]
         {
-            self.transmit_observers.retain(|_, weak| weak.strong_count() != 0);
-            self.buffered_progress.clear();
-            self.buffered_progress.extend(self.transmit_observers.keys().map(|id| proto::StreamTransmitProgress { id: *id, end: 0, fin: false }));
-            return self.inner.poll_transmit_observed(now, max_datagrams, &mut self.send_buffer, &mut self.buffered_progress)
+            self.transmit_observers.prune();
+            self.transmit_observers.prepare_progress()?;
+            return self.inner.poll_transmit_observed(now, max_datagrams, &mut self.send_buffer, &mut self.transmit_observers.progress)
                 .map_err(|_| io::Error::other("invalid transmit observation shape"));
         }
         #[cfg(not(feature = "native-stream-observer"))]
@@ -1291,8 +1369,8 @@ impl State {
     #[cfg(feature = "native-stream-observer")]
     fn publish_transmit_progress(&mut self,wakes:&mut TransmitWakeBatch) {
         let now = Instant::now();
-        for progress in &self.buffered_progress {
-            let Some(owner) = self.transmit_observers.get(&progress.id).and_then(std::sync::Weak::upgrade) else { continue; };
+        for progress in &self.transmit_observers.progress {
+            let Some(owner) = self.transmit_observers.get(&progress.id).and_then(|entry|entry.state.upgrade()) else { continue; };
             let mut state = owner.lock().unwrap_or_else(|error| error.into_inner());
             if progress.end > state.snapshot.end || (progress.fin && !state.snapshot.fin) {
                 if let Some(operation)=&mut state.operation {

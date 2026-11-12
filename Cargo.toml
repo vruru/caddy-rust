@@ -11,6 +11,7 @@ license = "Apache-2.0"
 native-run = []
 
 [dependencies]
+native-write-policy = { path = "vendor/native-write-policy" }
 opentelemetry = { version = "=0.33.1", default-features = false, features = ["metrics"] }
 opentelemetry_sdk = { version = "=0.33.1", default-features = false, features = ["metrics", "experimental_metrics_custom_reader", "experimental_metrics_bound_instruments"] }
 opentelemetry-otlp = { version = "=0.33.1", default-features = false, features = ["metrics", "http-proto", "grpc-tonic", "gzip-http", "gzip-tonic", "tls-provider-agnostic", "tls-roots"] }

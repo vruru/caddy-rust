@@ -87,7 +87,7 @@ fn run(parsed: args::Flags) -> Result<i32> {
         }
     }
     let cwd = std::env::current_dir().context("capturing application directory")?;
-    let config_dir = paths::config(&cwd);
+    let config_dir = paths::config(&cwd)?;
     let autosave = config_dir.join("autosave.json");
     let resumed = if parsed.boolean("resume") {
         caddy_compat_native::admin::read_autosave(&autosave)?
@@ -136,7 +136,7 @@ fn run(parsed: args::Flags) -> Result<i32> {
     let pidfile = nonempty(parsed.text("pidfile")).map(|path| cwd.join(path));
     let root = Arc::new(NativeBackend::new(RootOptions {
         paths: CertificatePaths {
-            default_storage: paths::data(&cwd),
+            default_storage: paths::data(&cwd)?,
             state_root: config_dir.join("native-state"),
             cwd: cwd.clone(),
         },

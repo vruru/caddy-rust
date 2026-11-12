@@ -468,3 +468,6 @@ Source: https://github.com/RustCrypto/password-hashes/tree/argon2-v0.5.3/argon2
 Original licenses are retained in vendor/argon2-0.5.3. Functional modifications
 add opt-in Go-compatible stored-hash parameter acceptance; the HTTP host adds
 independent scratch/work admission and zeroization.
+
+
+src/http_runtime/templates/request_url.rs follows Go1.27.3 src/net/url/url.go (Copyright2009 The Go Authors), under the Go BSD license retained in THIRD-PARTY-NOTICES.

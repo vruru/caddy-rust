@@ -1,3 +1,4 @@
+pub mod process_path;
 pub mod acme_wire;
 pub mod admin;
 pub mod admin_json;

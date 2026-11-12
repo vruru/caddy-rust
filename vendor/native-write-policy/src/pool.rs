@@ -15,9 +15,10 @@ impl Pool{
    match self.0.used.compare_exchange_weak(current,next,Ordering::AcqRel,Ordering::Acquire){Ok(_)=>return Ok(Lease{pool:self.clone(),bytes}),Err(actual)=>current=actual}
   }
  }
+ pub fn same_owner(&self,other:&Self)->bool{Arc::ptr_eq(&self.0,&other.0)}
  pub fn used(&self)->usize{self.0.used.load(Ordering::Acquire)}
 }
 #[derive(Debug)]pub struct Lease{pool:Pool,bytes:usize}
-impl Lease{pub fn bytes(&self)->usize{self.bytes}}
+impl Lease{pub fn bytes(&self)->usize{self.bytes} pub fn pool(&self)->Pool{self.pool.clone()}}
 impl AsRef<[u8]> for Lease{fn as_ref(&self)->&[u8]{&[]}}
 impl Drop for Lease{fn drop(&mut self){let previous=self.pool.0.used.fetch_sub(self.bytes,Ordering::AcqRel);debug_assert!(previous>=self.bytes,"write policy allocation accounting underflow");}}

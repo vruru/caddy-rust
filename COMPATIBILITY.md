@@ -585,3 +585,66 @@ the header map. Valid non-UTF-8 bytes and HTAB are preserved, including Add orde
 CR, LF and NUL are rejected without partial mutation. This intentionally differs
 from the baseline's H1 CR/LF rewriting and invalid NUL emission; accepting a
 malformed response field is not treated as additional useful compatibility.
+
+
+Request URL templates now retain decoded Go-string bytes for Path/User/Host facts and expose Redacted and MarshalBinary alongside the existing read methods. RawPath, empty absolute paths, ForceQuery, IPv6 zones and numeric port text (including values greater than65535) are retained; request hosts use ordinary URL rules rather than X.509 SAN restrictions. This layer is read-only and does not claim Parse/JoinPath/ResolveReference/AppendBinary/UnmarshalBinary mutability. The shared HTTP Uri parser still rejects percent-encoded DNS host bytes which Go can accept in an absolute-form target; this remains a separate pre-factory transport gap. Other unrepresented request-target forms and full net/url standard-library compatibility remain pending.
+
+Construction and method outputs are prepaid on the existing request Control before temporary vectors, field maps and byte-slice outputs allocate, with cancellation/retired-owner checks. The factory retains only a weak Control backlink and owns its private URL facts; it does not modify authenticated TLS facts. This host prepayment does not establish full-engine heap coverage or replace the narrower refundable printf allocation scope.
+
+
+Scoped HTTP/3 interim output and metadata
+----------------------------------------
+
+An installed native HTTP/3 write control is claimed once and shared from
+informational responses through the final response. Interim acknowledgements
+wait for actual local UDP transmission, and a hard ceiling remains active while
+the producer is paused. A different later control is rejected. A peer header
+size rejection before encoding acceptance can withdraw only its unchanged,
+unsealed zero-payload boundary; it earns no progress or rate credit.
+
+When a scoped allocation pool is installed, HTTP/3 prepays two fixed sorted Vec
+layouts and each actual scalar observation cell before allocation, plus its one
+native timer Box. Neither packet progress nor later registration grows these
+buffers. Strong observers and weak cached entries retain the same concrete cell
+loan through actual destruction; the table buffers retire before their table
+loan. A pool cannot replace one already bound to the connection. Legacy unscoped
+observation remains available without claiming a prepaid allocation contract.
+These named metadata limits exclude existing task/header/payload storage, QUIC
+retransmission storage and whole-process RSS. This internal support does not by
+itself register the remaining timeout configuration feature.
+
+
+Startup-selected directory aliases
+----------------------------------
+
+The CLI resolves protected current-user-owned aliases when selecting its trusted
+XDG/HOME/cwd application directories at startup. FD-relative metadata/readlink
+checks validate source namespace and target identity before returning a physical
+root path. The existing store and admin capability walks then apply their own
+NOFOLLOW, inode, type, ownership, private-anchor and file checks. API paths never
+use this startup resolver; child and terminal symlinks remain rejected.
+
+Resolution permits at most40 links,64 directories and16KiB of path input. It
+selects a root without creating directories or claiming a permanently pinned
+inode; the real file operations retain their descriptor-based authorization.
+This repairs autosave/reload/resume through a legitimate process-configured
+external-disk alias without allowing arbitrary API symlink traversal.
+
+
+HTTP request-target userinfo remains rejected with400, independently of the
+URL template factory. This follows RFC9110 section4.2.4's recipient guidance
+and retains the existing authority boundary; the baseline's acceptance of such
+a target is not used to weaken that check. Redacted/userinfo object operations
+are validated separately from accepting userinfo on an actual HTTP target.
+
+
+Bare-asterisk request targets
+----------------------------
+
+A bare `*` URL retains an empty RawPath, unlike `/*`. General `OPTIONS *`
+returns an empty200 with Content-Length0 outside application routes, preserving
+authority validation and the configured strict SNI/Host boundary. An unfinished
+HTTP/1 request body makes that one connection close after the response rather
+than waiting in an unbounded post-handler drain. Bodyless requests retain
+keepalive, while H2/H3 streams remain independently handled. Invalid star-query
+targets retain parser rejection.

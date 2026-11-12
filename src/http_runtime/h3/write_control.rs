@@ -14,13 +14,29 @@ pub(super) struct Writer {
     reported:u64,
     last_report:Option<Instant>,
     active:bool,
+    unwritten:Option<(u64,u64)>,
+    // The actual timer allocation precedes its concrete pool loan in drop
+    // order. This is independent of response/control logical completion.
+    _timer_credit:Option<native_write_policy::Lease>,
 }
 fn invalid(message:&'static str)->Failure {io::Error::other(message).into()}
 impl Writer {
     pub(super) fn new(connection:Connection,id:StreamId,control:ResponseWriteControl)->Result<Self,Failure> {
+        let pool=control.allocation_pool();
+        let timer_bytes=std::mem::size_of::<tokio::time::Sleep>()+std::mem::align_of::<tokio::time::Sleep>()+128;
+        let timer_credit=pool.as_ref().map(|pool|pool.reserve(timer_bytes).map_err(|_|invalid("HTTP/3 write timer allocation budget exhausted"))).transpose()?;
         let owner=control.claim()?;
-        let observe=connection.observe_stream_transmit(id)?;
-        Ok(Self{owner,observe,connection,id,timer:Box::pin(tokio::time::sleep(std::time::Duration::ZERO)),reported:0,last_report:None,active:false})
+        let observe=if let Some(pool)=pool{connection.observe_stream_transmit_with_budget(id,&pool)?}else{connection.observe_stream_transmit(id)?};
+        Ok(Self{owner,observe,connection,id,timer:Box::pin(tokio::time::sleep(std::time::Duration::ZERO)),reported:0,last_report:None,active:false,unwritten:None,_timer_credit:timer_credit})
+    }
+    pub(super) fn same_control(&self,control:&ResponseWriteControl)->bool{self.owner.same_control(control)}
+    pub(super) fn discard_rejected_wire(&mut self)->Result<(),Failure>{
+        let (accepted,revision)=self.unwritten.ok_or_else(||invalid("no withdrawable HTTP/3 header boundary"))?;
+        let current=self.connection.stream_written_offset(self.id)?;
+        if current!=accepted{return Err(invalid("rejected HTTP/3 headers accepted bytes"))}
+        self.observe.discard_unwritten_wire(current)?;
+        self.owner.discard_unwritten_boundary(revision)?;
+        self.unwritten=None;self.active=false;Ok(())
     }
     fn policy(&self)->Result<quinn::StreamWritePolicy,Failure> {
         let p=self.owner.policy();let s=self.owner.snapshot();
@@ -29,7 +45,9 @@ impl Writer {
             last_flush:s.last_flush,flushed_before:s.flushed_bytes})
     }
     pub(super) fn begin_wire(&mut self)->Result<(),Failure> {
+        let accepted=self.connection.stream_written_offset(self.id)?;
         self.owner.start_boundary(0,Instant::now())?;
+        self.unwritten=Some((accepted,self.owner.snapshot().version));
         let policy=self.policy()?;
         if let Some(scope)=self.owner.scoped_boundary()?{self.observe.begin_wire_scoped(policy,scope)?}else{self.observe.begin_wire(policy)?}
         self.reported=0;self.last_report=None;self.active=true;Ok(())
@@ -40,6 +58,7 @@ impl Writer {
         let varint=match n {0..=63=>1,64..=16383=>2,16384..=1073741823=>4,1073741824..=4611686018427387903=>8,_=>return Err(invalid("HTTP/3 DATA length outside QUIC range"))};
         let start=self.connection.stream_written_offset(self.id)?.checked_add(1+varint)
             .ok_or_else(||invalid("HTTP/3 DATA offset overflow"))?;
+        self.unwritten=None;
         self.owner.start_boundary(length,Instant::now())?;
         let policy=self.policy()?;
         if let Some(scope)=self.owner.scoped_boundary()?{self.observe.begin_data_scoped(start,length,policy,scope)?}else{self.observe.begin_data(start,length,policy)?}
@@ -69,7 +88,7 @@ impl Writer {
         if s.expired {return Err(invalid("HTTP/3 actual output exceeded write deadline"))}
         if s.completed {
             if self.owner.snapshot().pending_since.is_some(){self.owner.flushed(0,s.last_wire.ok_or_else(||invalid("HTTP/3 completion has no physical clock"))?)?;}
-            self.active=false;return Ok(true)
+            self.active=false;self.unwritten=None;return Ok(true)
         }
         Ok(false)
     }

@@ -161,28 +161,8 @@ pub(super) fn header_value(headers:Arc<Mutex<HeaderMap>>,writable:bool)->Value{
     });
     Value::Object(Arc::new(Object{data:Some(format_data),fields:Fields::new(),methods,map_view:Some(MapView{is_nil:Arc::new(||false),type_name:"http.Header",snapshot,zero:Value::Slice(gotmpl::TypedSlice::nil("[]string"))}),..Object::default()}))
 }
-fn decode(input:&str)->RenderResult<String>{percent_encoding::percent_decode_str(input).decode_utf8().map(|s|s.into_owned()).map_err(|_|error("URL contains unrepresentable byte string"))}
-fn url_value(uri:&Uri,control:&Arc<super::Control>)->RenderResult<Value>{
-    let path=decode(uri.path())?;let raw_path=if uri.path()==escape_path(&path,true){""}else{uri.path()};
-    let fields=Fields::from([
-        ("Scheme".into(),string(uri.scheme_str().unwrap_or_default())),("Opaque".into(),string("")),("User".into(),nil_user()),
-        ("Host".into(),string(uri.authority().map_or("",|a|a.as_str()))),("Path".into(),string(path.clone())),("RawPath".into(),string(raw_path)),
-        ("OmitHost".into(),Value::Bool(false)),("ForceQuery".into(),Value::Bool(uri.query()==Some(""))),("RawQuery".into(),string(uri.query().unwrap_or_default())),
-        ("Fragment".into(),string("")),("RawFragment".into(),string("")),
-    ]);
-    let mut methods=BTreeMap::<Arc<str>,ValueFunc>::new();
-    for name in ["String","RequestURI","EscapedPath","EscapedFragment","Hostname","Port","IsAbs","Query"]{
-        let uri=uri.clone();let owner=Arc::downgrade(control);methods.insert(name.into(),Arc::new(move|args|{arity(args,0,0)?;match name{
-            "String"=>Ok(string(uri.to_string())),"RequestURI"=>Ok(string(uri.path_and_query().map_or("/",|p|p.as_str()))),
-            "EscapedPath"=>Ok(string(uri.path())),"EscapedFragment"=>Ok(string("")),
-            "Hostname"=>Ok(string(uri.host().unwrap_or_default().trim_start_matches('[').trim_end_matches(']'))),"Port"=>Ok(string(uri.port_u16().map(|p|p.to_string()).unwrap_or_default())),
-            "IsAbs"=>Ok(Value::Bool(uri.scheme().is_some())),
-            "Query"=>byte_values(uri.query().unwrap_or_default().as_bytes(),&owner.upgrade().ok_or_else(||error("template owner retired"))?),
-            _=>Err(error("unknown URL method")),
-        }}));
-    }
-    Ok(Value::Object(Arc::new(Object{field_order:Some(["Scheme","Opaque","User","Host","Path","Fragment","RawQuery","RawPath","RawFragment","ForceQuery","OmitHost"].map(Arc::from).into()),display:Some(uri.to_string().into()),fields,methods,pointer_identity:Some(uri as *const Uri as usize),go_type:Some("*url.URL"),..Object::default()})))
-}
+#[path="request_url.rs"]mod request_url;
+fn url_value(uri:&Uri,control:&Arc<super::Control>)->RenderResult<Value>{request_url::value(uri,control)}
 fn escape_path(input:&str,slash:bool)->String{let mut out=String::new();for byte in input.bytes(){if byte.is_ascii_alphanumeric()||b"-_.~:@&=+$".contains(&byte)||(slash&&byte==b'/'){out.push(byte as char);}else{out.push_str(&format!("%{byte:02X}"));}}out}
 pub(super) fn path_escape(input:&str)->String{escape_path(input,false)}
 pub(super) fn strip_html(input:&str)->String{let mut out=String::new();let mut depth=0usize;let mut quote='\0';for ch in input.chars(){match ch{
@@ -254,12 +234,6 @@ pub(super) fn typed_map(type_name:&'static str,entries:Arc<Fields>,zero:Value)->
 
 fn nil_pointer(go_type:&'static str,names:&[&str])->Value{
     Value::Object(Arc::new(Object{go_type:Some(go_type),nil_pointer:Some(Arc::new(||true)),fields:names.iter().map(|name|(Arc::from(*name),Value::Nil)).collect(),..Object::default()}))
-}
-fn nil_user()->Value{
-    let mut methods=BTreeMap::<Arc<str>,ValueFunc>::new();
-    for name in ["String","Username"]{methods.insert(name.into(),Arc::new(|args|{arity(args,0,0)?;Ok(string(""))}));}
-    methods.insert("Password".into(),Arc::new(|_|Err(error("invalid function signature: second return value is not error"))));
-    Value::Object(Arc::new(Object{go_type:Some("*url.Userinfo"),nil_pointer:Some(Arc::new(||true)),display:Some("".into()),methods,..Object::default()}))
 }
 
 // ParseQuery is byte based: malformed pairs are ignored by URL.Query, while

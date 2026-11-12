@@ -419,6 +419,26 @@ where
         Ok(authority) => authority,
         Err(()) => return simple(StatusCode::BAD_REQUEST, "Bad Request\n"),
     };
+    // net/http's general server OPTIONS handler sits outside the application
+    // route stack. Preserve explicit authority/SNI validation while keeping
+    // this server-wide capability response out of templates and access logs.
+    if request.method()==Method::OPTIONS
+        && request.uri().path_and_query().is_some_and(|path|path.as_str()=="*")
+        && !(tls && server.plan.strict_sni_host
+            && !strict_host_matches(&authority,sni.unwrap_or_default()))
+    {
+        let mut response=simple(StatusCode::OK,Bytes::new());
+        response.headers_mut().insert(http::header::CONTENT_LENGTH,HeaderValue::from_static("0"));
+        if matches!(request.version(),Version::HTTP_10|Version::HTTP_11)
+            && !request.body().is_end_stream()
+        {
+            // Do not reproduce an unbounded post-handler body drain. Closing
+            // only this H1 connection lets an unfinished sender receive the
+            // capability response immediately without holding a socket forever.
+            response.headers_mut().insert(http::header::CONNECTION,HeaderValue::from_static("close"));
+        }
+        return response;
+    }
     let trusted = server
         .plan
         .trusted_proxies

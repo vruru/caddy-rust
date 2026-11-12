@@ -15,8 +15,8 @@ pub fn configuration(raw: serde_json::Value) -> Result<()> {
     let cwd = std::env::current_dir().context("capturing application directory")?;
     let root = NativeBackend::new(RootOptions {
         paths: CertificatePaths {
-            default_storage: paths::data(&cwd),
-            state_root: paths::config(&cwd).join("native-state"),
+            default_storage: paths::data(&cwd)?,
+            state_root: paths::config(&cwd)?.join("native-state"),
             cwd,
         },
         trust_installer: None,

@@ -1,5 +1,4 @@
-//! Exact immutable write constraints with concrete allocation ownership.
-//! Configuration handlers opt in separately; this crate registers no runtime.
+//! Private common exact policy kernel candidate. No runtime registration yet.
 #![forbid(unsafe_code)]
 mod pool;
 pub use pool::{Pool,Lease,Denied};
@@ -14,6 +13,9 @@ impl std::error::Error for Error{fn source(&self)->Option<&(dyn std::error::Erro
 /// Clones share this complete object; no callback or user data enters it.
 #[derive(Debug)]pub struct PolicySet{hard:Option<Instant>,flat:Option<Duration>,rates:Vec<Rate>,_lease:Lease}
 impl PolicySet{
+ /// The same concrete pool can prepay protocol metadata owned by this scope.
+ pub fn allocation_pool(&self)->Pool{self._lease.pool()}
+
  pub fn allocation_bound(rules:&[Rule])->Result<usize,Error>{
   if rules.len()>MAX_RULES{return Err(Error::TooManyRules)}
   let count=rules.iter().filter(|r|r.idle.is_some_and(|d|!d.is_zero())&&r.rate.is_some()).count();

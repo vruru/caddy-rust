@@ -12,6 +12,9 @@ use crate::byte_str::ByteStr;
 pub struct PathAndQuery {
     pub(super) data: ByteStr,
     pub(super) query: u32,
+    // Provenance only: preserve an absent absolute-form path without
+    // changing the normalized data used by legacy comparison and formatting.
+    implicit_slash: bool,
 }
 
 const NONE: u32 = u32::MAX;
@@ -68,7 +71,7 @@ impl PathAndQuery {
             unsafe { ByteStr::from_utf8_unchecked(src) }
         };
 
-        Ok(PathAndQuery { data, query })
+        Ok(PathAndQuery { data, query, implicit_slash: false })
     }
 
     /// Convert a `PathAndQuery` from a static string.
@@ -99,6 +102,7 @@ impl PathAndQuery {
             }) => PathAndQuery {
                 data: ByteStr::from_static(src),
                 query,
+                implicit_slash: false,
             },
             // Yes, we reject fragments and non-utf8
             _ => panic!("static str is not valid path"),
@@ -124,6 +128,7 @@ impl PathAndQuery {
         PathAndQuery {
             data: ByteStr::new(),
             query: NONE,
+            implicit_slash: false,
         }
     }
 
@@ -131,13 +136,21 @@ impl PathAndQuery {
         PathAndQuery {
             data: ByteStr::from_static("/"),
             query: NONE,
+            implicit_slash: false,
         }
+    }
+
+    pub(super) fn implicit_slash() -> Self {
+        let mut path = Self::slash();
+        path.implicit_slash = true;
+        path
     }
 
     pub(super) fn star() -> Self {
         PathAndQuery {
             data: ByteStr::from_static("*"),
             query: NONE,
+            implicit_slash: false,
         }
     }
 
@@ -176,6 +189,18 @@ impl PathAndQuery {
         }
 
         ret
+    }
+
+    /// Return the original encoded path before an absent absolute-form path
+    /// was normalized to `/`.
+    ///
+    /// Native request URL projections use this read-only extension to preserve
+    /// the distinction between an absent path and an explicit slash. Existing
+    /// `path` and `as_str` behavior is unchanged.
+    pub fn raw_path(&self) -> &str {
+        if self.implicit_slash { "" }
+        else if self.query == NONE { &self.data[..] }
+        else { &self.data[..self.query as usize] }
     }
 
     /// Returns the query string component

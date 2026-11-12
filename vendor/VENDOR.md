@@ -120,3 +120,6 @@ It contains checked write-deadline arithmetic and concrete atomic allocation
 ownership shared by the native Hyper, h2 and Quinn extensions; it is not an
 upstream third-party crate release. Configuration activation is tracked in
 COMPATIBILITY.md separately from these opt-in protocol primitives.
+
+
+The existing http 1.5.0 source retains its upstream license and original public URI behavior. PathAndQuery now preserves an implicit-slash provenance bit when parsing an absolute URI whose source has no path. The read-only raw_path accessor distinguishes that source from an explicit slash; path/as_str/Display/equality/hashing retain the normalized data and prior behavior. Clones and Parts transfers retain provenance. This does not widen accepted authorities, add a dependency or change normal URI parser limits.

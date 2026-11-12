@@ -250,6 +250,20 @@ impl InterimWriter {
     }
 }
 
+fn bind_writer(
+    writer:&mut Option<super::write_control::Writer>,
+    control:Option<hyper::ext::ResponseWriteControl>,
+    connection:&quinn::Connection,
+    id:quinn::StreamId,
+)->Result<(),Failure>{
+    if let Some(control)=control {
+        if let Some(existing)=writer {
+            if !existing.same_control(&control){return Err(malformed("HTTP/3 response write control changed"))}
+        }else{*writer=Some(super::write_control::Writer::new(connection.clone(),id,control)?);}
+    }
+    Ok(())
+}
+
 pub async fn drive<B>(
     mut stream: Sending,
     mut interim: tokio::sync::mpsc::Receiver<Interim>,
@@ -260,36 +274,54 @@ pub async fn drive<B>(
 where
     B: Body<Data = Bytes, Error = Failure> + Unpin,
 {
+    enum Event<B>{Interim(Option<Interim>),Final(Response<B>)}
     tokio::pin!(response);
+    let id=quinn::StreamId::from(quinn::VarInt::from_u64(stream.send_id().into_inner())?);
+    let mut writer:Option<super::write_control::Writer>=None;
     let mut open = true;
     loop {
-        tokio::select! {
+        let next=async{tokio::select! {
             biased;
-            next=interim.recv(),if open=>match next {
-                Some(Interim { response, acknowledged }) if !acknowledged.is_closed() => {
-                    let suppressed=match stream.send_response(response).await {
-                        Ok(())=>false,
-                        Err(h3::error::StreamError::HeaderTooBig{..})=>true,
+            next=interim.recv(),if open=>Event::Interim(next),
+            response=&mut response=>Event::Final(response),
+        }};
+        let event=if let Some(writer)=&mut writer{writer.action(next).await?}else{next.await};
+        match event {
+            Event::Interim(Some(Interim{mut response,acknowledged})) if !acknowledged.is_closed()=>{
+                let control=response.extensions_mut().remove::<hyper::ext::ResponseWriteControl>();
+                bind_writer(&mut writer,control,&connection,id)?;
+                let suppressed=if let Some(writer)=&mut writer {
+                    writer.begin_wire()?;
+                    match writer.action(stream.send_response(response)).await? {
+                        Ok(())=>{writer.seal_wire(false)?;writer.boundary().await?;false},
+                        Err(h3::error::StreamError::HeaderTooBig{..})=>{writer.discard_rejected_wire()?;true},
                         Err(error)=>return Err(error.into()),
-                    };
-                    let _=acknowledged.send(suppressed);
-                },
-                Some(_)=>{},
-                None=>open=false,
+                    }
+                }else{match stream.send_response(response).await {
+                    Ok(())=>false,
+                    Err(h3::error::StreamError::HeaderTooBig{..})=>true,
+                    Err(error)=>return Err(error.into()),
+                }};
+                let _=acknowledged.send(suppressed);
             },
-            response=&mut response=>return send(stream,response,head,connection).await,
+            Event::Interim(Some(_))=>{},
+            Event::Interim(None)=>open=false,
+            Event::Final(response)=>return send_with_writer(stream,response,head,connection,writer).await,
         }
     }
 }
 
-pub async fn send<B>(mut stream: Sending, response: Response<B>, head: bool, connection:quinn::Connection) -> Result<(), Failure>
-where
-    B: Body<Data = Bytes, Error = Failure> + Unpin,
-{
+pub async fn send<B>(stream:Sending,response:Response<B>,head:bool,connection:quinn::Connection)->Result<(),Failure>
+where B:Body<Data=Bytes,Error=Failure>+Unpin {
+    send_with_writer(stream,response,head,connection,None).await
+}
+
+async fn send_with_writer<B>(mut stream:Sending,response:Response<B>,head:bool,connection:quinn::Connection,mut writer:Option<super::write_control::Writer>)->Result<(),Failure>
+where B:Body<Data=Bytes,Error=Failure>+Unpin {
     let (mut parts, mut body) = response.into_parts();
     let control=parts.extensions.remove::<hyper::ext::ResponseWriteControl>();
     let id=quinn::StreamId::from(quinn::VarInt::from_u64(stream.send_id().into_inner())?);
-    let mut writer=control.map(|control|super::write_control::Writer::new(connection,id,control)).transpose()?;
+    bind_writer(&mut writer,control,&connection,id)?;
     let no_payload = head
         || parts.status == StatusCode::NO_CONTENT
         || parts.status == StatusCode::NOT_MODIFIED

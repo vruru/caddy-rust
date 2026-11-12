@@ -293,3 +293,8 @@ pub(crate) fn template_encode_host(raw:&str)->String{String::from_utf8(escape(ra
 /// Strict Go URL host decoding while preserving non-UTF8 wire bytes.
 pub(crate) fn template_decode_host_bytes(scheme:&[u8],raw:&[u8])->Result<Vec<u8>,()>{parse_host(raw,scheme)}
 pub(crate) fn template_encode_host_bytes(raw:&[u8])->Vec<u8>{escape(raw,|byte|byte<128&&host_allowed(byte))}
+
+// Template request URL views retain native Go-string path/user bytes.
+pub(crate) fn template_decode_bytes(raw:&[u8])->Result<Vec<u8>,()>{unescape(raw,0)}
+pub(crate) fn template_encode_path_bytes(raw:&[u8])->Vec<u8>{escape(raw,path_allowed)}
+pub(crate) fn template_encode_user_bytes(raw:&[u8])->Vec<u8>{escape(raw,user_allowed)}

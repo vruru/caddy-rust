@@ -132,6 +132,11 @@ impl ResponseWriteControl {
             },
         })))
     }
+    /// Concrete scoped allocation pool, if one was explicitly installed. Native
+    /// transports may prepay their own named metadata before allocating it.
+    pub fn allocation_pool(&self)->Option<native_write_policy::Pool>{
+        self.0.lock().unwrap_or_else(|e|e.into_inner()).policies.as_ref().map(|p|p.allocation_pool())
+    }
     /// Returns the immutable compiled policy.
     pub fn policy(&self) -> WritePolicy {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).policy
@@ -228,6 +233,20 @@ impl ResponseWriteOwner {
         state.snapshot.pending_bytes = bytes;
         state.snapshot.pending_since = Some(now);
         bump(&mut state.snapshot)
+    }
+    /// Withdraw a zero-payload boundary only when the protocol rejected its
+    /// encoding before accepting any wire bytes. The exact start revision must
+    /// still match, so this cannot erase a reported physical flush or deadline.
+    /// This is not progress and earns no time or payload credit.
+    pub fn discard_unwritten_boundary(&self, start_revision:u64)->Result<(),WriteControlError>{
+        let mut state=self.control.0.lock().unwrap_or_else(|e|e.into_inner());
+        let snapshot=&mut state.snapshot;
+        if snapshot.terminal.is_some() || snapshot.pending_since.is_none()
+            || snapshot.pending_bytes!=0 || snapshot.version!=start_revision {
+            return Err(WriteControlError);
+        }
+        snapshot.pending_since=None;
+        bump(snapshot)
     }
     /// Only the successful transport-flush owner reports payload progress.
     /// WINDOW_UPDATE, send_data acceptance, and body polling are not progress.

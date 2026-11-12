@@ -874,7 +874,7 @@ fn parse_full(mut s: Bytes) -> Result<Uri, InvalidUri> {
 
     // When absolute, path is coered to / if empty.
     let path_and_query = if s.is_empty() {
-        PathAndQuery::slash()
+        PathAndQuery::implicit_slash()
     } else {
         PathAndQuery::from_shared(s)?
     };
