@@ -1180,7 +1180,7 @@ pub fn is_true(val: &Value) -> bool {
 }
 
 mod go_slice;
-pub use go_slice::{TypedSlice,SliceRef,SliceIter,SliceType,SliceMethod};
+pub use go_slice::{TypedSlice,SliceRef,SliceIter,SliceType,SliceMethod,PreparedValuesWrites,ValuesWrite,ValuesCommitError};
 
 mod budget;
 pub use budget::{BudgetMeter,BudgetAccount,ByteLease,BudgetedBytes};

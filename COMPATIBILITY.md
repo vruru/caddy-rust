@@ -215,3 +215,28 @@ order blocked until the original parameters are restored or the order is
 explicitly resolved. A definitively rejected prepared request and a completed
 stored certificate do not lock future requests to obsolete parameters. This
 preserves existing lease, scope, publication-CAS and compromised-key checks.
+
+
+Prepaid Values mutation
+----------------------
+
+The template host's new Values mutation entry points accept edge-free scalar
+payloads. Composite slices remain constructible and readable, but writing
+Slice, Object, Map, List, Function or named values with captured dynamic methods
+requires a graph-aware writer and is not exposed by these entry points. This
+prevents safe host APIs from creating unreclaimable reference cycles. Existing
+strong or weak read snapshots require prepaid copy-on-write; replacing an old
+opaque value also retains its snapshot until the backing lock has been released,
+so arbitrary destructors cannot reenter that locked backing.
+
+A prepared atomic ticket supports at most 256 writes and 1,048,576 supplied
+values. Preparation checks complete inputs, prepays metadata and replacement
+backings, and executes admission callbacks outside backing locks. Commit locks
+distinct cells in stable identity order, checks every original snapshot, then
+swaps all replacements or changes none. Its one bounded guard-vector allocation
+is prepaid and happens before acquiring any backing-cell lock. Tickets are
+single-use and retain old snapshots after either result. Hosts recheck their
+receiver ownership, commit and update metadata, unlock all receiver guards, and
+only then drop the ticket or convert its allocation-free error. Nonempty atomic
+writes without std are explicitly unsupported. These host primitives do not
+establish completion of the remaining template methods or composite copy.

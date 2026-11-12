@@ -79,6 +79,20 @@ fn canonical_elem_ok(v: &Value, elem: &str) -> bool {
     }
 }
 
+// These mutation entry points do not participate in MapContext graph retirement.
+// Admit only payloads with no owned Value graph edges. Fn pointers carry no
+// captured environment; NamedInt64 dyn method closures are deliberately denied.
+#[cfg(feature="std")]
+fn values_payload_has_no_edges(value:&Value)->bool {
+    match value {
+        Value::Nil|Value::NilError|Value::Bool(_)|Value::Int(_)|Value::Int64(_)|Value::Uint(_)|Value::Uint32(_)|Value::Uint8(_)|Value::Uint16(_)|Value::Float(_)|Value::String(_)|Value::ByteString(_)=>true,
+        Value::NamedInt64(_,kind)=>kind.methods.is_empty(),
+        #[cfg(feature="html")]
+        Value::Safe{..}=>true,
+        _=>false,
+    }
+}
+
 // ─── TypedSlice ───────────────────────────────────────────────────────────────
 
 /// Immutable Go named-slice metadata. Receivers are the current slice view,
@@ -234,6 +248,10 @@ impl TypedSlice {
     /// existing immutable snapshots keep their old backing through COW.
     /// A COW allocation requires a host budget. Its callback runs outside the
     /// cell lock and reserves the full backing before it can be cloned.
+    /// Copies only edge-free scalar payloads. Composite Value graphs require
+    /// a graph-aware writer; dyn method-bearing named integers are rejected.
+    /// COW caused by strong/weak observers or old callback-bearing values is
+    /// prepaid. Old opaque values are retained until the cell lock is released.
     #[cfg(feature="std")]
     pub fn write_values_range(&self,offset:usize,buf:&[Value])->Result<usize>{
         if offset>self.len{return Err(TemplateError::Exec("slice index out of range".into()));}
@@ -241,6 +259,9 @@ impl TypedSlice {
             .ok_or_else(||TemplateError::Exec("invalid Values slice type".into()))?;
         if buf.iter().any(|value|!canonical_elem_ok(value,elem)){
             return Err(TemplateError::Exec("slice element type mismatch".into()));
+        }
+        if buf.iter().any(|value|!values_payload_has_no_edges(value)){
+            return Err(TemplateError::Exec("Values mutation accepts edge-free scalar payloads only".into()));
         }
         if matches!(self.storage.as_ref(),Some(SliceData::Bytes(_)))||self.values_backing_len().is_none(){
             return Err(TemplateError::Exec("write_values_range requires Values backing".into()));
@@ -257,8 +278,16 @@ impl TypedSlice {
             if end>current.len(){return Err(TemplateError::Exec("invalid Values slice span".into()));}
             let peak=current.len().checked_mul(core::mem::size_of::<Value>()).and_then(|n|n.checked_add(128)).and_then(|n|n.checked_mul(2))
                 .ok_or_else(||TemplateError::Exec("Values COW size overflow".into()))?;
-            if Arc::strong_count(&current)==1||paid>=peak {
-                Arc::make_mut(&mut current)[start..end].clone_from_slice(&buf[..n]);return Ok(n);
+            let retire_old=current[start..end].iter().any(|value|!values_payload_has_no_edges(value));
+            let can_in_place=Arc::strong_count(&current)==1&&Arc::weak_count(&current)==0&&!retire_old;
+            if can_in_place||paid>=peak {
+                // Keep a strong snapshot when old payloads can execute Drop.
+                // This forces COW even if another observer concurrently exits.
+                let retired=retire_old.then(||current.clone());
+                Arc::make_mut(&mut current)[start..end].clone_from_slice(&buf[..n]);
+                drop(current);
+                drop(retired);
+                return Ok(n);
             }
             drop(current);
             self.reserve_host_bytes(peak)?;
@@ -721,3 +750,7 @@ impl<'a> ExactSizeIterator for SliceIter<'a> {}
 
 impl AsRef<[u8]> for ByteView{fn as_ref(&self)->&[u8]{self}}
 impl From<ByteView> for Arc<[u8]>{fn from(view:ByteView)->Self{if view.start==0&&view.len==view.data.len(){view.data}else{Arc::from(&*view)}}}
+
+#[path = "go_slice_atomic.rs"]
+mod atomic;
+pub use atomic::{PreparedValuesWrites, ValuesWrite, ValuesCommitError};
