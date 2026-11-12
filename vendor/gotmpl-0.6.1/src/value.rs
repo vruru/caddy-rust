@@ -615,7 +615,7 @@ impl Value {
     /// index/slice paths all do. The sole remaining uint consumer here is `%c`,
     /// where a value outside the rune range is invalid regardless of sign, so the
     /// wrap is harmless (it maps to U+FFFD either way).
-    pub fn as_go_integer(&self)->Option<i128>{match self{Self::Int(n)|Self::Int64(n)|Self::NamedInt64(n,_)=>Some(i128::from(*n)),Self::Uint(n)=>Some(i128::from(*n)),Self::Uint32(n)=>Some(i128::from(*n)),Self::Uint8(n)=>Some(i128::from(*n)),Self::Uint16(n)=>Some(i128::from(*n)),_=>None}}
+    pub fn as_go_integer(&self)->Option<i128>{match self{Self::NamedInt64(n,kind)if kind.kind.starts_with("uint")=>Some(i128::from(*n as u64)),Self::Int(n)|Self::Int64(n)|Self::NamedInt64(n,_)=>Some(i128::from(*n)),Self::Uint(n)=>Some(i128::from(*n)),Self::Uint32(n)=>Some(i128::from(*n)),Self::Uint8(n)=>Some(i128::from(*n)),Self::Uint16(n)=>Some(i128::from(*n)),_=>None}}
     pub fn as_go_signed(&self) -> Option<i64> {
         match self {Self::Int(n)|Self::Int64(n)=>Some(*n),Self::NamedInt64(n,kind)if !kind.kind.starts_with("uint")=>Some(*n),_=>None}
     }
@@ -636,6 +636,7 @@ impl Value {
     pub fn as_float(&self) -> Option<f64> {
         match self {
             Value::Float(f) => Some(*f),
+            Value::NamedInt64(n,kind)if kind.kind.starts_with("uint")=>Some((*n as u64)as f64),
             Value::Int(n) | Value::Int64(n) | Value::NamedInt64(n,_) => Some(*n as f64),
             Value::Uint(n) => Some(*n as f64),
             Value::Uint32(n) => Some(f64::from(*n)),
@@ -670,7 +671,7 @@ impl fmt::Display for Value {
             Value::Nil|Value::NilError => write!(f, "<nil>"),
             Value::Bool(b) => write!(f, "{b}"),
             Value::Int(n) | Value::Int64(n) => write!(f, "{n}"),
-            Value::NamedInt64(n,kind)=>if let Some(stringer)=kind.stringer{f.write_str(&stringer(*n))}else{write!(f,"{n}")},
+            Value::NamedInt64(n,kind)=>if let Some(stringer)=kind.stringer{f.write_str(&stringer(*n))}else if kind.kind.starts_with("uint"){write!(f,"{}",*n as u64)}else{write!(f,"{n}")},
             Value::Uint(n) => write!(f, "{n}"),
             Value::Uint32(n) => write!(f, "{n}"),
             Value::Uint8(n) => write!(f, "{n}"),
@@ -776,7 +777,7 @@ impl PartialEq for Value {
 impl PartialOrd for Value {
     fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         match (self, other) {
-            (Value::NamedInt64(a,ta),Value::NamedInt64(b,tb))if ta.name==tb.name=>a.partial_cmp(b),
+            (Value::NamedInt64(a,ta),Value::NamedInt64(b,tb))if ta.name==tb.name=>if ta.kind.starts_with("uint"){(*a as u64).partial_cmp(&(*b as u64))}else{a.partial_cmp(b)},
             (Value::Int(a), Value::Int(b)) | (Value::Int64(a), Value::Int64(b)) => a.partial_cmp(b),
             (Value::Uint(a), Value::Uint(b)) => a.partial_cmp(b),
             (Value::Uint32(a), Value::Uint32(b)) => a.partial_cmp(b),

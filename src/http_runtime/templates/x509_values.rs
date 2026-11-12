@@ -4,6 +4,8 @@
 mod hostname;
 #[path = "x509_values_numbers.rs"]
 mod numbers;
+#[path = "x509_values_public_key.rs"]
+mod public_key_methods;
 #[path = "x509_values_types.rs"]
 mod types;
 #[path = "x509_values_url.rs"]
@@ -350,7 +352,15 @@ fn parse(
         "PublicKeyAlgorithm".into(),
         numbers::enumeration("x509.PublicKeyAlgorithm", public_kind),
     );
-    result.insert("PublicKey".into(), public_key(factory, pki, public_kind)?);
+    let public = if public_kind == 4 {
+        let Value::Slice(slice) = raw(factory, pki.subject_public_key.data.as_ref())? else {
+            unreachable!()
+        };
+        types::bind(factory, slice.with_named_bytes(&ED25519_TYPE)?)?
+    } else {
+        public_key(factory, pki, public_kind)?
+    };
+    result.insert("PublicKey".into(), public);
     result.insert("KeyUsage".into(), numbers::enumeration("x509.KeyUsage", 0));
     let mut extensions = Vec::with_capacity(cert.extensions().len());
     let mut unhandled = Vec::new();
@@ -1014,49 +1024,41 @@ fn public_key(
         kind,
         der: pki.raw.into(),
     });
-    let owner = Arc::downgrade(factory);
-    let eq = data.clone();
+    let own_fields = Arc::new(fields.clone());
     let mut methods = BTreeMap::<Arc<str>, ValueFunc>::new();
     if kind != 2 {
+        let owner = Arc::downgrade(factory);
+        let original = data.clone();
+        let fields = own_fields.clone();
         methods.insert(
             "Equal".into(),
             Arc::new(move |args| {
                 arity(args, 1, 1)?;
-                let f = owner
+                let factory = owner
                     .upgrade()
                     .ok_or_else(|| error("certificate owner retired"))?;
-                f.work(1)?;
                 let Value::Object(other) = &args[0] else {
                     return Ok(Value::Bool(false));
                 };
-                Ok(Value::Bool(
-                    other
-                        .data
-                        .as_ref()
-                        .and_then(|d| d.downcast_ref::<PublicKeyData>())
-                        .is_some_and(|other| other.kind == eq.kind && other.der == eq.der),
-                ))
+                Ok(Value::Bool(public_key_methods::equal(
+                    &factory, kind, &fields, &original, other,
+                )?))
             }),
         );
     }
     if kind == 1 {
-        let raw = pki.subject_public_key.data.as_ref();
-        let mut seq = der_element(raw)?.1;
-        let (_, _, n) = take(&mut seq)?;
-        let size = (n.len() - usize::from(n.first() == Some(&0))) as i64;
+        let fields = own_fields.clone();
         methods.insert(
             "Size".into(),
-            Arc::new(move |a| {
-                arity(a, 0, 0)?;
-                Ok(Value::Int(size))
+            Arc::new(move |args| {
+                arity(args, 0, 0)?;
+                Ok(Value::Int(public_key_methods::rsa_size(&fields)? as i64))
             }),
         );
     }
     if kind == 3 {
-        let bytes: Arc<[u8]> = pki.subject_public_key.data.as_ref().into();
-        if bytes.first() != Some(&4) {
-            return Err(error("unsupported compressed X.509 EC public key"));
-        }
+        let fields = own_fields.clone();
+        let key_data = data.clone();
         let owner = Arc::downgrade(factory);
         methods.insert(
             "Bytes".into(),
@@ -1065,8 +1067,14 @@ fn public_key(
                 let factory = owner
                     .upgrade()
                     .ok_or_else(|| error("certificate owner retired"))?;
-                factory.reserve(bytes.len() * 2 + 128)?;
-                factory.byte_slice(bytes.clone(), false)
+                factory.reserve(4096)?;
+                let value = Value::Object(Arc::new(Object {
+                    fields: fields.as_ref().clone(),
+                    data: Some(key_data.clone()),
+                    go_type: Some("*ecdsa.PublicKey"),
+                    ..Object::default()
+                }));
+                public_key_methods::ec_bytes(&factory, &value)
             }),
         );
     }
@@ -1195,13 +1203,11 @@ fn curve_value(factory: &Arc<Factory>, group: &openssl::ec::EcGroupRef) -> Rende
         .into_iter()
         .enumerate()
     {
-        let mut value = numbers::integer(factory, &n.to_vec(), false)?;
-        if let Value::Object(object) = &mut value {
-            Arc::get_mut(object)
-                .ok_or_else(|| error("new curve integer unexpectedly shared"))?
-                .pointer_identity =
-                Some(&CURVE_NUMBER_IDENTITIES[curve_index * 5 + index] as *const u8 as usize);
-        }
+        let value = numbers::singleton_integer(
+            factory,
+            &n.to_vec(),
+            &CURVE_NUMBER_IDENTITIES[curve_index * 5 + index] as *const u8 as usize,
+        )?;
         fields.insert(name.into(), value);
     }
     fields.insert("BitSize".into(), Value::Int(i64::from(group.degree())));
@@ -1394,7 +1400,9 @@ fn method(receiver: &Receiver, name: &str, args: &[Value]) -> RenderResult<Value
             .and_then(Value::as_int)
             .ok_or_else(|| error("missing certificate signature algorithm"))?;
         (
-            parent.certificate.der.clone(),
+            p.get("PublicKey")
+                .cloned()
+                .ok_or_else(|| error("missing parent public key"))?,
             algo,
             bytes("RawTBSCertificate")?,
             bytes("Signature")?,
@@ -1423,14 +1431,19 @@ fn method(receiver: &Receiver, name: &str, args: &[Value]) -> RenderResult<Value
                 .to_vec())
         };
         (
-            receiver.certificate.der.clone(),
+            receiver
+                .certificate
+                .fields(f)?
+                .get("PublicKey")
+                .cloned()
+                .ok_or_else(|| error("missing public key"))?,
             algo,
             bytes(&args[1])?,
             bytes(&args[2])?,
         )
     };
-    f.reserve((key.len() + message.len() + signature.len()) * 32 + 65536)?;
-    f.work((key.len() + message.len() + signature.len()) * 16 + 1)?;
+    f.reserve((message.len() + signature.len()) * 32 + 65536)?;
+    f.work((message.len() + signature.len()) * 16 + 1)?;
     if algo == 2 || name == "CheckSignatureFrom" && matches!(algo, 3 | 7 | 9) {
         return Ok(numbers::insecure_algorithm(algo));
     }
@@ -1447,20 +1460,7 @@ fn method(receiver: &Receiver, name: &str, args: &[Value]) -> RenderResult<Value
             ));
         }
     };
-    let cert = openssl::x509::X509::from_der(&key)
-        .map_err(|e| error(format!("certificate crypto projection: {e}")))?;
-    let key = cert
-        .public_key()
-        .map_err(|e| error(format!("certificate public key projection: {e}")))?;
-    let (actual, actual_type) = if key.id() == openssl::pkey::Id::RSA {
-        (1, "*rsa.PublicKey")
-    } else if key.id() == openssl::pkey::Id::EC {
-        (3, "*ecdsa.PublicKey")
-    } else if key.id() == openssl::pkey::Id::ED25519 {
-        (4, "ed25519.PublicKey")
-    } else {
-        (0, "<nil>")
-    };
+    let (actual, actual_type) = public_key_methods::kind(&key);
     if actual == 0 {
         return Ok(error_value(
             "*errors.errorString",
@@ -1482,11 +1482,41 @@ fn method(receiver: &Receiver, name: &str, args: &[Value]) -> RenderResult<Value
             ),
         ));
     }
+    if actual == 1 {
+        let Value::Object(object) = &key else {
+            unreachable!()
+        };
+        let n = numbers::current(
+            object
+                .fields
+                .get("N")
+                .ok_or_else(|| error("missing RSA modulus"))?,
+        )?;
+        if n.bits() < 1024 {
+            return Ok(error_value(
+                "*errors.errorString",
+                format!(
+                    "crypto/rsa: {}-bit keys are insecure (see https://go.dev/pkg/crypto/rsa#hdr-Minimum_key_size)",
+                    n.bits()
+                ),
+            ));
+        }
+        if !n.bit(0) {
+            return Ok(error_value(
+                "*errors.errorString",
+                "crypto/rsa: public modulus is even".into(),
+            ));
+        }
+    }
+    let native = public_key_methods::native(f, &key)?;
     let failure = match actual {
         1 => "crypto/rsa: verification error",
         3 => "x509: ECDSA verification failure",
         4 => "x509: Ed25519 verification failure",
         _ => "x509: cannot verify signature: algorithm unimplemented",
+    };
+    let Some(key) = native else {
+        return Ok(error_value("*errors.errorString", failure.into()));
     };
     let result = (|| -> Result<bool, openssl::error::ErrorStack> {
         let digest = match algo {

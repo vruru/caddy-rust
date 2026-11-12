@@ -26,12 +26,11 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    caddy_compat_native::crypto::install_default()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let report = match args.as_slice() {
         [flag] if flag == "--help" => {
             println!(
-                "caddy-compat-native fmt [FLAGS] [FILE] | adapt [FLAGS] | validate [FLAGS] | inspect-config FILE | inspect-storage CERTMAGIC_ROOT"
+                "caddy-compat-native fmt [FLAGS] [FILE] | adapt [FLAGS] | validate [FLAGS] | hash-password [FLAGS] | inspect-config FILE | inspect-storage CERTMAGIC_ROOT"
             );
             if cfg!(feature = "native-run") {
                 println!(
@@ -44,9 +43,9 @@ fn run() -> Result<()> {
             }
             return Ok(());
         }
-        [flag] if flag == "--version" => {
+        [flag] if flag == "--version" || flag == "version" => {
             println!(
-                "caddy-compat-native {} (inspection stage)",
+                "caddy-compat-native {} (development candidate)",
                 env!("CARGO_PKG_VERSION")
             );
             return Ok(());
@@ -59,6 +58,7 @@ fn run() -> Result<()> {
             caddy_compat_native::surface::inspect(&bytes)?
         }
         [command, path] if command == "inspect-storage" => {
+            caddy_compat_native::crypto::install_default()?;
             caddy_compat_native::certmagic::inspect(Path::new(path))?
         }
         _ => bail!("unknown inspection command"),

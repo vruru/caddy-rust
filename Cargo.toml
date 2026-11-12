@@ -62,7 +62,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["ring",
 regex = "1"
 regex-automata = { version = "=0.4.18", default-features = false, features = ["std", "syntax", "meta", "nfa-pikevm", "hybrid", "dfa-onepass", "unicode"] }
 regex-syntax = { version = "=0.8.11", default-features = false, features = ["std", "unicode"] }
-bcrypt = "0.17"
+bcrypt = { version = "0.17", features = ["zeroize"] }
 arc-swap = "1"
 ipnet = "2"
 percent-encoding = "2"

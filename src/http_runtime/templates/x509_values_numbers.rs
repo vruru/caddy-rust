@@ -1,19 +1,176 @@
 //! Go named X.509 integers and big.Int read views. No key material is derived
 //! from a display string; formatting reads the actual arbitrary-precision value.
+#[path = "x509_values_advanced.rs"]
+mod advanced;
+#[path = "x509_values_arithmetic.rs"]
+mod arithmetic;
 use super::{Factory, RenderResult, arity, error};
 use bigdecimal::num_bigint::{BigInt, Sign};
 use gotmpl::{ArgKind, HostFormat, HostMethod, HostType, Object, Signature, Value};
 use std::{
     collections::BTreeMap,
-    sync::{Arc, LazyLock, Weak},
+    sync::{Arc, LazyLock, Mutex, Weak},
 };
-pub(super) struct Integer {
+struct State {
     number: BigInt,
+    epoch: u64,
+}
+pub(super) struct Integer {
+    number: Mutex<State>,
     owner: Weak<Factory>,
 }
 static INT_ARG: Signature = Signature::from_static(&[ArgKind::Int], None);
 static BIG_TYPE: HostType = HostType {
     methods: &[
+        HostMethod {
+            name: "Exp",
+            invoke: |o, a| advanced::invoke(o, "Exp", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "ModInverse",
+            invoke: |o, a| advanced::invoke(o, "ModInverse", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "GCD",
+            invoke: |o, a| advanced::invoke(o, "GCD", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "MulRange",
+            invoke: |o, a| advanced::invoke(o, "MulRange", a),
+            signature: Some(&RANGE_INT64),
+        },
+        HostMethod {
+            name: "Binomial",
+            invoke: |o, a| advanced::invoke(o, "Binomial", a),
+            signature: Some(&RANGE_INT64),
+        },
+        HostMethod {
+            name: "Set",
+            invoke: |o, a| mutate(o, "Set", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "SetInt64",
+            invoke: |o, a| mutate(o, "SetInt64", a),
+            signature: Some(&SET_INT64),
+        },
+        HostMethod {
+            name: "SetUint64",
+            invoke: |o, a| mutate(o, "SetUint64", a),
+            signature: Some(&SET_UINT64),
+        },
+        HostMethod {
+            name: "SetBytes",
+            invoke: |o, a| mutate(o, "SetBytes", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "Abs",
+            invoke: |o, a| mutate(o, "Abs", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "Neg",
+            invoke: |o, a| mutate(o, "Neg", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "Add",
+            invoke: |o, a| mutate(o, "Add", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "Sub",
+            invoke: |o, a| mutate(o, "Sub", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "Mul",
+            invoke: |o, a| mutate(o, "Mul", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "Lsh",
+            invoke: |o, a| mutate(o, "Lsh", a),
+            signature: Some(&SHIFT),
+        },
+        HostMethod {
+            name: "Rsh",
+            invoke: |o, a| mutate(o, "Rsh", a),
+            signature: Some(&SHIFT),
+        },
+        HostMethod {
+            name: "Quo",
+            invoke: |o, a| mutate(o, "Quo", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "Rem",
+            invoke: |o, a| mutate(o, "Rem", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "Div",
+            invoke: |o, a| mutate(o, "Div", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "Mod",
+            invoke: |o, a| mutate(o, "Mod", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "And",
+            invoke: |o, a| mutate(o, "And", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "AndNot",
+            invoke: |o, a| mutate(o, "AndNot", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "Or",
+            invoke: |o, a| mutate(o, "Or", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "Xor",
+            invoke: |o, a| mutate(o, "Xor", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "Not",
+            invoke: |o, a| mutate(o, "Not", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "SetBit",
+            invoke: |o, a| mutate(o, "SetBit", a),
+            signature: Some(&SET_BIT),
+        },
+        HostMethod {
+            name: "Sqrt",
+            invoke: |o, a| mutate(o, "Sqrt", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "TrailingZeroBits",
+            invoke: |o, a| {
+                arity(a, 0, 0)?;
+                let d = payload(o)?;
+                let f = owner(d)?;
+                let n = read_number(d, &f)?;
+                let z = n.trailing_zeros().unwrap_or(0);
+                Ok(uint_value(
+                    i64::try_from(z).map_err(|_| error("uint size overflow"))?,
+                ))
+            },
+            signature: None,
+        },
         HostMethod {
             name: "String",
             invoke: |o, a| call(o, "String", a),
@@ -97,6 +254,9 @@ static BIG_TYPE: HostType = HostType {
     ],
 };
 fn payload(o: &Object) -> RenderResult<&Integer> {
+    if o.is_nil_pointer() {
+        return Err(error("nil big.Int receiver"));
+    }
     o.host_data::<Integer>("*big.Int")
         .ok_or_else(|| error("invalid big.Int receiver"))
 }
@@ -105,6 +265,18 @@ fn owner(value: &Integer) -> RenderResult<Arc<Factory>> {
         .owner
         .upgrade()
         .ok_or_else(|| error("certificate owner retired"))
+}
+fn conversion_work(f: &Factory, bits: u64, base: u32) -> RenderResult<()> {
+    let limbs = usize::try_from(bits.div_ceil(64))
+        .map_err(|_| error("big.Int conversion work overflow"))?
+        .max(1);
+    f.work(if base.is_power_of_two() {
+        limbs
+    } else {
+        limbs
+            .checked_mul(limbs)
+            .ok_or_else(|| error("big.Int conversion work overflow"))?
+    })
 }
 fn radix(n: &BigInt, base: u32) -> String {
     let (sign, digits) = n.to_radix_be(base);
@@ -134,9 +306,8 @@ pub(super) fn integer(factory: &Arc<Factory>, bytes: &[u8], signed: bool) -> Ren
     } else {
         BigInt::from_bytes_be(Sign::Plus, bytes)
     };
-    let decimal = number.to_str_radix(10);
     let data = Arc::new(Integer {
-        number,
+        number: Mutex::new(State { number, epoch: 0 }),
         owner: Arc::downgrade(factory),
     });
     let id = Arc::as_ptr(&data) as usize;
@@ -146,13 +317,47 @@ pub(super) fn integer(factory: &Arc<Factory>, bytes: &[u8], signed: bool) -> Ren
         data: Some(data),
         data_bytes: bytes.len() * 4 + 128,
         host_type: Some(&BIG_TYPE),
-        display: Some(decimal.clone().into()),
-        json: Some(Ok(decimal.into())),
+        json_dynamic: Some(json_current),
         formatter: Some(format_integer),
         ..Object::default()
     })))
 }
 fn call(o: &Object, name: &str, args: &[Value]) -> RenderResult<Value> {
+    if o.is_nil_pointer() {
+        let d = o
+            .host_data::<Integer>("*big.Int")
+            .ok_or_else(|| error("invalid nil integer"))?;
+        let f = owner(d)?;
+        f.reserve(1024)?;
+        f.work(1)?;
+        match name {
+            "String" => {
+                arity(args, 0, 0)?;
+                return Ok(Value::String("<nil>".into()));
+            }
+            "Text" => {
+                arity(args, 1, 1)?;
+                return Ok(Value::String("<nil>".into()));
+            }
+            "MarshalText" | "MarshalJSON" => {
+                arity(args, 0, 0)?;
+                return f.byte_slice(
+                    Arc::from(if name == "MarshalJSON" {
+                        &b"null"[..]
+                    } else {
+                        &b"<nil>"[..]
+                    }),
+                    false,
+                );
+            }
+            "Append" => {
+                arity(args, 2, 2)?;
+                return f.append_bytes(&args[0], b"<nil>");
+            }
+            _ => return Err(error("nil big.Int receiver")),
+        }
+    }
+
     let data = payload(o)?;
     let factory = owner(data)?;
     factory.work(1)?;
@@ -162,13 +367,17 @@ fn call(o: &Object, name: &str, args: &[Value]) -> RenderResult<Value> {
         _ => 0,
     };
     arity(args, count, count)?;
-    let n = &data.number;
+    let current = read_number(data, &factory)?;
+    let n = &current;
     let bits = n.bits() as usize;
     factory.reserve(
         bits.checked_mul(4)
             .and_then(|n| n.checked_add(1024))
             .ok_or_else(|| error("big.Int output overflow"))?,
     )?;
+    if matches!(name, "String" | "MarshalText" | "MarshalJSON") {
+        conversion_work(&factory, n.bits(), 10)?
+    }
     match name {
         "String" => Ok(Value::String(n.to_str_radix(10).into())),
         "Text" => {
@@ -176,6 +385,7 @@ fn call(o: &Object, name: &str, args: &[Value]) -> RenderResult<Value> {
                 .as_int()
                 .filter(|base| (2..=62).contains(base))
                 .ok_or_else(|| error("invalid big.Int base"))?;
+            conversion_work(&factory, n.bits(), base as u32)?;
             Ok(Value::String(radix(&n, base as u32).into()))
         }
         "Sign" => Ok(Value::Int(match n.sign() {
@@ -243,7 +453,8 @@ fn call(o: &Object, name: &str, args: &[Value]) -> RenderResult<Value> {
             if std::ptr::eq(data, other) {
                 return Ok(Value::Int(0));
             }
-            let other = &other.number;
+            let other_value = read_number(other, &factory)?;
+            let other = &other_value;
             let order = if name == "CmpAbs" {
                 n.magnitude().cmp(other.magnitude())
             } else {
@@ -260,6 +471,7 @@ fn call(o: &Object, name: &str, args: &[Value]) -> RenderResult<Value> {
                 .as_int()
                 .filter(|n| (2..=62).contains(n))
                 .ok_or_else(|| error("invalid big.Int base"))?;
+            conversion_work(&factory, n.bits(), base as u32)?;
             let text = radix(n, base as u32);
             factory.append_bytes(&args[0], text.as_bytes())
         }
@@ -295,9 +507,26 @@ fn call(o: &Object, name: &str, args: &[Value]) -> RenderResult<Value> {
     }
 }
 fn format_integer(o: &Object, verb: char, f: &HostFormat) -> RenderResult<Value> {
+    if o.is_nil_pointer() {
+        let d = o
+            .host_data::<Integer>("*big.Int")
+            .ok_or_else(|| error("invalid nil integer"))?;
+        let owner = owner(d)?;
+        owner.reserve(1024)?;
+        owner.work(1)?;
+        return Ok(Value::String(
+            if matches!(verb, 'b' | 'o' | 'O' | 'd' | 's' | 'v' | 'x' | 'X') {
+                "<nil>".into()
+            } else {
+                format!("%!{verb}(big.Int=<nil>)").into()
+            },
+        ));
+    }
+
     let data = payload(o)?;
     let factory = owner(data)?;
-    let n = &data.number;
+    let current = read_number(data, &factory)?;
+    let n = &current;
     let bits = n.bits() as usize;
     let maximum = bits.max(f.width.unwrap_or(0)).max(f.precision.unwrap_or(0));
     if maximum > 1 << 20 {
@@ -310,17 +539,19 @@ fn format_integer(o: &Object, verb: char, f: &HostFormat) -> RenderResult<Value>
             .ok_or_else(|| error("big.Int format overflow"))?,
     )?;
     factory.work(bits.div_ceil(64) + 1)?;
-    let base = match verb {
+    let base: u32 = match verb {
         'b' => 2,
         'o' | 'O' => 8,
         'd' | 's' | 'v' => 10,
         'x' | 'X' => 16,
         _ => {
+            conversion_work(&factory, n.bits(), 10)?;
             return Ok(Value::String(
                 format!("%!{verb}(big.Int={})", n.to_str_radix(10)).into(),
             ));
         }
     };
+    conversion_work(&factory, n.bits(), base)?;
     let mut digits = n.magnitude().to_str_radix(base);
     if verb == 'X' {
         digits.make_ascii_uppercase();
@@ -557,4 +788,282 @@ pub(super) fn insecure_algorithm(value: i64) -> Value {
         })
     });
     Value::NamedInt64(value, TYPE.clone())
+}
+
+fn read_number(data: &Integer, factory: &Arc<Factory>) -> RenderResult<BigInt> {
+    for _ in 0..8 {
+        let (bits, epoch) = {
+            let state = data
+                .number
+                .lock()
+                .map_err(|_| error("big.Int cell poisoned"))?;
+            (state.number.bits(), state.epoch)
+        };
+        let bytes =
+            usize::try_from(bits.div_ceil(8)).map_err(|_| error("big.Int size overflow"))?;
+        factory.reserve(
+            bytes
+                .checked_mul(4)
+                .and_then(|n| n.checked_add(1024))
+                .ok_or_else(|| error("big.Int snapshot budget overflow"))?,
+        )?;
+        factory.work(bytes.div_ceil(8) + 1)?;
+        let state = data
+            .number
+            .lock()
+            .map_err(|_| error("big.Int cell poisoned"))?;
+        if state.epoch != epoch {
+            continue;
+        }
+        return Ok(state.number.clone());
+    }
+    Err(error("concurrent big.Int change limit exceeded"))
+}
+fn json_current(object: &Object) -> RenderResult<Value> {
+    let data = payload(object)?;
+    let factory = owner(data)?;
+    let n = read_number(data, &factory)?;
+    factory.reserve(
+        (n.bits() as usize)
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(1024))
+            .ok_or_else(|| error("big.Int JSON budget overflow"))?,
+    )?;
+    conversion_work(&factory, n.bits(), 10)?;
+    Ok(Value::String(n.to_str_radix(10).into()))
+}
+fn shared_payload(object: &Object) -> RenderResult<Arc<Integer>> {
+    if object.go_type != Some("*big.Int") || object.is_nil_pointer() {
+        return Err(error("expected *big.Int"));
+    }
+    object
+        .data
+        .clone()
+        .ok_or_else(|| error("nil big.Int receiver"))?
+        .downcast::<Integer>()
+        .map_err(|_| error("invalid big.Int receiver"))
+}
+fn rewrap(object: &Object, data: Arc<Integer>, bits: u64) -> RenderResult<Value> {
+    let bytes = usize::try_from(bits.div_ceil(8)).map_err(|_| error("big.Int size overflow"))?;
+    Ok(Value::Object(Arc::new(Object {
+        go_type: Some("*big.Int"),
+        pointer_identity: object.pointer_identity,
+        data: Some(data),
+        data_bytes: bytes * 4 + 128,
+        host_type: Some(&BIG_TYPE),
+        json_dynamic: Some(json_current),
+        formatter: Some(format_integer),
+        ..Object::default()
+    })))
+}
+fn native_uint(value: &Value) -> RenderResult<u64> {
+    match value {
+        Value::NamedInt64(n, kind) if kind.name == "uint" && *n >= 0 => Ok(*n as u64),
+        _ => Err(error("expected uint")),
+    }
+}
+fn uint_value(value: i64) -> Value {
+    static KIND: LazyLock<Arc<gotmpl::Int64Type>> = LazyLock::new(|| {
+        Arc::new(gotmpl::Int64Type {
+            name: "uint",
+            kind: "uint",
+            stringer: None,
+            methods: BTreeMap::new(),
+            signatures: BTreeMap::new(),
+        })
+    });
+    Value::NamedInt64(value, KIND.clone())
+}
+static RANGE_INT64: Signature = Signature::from_static(&[ArgKind::Int64, ArgKind::Int64], None);
+static SET_INT64: Signature = Signature::from_static(&[ArgKind::Int64], None);
+static SET_UINT64: Signature = Signature::from_static(&[ArgKind::Uint64], None);
+static SHIFT: Signature = Signature::from_static(
+    &[ArgKind::Any, ArgKind::NamedInt64("uint", uint_value)],
+    None,
+);
+static SET_BIT: Signature = Signature::from_static(
+    &[
+        ArgKind::Any,
+        ArgKind::Int,
+        ArgKind::NamedInt64("uint", uint_value),
+    ],
+    None,
+);
+fn mutate(object: &Object, name: &str, args: &[Value]) -> RenderResult<Value> {
+    let data = shared_payload(object)?;
+    let factory = owner(&data)?;
+    factory.work(1)?;
+    let count = match name {
+        "SetInt64" | "SetUint64" | "SetBytes" | "Set" | "Abs" | "Neg" | "Not" | "Sqrt" => 1,
+        "SetBit" => 3,
+        _ => 2,
+    };
+    arity(args, count, count)?;
+    let result = match name {
+        "SetInt64" => {
+            let Value::Int64(n) = args[0] else {
+                return Err(error("expected int64"));
+            };
+            factory.reserve(2048)?;
+            BigInt::from(n)
+        }
+        "SetUint64" => {
+            let Value::Uint(n) = args[0] else {
+                return Err(error("expected uint64"));
+            };
+            factory.reserve(2048)?;
+            BigInt::from(n)
+        }
+        "SetBytes" => {
+            let bytes = byte_argument(&args[0])?;
+            factory.reserve(
+                bytes
+                    .len()
+                    .checked_mul(8)
+                    .and_then(|n| n.checked_add(2048))
+                    .ok_or_else(|| error("big.Int SetBytes overflow"))?,
+            )?;
+            factory.work(bytes.len().div_ceil(8) + 1)?;
+            let bytes = bytes.visible_bytes();
+            BigInt::from_bytes_be(Sign::Plus, bytes.as_deref().unwrap_or_default())
+        }
+        _ => {
+            let Value::Object(input) = &args[0] else {
+                return Err(error("expected *big.Int"));
+            };
+            let x = read_number(payload(input)?, &factory)?;
+            let unary = matches!(name, "Set" | "Abs" | "Neg" | "Not" | "Sqrt");
+            let mut scalar = 0u64;
+            let y = if unary {
+                None
+            } else if matches!(name, "Lsh" | "Rsh") {
+                scalar = native_uint(&args[1])?;
+                None
+            } else if name == "SetBit" {
+                let Value::Int(index) = args[1] else {
+                    return Err(error("expected int bit index"));
+                };
+                scalar = u64::try_from(index).map_err(|_| error("negative bit index"))?;
+                let bit = native_uint(&args[2])?;
+                if bit > 1 {
+                    return Err(error("set bit is not 0 or 1"));
+                }
+                Some(BigInt::from(bit))
+            } else {
+                let Value::Object(input) = &args[1] else {
+                    return Err(error("expected *big.Int"));
+                };
+                Some(read_number(payload(input)?, &factory)?)
+            };
+            let xb = x.bits();
+            let yb = y.as_ref().map_or(0, BigInt::bits);
+            let out = match name {
+                "Mul" => xb.checked_add(yb),
+                "Lsh" => {
+                    if x.sign() == Sign::NoSign {
+                        Some(0)
+                    } else {
+                        xb.checked_add(scalar)
+                    }
+                }
+                "SetBit" => {
+                    let unchanged = scalar >= xb
+                        && ((x.sign() != Sign::Minus
+                            && y.as_ref().is_some_and(|y| y.sign() == Sign::NoSign))
+                            || (x.sign() == Sign::Minus
+                                && y.as_ref().is_some_and(|y| y.sign() == Sign::Plus)));
+                    if unchanged {
+                        Some(xb)
+                    } else {
+                        scalar.checked_add(2).map(|n| n.max(xb))
+                    }
+                }
+                _ => xb.max(yb).checked_add(2),
+            }
+            .ok_or_else(|| error("big.Int result size overflow"))?;
+            let bytes = usize::try_from(out.div_ceil(8))
+                .map_err(|_| error("big.Int result size overflow"))?;
+            factory.reserve(
+                bytes
+                    .checked_mul(24)
+                    .and_then(|n| n.checked_add(4096))
+                    .ok_or_else(|| error("big.Int operation budget overflow"))?,
+            )?;
+            let limbs = usize::try_from(xb.max(yb).div_ceil(64))
+                .map_err(|_| error("big.Int work overflow"))?
+                .max(1);
+            let work = if matches!(name, "Mul" | "Quo" | "Rem" | "Div" | "Mod" | "Sqrt") {
+                limbs.checked_mul(limbs).and_then(|n| {
+                    if name == "Sqrt" {
+                        n.checked_mul((64 - u64::from(xb.max(1)).leading_zeros()) as usize + 1)
+                    } else {
+                        Some(n)
+                    }
+                })
+            } else {
+                Some(limbs)
+            }
+            .ok_or_else(|| error("big.Int work overflow"))?;
+            factory.work(work)?;
+            if name == "Set" {
+                x
+            } else {
+                arithmetic::compute(&factory, name, x, y, scalar)?
+            }
+        }
+    };
+    factory.reserve(512)?;
+    factory.work(0)?;
+    let wrapped = rewrap(object, data.clone(), result.bits())?;
+    {
+        let mut state = data
+            .number
+            .lock()
+            .map_err(|_| error("big.Int cell poisoned"))?;
+        let next = state
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| error("big.Int epoch overflow"))?;
+        state.number = result;
+        state.epoch = next;
+    }
+    Ok(wrapped)
+}
+
+pub(super) fn singleton_integer(
+    factory: &Arc<Factory>,
+    bytes: &[u8],
+    identity: usize,
+) -> RenderResult<Value> {
+    if let Some(value) = factory
+        .integer_values
+        .lock()
+        .map_err(|_| error("integer cache poisoned"))?
+        .get(&identity)
+        .cloned()
+    {
+        return Ok(value);
+    }
+    factory.reserve(384)?;
+    let mut value = integer(factory, bytes, false)?;
+    let Value::Object(object) = &mut value else {
+        return Err(error("invalid integer cache value"));
+    };
+    Arc::get_mut(object)
+        .ok_or_else(|| error("new integer unexpectedly shared"))?
+        .pointer_identity = Some(identity);
+    let mut cache = factory
+        .integer_values
+        .lock()
+        .map_err(|_| error("integer cache poisoned"))?;
+    Ok(cache.entry(identity).or_insert(value).clone())
+}
+
+pub(super) fn current(value: &Value) -> RenderResult<BigInt> {
+    let Value::Object(object) = value else {
+        return Err(error("expected *big.Int"));
+    };
+    let data = payload(object)?;
+    let factory = owner(data)?;
+    read_number(data, &factory)
 }

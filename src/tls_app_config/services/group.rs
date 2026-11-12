@@ -397,6 +397,7 @@ impl CertificateServices {
             // Caddy admin identity uses a separate certmagic.Config without
             // tlsApp.onEvent; only business certificates join the TLS app.
             .with_events((!identity).then(|| self.context.events.clone()).flatten())?
+            .with_csr_options(policy.must_staple,policy.reuse_private_keys)?
             .storage_only()?;
             solver = Some(broker);
             GroupIssuer::Acme(manager)
@@ -883,6 +884,17 @@ impl CertificateServices {
         }
     }
 
+    async fn read_group_issuer_material(&self,group:&Group,issuer:&str,key:&str,cancel:CancellationToken)
+        ->Result<(Option<CertificateBundle>,Option<(crate::certstore::InitialPrivateKey,crate::cert_automation::ReusableKey)>)> {
+        if !group.policy.reuse_private_keys {return Ok((group.store.fs.load_certificate(issuer,key).await?,None));}
+        let (bundle,initial)=group.store.fs.load_certificate_for_key_reuse(issuer,key).await?;
+        let initial=if let Some(initial)=initial {
+            let pem=initial.pem();let deny=self.context.leaf_guard.key_deny().clone();
+            let reusable=crate::cert_cpu::run(self.context.resources.cpu.clone(),cancel,move||
+                cert_automation::prepare_reusable_key(pem,&deny)).await?;
+            Some((initial,reusable))
+        }else{None};Ok((bundle,initial))
+    }
     async fn probe_group_pinned(
         &self,
         group: &Arc<Group>,
@@ -909,11 +921,9 @@ impl CertificateServices {
                 }
             }
             GroupIssuer::Internal { ca, .. } => {
-                group
-                    .store
-                    .fs
-                    .load_certificate(ca, &names_key(&group.names)?)
-                    .await?
+                let key=names_key(&group.names)?;
+                if group.store.fs.certificate_recovery_pending(ca,&key,&format!("issue_cert_{}",group.names[0])).await? {None}
+                else {self.read_group_issuer_material(group,ca,&key,cancel.clone()).await?.0}
             }
         };
         let Some(bundle) = bundle else {
@@ -1105,7 +1115,22 @@ impl CertificateServices {
                         .recover_certificate_with_lease(ca, &key, &lease)
                         .await?;
                     let mut renewal_names = None;
-                    if let Some(bundle) = group.store.fs.load_certificate(ca, &key).await? {
+                    let mut reuse_key=None;
+                    let mut _reuse_key_state=None;
+                    let (stored,initial)=self.read_group_issuer_material(group,ca,&key,cancel.clone()).await?;
+                    let mut initial_snapshot=None;
+                    if let Some((snapshot,reusable))=initial {
+                        if reusable.state.banned() {
+                            let archived=group.store.fs.archive_initial_private_key(ca,&key,&snapshot,
+                                <sha2::Sha256 as sha2::Digest>::digest(&reusable.spki).into(),&group.names,&lease).await;
+                            let _=self.events.send(CertificateEvent{names:group.names.clone(),kind:match archived {
+                                Ok(true)=>"compromised_key_archived",Ok(false)=>"compromised_key_not_archived",Err(_)=>"compromised_key_archive_failed",
+                            }});
+                        }
+                        _reuse_key_state=Some(reusable.state);
+                        reuse_key=Some(reusable.pem);initial_snapshot=Some(snapshot);
+                    }
+                    if let Some(bundle) = stored {
                         let preserved = crate::certstore::name0_renewal_names(&bundle, &key)?;
                         let mut material = self
                             .parse_material(
@@ -1127,6 +1152,10 @@ impl CertificateServices {
                                     Err(_) => "compromised_key_archive_failed",
                                 },
                             });
+                        }
+                        if group.policy.reuse_private_keys && material.key_allowed(self.context.leaf_guard.key_deny()) {
+                            _reuse_key_state=Some(material.register_key(self.context.leaf_guard.key_deny())?);
+                            reuse_key=Some(material.key.clone());
                         }
                         if material.key_allowed(self.context.leaf_guard.key_deny()) && !self.context.leaf_guard.intern(material.leaf_id, material.times()?.1)?.revocation()?.is_some_and(|r| r.version.reason == Some(1)) {
                             renewal_names = preserved;
@@ -1165,10 +1194,11 @@ impl CertificateServices {
                     let names = issuance_names.clone();
                     let kind = group.policy.key_type;
                     let key_registry=self.context.leaf_guard.key_deny().clone();
+                    let must_staple=group.policy.must_staple;
                     let (csr,private_key_pem,_key_reservation)=loaders::blocking(
-                        self.context.resources.io.clone(),
+                        self.context.resources.cpu.clone(),
                         cancel.clone(),
-                        move || cert_automation::generate_csr(&names,kind,&key_registry),
+                        move || cert_automation::generate_csr_with_options(&names,kind,&key_registry,must_staple,reuse_key),
                     )
                     .await?;
                     let event_csr=csr.clone();
@@ -1187,11 +1217,9 @@ impl CertificateServices {
                         metadata: json!({"sans":issuance_names,"issuer_data":{"ca":ca}}),
                     };
                     lease.check().await?;
-                    group
-                        .store
-                        .fs
-                        .save_certificate(ca, &key, &bundle, &lease)
-                        .await?;
+                    if let Some(initial)=initial_snapshot {
+                        group.store.fs.save_certificate_with_initial_key(ca,&key,&bundle,&lease,&initial).await?;
+                    } else {group.store.fs.save_certificate(ca,&key,&bundle,&lease).await?;}
                     lifecycle.obtained(events,ca,&group.names,&event_csr,&cancel).await;
                     lease.check().await?;
                     let due = self.current_renewal_time(&material, &group.policy)?;

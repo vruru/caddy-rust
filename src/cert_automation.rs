@@ -220,6 +220,8 @@ pub struct CertificateManager {
     inner: Arc<ManagerInner>,
 }
 struct ManagerInner {
+    must_staple: bool,
+    reuse_private_keys: bool,
     lifecycle_events: Option<Arc<crate::events::EventsApp>>,
     store: FsStore,
     registry: ChallengeRegistry,
@@ -413,12 +415,18 @@ struct Job {
     #[serde(default)]
     leaf_key_type: KeyType,
     #[serde(default)]
+    must_staple: bool,
+    #[serde(default)]
+    reuse_private_keys: bool,
+    #[serde(default)]
     attempt_id: String,
     #[serde(default)]
     abandoned: bool,
     phase: String,
     csr_der: Vec<u8>,
     private_key_pem: String,
+    #[serde(default)]
+    initial_key_hash: Option<String>,
     #[serde(default)]
     order_url: Option<String>,
     #[serde(default)]
@@ -448,6 +456,10 @@ struct Reservation {
     account_location: String,
     config_email: String,
     leaf_key_type: KeyType,
+    #[serde(default)]
+    must_staple: bool,
+    #[serde(default)]
+    reuse_private_keys: bool,
     job_id: String,
     active: bool,
 }
@@ -496,7 +508,21 @@ struct MaterialInfo {
     leaf_sha256: String,
 }
 #[derive(Clone)]
+pub(crate) struct ReusableKey {
+    pub(crate) pem:Zeroizing<Vec<u8>>,
+    pub(crate) state:Arc<crate::key_compromise::KeyState>,
+    pub(crate) spki:Arc<[u8]>,
+}
+pub(crate) fn prepare_reusable_key(pem:Zeroizing<Vec<u8>>,deny:&crate::key_compromise::KeyDeny)->Result<ReusableKey> {
+    use rcgen::PublicKeyData;
+    let signer=crate::crypto::x509_signer::X509Signer::from_private_key(&pem)?;
+    let spki:Arc<[u8]>=Arc::from(signer.subject_public_key_info());
+    let state=deny.register_spki(spki.clone())?;
+    Ok(ReusableKey{pem,state,spki})
+}
+#[derive(Clone)]
 struct Replacement {
+    reuse_key: Option<ReusableKey>,
     not_after: i64,
     forced: bool,
     renewal_names: Option<Vec<String>>,
@@ -649,6 +675,8 @@ impl CertificateManager {
         let (events, _) = broadcast::channel(256);
         Ok(Self {
             inner: Arc::new(ManagerInner {
+                must_staple:false,
+                reuse_private_keys:false,
                 lifecycle_events: None,
                 store,
                 registry,
@@ -672,6 +700,11 @@ impl CertificateManager {
             .ok_or_else(|| anyhow!("certificate manager already shared"))?
             .lifecycle_events = events;
         Ok(self)
+    }
+    /// Generation-scoped leaf CSR behavior; account signing keys are unaffected.
+    pub fn with_csr_options(mut self,must_staple:bool,reuse_private_keys:bool)->Result<Self> {
+        let inner=Arc::get_mut(&mut self.inner).ok_or_else(||anyhow!("certificate manager already shared"))?;
+        inner.must_staple=must_staple;inner.reuse_private_keys=reuse_private_keys;Ok(self)
     }
     async fn emit_obtaining(&self, names: &[String], previous: Option<&Replacement>,
         cancel: &CancellationToken) -> Result<crate::cert_events::Attempt> {
@@ -1008,11 +1041,12 @@ impl CertificateManager {
             // network request is necessary. Keep registration/domain lock order.
             let (ready, previous) = self.load_state(&names, &lease, &cancel).await?;
             if ready.is_some() {
-                return Ok((ready, previous, None, None));
+                return Ok((ready, previous, None, None, None));
             }
             // One abortable event precedes new attempt/key/account/order work,
             // including issuer fallback; already ready material emits nothing.
             let lifecycle=self.emit_obtaining(&names, previous.as_ref(), &cancel).await?;
+            let initial_reuse=if previous.is_none(){self.initial_reuse_plan(&names,&cancel).await?}else{None};
             use p256::elliptic_curve::rand_core::RngCore;
             let mut random = [0u8; 32];
             p256::elliptic_curve::rand_core::OsRng.fill_bytes(&mut random);
@@ -1020,12 +1054,11 @@ impl CertificateManager {
                 version: 1,
                 names: names.clone(),
                 attempt_id: digest(&random),
-                issuer_sequence: self
-                    .inner
-                    .issuers
-                    .iter()
-                    .map(|i| i.config.wire.directory.clone())
-                    .collect(),
+                issuer_sequence: {
+                    let mut sequence=self.inner.issuers.iter().map(|issuer|issuer.config.wire.directory.clone()).collect::<Vec<_>>();
+                    if let Some((_,preferred))=&initial_reuse {let first=sequence.remove(*preferred);sequence.insert(0,first);}
+                    sequence
+                },
                 current_job_id: None,
                 base_leaf: previous.as_ref().map(|p| p.previous_leaf.clone()),
                 winner: None,
@@ -1036,11 +1069,11 @@ impl CertificateManager {
                 &lease,
             )
             .await?;
-            Ok::<_, anyhow::Error>((None, previous, Some(attempt.attempt_id), Some(lifecycle)))
+            Ok::<_, anyhow::Error>((None, previous, Some(attempt.attempt_id), Some(lifecycle),initial_reuse))
         }
         .await;
         let release = lease.release().await;
-        let (ready, mut previous, attempt_id, lifecycle) = initial?;
+        let (ready, mut previous, attempt_id, lifecycle,initial_reuse) = initial?;
         release?;
         if let Some(ready) = ready {
             return Ok(ready);
@@ -1055,15 +1088,18 @@ impl CertificateManager {
         });
         let mut last_error = None;
         let mut tried_issuers = std::collections::HashSet::new();
-        for (index, issuer) in self.inner.issuers.iter().enumerate() {
+        let mut issuer_order=(0..self.inner.issuers.len()).collect::<Vec<_>>();
+        if let Some((_,preferred))=&initial_reuse {issuer_order.remove(*preferred);issuer_order.insert(0,*preferred);}
+        for (rank,index) in issuer_order.into_iter().enumerate() {
+            let issuer=&self.inner.issuers[index];
             if !tried_issuers.insert(issuer_key(&issuer.config.wire.directory)?) {
                 continue;
             }
             if cancel.is_cancelled() {
                 bail!("ACME operation cancelled")
             }
-            if index > 0 {
-                sleep_cancel(Duration::from_millis(250u64 << index.min(5)), &cancel).await?;
+            if rank > 0 {
+                sleep_cancel(Duration::from_millis(250u64 << rank.min(5)), &cancel).await?;
             }
             let allowed = issuer.ca.next_allowed_unix.load(Ordering::Acquire);
             if allowed > now() {
@@ -1143,11 +1179,7 @@ impl CertificateManager {
                         .store
                         .recover_certificate_with_lease(&scope_issuer, &scope_names, &lease)
                         .await?;
-                    let _ = self
-                        .inner
-                        .store
-                        .load_certificate(&scope_issuer, &scope_names)
-                        .await?;
+                    let _ = self.read_issuer_certificate(&scope_issuer,&scope_names,&leg_cancel).await?;
                     let current = self.read_reservation(&names, issuer).await?;
                     if let Some(active) = current.as_ref() {
                         ensure!(
@@ -1166,6 +1198,7 @@ impl CertificateManager {
                         &account,
                         &lease,
                         (previous.as_ref(), current.as_ref(), &attempt_id),
+                        initial_reuse.as_ref().map(|(key,_)|key),
                         &lifecycle,
                         &leg_cancel,
                     )
@@ -1214,6 +1247,50 @@ impl CertificateManager {
         Err(error)
     }
 
+    async fn initial_key(&self,issuer:&str,key:&str,cancel:&CancellationToken)
+        ->Result<Option<(crate::certstore::InitialPrivateKey,ReusableKey)>> {
+        if !self.inner.reuse_private_keys {return Ok(None);}
+        let (_,initial)=self.inner.store.load_certificate_for_key_reuse(issuer,key).await?;
+        let Some(initial)=initial else{return Ok(None);};
+        let pem=initial.pem();let deny=self.inner.resolver.leaf_guard().key_deny().clone();
+        let reusable=self.cpu(cancel,move||prepare_reusable_key(pem,&deny)).await?;
+        Ok(Some((initial,reusable)))
+    }
+    async fn read_issuer_certificate(&self,issuer:&str,key:&str,cancel:&CancellationToken)->Result<Option<CertificateBundle>> {
+        if !self.inner.reuse_private_keys {return self.inner.store.load_certificate(issuer,key).await;}
+        let (bundle,initial)=self.inner.store.load_certificate_for_key_reuse(issuer,key).await?;
+        if let Some(initial)=initial {
+            let pem=initial.pem();let deny=self.inner.resolver.leaf_guard().key_deny().clone();
+            self.cpu(cancel,move||prepare_reusable_key(pem,&deny)).await?;
+        }
+        Ok(bundle)
+    }
+    async fn initial_reuse_plan(&self,names:&[String],cancel:&CancellationToken)->Result<Option<(ReusableKey,usize)>> {
+        let key=names_key(names)?;
+        for (index,issuer) in self.inner.issuers.iter().enumerate() {
+            let issuer=issuer_key(&issuer.config.wire.directory)?;
+            if let Some((_,reusable))=self.initial_key(&issuer,&key,cancel).await? {
+                if !reusable.state.banned() {return Ok(Some((reusable,index)));}
+            }
+        }
+        Ok(None)
+    }
+    async fn save_issued_certificate(&self,issuer:&str,key:&str,bundle:&CertificateBundle,
+        lease:&StorageLease,initial_hash:Option<&str>)->Result<()> {
+        if let Some(expected)=initial_hash {
+            let (current,initial)=self.inner.store.load_certificate_for_key_reuse(issuer,key).await?;
+            if let Some(initial)=initial {
+                ensure!(initial.digest()==expected,"initial certificate private key changed during issuance");
+                return self.inner.store.save_certificate_with_initial_key(issuer,key,bundle,lease,&initial).await;
+            }
+            // A committed leg may have survived its final checkpoint. Never
+            // overwrite a different generation installed by an external writer.
+            ensure!(current.as_ref().is_some_and(|current|current.chain_pem==bundle.chain_pem
+                && current.private_key_pem.as_slice()==bundle.private_key_pem.as_slice()),
+                "initial certificate bootstrap generation changed");
+            Ok(())
+        } else {self.inner.store.save_certificate(issuer,key,bundle,lease).await}
+    }
     async fn load_state(
         &self,
         names: &[String],
@@ -1270,7 +1347,9 @@ impl CertificateManager {
         }
         ensure!(
             marker.config_email == issuer.config.email
-                && marker.leaf_key_type == issuer.config.leaf_key_type,
+                && marker.leaf_key_type == issuer.config.leaf_key_type
+                && marker.must_staple == self.inner.must_staple
+                && marker.reuse_private_keys == self.inner.reuse_private_keys,
             "active issuer configuration changed; restore it or explicitly resolve that issuer order"
         );
         Ok(Some(marker))
@@ -1324,23 +1403,27 @@ impl CertificateManager {
                 && job.directory == marker.directory
                 && job.account_location == marker.account_location
                 && job.config_email == marker.config_email
-                && job.leaf_key_type == marker.leaf_key_type,
+                && job.leaf_key_type == marker.leaf_key_type
+                && job.must_staple == marker.must_staple
+                && job.reuse_private_keys == marker.reuse_private_keys,
             "active ACME checkpoint identity changed"
         );
         self.validate_job_renewal_scope(&job).await?;
-        if job.phase == "prepared" {
-            self.save_job(&marker.job_id, &job, lease).await?;
-            return Ok(None);
-        }
         ensure!(
             self.inner
                 .issuers
                 .iter()
                 .any(|i| i.config.wire.directory == marker.directory
                     && i.config.email == marker.config_email
-                    && i.config.leaf_key_type == marker.leaf_key_type),
+                    && i.config.leaf_key_type == marker.leaf_key_type
+                    && marker.must_staple == self.inner.must_staple
+                    && marker.reuse_private_keys == self.inner.reuse_private_keys),
             "active ACME issuer configuration changed; restore it or explicitly resolve the order"
         );
+        if job.phase == "prepared" {
+            self.save_job(&marker.job_id, &job, lease).await?;
+            return Ok(None);
+        }
         let issuer = issuer_key(&marker.directory)?;
         let key = names_key(names)?;
         self.inner
@@ -1349,7 +1432,7 @@ impl CertificateManager {
             .await?;
         // Finish an already validated candidate without depending on CA/account
         // connectivity. A prior commit may have succeeded before its checkpoint.
-        if let Some(current) = self.inner.store.load_certificate(&issuer, &key).await? {
+        if let Some(current) = self.read_issuer_certificate(&issuer,&key,cancel).await? {
             let info = self.inspect_material(&current, names, cancel).await?;
             if job.stored_leaf_sha256.as_deref() == Some(&info.leaf_sha256) {
                 job.phase = "stored".to_owned();
@@ -1404,10 +1487,7 @@ impl CertificateManager {
             job.phase = "store_intent".to_owned();
             job.stored_leaf_sha256 = Some(info.leaf_sha256);
             self.save_job(&marker.job_id, &job, lease).await?;
-            self.inner
-                .store
-                .save_certificate(&issuer, &key, &bundle, lease)
-                .await?;
+            self.save_issued_certificate(&issuer,&key,&bundle,lease,job.initial_key_hash.as_deref()).await?;
             job.phase = "stored".to_owned();
             job.private_key_pem.zeroize();
             job.csr_der.clear();
@@ -1470,11 +1550,7 @@ impl CertificateManager {
                             .recover_certificate_with_lease(&issuer_name, &key, lease)
                             .await?;
                     }
-                    let Some(bundle) = self
-                        .inner
-                        .store
-                        .load_certificate(&issuer_name, &key)
-                        .await?
+                    let Some(bundle) = self.read_issuer_certificate(&issuer_name,&key,cancel).await?
                     else {
                         return Ok(None);
                     };
@@ -1637,7 +1713,11 @@ impl CertificateManager {
                     Ok(None) => {}
                 }
             }
+            let reuse_key=(self.inner.reuse_private_keys && !denied
+                && !revocation.as_ref().is_some_and(|v|v.version.reason==Some(1)))
+                .then(||ReusableKey{pem:bundle.private_key_pem.clone(),state:info._key_state.clone(),spki:info.spki_der.clone()});
             previous_id = Some(Replacement {
+                reuse_key,
                 not_after: info.not_after,
                 forced: revoked,
                 renewal_names,
@@ -2150,6 +2230,7 @@ impl CertificateManager {
         account: &AccountSession,
         lease: &StorageLease,
         cycle: (Option<&Replacement>, Option<&Reservation>, &str),
+        initial_reuse:Option<&ReusableKey>,
         lifecycle: &crate::cert_events::Attempt,
         cancel: &CancellationToken,
     ) -> Result<ManagedCertificate> {
@@ -2165,6 +2246,17 @@ impl CertificateManager {
             })
             .await?;
         let issuer_name = issuer_key(wire.directory_url())?;
+        let initial=self.initial_key(&issuer_name,&names_key(names)?,cancel).await?;
+        let initial_hash=initial.as_ref().map(|(snapshot,_)|snapshot.digest().to_owned());
+        if let Some((snapshot,key))=&initial && key.state.banned() {
+            let archived=self.inner.store.archive_initial_private_key(&issuer_name,&names_key(names)?,snapshot,
+                Sha256::digest(&key.spki).into(),names,lease).await;
+            let _=self.inner.events.send(AutomationEvent{names:names.to_vec(),kind:match archived {
+                Ok(true)=>"compromised_key_archived",Ok(false)=>"compromised_key_not_archived",Err(_)=>"compromised_key_archive_failed",
+            },recovery_issue:None});
+        }
+
+
         let renewal_names = replacement.filter(|r| r.directory == wire.directory_url())
             .and_then(|r| r.renewal_names.clone());
         let replaces = replacement
@@ -2174,8 +2266,7 @@ impl CertificateManager {
                     && wire.directory().renewal_info.is_some()
             })
             .and_then(|r| r.certificate_id.as_deref());
-        let computed_id = digest(
-            format!(
+        let mut order_identity = format!(
                 "order\0{}\0{}\0{:?}\0{}\0{}",
                 wire.directory_url(),
                 account.location(),
@@ -2184,9 +2275,11 @@ impl CertificateManager {
                 replacement
                     .map(|r| r.previous_leaf.as_str())
                     .unwrap_or("initial")
-            )
-            .as_bytes(),
-        );
+            );
+        if self.inner.must_staple || self.inner.reuse_private_keys {
+            order_identity.push_str(&format!("\0csr-v2:{}:{}",self.inner.must_staple,self.inner.reuse_private_keys));
+        }
+        let computed_id=digest(order_identity.as_bytes());
         let id = reservation.map(|r| r.job_id.clone()).unwrap_or(computed_id);
         let mut _job_key_reservation: Option<Arc<crate::key_compromise::KeyState>>=None;
         let mut job = if let Some(value) = self.inner.store.journal_load(&id).await? {
@@ -2198,7 +2291,9 @@ impl CertificateManager {
                     && job.account_location == account.location()
                     && job.names == names
                     && job.config_email == issuer.config.email
-                    && job.leaf_key_type == issuer.config.leaf_key_type,
+                    && job.leaf_key_type == issuer.config.leaf_key_type
+                    && job.must_staple == self.inner.must_staple
+                    && job.reuse_private_keys == self.inner.reuse_private_keys,
                 "ACME order checkpoint identity changed"
             );
             job
@@ -2206,7 +2301,10 @@ impl CertificateManager {
             let csr_names = renewal_names.clone().unwrap_or_else(|| names.to_vec());
             let kind = issuer.config.leaf_key_type;
             let deny=self.inner.resolver.leaf_guard().key_deny().clone();
-            let (csr,key,reserved_key)=self.cpu(cancel,move ||generate_csr(&csr_names,kind,&deny)).await?;
+            let must_staple=self.inner.must_staple;
+            let reusable=replacement.and_then(|r|r.reuse_key.as_ref()).or(initial_reuse)
+                .or_else(||initial.as_ref().map(|(_,key)|key)).map(|key|key.pem.clone());
+            let (csr,key,reserved_key)=self.cpu(cancel,move ||generate_csr_with_options(&csr_names,kind,&deny,must_staple,reusable)).await?;
             _job_key_reservation=Some(reserved_key);
             let job = Job {
                 version: 1,
@@ -2216,10 +2314,13 @@ impl CertificateManager {
                 account_location: account.location().to_owned(),
                 config_email: issuer.config.email.clone(),
                 leaf_key_type: issuer.config.leaf_key_type,
+                must_staple:self.inner.must_staple,
+                reuse_private_keys:self.inner.reuse_private_keys,
                 attempt_id: attempt_id.to_owned(),
                 abandoned: false,
                 phase: "prepared".to_owned(),
                 csr_der: csr,
+                initial_key_hash:initial_hash.clone(),
                 private_key_pem: std::str::from_utf8(&key)
                     .map_err(|_| anyhow!("invalid generated certificate key"))?
                     .to_owned(),
@@ -2233,6 +2334,9 @@ impl CertificateManager {
             self.save_job(&id, &job, lease).await?;
             job
         };
+        if job.phase!="stored" && job.initial_key_hash.is_some() {
+            ensure!(job.initial_key_hash==initial_hash,"initial certificate private key checkpoint scope changed");
+        }
         self.validate_job_renewal_scope(&job).await?;
         if job.phase != "stored" {
             match self.check_job_key(job.private_key_pem.as_bytes(), cancel).await {
@@ -2240,12 +2344,13 @@ impl CertificateManager {
                 Err(error) if error.is::<crate::key_compromise::KeyCompromised>() => {
                     let csr_names = renewal_names.clone().unwrap_or_else(|| names.to_vec()); let kind = issuer.config.leaf_key_type;
                     let deny=self.inner.resolver.leaf_guard().key_deny().clone();
-                    let (csr,key,reserved_key)=self.cpu(cancel,move ||generate_csr(&csr_names,kind,&deny)).await?;
+                    let must_staple=self.inner.must_staple;
+                    let (csr,key,reserved_key)=self.cpu(cancel,move ||generate_csr_with_options(&csr_names,kind,&deny,must_staple,None)).await?;
                     _job_key_reservation=Some(reserved_key);
                     job.private_key_pem.zeroize();
                     job.private_key_pem = std::str::from_utf8(&key)?.to_owned();
                     job.renewal_names = renewal_names.clone();
-                    job.csr_der = csr; job.phase = "prepared".to_owned();
+                    job.csr_der = csr; job.initial_key_hash=initial_hash.clone();job.phase = "prepared".to_owned();
                     job.order_url = None; job.certificate_url = None; job.downloaded_pem = None;
                     job.stored_leaf_sha256 = None; job.poll_after_unix = 0; job.replaces_disabled = false;
                     self.save_job(&id, &job, lease).await?;
@@ -2258,11 +2363,7 @@ impl CertificateManager {
         job.abandoned = false;
         self.save_job(&id, &job, lease).await?;
         if job.phase == "stored" {
-            let current = self
-                .inner
-                .store
-                .load_certificate(&issuer_name, &names_key(names)?)
-                .await?;
+            let current = self.read_issuer_certificate(&issuer_name,&names_key(names)?,cancel).await?;
             if let Some(bundle) = current {
                 let info = self.inspect_material(&bundle, names, cancel).await?;
                 let renew_at = renewal_time(
@@ -2299,10 +2400,14 @@ impl CertificateManager {
             let csr_names = renewal_names.clone().unwrap_or_else(|| names.to_vec());
             let kind = issuer.config.leaf_key_type;
             let deny=self.inner.resolver.leaf_guard().key_deny().clone();
-            let (csr,key,reserved_key)=self.cpu(cancel,move ||generate_csr(&csr_names,kind,&deny)).await?;
+            let must_staple=self.inner.must_staple;
+            let reusable=replacement.and_then(|r|r.reuse_key.as_ref()).or(initial_reuse)
+                .or_else(||initial.as_ref().map(|(_,key)|key)).map(|key|key.pem.clone());
+            let (csr,key,reserved_key)=self.cpu(cancel,move ||generate_csr_with_options(&csr_names,kind,&deny,must_staple,reusable)).await?;
             _job_key_reservation=Some(reserved_key);
             job.renewal_names = renewal_names.clone();
             job.csr_der = csr;
+            job.initial_key_hash=initial_hash.clone();
             job.private_key_pem = std::str::from_utf8(&key)
                 .map_err(|_| anyhow!("invalid generated certificate key"))?
                 .to_owned();
@@ -2482,7 +2587,7 @@ impl CertificateManager {
             ensure!(info.not_before<=now() && info.not_after>now(),"issued certificate is not currently valid");
             if let Some(cert_id)=self.certificate_id(&bundle.chain_pem,cancel).await? && let Ok(Some(ari))=wire.renewal_info(&cert_id,cancel).await {write_ari(&mut bundle.metadata,&ari,&info,self.inner.options.renewal_window_ratio)?;}
             job.stored_leaf_sha256=Some(info.leaf_sha256.clone());job.phase="store_intent".to_owned();self.save_job(&id,&job,lease).await?;
-            lease.check().await?;self.inner.store.save_certificate(&issuer_name,&names_key(names)?,&bundle,lease).await?;
+            lease.check().await?;self.save_issued_certificate(&issuer_name,&names_key(names)?,&bundle,lease,job.initial_key_hash.as_deref()).await?;
             lifecycle.obtained(self.inner.lifecycle_events.as_ref(),&issuer_name,names,&job.csr_der,cancel).await;
             job.phase="stored".to_owned();job.private_key_pem.zeroize();job.downloaded_pem=None;job.csr_der.clear();self.save_job(&id,&job,lease).await?;
             // Once persisted, publication errors retain this candidate. A later
@@ -2542,6 +2647,8 @@ impl CertificateManager {
                 account_location: job.account_location.clone(),
                 config_email: job.config_email.clone(),
                 leaf_key_type: job.leaf_key_type,
+                must_staple:job.must_staple,
+                reuse_private_keys:job.reuse_private_keys,
                 job_id: id.to_owned(),
                 active,
             };
@@ -2945,82 +3052,49 @@ fn validate_order(order: &Order, names: &[String]) -> Result<()> {
     ensure!(actual == expected, "ACME order identifiers changed");
     Ok(())
 }
-/// rcgen's built-in ring key importer caps RSA key sizes. Keep the caller's
-/// actual key and use RustCrypto directly, including rsa8192, for PKCS10 signing.
-pub(crate) struct CsrSigner {
-    signer: AccountSigner,
-    public: Vec<u8>,
+/// Generate a CSR only after the exact SPKI owns its reserved KeyState.
+pub(crate) fn generate_csr(names:&[String],kind:KeyType,deny:&crate::key_compromise::KeyDeny)
+    ->Result<(Vec<u8>,Zeroizing<Vec<u8>>,Arc<crate::key_compromise::KeyState>)> {
+    generate_csr_with_options(names,kind,deny,false,None)
 }
-impl CsrSigner {
-    pub(crate) fn new(signer: AccountSigner) -> Result<Self> {
-        use p256::pkcs8::der::Decode;
-        let spki = signer.public_spki()?;
-        let info = p256::pkcs8::spki::SubjectPublicKeyInfoRef::from_der(&spki)
-            .map_err(|_| anyhow!("invalid CSR public key"))?;
-        let public = info
-            .subject_public_key
-            .as_bytes()
-            .ok_or_else(|| anyhow!("invalid CSR key bits"))?
-            .to_vec();
-        Ok(Self { signer, public })
-    }
-}
-impl rcgen::PublicKeyData for CsrSigner {
-    fn der_bytes(&self) -> &[u8] {
-        &self.public
-    }
-    fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
-        match self.signer {
-            AccountSigner::P256(_) => &rcgen::PKCS_ECDSA_P256_SHA256,
-            AccountSigner::P384(_) => &rcgen::PKCS_ECDSA_P384_SHA384,
-            AccountSigner::Rsa(_) => &rcgen::PKCS_RSA_SHA256,
-            AccountSigner::Ed25519(_) => &rcgen::PKCS_ED25519,
+pub(crate) fn generate_csr_with_options(names:&[String],kind:KeyType,deny:&crate::key_compromise::KeyDeny,
+    must_staple:bool,reusable:Option<Zeroizing<Vec<u8>>>)
+    ->Result<(Vec<u8>,Zeroizing<Vec<u8>>,Arc<crate::key_compromise::KeyState>)> {
+    use rcgen::{PublicKeyData,SigningKey};
+    use der::{Decode,Encode};
+    use x509_parser::prelude::FromDer;
+    let pem=if let Some(pem)=reusable {
+        let signer=crate::crypto::x509_signer::X509Signer::from_private_key(&pem)?;
+        let spki=signer.subject_public_key_info();
+        let state=deny.register_spki(Arc::from(spki))?;
+        if deny.check_state(&state).is_ok() {pem} else {
+            AccountSigner::generate(kind)?.1
         }
-    }
-}
-impl rcgen::SigningKey for CsrSigner {
-    fn sign(&self, message: &[u8]) -> std::result::Result<Vec<u8>, rcgen::Error> {
-        let raw = self
-            .signer
-            .sign(message)
-            .map_err(|_| rcgen::Error::RemoteKeyError)?;
-        // JOSE uses fixed-width r||s; X.509/PKCS10 requires an ASN.1 sequence.
-        match self.signer {
-            AccountSigner::P256(_) => Ok(p256::ecdsa::Signature::from_slice(&raw)
-                .map_err(|_| rcgen::Error::RemoteKeyError)?
-                .to_der()
-                .as_bytes()
-                .to_vec()),
-            AccountSigner::P384(_) => Ok(p384::ecdsa::Signature::from_slice(&raw)
-                .map_err(|_| rcgen::Error::RemoteKeyError)?
-                .to_der()
-                .as_bytes()
-                .to_vec()),
-            _ => Ok(raw),
-        }
-    }
-}
-pub(crate) fn generate_csr(
-    names: &[String],
-    kind: KeyType,
-    deny: &crate::key_compromise::KeyDeny,
-) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>, Arc<crate::key_compromise::KeyState>)> {
-    let (signer, pem) = AccountSigner::generate(kind)?;
-    let reservation=deny.register_spki(Arc::from(signer.public_spki()?))?;
+    } else {AccountSigner::generate(kind)?.1};
+    let signer=crate::crypto::x509_signer::X509Signer::from_private_key(&pem)?;
+    let spki=signer.subject_public_key_info();
+    let reservation=deny.register_spki(Arc::from(spki.clone()))?;
     deny.check_state(&reservation)?;
-    let pair = CsrSigner::new(signer)?;
-    let mut params = rcgen::CertificateParams::new(names.to_vec())
-        .map_err(|_| anyhow!("invalid certificate CSR names"))?;
-    params.distinguished_name = rcgen::DistinguishedName::new();
-    Ok((
-        params
-            .serialize_request(&pair)
-            .map_err(|_| anyhow!("certificate CSR signing failed"))?
-            .der()
-            .to_vec(),
-        pem,
-        reservation,
-    ))
+    let mut params=rcgen::CertificateParams::new(names.to_vec()).map_err(|_|anyhow!("invalid certificate CSR names"))?;
+    params.distinguished_name=rcgen::DistinguishedName::new();
+    if must_staple {params.custom_extensions.push(rcgen::CustomExtension::from_oid_content(
+        &[1,3,6,1,5,5,7,1,24],vec![0x30,0x03,0x02,0x01,0x05]));}
+    let encoded=params.serialize_request(&signer).map_err(|_|anyhow!("certificate CSR signing failed"))?.der().to_vec();
+    // Rcgen has no P224 SignatureAlgorithm and encodes its P256 template OID.
+    // Bind the actual validated SPKI and sign that exact CertificationRequestInfo.
+    let mut request=x509_cert::request::CertReq::from_der(&encoded)?;
+    let csr=if request.info.public_key.to_der()?!=spki {
+        request.info.public_key=x509_cert::spki::SubjectPublicKeyInfoOwned::from_der(&spki)?;
+        let signature=signer.sign(&request.info.to_der()?).map_err(|_|anyhow!("CSR SPKI binding signature failed"))?;
+        request.signature=der::asn1::BitString::new(0,signature)?;
+        request.to_der()?
+    } else {encoded};
+    let (_,parsed)=x509_parser::certification_request::X509CertificationRequest::from_der(&csr)
+        .map_err(|_|anyhow!("generated CSR is invalid"))?;
+    crate::cert_status::verify_x509_signature(&parsed.certification_request_info.subject_pki,
+        &parsed.signature_algorithm,&parsed.signature_value.data,parsed.certification_request_info.raw,true)?;
+    deny.check_state(&reservation)?;
+    Ok((csr,pem,reservation))
 }
 fn material_info(bundle: &CertificateBundle, names: &[String], deny:&crate::key_compromise::KeyDeny) -> Result<MaterialInfo> {
     use x509_parser::extensions::GeneralName;

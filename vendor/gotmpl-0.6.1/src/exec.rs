@@ -567,6 +567,17 @@ impl<'a> Executor<'a> {
                         .map(|(k, v)| (Value::String(Arc::clone(k)), v.clone()))
                 );
             }
+            Value::NamedInt64(n,kind) if kind.kind.starts_with("uint") => {
+                ensure_single_range_var(branch, &val)?;
+                let count=*n as u64;
+                if count==0 {
+                    if let Some(ref else_body)=branch.else_body {self.walk(w,else_body,dot)?;}
+                } else {
+                    range_loop!(self,w,branch,(0..count).map(|i|{
+                        let value=Value::NamedInt64(i as i64,kind.clone());(value.clone(),value)
+                    }));
+                }
+            }
             Value::Int(n) | Value::Int64(n) | Value::NamedInt64(n,_) => {
                 // Go 1.22+: range over integer
                 ensure_single_range_var(branch, &val)?;

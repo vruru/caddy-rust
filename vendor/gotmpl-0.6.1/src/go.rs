@@ -509,7 +509,8 @@ fn format_value(out:&mut ByteBuffer,arg:&Value,verb:char,mut spec:FmtSpec,depth:
         if verb=='v'&&spec.hash{if let Some(bytes)=arg.as_go_bytes(){let start=out.len();quote_bytes(out,bytes,false);spec.pad_in_place(out,start,false);return out.check();}}
     }
         let displayed=match arg {
-            Value::NamedInt64(n,kind)if matches!(verb,'s'|'q'|'x'|'X')||(verb=='v'&&!spec.hash)=>kind.stringer.map(|stringer|Value::String(stringer(*n).into())),
+            Value::NamedInt64(n,kind)if kind.stringer.is_some()&&(matches!(verb,'s'|'q'|'x'|'X')||(verb=='v'&&!spec.hash))=>kind.stringer.map(|stringer|Value::String(stringer(*n).into())),
+            Value::NamedInt64(n,kind)if kind.kind.starts_with("uint")&&matches!(verb,'v'|'b'|'c'|'d'|'o'|'O'|'q'|'x'|'X'|'U')=>Some(Value::Uint(*n as u64)),
             Value::NamedInt64(n,kind)if verb=='v'&&spec.hash=>Some(if matches!(kind.kind,"uint"|"uint8"|"uint16"|"uint32"|"uint64"|"uintptr"){Value::Uint(*n as u64)}else{Value::Int64(*n)}),
             Value::Object(object) if matches!(verb,'s'|'q'|'x'|'X')||(verb=='v'&&!spec.hash)=>object.display.as_ref().map(|text|Value::String(text.clone())),
             _=>None,
@@ -678,8 +679,8 @@ fn format_value(out:&mut ByteBuffer,arg:&Value,verb:char,mut spec:FmtSpec,depth:
                 }
                 _ => write_bad_verb(out, verb, arg),
             },
-            'x' | 'X' | 'o' | 'b' => match arg {
-                Value::Float(value)if verb!='o'=>write_float_binary_hex(out,*value,verb,&spec),
+            'x' | 'X' | 'o' | 'O' | 'b' => match arg {
+                Value::Float(value)if !matches!(verb,'o'|'O')=>write_float_binary_hex(out,*value,verb,&spec),
                 value if value.as_go_bytes().is_some()&&(verb=='x'||verb=='X') => {
                     format_string_hex_into(out,value.as_go_bytes().unwrap_or_default(),verb=='X',&spec);
                     spec.pad_in_place(out, start, false);
@@ -701,11 +702,11 @@ fn format_value(out:&mut ByteBuffer,arg:&Value,verb:char,mut spec:FmtSpec,depth:
                     None => write_bad_verb(out, verb, arg),
                 },
             },
-            'c' => match arg.as_go_integer().and_then(|n|i64::try_from(n).ok()) {
-                Some(n) => match u32::try_from(n).ok().and_then(char::from_u32) {
+            'c' => match arg.as_go_integer() {
+                Some(n) => {match u32::try_from(n).ok().and_then(char::from_u32) {
                     Some(c) => out.push(c),
                     None => out.push('\u{FFFD}'),
-                },
+                }if spec.zero&&!spec.left_align{if let Some(width)=spec.width{insert_repeated(out,start,'0',width.saturating_sub(1));}}else{spec.pad_in_place(out,start,false);}},
                 None => write_bad_verb(out, verb, arg),
             },
             _ => write_bad_verb(out, verb, arg),
@@ -994,14 +995,16 @@ fn format_magnitude_base_into(
     let _ = match base {
         'x' => write!(digits, "{:x}", mag),
         'X' => write!(digits, "{:X}", mag),
-        'o' => write!(digits, "{:o}", mag),
+        'o' | 'O' => write!(digits, "{:o}", mag),
         'b' => write!(digits, "{:b}", mag),
         #[allow(
             clippy::unreachable,
-            reason = "private helper; callers only pass 'x', 'X', 'o', 'b'"
+            reason = "private helper; callers only pass 'x', 'X', 'o', 'O', 'b'"
         )]
         _ => unreachable!(),
     };
+
+    if mag==0 && spec.precision==Some(0){return;}
 
     // Go's rule: `0` flag without `-` and without explicit precision turns
     // into "pad digits up to width − sign_len". An explicit precision wins
@@ -1028,12 +1031,13 @@ fn format_magnitude_base_into(
     if let Some(s) = sign {
         out.push(s);
     }
+    if base=='O'{out.push_str("0o");}
     if spec.hash {
         match base {
             'x' => out.push_str("0x"),
             'X' => out.push_str("0X"),
             'b' => out.push_str("0b"),
-            'o' => {
+            'o' | 'O' => {
                 // Go skips the `0` octal prefix when the first digit is
                 // already `0` — which happens naturally after zero-padding.
                 if !digits.starts_with('0') {
@@ -1042,7 +1046,7 @@ fn format_magnitude_base_into(
             }
             #[allow(
                 clippy::unreachable,
-                reason = "private helper; callers only pass 'x', 'X', 'o', 'b'"
+                reason = "private helper; callers only pass 'x', 'X', 'o', 'O', 'b'"
             )]
             _ => unreachable!(),
         }

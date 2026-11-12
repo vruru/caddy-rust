@@ -213,6 +213,64 @@ impl TypedSlice {
         }
     }
 
+    /// Full Values backing size without cloning it or entering a host budget.
+    /// A nil byte slice is not a Values backing, even though it has no cell.
+    pub fn values_backing_len(&self) -> Option<usize> {
+        match &self.storage {
+            Some(SliceData::Values(cell)) => {
+                #[cfg(feature="std")]
+                { Some(cell.lock().unwrap_or_else(|p|p.into_inner()).len()) }
+                #[cfg(not(feature="std"))]
+                { Some(cell.len()) }
+            }
+            None if self.named.map(|kind|kind.element).or_else(||self.go_type.strip_prefix("[]"))
+                .is_some_and(|elem|!matches!(elem,"byte"|"uint8")) => Some(0),
+            _ => None,
+        }
+    }
+
+    /// Copy into the visible Values window. The entire input is type-checked,
+    /// including any part beyond the destination window. Views share one cell;
+    /// existing immutable snapshots keep their old backing through COW.
+    /// A COW allocation requires a host budget. Its callback runs outside the
+    /// cell lock and reserves the full backing before it can be cloned.
+    #[cfg(feature="std")]
+    pub fn write_values_range(&self,offset:usize,buf:&[Value])->Result<usize>{
+        if offset>self.len{return Err(TemplateError::Exec("slice index out of range".into()));}
+        let elem=self.named.map(|kind|kind.element).or_else(||self.go_type.strip_prefix("[]"))
+            .ok_or_else(||TemplateError::Exec("invalid Values slice type".into()))?;
+        if buf.iter().any(|value|!canonical_elem_ok(value,elem)){
+            return Err(TemplateError::Exec("slice element type mismatch".into()));
+        }
+        if matches!(self.storage.as_ref(),Some(SliceData::Bytes(_)))||self.values_backing_len().is_none(){
+            return Err(TemplateError::Exec("write_values_range requires Values backing".into()));
+        }
+        if let Some(reserve)=&self.host_budget{reserve(0)?;}
+        let n=buf.len().min(self.len-offset);
+        if n==0{return Ok(0);}
+        let Some(SliceData::Values(cell))=&self.storage else{return Err(TemplateError::Exec("nil Values slice write".into()));};
+        let start=self.start.checked_add(offset).ok_or_else(||TemplateError::Exec("slice span overflow".into()))?;
+        let end=start.checked_add(n).ok_or_else(||TemplateError::Exec("slice span overflow".into()))?;
+        let mut paid=0;
+        for _ in 0..8 {
+            let mut current=cell.lock().unwrap_or_else(|p|p.into_inner());
+            if end>current.len(){return Err(TemplateError::Exec("invalid Values slice span".into()));}
+            let peak=current.len().checked_mul(core::mem::size_of::<Value>()).and_then(|n|n.checked_add(128)).and_then(|n|n.checked_mul(2))
+                .ok_or_else(||TemplateError::Exec("Values COW size overflow".into()))?;
+            if Arc::strong_count(&current)==1||paid>=peak {
+                Arc::make_mut(&mut current)[start..end].clone_from_slice(&buf[..n]);return Ok(n);
+            }
+            drop(current);
+            self.reserve_host_bytes(peak)?;
+            paid=peak;
+        }
+        Err(TemplateError::Exec("Values backing changed during write admission".into()))
+    }
+    #[cfg(not(feature="std"))]
+    pub fn write_values_range(&self,_offset:usize,_buf:&[Value])->Result<usize>{
+        Err(TemplateError::Exec("mutation not available in no_std".into()))
+    }
+
     pub fn named_values(kind: &'static SliceType, data: Option<Arc<[Value]>>) -> Result<Self> {
         if kind.name.is_empty() || kind.name.starts_with("[]") || kind.element == "uint8" || kind.element.is_empty() {
             return Err(TemplateError::Exec("invalid named value slice descriptor".into()));

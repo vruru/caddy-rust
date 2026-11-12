@@ -476,6 +476,7 @@ pub(super) fn issue(
         true,
     )
     .map_err(|_| anyhow!("invalid CSR signature"))?;
+    let mut requested_tls_feature=None;
     let mut attributes = HashSet::new();
     for attribute in request.certification_request_info.iter_attributes() {
         ensure!(
@@ -491,6 +492,12 @@ pub(super) fn issue(
                     oids.insert(extension.oid.to_id_string()),
                     "duplicate CSR extension"
                 );
+                if extension.oid.to_id_string()=="1.3.6.1.5.5.7.1.24" {
+                    let features=<Vec<u64> as der::Decode>::from_der(extension.value)?;
+                    ensure!(!features.is_empty() && features.iter().all(|feature|*feature<=u16::MAX as u64)
+                        && features.to_der()?==extension.value,"invalid internal CSR TLS feature");
+                    requested_tls_feature=Some((extension.critical,extension.value.to_vec()));
+                }
                 ensure!(
                     !matches!(
                         extension.parsed_extension(),
@@ -557,6 +564,10 @@ pub(super) fn issue(
                 }
             }
         }
+    }
+    if let Some((critical,feature))=requested_tls_feature {
+        let mut extension=rcgen::CustomExtension::from_oid_content(&[1,3,6,1,5,5,7,1,24],feature);
+        extension.set_criticality(critical);params.custom_extensions.push(extension);
     }
     let cert = params.signed_by(&public, &issuer)?;
     let der = bind_names(

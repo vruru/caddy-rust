@@ -39,6 +39,7 @@ pub(super) struct Factory {
     pub(super) snapshot: Option<Arc<ConnectionSnapshot>>,
     pub(super) control: Weak<Control>,
     certificates: Mutex<BTreeMap<usize, Arc<x509_values::Certificate>>>,
+    pub(super) integer_values: Mutex<BTreeMap<usize, Value>>,
 }
 impl Factory {
     pub(super) fn owner(&self) -> RenderResult<Arc<Control>> {
@@ -326,6 +327,7 @@ pub(super) fn value(
                     snapshot,
                     control: Arc::downgrade(control),
                     certificates: Mutex::new(BTreeMap::new()),
+                    integer_values: Mutex::new(BTreeMap::new()),
                 });
                 *slot = Some((Arc::downgrade(control), factory.clone()));
                 factory
@@ -336,6 +338,7 @@ pub(super) fn value(
                 snapshot,
                 control: Arc::downgrade(control),
                 certificates: Mutex::new(BTreeMap::new()),
+                integer_values: Mutex::new(BTreeMap::new()),
             });
             *slot = Some((Arc::downgrade(control), factory.clone()));
             factory

@@ -1,6 +1,7 @@
 //! CLI startup happens before runtime/worker construction, including env files.
 #[path = "cli/args.rs"]
 mod args;
+#[path="cli/password.rs"]mod password;
 #[path = "cli/config.rs"]
 mod config;
 #[path = "cli/envfile.rs"]
@@ -245,6 +246,7 @@ pub unsafe fn dispatch_early(input: &[OsString]) -> Result<Option<i32>> {
         }));
     }
     match command {
+        "hash-password"=>Ok(Some(unsafe { password::command(&input[1..])? })),
         "fmt" => {
             let mut specs = COMMON.to_vec();
             specs.extend([

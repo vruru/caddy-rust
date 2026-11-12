@@ -32,6 +32,7 @@ pub(crate) fn key_compare(a:&Value,b:&Value)->Result<Ordering>{
     if let(Some(a),Some(b))=(a.as_go_bytes(),b.as_go_bytes()){return Ok(a.cmp(b));}
     Ok(match(a,b){
         (Value::Nil|Value::NilError,Value::Nil|Value::NilError)=>Ordering::Equal,
+        (Value::NamedInt64(a,kind),Value::NamedInt64(b,_))if kind.kind.starts_with("uint")=>(*a as u64).cmp(&(*b as u64)),
         (Value::Bool(a),Value::Bool(b))=>a.cmp(b),(Value::Int(a),Value::Int(b))|(Value::Int64(a),Value::Int64(b))|(Value::NamedInt64(a,_),Value::NamedInt64(b,_))=>a.cmp(b),
         (Value::Uint(a),Value::Uint(b))=>a.cmp(b),(Value::Uint32(a),Value::Uint32(b))=>a.cmp(b),(Value::Uint8(a),Value::Uint8(b))=>a.cmp(b),(Value::Uint16(a),Value::Uint16(b))=>a.cmp(b),
         (Value::Float(a),Value::Float(b))=>if a.is_nan(){if b.is_nan(){Ordering::Equal}else{Ordering::Less}}else if b.is_nan(){Ordering::Greater}else{a.partial_cmp(b).unwrap_or(Ordering::Equal)},

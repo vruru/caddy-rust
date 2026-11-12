@@ -298,14 +298,8 @@ fn policy(value: &Value, path: &str) -> Result<Policy> {
     {
         policy.renewal_ratio = value;
     }
-    for (field, feature) in [
-        ("must_staple", "managed_must_staple"),
-        ("reuse_private_keys", "managed_reuse_private_keys"),
-    ] {
-        if object.boolean(field)?.unwrap_or(false) {
-            return Err(ConfigError::unsupported(object.at(field), feature));
-        }
-    }
+    policy.must_staple=object.boolean("must_staple")?.unwrap_or(false);
+    policy.reuse_private_keys=object.boolean("reuse_private_keys")?.unwrap_or(false);
     let managers = object.array("get_certificate")?;
     if managers.len() > 16 { return Err(ConfigError::invalid(object.at("get_certificate"))); }
     for (index, manager) in managers.iter().enumerate() {

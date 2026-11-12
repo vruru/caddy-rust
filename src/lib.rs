@@ -9,6 +9,7 @@ pub mod certmagic;
 pub mod certstore;
 pub mod challenge;
 pub mod crypto;
+pub mod password;
 pub mod http_config;
 pub mod http_runtime;
 pub mod leaf_guard;

@@ -293,7 +293,8 @@ impl CertificateServices {
                 .unwrap_or(true) || key_pending();
             let result = if let Err(error) = refreshed {
                 Err(error)
-            } else if pending && !group.identity {
+            } else if pending && !group.identity
+                && group.publication.lock().is_ok_and(|publication|publication.is_some()) {
                 // The service-owned physical worker resolves current Name0
                 // policy and exact old receipt. A historical publisher job
                 // cannot renew the revoked chain under its old policy.

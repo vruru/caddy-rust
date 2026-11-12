@@ -48,7 +48,7 @@ impl serde::Serialize for JsonValue<'_>{
                 let mut entries=Vec::new();entries.try_reserve_exact(snapshot.len()).map_err(S::Error::custom)?;
                 for(key,value)in snapshot.iter(){
                     let name=if let Some(bytes)=key.as_go_bytes(){account.reserve(bytes.len().saturating_mul(3)).map_err(S::Error::custom)?;go_utf8_text(bytes).into_owned()}else{match key{
-                        V::Int(n)|V::Int64(n)|V::NamedInt64(n,_)=>n.to_string(),V::Uint(n)=>n.to_string(),V::Uint32(n)=>n.to_string(),V::Uint8(n)=>n.to_string(),V::Uint16(n)=>n.to_string(),
+                        V::NamedInt64(n,kind)if kind.kind.starts_with("uint")=>(*n as u64).to_string(),V::Int(n)|V::Int64(n)|V::NamedInt64(n,_)=>n.to_string(),V::Uint(n)=>n.to_string(),V::Uint32(n)=>n.to_string(),V::Uint8(n)=>n.to_string(),V::Uint16(n)=>n.to_string(),
                         V::Object(object)if object.go_type==Some("time.Time")=>{
                             let json=object.json.as_ref().ok_or_else(||S::Error::custom("time has no text encoding"))?.as_ref().map_err(S::Error::custom)?;
                             serde_json::from_str::<String>(json).map_err(S::Error::custom)?
@@ -61,6 +61,7 @@ impl serde::Serialize for JsonValue<'_>{
                 let mut object=serializer.serialize_map(Some(entries.len()))?;for(key,value)in entries{object.serialize_entry(&key,&JsonValue(value,self.1+1))?;}object.end()
             }
             V::Nil|V::NilError=>serializer.serialize_none(),V::Bool(value)=>serializer.serialize_bool(*value),
+            V::NamedInt64(value,kind)if kind.kind.starts_with("uint")=>serializer.serialize_u64(*value as u64),
             V::Int(value)|V::Int64(value)|V::NamedInt64(value,_)=>serializer.serialize_i64(*value),
             V::Uint(value)=>serializer.serialize_u64(*value),V::Uint32(value)=>serializer.serialize_u32(*value),V::Uint8(value)=>serializer.serialize_u8(*value),V::Uint16(value)=>serializer.serialize_u16(*value),
             V::Float(value)=>{let text=crate::json_float::format(*value).map_err(S::Error::custom)?;let raw=serde_json::from_str::<&serde_json::value::RawValue>(&text).map_err(S::Error::custom)?;raw.serialize(serializer)},

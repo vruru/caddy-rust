@@ -129,6 +129,17 @@ pub struct CertificateBundle {
     pub metadata: Value,
 }
 
+/// A stable, exact key-only legacy generation. It is never deserialized or
+/// created from certificate metadata. Only the explicit key-reuse load path
+/// can obtain this capability; ordinary partial-resource reads stay strict.
+#[derive(Clone)]
+pub(crate) struct InitialPrivateKey {
+    core:Arc<Core>,base:String,key:Zeroizing<Vec<u8>>,digest:String,
+}
+impl InitialPrivateKey {
+    pub(crate) fn pem(&self)->Zeroizing<Vec<u8>> {self.key.clone()}
+    pub(crate) fn digest(&self)->&str {&self.digest}
+}
 #[derive(Serialize, Deserialize)]
 struct StoreIdentity {
     version: u32,
@@ -173,6 +184,8 @@ struct Transaction {
     lock_name: String,
     lease_owner: String,
     phase: Phase,
+    #[serde(default)]
+    key_only_bootstrap: bool,
     parts: Vec<TxPart>,
 }
 
@@ -741,6 +754,20 @@ impl FsStore {
         let key = key.to_owned();
         self.fenced(lease, move |c| c.data.delete(&key)).await
     }
+    /// A candidate does not wait for an active issuer. Only a structurally
+    /// authenticated transaction in this exact store/scope can defer its read
+    /// to the post-commit worker, which obtains a new lease before recovery.
+    pub(crate) async fn certificate_recovery_pending(&self,issuer:&str,name:&str,expected_lock:&str)->Result<bool> {
+        let key=self.tx_key(Kind::Certificate,issuer,name)?;
+        ensure!(self.state_load(&key.replace(".json",".quarantine")).await?.is_none(),
+            "quarantined storage transaction requires operator review");
+        let Some(raw)=self.state_load(&key).await? else {return Ok(false)};
+        let tx:Transaction=serde_json::from_slice(&raw).map_err(|_|anyhow!("invalid storage transaction journal"))?;
+        self.validate_transaction(&key,&tx)?;
+        ensure!(matches!(tx.kind,Kind::Certificate) && tx.issuer==issuer && tx.name==name && tx.lock_name==expected_lock,
+            "certificate transaction scope changed");
+        Ok(true)
+    }
     async fn pending(&self, kind: Kind, issuer: &str, name: &str) -> Result<bool> {
         let key = self.tx_key(kind, issuer, name)?;
         self.blocking(move |c| pending_core(&c, &key)).await
@@ -924,6 +951,15 @@ impl FsStore {
         issuer: &str,
         name: &str,
     ) -> Result<Option<CertificateBundle>> {
+        let (bundle,initial)=self.load_certificate_generation(issuer,name,false).await?;
+        ensure!(initial.is_none(),"unexpected initial certificate key");Ok(bundle)
+    }
+    pub(crate) async fn load_certificate_for_key_reuse(&self,issuer:&str,name:&str)
+        ->Result<(Option<CertificateBundle>,Option<InitialPrivateKey>)> {
+        self.load_certificate_generation(issuer,name,true).await
+    }
+    async fn load_certificate_generation(&self,issuer:&str,name:&str,allow_initial_key:bool)
+        ->Result<(Option<CertificateBundle>,Option<InitialPrivateKey>)> {
         let base = cert_path(issuer, name)?;
         let mut values = self
             .read_group(
@@ -945,7 +981,12 @@ impl FsStore {
             .pop()
             .ok_or_else(|| anyhow!("incomplete grouped read"))?;
         match (key, crt, meta) {
-            (None, None, None) => Ok(None),
+            (None, None, None) => Ok((None,None)),
+            (Some(key),None,None) if allow_initial_key=>{
+                ensure!(!key.is_empty() && key.len()<=128*1024,"initial certificate key size limit exceeded");
+                let digest=hash(&key);
+                Ok((None,Some(InitialPrivateKey{core:self.core.clone(),base,key,digest})))
+            },
             (Some(key), Some(crt), Some(meta)) => {
                 let metadata = serde_json::from_slice(&meta)
                     .map_err(|_| anyhow!("invalid certificate metadata JSON"))?;
@@ -955,11 +996,11 @@ impl FsStore {
                         || legacy_name0_sans(&crt, &metadata, name)?.is_some(),
                     "certificate metadata storage name mismatch"
                 );
-                Ok(Some(CertificateBundle {
+                Ok((Some(CertificateBundle {
                     chain_pem: crt.to_vec(),
                     private_key_pem: key,
                     metadata,
-                }))
+                }),None))
             }
             _ => bail!("partial certificate material; recovery required, reissuance refused"),
         }
@@ -1018,6 +1059,39 @@ impl FsStore {
         Ok(true)
     }
 
+    /// Copy only an exact key-only generation already known compromised by
+    /// the caller's shared KeyState. This never creates a revocation fact or
+    /// grants a wider certificate namespace than this canonical configured group.
+    pub(crate) async fn archive_initial_private_key(&self,issuer:&str,name:&str,
+        initial:&InitialPrivateKey,expected_spki:[u8;32],authorized_names:&[String],lease:&StorageLease)->Result<bool> {
+        let base=cert_path(issuer,name)?;
+        ensure!(Arc::ptr_eq(&initial.core,&self.core) && initial.base==base
+            && safe(&names_key(authorized_names)?)==safe(name),"initial key archive scope changed");
+        let first=authorized_names.first().ok_or_else(||anyhow!("initial key archive has no authorized name"))?;
+        ensure!(lease.belongs(&self.core,&format!("issue_cert_{first}")),"initial key archive lease scope mismatch");
+        let scoped=self.scoped(&self.tx_key(Kind::Certificate,issuer,name)?,&base,lease).await?;
+        let (_,current)=scoped.load_certificate_for_key_reuse(issuer,name).await?;
+        let Some(current)=current else{return Ok(false);};
+        ensure!(current.digest()==initial.digest(),"initial key archive generation changed");
+        let expected=initial.digest.clone();let key=current.key;
+        scoped.fenced(lease,move|c|{
+            let now=c.data.load(&format!("{base}.key"),true)?.ok_or_else(||anyhow!("initial private key disappeared"))?;
+            ensure!(hash(&now)==expected,"initial private key changed before archive");
+            let signer=crate::certmagic::signing_key(&key,"initial-key-archive")?;
+            let public=signer.public_key().ok_or_else(||anyhow!("initial key public value unavailable"))?;
+            ensure!(<[u8;32]>::from(Sha256::digest(public.as_ref()))==expected_spki,"initial key archive SPKI changed");
+            let primary=format!("{base}.key.compromised");let fallback=format!("{primary}.{}",hash(public.as_ref()));
+            let destination=match c.data.load(&primary,true)? {
+                Some(existing) if existing.as_slice()==key.as_slice()=>return Ok(()),
+                Some(_)=>fallback,None=>primary,
+            };
+            if let Some(existing)=c.data.load(&destination,true)? {
+                ensure!(existing.as_slice()==key.as_slice(),"initial compromised key archive collision");return Ok(());
+            }
+            c.data.store(&destination,&key)
+        }).await?;Ok(true)
+    }
+
     pub async fn save_certificate(
         &self,
         issuer: &str,
@@ -1025,6 +1099,17 @@ impl FsStore {
         bundle: &CertificateBundle,
         lease: &StorageLease,
     ) -> Result<()> {
+        self.save_certificate_generation(issuer,name,bundle,lease,None).await
+    }
+    pub(crate) async fn save_certificate_with_initial_key(&self,issuer:&str,name:&str,
+        bundle:&CertificateBundle,lease:&StorageLease,initial:&InitialPrivateKey)->Result<()> {
+        let base=cert_path(issuer,name)?;
+        ensure!(Arc::ptr_eq(&initial.core,&self.core) && initial.base==base,
+            "initial certificate key belongs to another storage scope");
+        self.save_certificate_generation(issuer,name,bundle,lease,Some(initial.digest())).await
+    }
+    async fn save_certificate_generation(&self,issuer:&str,name:&str,bundle:&CertificateBundle,
+        lease:&StorageLease,initial_key_hash:Option<&str>)->Result<()> {
         validate_certificate(&bundle.chain_pem, &bundle.private_key_pem, &bundle.metadata)?;
         let blocks = crate::certmagic::pem_blocks(&bundle.chain_pem, "certificate-candidate")?;
         let (_, leaf) = x509_parser::parse_x509_certificate(&blocks[0].1)
@@ -1035,6 +1120,8 @@ impl FsStore {
         );
         let sans = metadata_names(&bundle.metadata)?;
         let canonical = safe(&names_key(&sans)?) == safe(name);
+        ensure!(initial_key_hash.is_none() || canonical,
+            "initial certificate key cannot authorize an unanchored Name0 alias scope");
         let legacy = if canonical { None } else {
             Some(legacy_name0_sans(&bundle.chain_pem, &bundle.metadata, name)?
                 .ok_or_else(|| anyhow!("certificate metadata storage name mismatch"))?)
@@ -1068,6 +1155,7 @@ impl FsStore {
                 ),
             ],
             lease,
+            initial_key_hash,
         )
         .await
     }
@@ -1084,7 +1172,7 @@ impl FsStore {
         let key = self.tx_key(kind, issuer, name)?;
         let scoped = self.scoped(&key, base, lease).await?;
         scoped
-            .commit_scoped(kind, issuer, name, base, values, lease)
+            .commit_scoped(kind, issuer, name, base, values, lease, None)
             .await
     }
     async fn commit_scoped(
@@ -1095,6 +1183,7 @@ impl FsStore {
         base: &str,
         values: &[(&str, Zeroizing<Vec<u8>>)],
         lease: &StorageLease,
+        initial_key_hash:Option<&str>,
     ) -> Result<()> {
         let tx_key = self.tx_key(kind, issuer, name)?;
         lease.check().await?;
@@ -1113,10 +1202,15 @@ impl FsStore {
             });
             old.push(value);
         }
-        ensure!(
-            old.iter().all(Option::is_none) || old.iter().all(Option::is_some),
-            "partial existing material; transaction refused"
-        );
+        let key_only_bootstrap=if let Some(expected)=initial_key_hash {
+            ensure!(matches!(kind,Kind::Certificate) && matches!(old.as_slice(),[Some(_),None,None])
+                && old[0].as_ref().is_some_and(|key|hash(key)==expected),
+                "initial certificate key generation changed");
+            true
+        } else {
+            ensure!(old.iter().all(Option::is_none) || old.iter().all(Option::is_some),
+                "partial existing material; transaction refused");false
+        };
         // Validate complete old material as well, so a corrupt old generation is
         // never silently replaced and later reported as merely missing.
         match kind {
@@ -1164,6 +1258,7 @@ impl FsStore {
             lock_name: lease.name().to_owned(),
             lease_owner: lease.owner().to_owned(),
             phase: Phase::Staging,
+            key_only_bootstrap,
             parts,
         };
         self.write_transaction(&tx_key, &tx, lease).await?;
@@ -1569,11 +1664,13 @@ impl FsStore {
                     && p.old_hash.as_ref().is_none_or(|s| is_hex(s, 64))),
             "invalid transaction part manifest"
         );
-        ensure!(
-            tx.parts.iter().all(|p| p.old_hash.is_some())
-                || tx.parts.iter().all(|p| p.old_hash.is_none()),
-            "invalid old transaction generation"
-        );
+        ensure!(if tx.key_only_bootstrap {
+            matches!(tx.kind,Kind::Certificate) && tx.parts.len()==3
+                && tx.parts[0].old_hash.is_some() && tx.parts[1].old_hash.is_none()
+                && tx.parts[2].old_hash.is_none()
+        } else {
+            tx.parts.iter().all(|p|p.old_hash.is_some()) || tx.parts.iter().all(|p|p.old_hash.is_none())
+        },"invalid old transaction generation");
         ensure!(
             !tx.lock_name.is_empty() && tx.lock_name.len() <= 2048 && is_hex(&tx.lease_owner, 32),
             "invalid transaction lease metadata"

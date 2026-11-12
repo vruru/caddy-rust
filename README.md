@@ -5,10 +5,10 @@
 ## Current Status
 
 The project currently covers a specific subset of functionalities:
-*   **CLI**: `fmt`, `adapt`, `validate`, `run`, `start`, `reload`, `stop`, and recovery with `run --resume`.
+*   **CLI**: `fmt`, `adapt`, `validate`, `run`, `start`, `reload`, `stop`, `hash-password` (bcrypt and Argon2id), and recovery with `run --resume`.
 *   **HTTP/Admin**: Transactional endpoints, Host/origin/remote authorization, conditional configurations, and ETag support.
 *   **Transports**: H1, H2, and H3 streaming uploads and downloads, range-conditional responses, compression, reverse proxying (including FastCGI and WebSocket), and load balancing with dynamic upstream health checks.
-*   **TLS & Certificates**: TLS 1.2/1.3, managed and manual certificate support, on-demand ACME (HTTP-01, TLS-ALPN-01), local PKI, OCSP, session tickets, and external certificate retrieval (HTTP, Tailscale).
+*   **TLS & Certificates**: TLS 1.2/1.3, managed and manual certificate support, on-demand ACME (HTTP-01, TLS-ALPN-01), local PKI, OCSP, session tickets, external certificate retrieval (HTTP, Tailscale), generation-scoped Must-Staple requests and private-key reuse.
 *   **Templates & Logic**: Native Go-template, Goldmark and CEL behavior has differential coverage; remaining host methods and edge cases are tracked explicitly.
 
 **Runtime Characteristics**:

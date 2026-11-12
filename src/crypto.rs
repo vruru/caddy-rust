@@ -7,6 +7,8 @@ mod ecdsa;
 mod legacy_sign;
 #[path = "crypto/verification.rs"]
 mod verification;
+#[path = "crypto/x509_signer.rs"]
+pub(crate) mod x509_signer;
 
 use rsa::pkcs8::der::Decode;
 use rustls::{
