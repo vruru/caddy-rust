@@ -63,7 +63,7 @@ fn acme(value: &Value, path: &str) -> Result<Issuer> {
     config.email = object.string("email")?.into();
     for (field, feature) in [
         ("test_ca", "acme_test_ca_retry"),
-        ("account_key", "configured_acme_account_key"),
+
     ] {
         if !object.string(field)?.is_empty() {
             return Err(ConfigError::unsupported(object.at(field), feature));
@@ -123,6 +123,9 @@ fn acme(value: &Value, path: &str) -> Result<Issuer> {
         parsed.validate().map_err(|_|ConfigError::invalid(path))?;
         config.wire.network_proxy=Some(parsed);
     }
+    let account_key = object.string("account_key")?;
+    let account_key = if account_key.is_empty() {None}else{Some(std::sync::Arc::new(
+        super::issuer_account_key::Input::new(account_key).map_err(|_|ConfigError::invalid(object.at("account_key")))?))};
     let roots = object
         .strings("trusted_roots_pem_files")?
         .into_iter()
@@ -130,6 +133,7 @@ fn acme(value: &Value, path: &str) -> Result<Issuer> {
         .collect();
     let mut settings = AcmeSettings {
         config,
+        account_key,
         roots,
         http_port: None,
         alpn_port: None,

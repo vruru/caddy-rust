@@ -7,6 +7,8 @@ mod decode;
 mod error;
 #[path = "tls_app_config/external.rs"]
 mod external;
+#[path = "tls_app_config/issuer_account_key.rs"]
+mod issuer_account_key;
 #[path = "tls_app_config/issuer_parse.rs"]
 mod issuer_parse;
 #[path = "tls_app_config/loaders.rs"]

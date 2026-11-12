@@ -648,3 +648,34 @@ HTTP/1 request body makes that one connection close after the response rather
 than waiting in an unbounded post-handler drain. Bodyless requests retain
 keepalive, while H2/H3 streams remain independently handled. Invalid star-query
 targets retain parser rejection.
+
+
+ACME JSON `account_key` selects an already existing account using a literal PEM
+or a global environment/file placeholder. Preparation runs once per configured
+issuer and generation on the blocking CPU lane. P-256, P-384, RSA and Ed25519
+keys use the native signer; the CA may independently reject an algorithm (the
+stock isolated Pebble policy rejects EdDSA despite a verified valid JWS).
+Unknown or empty placeholder expansion rejects provisioning. A malformed PEM
+is an issuer-local failure, allowing an independent fallback issuer to run.
+An empty literal retains the ordinary automatic-account behavior.
+
+The explicit key path uses `onlyReturnExisting`; it cannot register an unknown
+key or fall back to an unrelated email-selected account. A fenced public
+metadata sidecar is keyed by canonical directory URL and RFC 7638 signer
+identity, contains no PEM, and shares lookup results across concurrent groups.
+Native leaves the historical email account files intact, avoiding the original
+implementation's same-email overwrite. Pending orders still require the same
+authenticated account URL: switching credentials cannot take over an active
+order, and restoring the original credentials resumes the original URL. A
+forced reload rereads a file placeholder even if its path and configuration
+text are unchanged; the current certificate continues serving until a new
+certificate is published. Existing CSR, lease, CAS, key-veto, OCSP and storage
+publication gates continue to apply.
+
+Rust library callers gain `AcmeIssuerConfig::account_key` with type
+`Option<Arc<ConfiguredAccountKey>>`; struct-literal callers must supply that
+field. This is a Rust source interface extension, not a cross-language plugin
+ABI. Signing-key/control input residency is distinct from certificate-chain
+payload pools; this feature does not claim a whole-process heap or RSS bound.
+`test_ca`, the independent ZeroSSL API issuer, DNS solver/resolver/ECH options,
+and client-auth PKI/storage/HTTP CA providers remain explicitly unfinished.

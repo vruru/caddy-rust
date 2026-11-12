@@ -292,6 +292,7 @@ impl CertificateServices {
                 // business email-based DefaultIssuers factory.
                 policy.issuers = vec![Issuer::Acme(Box::new(AcmeSettings {
                     config: AcmeIssuerConfig::lets_encrypt(),
+                    account_key: None,
                     roots: Vec::new(),
                     http_port: None,
                     alpn_port: None,
@@ -346,6 +347,9 @@ impl CertificateServices {
                     unreachable!()
                 };
                 let mut issuer = settings.config.clone();
+                if let Some(input) = &settings.account_key {
+                    issuer.account_key = Some(input.prepare(self.context.resources.cpu.clone(),cancel.clone()).await?);
+                }
                 issuer.leaf_key_type = policy.key_type;
                 for path in &settings.roots {
                     let path = absolute(&self.context.paths.cwd, path);

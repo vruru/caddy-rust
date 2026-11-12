@@ -20,6 +20,7 @@ pub(super) enum Issuer {
 #[derive(Clone)]
 pub(super) struct AcmeSettings {
     pub config: AcmeIssuerConfig,
+    pub account_key: Option<std::sync::Arc<super::issuer_account_key::Input>>,
     pub roots: Vec<PathBuf>,
     pub http_port: Option<u16>,
     pub alpn_port: Option<u16>,

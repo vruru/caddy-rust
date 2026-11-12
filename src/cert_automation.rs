@@ -5,6 +5,9 @@
 //! service; deployments must keep only one active certificate-manager runtime.
 
 mod job_codec;
+mod account_key;
+mod configured_account;
+pub use account_key::ConfiguredAccountKey;
 
 use crate::{
     acme_wire::{
@@ -83,6 +86,7 @@ pub struct AcmeIssuerConfig {
     pub wire: WireOptions,
     pub email: String,
     pub account_key_type: KeyType,
+    pub account_key: Option<Arc<ConfiguredAccountKey>>,
     pub leaf_key_type: KeyType,
     pub certificate_lifetime_ns: i64,
     pub profile: String,
@@ -104,6 +108,7 @@ impl AcmeIssuerConfig {
             },
             email: String::new(),
             account_key_type: KeyType::P256,
+            account_key: None,
             leaf_key_type: KeyType::P256,
             certificate_lifetime_ns: 0,
             profile: String::new(),
@@ -350,6 +355,7 @@ impl AutomationResources {
         hash.update(ino.to_be_bytes());
         frame(&mut hash, config.wire.directory.as_bytes());
         frame(&mut hash, config.email.as_bytes());
+        match &config.account_key {Some(key)=>{hash.update([1]);frame(&mut hash,key.fingerprint().as_bytes());},None=>hash.update([0]),}
         frame(&mut hash, config.profile.as_bytes());
         frame(&mut hash,&serde_json::to_vec(&config.preferred_chains)?);
         hash.update(config.certificate_lifetime_ns.to_be_bytes());
@@ -1861,6 +1867,9 @@ impl CertificateManager {
         expected_location: Option<&str>,
         cancel: &CancellationToken,
     ) -> Result<AccountSession> {
+        if let Some(key) = &issuer.config.account_key {
+            return self.configured_account(issuer, wire, key, expected_location, cancel).await;
+        }
         for _ in 0..8 {
             match self
                 .account_once(issuer, wire, expected_location, cancel)
