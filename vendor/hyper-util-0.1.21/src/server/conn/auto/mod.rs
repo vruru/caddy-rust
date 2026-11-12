@@ -1023,6 +1023,11 @@ pub struct Http2Builder<'a, E> {
 
 #[cfg(feature = "http2")]
 impl<E> Http2Builder<'_, E> {
+    /// Enable bounded HTTP/2 push using one shared concrete metadata pool.
+    pub fn server_push(&mut self,pending:usize,live:usize,pool:hyper::ext::ServerPushPool)->&mut Self{
+        self.inner.http2.server_push(pending,live,pool);self
+    }
+
     /// Enable informational responses with aggregate per-request count and
     /// header-byte limits. A zero limit disables them.
     pub fn informational_responses(

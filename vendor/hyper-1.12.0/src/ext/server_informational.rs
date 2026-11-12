@@ -328,14 +328,12 @@ pub(crate) fn install(
             return previous;
         }
     }
-    let shared = Arc::new(Shared {
-        flags: AtomicU8::new(0),
-        state: Mutex::new(State::default()),
-        limits,
-        emit_interims,
-    });
-    request
-        .body_mut()
-        .set_informational(InformationalSender(shared.clone()));
-    InformationalReceiver(shared)
+    let (sender,receiver)=channel(limits,emit_interims);
+    request.body_mut().set_informational(sender);
+    receiver
+}
+
+pub(crate) fn channel(limits:InformationalLimits,emit_interims:bool)->(InformationalSender,InformationalReceiver){
+    let shared=Arc::new(Shared{flags:AtomicU8::new(0),state:Mutex::new(State::default()),limits,emit_interims});
+    (InformationalSender(shared.clone()),InformationalReceiver(shared))
 }

@@ -1624,6 +1624,13 @@ impl Future for PushedResponseFuture {
 }
 
 impl PushedResponseFuture {
+    /// Poll an informational response on this promised stream before polling
+    /// the final response. The same per-stream ordering applies as ordinary
+    /// response futures; no parent or sibling response is consumed.
+    pub fn poll_informational(&mut self,cx:&mut Context<'_>)->Poll<Option<Result<Response<()>,crate::Error>>>{
+        self.inner.poll_informational(cx)
+    }
+
     /// Returns the stream ID of the response stream.
     ///
     /// # Panics

@@ -1436,6 +1436,14 @@ impl<B: Buf> SendPushedResponse<B> {
         self.inner.send_response_observed_with_policy(response, end_of_stream, credit, deadline)
     }
 
+    /// Observe a 1xx response on this promised stream without closing it.
+    pub fn send_informational_observed_with_policy(
+        &mut self, response: Response<()>, credit: Option<bytes::Bytes>,
+        policy: Option<crate::ext::DataWritePolicy>,
+    ) -> Result<crate::ext::DataWriteReceipt<B>, crate::Error> {
+        self.inner.send_informational_observed_with_policy(response, credit, policy)
+    }
+
     /// Send a stream reset to the peer.
     ///
     /// This essentially cancels the stream, including any inbound or outbound

@@ -58,6 +58,7 @@ pub(crate) struct Config {
     pub(crate) max_header_list_size: u32,
     pub(crate) date_header: bool,
     pub(crate) informational: Option<crate::ext::InformationalLimits>,
+    pub(crate) push:Option<crate::ext::PushLimits>,
 }
 
 impl Default for Config {
@@ -79,6 +80,7 @@ impl Default for Config {
             max_header_list_size: DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE,
             date_header: true,
             informational: None,
+            push:None,
         }
     }
 }
@@ -95,6 +97,8 @@ pin_project! {
         state: State<T, B>,
         date_header: bool,
         informational: Option<crate::ext::InformationalLimits>,
+        push:Option<crate::ext::PushLimits>,
+        push_activity:Option<std::sync::Arc<crate::ext::PushActivity>>,
         close_pending: bool,
         idle_timeout: Option<Duration>,
     }
@@ -126,6 +130,8 @@ where
     idle_closing: Option<Pin<Box<dyn Sleep>>>,
     date_header: bool,
     informational: Option<crate::ext::InformationalLimits>,
+    push:Option<crate::ext::PushLimits>,
+        push_activity:Option<std::sync::Arc<crate::ext::PushActivity>>,
 }
 
 impl<T, S, B, E> Server<T, S, B, E>
@@ -180,6 +186,7 @@ where
             keep_alive_while_idle: true,
         };
 
+        let push_activity=config.push.as_ref().and_then(crate::ext::PushActivity::new);
         Server {
             exec,
             timer,
@@ -190,6 +197,8 @@ where
             service,
             date_header: config.date_header,
             informational: config.informational,
+            push:if push_activity.is_some(){config.push.clone()}else{None},
+            push_activity,
             close_pending: false,
             idle_timeout: config.idle_timeout,
         }
@@ -242,6 +251,8 @@ where
                         idle_closing: None,
                         date_header: me.date_header,
                         informational: me.informational,
+                        push:me.push.clone(),
+                        push_activity:me.push_activity.clone(),
                     })
                 }
                 State::Serving(srv) => {
@@ -290,13 +301,14 @@ where
             loop {
                 self.poll_ping(cx);
 
+                if let Some(activity)=&self.push_activity{activity.register(cx);}
                 let next = match self.conn.poll_accept(cx) {
                     Poll::Ready(next) => {
                         self.idle = None;
                         next
                     }
                     Poll::Pending => {
-                        if self.conn.has_active_streams() {
+                        if self.conn.has_active_streams()||self.push_activity.as_ref().is_some_and(|activity|activity.active()) {
                             self.idle = None;
                         } else if let Some(duration) = self.idle_timeout {
                             let sleep = self.idle.get_or_insert_with(|| self.timer.sleep(duration));
@@ -375,6 +387,9 @@ where
                         let informational = self.informational.map(|limits| {
                             crate::ext::install_informational(&mut req, limits, None)
                         });
+                        let push= self.push.as_ref().and_then(|limits|crate::ext::install_push(&mut req,limits))
+                            .and_then(|receiver|PushState::new(receiver,self.informational,self.date_header,self.timer.clone(),self.push_activity.as_ref()?.clone()));
+                        if push.is_none(){req.extensions_mut().remove::<crate::ext::ServerPush>();}
                         let fut = H2Stream::new(
                             service.call(req),
                             connect_parts,
@@ -384,6 +399,7 @@ where
                             informational,
                             ContinueOnRead::new(continue_demand),
                             self.timer.clone(),
+                            push,
                         );
 
                         exec.execute_h2stream(fut);
@@ -445,6 +461,8 @@ pin_project! {
         interim_write: Option<Box<super::response_write::Controlled<B::Data>>>,
         interim_ack: Option<tokio::sync::oneshot::Sender<()>>,
         ready_response: Option<Box<Response<B>>>,
+        push:Option<PushState<B::Data>>,
+        parent_done:bool,
         date_header: bool,
         exec: E,
     }
@@ -468,6 +486,7 @@ pin_project! {
             pipe: PipeToSendStream<B>,
         },
         FlushingResponseHead,
+        Done,
     }
 }
 
@@ -490,6 +509,7 @@ where
         informational: Option<crate::ext::InformationalReceiver>,
         continue_on_read: ContinueOnRead,
         write_timer: Time,
+        push:Option<PushState<B::Data>>,
     ) -> H2Stream<F, B, E> {
         H2Stream {
             reply: respond,
@@ -503,6 +523,7 @@ where
             interim_write: None,
             interim_ack: None,
             ready_response: None,
+            push,parent_done:false,
             write_timer,
             date_header,
             exec,
@@ -876,6 +897,7 @@ where
                     }
                     result => return result,
                 },
+                H2StreamStateProj::Done=>return Poll::Ready(Ok(())),
                 H2StreamStateProj::FlushingResponseHead => {
                     // The existing reply handle keeps the stream referenced
                     // even after the response body and its send handle finish.
@@ -903,15 +925,81 @@ where
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.as_mut().poll2(cx) {
-            Poll::Ready(Err(_e)) => {
-                let me = self.project();
-                if me.interim_write.is_some() { me.reply.send_reset(Reason::CANCEL); }
-                debug!("stream error: {}", _e);
-                Poll::Ready(())
+        {
+            let me=self.as_mut().project();
+            if let Some(push)=me.push.as_mut(){push.poll(cx,me.reply,!*me.parent_done);}
+        }
+        if !*self.as_mut().project().parent_done {
+            if let Poll::Ready(result)=self.as_mut().poll2(cx){
+                let mut me=self.as_mut().project();
+                if let Err(error)=result{
+                    if me.interim_write.is_some(){me.reply.send_reset(Reason::CANCEL);}
+                    debug!("stream error: {}",error);
+                }
+                *me.parent_done=true;
+                // Destroy the finished/cancelled parent's application future and
+                // body now. Accepted children have independent transport owners.
+                me.state.set(H2StreamState::Done);
+                drop(me.interim_write.take());drop(me.interim_ack.take());
+                drop(me.ready_response.take());drop(me.response_head.take());
             }
-            Poll::Ready(Ok(())) => Poll::Ready(()),
-            Poll::Pending => Poll::Pending,
+        }
+        let me=self.project();
+        if let Some(push)=me.push.as_mut(){
+            push.poll(cx,me.reply,!*me.parent_done);
+            if *me.parent_done && push.children.is_empty(){*me.push=None;}
+        }
+        if *me.parent_done && me.push.is_none(){Poll::Ready(())}else{Poll::Pending}
+    }
+}
+
+struct PushState<D:bytes::Buf>{
+    receiver:crate::ext::PushReceiver,
+    children:Vec<super::child_push::Child<D>>,
+    informational:Option<crate::ext::InformationalLimits>,
+    date_header:bool,
+    timer:Time,
+    activity:std::sync::Arc<crate::ext::PushActivity>,
+    _vector:native_write_policy::Lease,
+}
+impl<D:bytes::Buf> PushState<D>{
+    fn new(receiver:crate::ext::PushReceiver,informational:Option<crate::ext::InformationalLimits>,date_header:bool,timer:Time,activity:std::sync::Arc<crate::ext::PushActivity>)->Option<Self>{
+        let bytes=std::mem::size_of::<super::child_push::Child<D>>().checked_mul(receiver.limit)?.checked_add(256)?;
+        let credit=receiver.pool.reserve(bytes).ok()?;
+        let children=Vec::with_capacity(receiver.limit);
+        Some(Self{receiver,children,informational,date_header,timer,activity,_vector:credit})
+    }
+}
+impl<D:bytes::Buf+'static> PushState<D>{
+    fn poll(&mut self,cx:&mut Context<'_>,parent:&mut SendResponse<SendBuf<D>>,admit:bool){
+        let mut index=0;
+        while index<self.children.len(){
+            if self.children[index].poll(cx).is_ready(){drop(self.children.swap_remove(index));}else{index+=1;}
+        }
+        if !admit{self.receiver.close();}
+        for _ in 0..16{
+            let request=match self.receiver.poll(cx){Poll::Ready(Some(request))=>request,_=>break};
+            let crate::ext::PushRequest{request,control,reply,retained}=request;
+            if !admit{let _=reply.send(Err(crate::ext::PushError::Closed));continue;}
+            if self.children.len()>=self.receiver.limit{let _=reply.send(Err(crate::ext::PushError::Full));continue;}
+            // Includes Tokio's 32-slot minimum mailbox allocation and interim
+            // state/ack/cancel cells before creating any child channel.
+            let bytes=std::mem::size_of::<crate::ext::PushWrite>().saturating_mul(64).saturating_add(16384);
+            let allocation=match self.receiver.pool.reserve(bytes){Ok(lease)=>std::sync::Arc::new(lease),Err(_)=>{let _=reply.send(Err(crate::ext::PushError::Full));continue}};
+            let owner=match control.claim(){Ok(owner)=>owner,Err(_)=>{let _=reply.send(Err(crate::ext::PushError::Protocol));continue}};
+            if owner.start_boundary(0,self.timer.now()).is_err(){let _=reply.send(Err(crate::ext::PushError::Write));continue}
+            let policy=match super::response_write::compiled_policy(&owner){Ok(policy)=>Some(policy),Err(_)=>{let _=reply.send(Err(crate::ext::PushError::Write));continue}};
+            let retained=bytes::Bytes::from_owner(PushCredit{_request:retained,_control:owner.retention(),_protocol:allocation.clone()});
+            let (response,promise)=match parent.push_request_observed(request,retained.clone(),policy){Ok(pair)=>pair,Err(_)=>{let _=reply.send(Err(crate::ext::PushError::Write));continue}};
+            let(writer,rx,abort,informational)=crate::ext::push_writer(retained.clone(),self.informational,allocation.clone());
+            let mut child=super::child_push::Child::new(response,owner,promise,self.timer.clone(),rx,abort,retained,self.date_header,allocation,informational,self.activity.acquire());
+            if reply.send(Ok(writer)).is_err(){drop(child);continue;}
+            // Register child wire/reset wakes before returning to a pending
+            // parent future; accepted work cannot rely on another request.
+            if child.poll(cx).is_pending(){self.children.push(child);}
         }
     }
 }
+
+struct PushCredit{_request:bytes::Bytes,_control:Option<bytes::Bytes>,_protocol:std::sync::Arc<native_write_policy::Lease>}
+impl AsRef<[u8]> for PushCredit{fn as_ref(&self)->&[u8]{&[]}}

@@ -16,6 +16,8 @@ use crate::body::Body;
 pub(crate) mod ping;
 #[cfg(feature = "server")]
 mod response_write;
+#[cfg(feature = "server")]
+mod child_push;
 pub(crate) mod upgrade;
 #[cfg(feature = "server")]
 type OptControlled<D> = Option<Box<response_write::Controlled<D>>>;

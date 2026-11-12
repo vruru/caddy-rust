@@ -62,10 +62,17 @@ pub use send_completion::{SendCompletion, SendOutcome};
 mod server_informational;
 #[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
 pub(crate) use server_informational::{
-    install as install_informational, InformationalHead, InformationalLimits, InformationalReceiver,
+    channel as informational_channel, install as install_informational, InformationalHead, InformationalLimits, InformationalReceiver,
 };
 #[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
 pub use server_informational::{InformationalError, InformationalSender};
+
+#[cfg(all(feature = "server", feature = "http2"))]
+mod server_push;
+#[cfg(all(feature = "server", feature = "http2"))]
+pub use server_push::{ServerPush, PushWriter, PushError};
+#[cfg(all(feature = "server", feature = "http2"))]
+pub(crate) use server_push::{install as install_push, writer as push_writer, PushReceiver, PushRequest, PushWrite, PushLimits, PushActivity, PushActivityGuard};
 
 #[cfg(feature = "http1")]
 pub mod trailer_compat;
@@ -306,3 +313,7 @@ impl OriginalHeaderOrder {
         self.entry_order.iter()
     }
 }
+
+/// Shared concrete metadata budget for opt-in server Push.
+#[cfg(all(feature="server",feature="http2"))]
+pub use native_write_policy::Pool as ServerPushPool;

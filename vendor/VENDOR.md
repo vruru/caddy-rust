@@ -175,3 +175,25 @@ bytes and the public retry-verification boundary on a bounded CPU lane; raw
 observations, abandoned worker results and service shutdown retain their actual
 owners. See COMPATIBILITY.md for limits and unfinished server/client-identity
 capabilities.
+
+
+Hyper exposes an opt-in, bounded HTTP/2 server-push command bridge. A request
+extension admits promises without adding Clone/Send bounds to unrelated
+Services or generic response data. Accepted children retain independent output
+owners after normal parent completion or parent RST; a child cancellation,
+failed control identity, expired write deadline or admission denial affects
+that child only. Their one-item output mailboxes wait for actual local
+HEADERS/DATA/trailer flush receipts, including flow-control and continuation
+boundaries; this is not proof of remote application consumption. Unique interim
+writers preserve 1xx/final ordering. The h2 pushed-response client exposes the
+same informational polling as an ordinary response future.
+
+One concrete shared allocation pool prepays parent queues, child storage and
+writer/interim metadata. Retained request/frame credit survives actual protocol
+owners, while DATA carries its own source ownership. A separate per-connection
+accepted-child activity guard prevents idle-close while reserved pushes are
+still generating responses; RFC concurrent-stream counters omit reserved
+states and cannot replace this guard. Last-child retirement wakes the idle
+poller outside h2 and activity-state locks. Ordinary listeners leave this
+extension disabled. Native route-level push dispatch remains separate and is
+not enabled merely by these transport APIs.

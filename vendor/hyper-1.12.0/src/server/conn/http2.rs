@@ -309,6 +309,14 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Enable bounded HTTP/2 pushed responses. The pool prepays actual channel
+    /// and child-slot metadata across all connections using this builder.
+    /// Zero limits disable push; pending above 16 or live above 64 are rejected
+    /// by disabling the optional extension.
+    pub fn server_push(&mut self,pending:usize,live:usize,pool:native_write_policy::Pool)->&mut Self{
+        self.h2_builder.push=crate::ext::PushLimits::new(pending,live,pool);self
+    }
+
     /// Set whether the `date` header should be included in HTTP responses.
     ///
     /// Note that including the `date` header is recommended by RFC 7231.
