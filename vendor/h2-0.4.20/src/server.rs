@@ -1298,6 +1298,22 @@ impl<B: Buf> SendResponse<B> {
     pub fn send_response_observed_with_policy(&mut self,response:Response<()>,end_of_stream:bool,credit:Option<bytes::Bytes>,policy:Option<crate::ext::DataWritePolicy>)->Result<(SendStream<B>,crate::ext::DataWriteReceipt<B>),crate::Error>{
         self.inner.send_response_observed(response,end_of_stream,credit,policy).map(|receipt|(SendStream::new(self.inner.clone()),receipt)).map_err(Into::into)
     }
+    /// Observes an interim header block through its actual physical flush.
+    /// The receipt retains the same bounded ownership as final observed headers.
+    #[doc(hidden)]
+    pub fn send_informational_observed_with_policy(
+        &mut self, mut response: Response<()>, credit: Option<bytes::Bytes>,
+        policy: Option<crate::ext::DataWritePolicy>,
+    ) -> Result<crate::ext::DataWriteReceipt<B>, crate::Error> {
+        if !response.status().is_informational() {
+            return Err(UserError::InvalidInformationalStatusCode.into());
+        }
+        // Foreign extension destructors must run outside stream/store locks.
+        response.extensions_mut().clear();
+        let frame = Peer::convert_send_message(self.inner.stream_id(), response, false);
+        self.inner.send_informational_observed(frame, credit, policy).map_err(Into::into)
+    }
+
     /// Sends final response headers on this stream.
     pub fn send_response(
         &mut self,

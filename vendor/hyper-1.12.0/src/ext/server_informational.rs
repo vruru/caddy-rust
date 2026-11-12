@@ -69,6 +69,8 @@ struct State {
     bytes: usize,
     waker: Option<Waker>,
     pending: Option<InformationalHead>,
+    write_control: Option<crate::ext::ResponseWriteControl>,
+    write_control_delivered: bool,
 }
 
 struct Shared {
@@ -127,8 +129,25 @@ impl InformationalSender {
         request.body_mut().take_informational()
     }
 
+    /// Bind an existing response scope before an automatic 100 response is
+    /// demanded by the first request-body read. This writes no headers and
+    /// starts no pending-output clock. Rebinding a different scope is rejected.
+    pub fn bind_write_control(&mut self,control:crate::ext::ResponseWriteControl)->Result<(),InformationalError>{
+        if !self.0.touch(){return Err(InformationalError(ErrorKind::Closed))}
+        let (result,waker)={
+            let mut state=self.0.state();
+            if self.0.closed(){(Err(InformationalError(ErrorKind::Closed)),None)}
+            else if let Some(current)=&state.write_control {
+                (if current.same_control(&control){Ok(())}else{Err(InformationalError(ErrorKind::Busy))},None)
+            }else{state.write_control=Some(control.clone());(Ok(()),state.waker.take())}
+        };
+        if let Some(waker)=waker{waker.wake();}
+        result
+    }
+
     /// Write a 1xx response (excluding 101). HTTP/1 completes after IO flush;
-    /// HTTP/2 completes when the connection has accepted the header frame.
+    /// Controlled HTTP/2 completes after the actual header-block IO flush;
+    /// ordinary HTTP/2 completes when the connection accepts the header frame.
     /// A duplicate 100 for the same Expect exchange may be suppressed.
     ///
     /// Dropping the future withdraws an unconsumed head. A head already taken
@@ -213,6 +232,23 @@ pub(crate) struct InformationalHead {
 pub(crate) struct InformationalReceiver(Arc<Shared>);
 
 impl InformationalReceiver {
+    pub(crate) fn poll_write_control(&mut self,cx:&mut Context<'_>)->Option<crate::ext::ResponseWriteControl>{
+        if !self.0.touch(){return None}
+        let incoming=cx.waker().clone();
+        let (control,old)={
+            let mut state=self.0.state();
+            if self.0.closed(){(None,None)}else{
+                let old=state.waker.replace(incoming);
+                let control=if state.write_control_delivered{None}else{
+                    let control=state.write_control.clone();
+                    if control.is_some(){state.write_control_delivered=true;}
+                    control
+                };
+                (control,old)
+            }
+        };
+        drop(old);control
+    }
     pub(crate) fn poll_take(&mut self, cx: &mut Context<'_>) -> Poll<InformationalHead> {
         if !self.0.touch() {
             return Poll::Pending;

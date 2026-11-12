@@ -42,7 +42,7 @@ impl<D: Buf> Controlled<D> {
     pub(super) fn new(
         owner: ResponseWriteOwner,
         timer: Time,
-        header: h2::ext::DataWriteReceipt<SendBuf<D>>,
+        header: Option<h2::ext::DataWriteReceipt<SendBuf<D>>>,
         ended: bool,
     ) -> Self
     where
@@ -59,7 +59,7 @@ impl<D: Buf> Controlled<D> {
             timer,
             sleep: None,
             sleep_at: None,
-            receipt: Some(header),
+            receipt: header,
             reported: 0,
             wire_seen: None,
             chunk: None,
@@ -114,41 +114,13 @@ impl<D: Buf> Controlled<D> {
         }
         Poll::Pending
     }
-    pub(super) fn poll<S>(
-        &mut self,
-        mut body: Pin<&mut S>,
-        tx: &mut h2::SendStream<SendBuf<D>>,
-        cx: &mut Context<'_>,
-    ) -> Poll<crate::Result<()>>
-    where
-        S: Body<Data = D>,
-        S::Error: Into<Box<dyn StdError + Send + Sync>>,
-    {
-        let result = self.poll_inner(body.as_mut(), tx, cx);
-        if matches!(&result, Poll::Ready(Err(_))) {
-            // Drop the receipt only after send_reset releases its stream/store lock.
-            // Actual queued/codec tails retain payload and metadata independently.
-            tx.send_reset(h2::Reason::CANCEL);
-            self.receipt = None;
-            self.chunk = None;
-            self.owner.abandon();
-        }
-        result
+    pub(super) fn owner(&self) -> &ResponseWriteOwner { &self.owner }
+    pub(super) fn set_header(&mut self, receipt: h2::ext::DataWriteReceipt<SendBuf<D>>, ended: bool) {
+        debug_assert!(self.receipt.is_none());
+        self.receipt = Some(receipt); self.ended = ended;
     }
-    fn poll_inner<S>(
-        &mut self,
-        mut body: Pin<&mut S>,
-        tx: &mut h2::SendStream<SendBuf<D>>,
-        cx: &mut Context<'_>,
-    ) -> Poll<crate::Result<()>>
-    where
-        S: Body<Data = D>,
-        S::Error: Into<Box<dyn StdError + Send + Sync>>,
-    {
-        loop {
-            if let Poll::Ready(reset) = tx.poll_reset(cx).map_err(Self::error)? {
-                return Poll::Ready(Err(Self::error(h2::Error::from(reset))));
-            }
+    /// A header-only wait uses the existing stream task and its one timer.
+    pub(super) fn poll_header(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
             if let Some(receipt) = self.receipt.as_ref() {
                 let mut state = receipt.snapshot();
                 // Register before checking the absolute deadline, then re-read to
@@ -192,10 +164,7 @@ impl<D: Buf> Controlled<D> {
                     self.receipt = None;
                     self.reported = 0;
                     self.wire_seen = None;
-                    if self.ended {
-                        self.owner.finish().map_err(Self::error)?;
-                        return Poll::Ready(Ok(()));
-                    }
+                    return Poll::Ready(Ok(()));
                 } else {
                     if matches!(state.outcome, Some(h2::ext::SendOutcome::Abandoned)) {
                         return Poll::Ready(Err(Self::error("HTTP/2 response boundary abandoned")));
@@ -212,6 +181,53 @@ impl<D: Buf> Controlled<D> {
                     }
                     return Poll::Pending;
                 }
+            }
+
+        if let Poll::Ready(result) = self.poll_deadline(cx) { return Poll::Ready(result); }
+        Poll::Ready(Ok(()))
+    }
+    pub(super) fn poll<S>(
+        &mut self,
+        mut body: Pin<&mut S>,
+        tx: &mut h2::SendStream<SendBuf<D>>,
+        cx: &mut Context<'_>,
+    ) -> Poll<crate::Result<()>>
+    where
+        S: Body<Data = D>,
+        S::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let result = self.poll_inner(body.as_mut(), tx, cx);
+        if matches!(&result, Poll::Ready(Err(_))) {
+            // Drop the receipt only after send_reset releases its stream/store lock.
+            // Actual queued/codec tails retain payload and metadata independently.
+            tx.send_reset(h2::Reason::CANCEL);
+            self.receipt = None;
+            self.chunk = None;
+            self.owner.abandon();
+        }
+        result
+    }
+    fn poll_inner<S>(
+        &mut self,
+        mut body: Pin<&mut S>,
+        tx: &mut h2::SendStream<SendBuf<D>>,
+        cx: &mut Context<'_>,
+    ) -> Poll<crate::Result<()>>
+    where
+        S: Body<Data = D>,
+        S::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        loop {
+            if let Poll::Ready(reset) = tx.poll_reset(cx).map_err(Self::error)? {
+                return Poll::Ready(Err(Self::error(h2::Error::from(reset))));
+            }
+            match self.poll_header(cx) {
+                Poll::Ready(Ok(())) => {},
+                result => return result,
+            }
+            if self.ended {
+                self.owner.finish().map_err(Self::error)?;
+                return Poll::Ready(Ok(()));
             }
 
             if let Poll::Ready(result) = self.poll_deadline(cx) {

@@ -679,3 +679,22 @@ ABI. Signing-key/control input residency is distinct from certificate-chain
 payload pools; this feature does not claim a whole-process heap or RSS bound.
 `test_ca`, the independent ZeroSSL API issuer, DNS solver/resolver/ECH options,
 and client-auth PKI/storage/HTTP CA providers remain explicitly unfinished.
+
+Controlled HTTP/2 informational output
+------------------------------------
+
+Opt-in physical-output controls can bind before an automatic `100 Continue`
+without sending a header or starting an idle clock. Interim and final headers
+share one uniquely claimed stream owner. Controlled informational acknowledgments
+wait for actual HEADERS/CONTINUATION flush; socket acceptance alone is insufficient.
+A stalled stream is reset independently, while a hard ceiling also applies
+while its application source is pending. Completed physical boundaries preserve
+their actual completion before timer checks.
+
+One bounded ready-final slot retains the response while an interim is pending.
+Callers prepay its generic body size with the native H2 allowance; existing
+header/payload storage and connection tables retain separate actual owners.
+Replacing route clauses between acknowledged boundaries requires the same pool,
+no pending output and no final payload progress, preserving all outer clauses.
+Controlled HTTP/2 CONNECT tunnel handoff remains an explicit unsupported path.
+Route/server timeout configuration remains a development integration gate.

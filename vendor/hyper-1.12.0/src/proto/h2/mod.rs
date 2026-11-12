@@ -135,21 +135,9 @@ where
     }
 
     #[cfg(feature = "server")]
-    fn new_controlled(
-        stream: S,
-        tx: SendStream<SendBuf<S::Data>>,
-        owner: crate::ext::ResponseWriteOwner,
-        timer: crate::common::time::Time,
-        head: h2::ext::DataWriteReceipt<SendBuf<S::Data>>,
-        ended: bool,
-    ) -> Self
-    where
-        S::Data: 'static,
-    {
+    fn with_controlled(stream: S, tx: SendStream<SendBuf<S::Data>>, controlled: Box<response_write::Controlled<S::Data>>) -> Self {
         let mut pipe = Self::new(stream, tx);
-        pipe.controlled = Some(Box::new(response_write::Controlled::new(
-            owner, timer, head, ended,
-        )));
+        pipe.controlled = Some(controlled);
         pipe
     }
     #[cfg(feature = "client")]

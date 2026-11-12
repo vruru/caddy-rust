@@ -92,6 +92,15 @@ impl ResponseWriteControl {
     #[cfg(feature = "http2")]
     pub const H2_PROTOCOL_ALLOCATION_UPPER_BYTES: usize =
         h2::ext::DATA_WRITE_ALLOCATION_UPPER_BYTES + 4096;
+    /// Native HTTP/2 allowance including its one bounded ready-final slot.
+    /// The generic body is moved, never duplicated; its pre-existing payload
+    /// and header allocations remain separately owned and prepaid by the caller.
+    #[cfg(feature = "http2")]
+    pub fn native_h2_protocol_allocation_upper_bytes<B: crate::body::Body<Data = Bytes>>() -> Option<usize> {
+        Self::H2_PROTOCOL_ALLOCATION_UPPER_BYTES
+            .checked_add(std::mem::size_of::<http::Response<B>>())?
+            .checked_add(std::mem::align_of::<http::Response<B>>())
+    }
     /// Additional native HTTP/1 allowance for Bytes encoding, the native
     /// bounded timer/owner, and one queued final response while an interim or
     /// automatic 100 boundary is still flushing. Existing payload/header
@@ -137,6 +146,28 @@ impl ResponseWriteControl {
     pub fn allocation_pool(&self)->Option<native_write_policy::Pool>{
         self.0.lock().unwrap_or_else(|e|e.into_inner()).policies.as_ref().map(|p|p.allocation_pool())
     }
+    /// Replace the complete compiled native clause set between physical
+    /// boundaries, before any response payload has been transmitted. This is
+    /// for the same producer adding nested route settings after an acknowledged
+    /// interim response; callers must retain all earlier active constraints.
+    /// The concrete allocation pool cannot change, and failed replacement does
+    /// not mutate the current policy. No external configuration wake is provided.
+    pub fn replace_scoped_policies(&self,policies:Arc<native_write_policy::PolicySet>)->Result<(),WriteControlError>{
+        let old={
+            let mut state=self.0.lock().unwrap_or_else(|e|e.into_inner());
+            let current=state.policies.as_ref().ok_or(WriteControlError)?;
+            if state.snapshot.terminal.is_some() || state.snapshot.pending_since.is_some()
+                || state.snapshot.flushed_bytes!=0
+                || !current.allocation_pool().same_owner(&policies.allocation_pool()) {
+                return Err(WriteControlError);
+            }
+            bump(&mut state.snapshot)?;
+            state.policies.replace(policies)
+        };
+        drop(old);Ok(())
+    }
+    /// Whether both handles refer to the same concrete response scope.
+    pub fn same_control(&self,other:&Self)->bool{Arc::ptr_eq(&self.0,&other.0)}
     /// Returns the immutable compiled policy.
     pub fn policy(&self) -> WritePolicy {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).policy

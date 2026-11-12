@@ -1372,6 +1372,22 @@ impl<B> StreamRef<B> {
         }
     }
 
+    pub fn send_informational_observed(
+        &mut self, mut frame: frame::Headers, credit: Option<Bytes>,
+        deadline: Option<crate::ext::DataWritePolicy>,
+    ) -> Result<crate::ext::DataWriteReceipt<B>, UserError> where B: Buf {
+        let queue = self.send_buffer.data_receipts
+            .get_or_init(|| crate::data_receipt::DeferredData::new(credit.clone())).clone();
+        let (receipt, owner, source) = crate::ext::DataWriteReceipt::new(
+            self.clone(), Bytes::new(), credit, queue.clone(), deadline,
+        ).ok_or(UserError::Rejected)?;
+        frame.set_receipt(owner, source);
+        let result = self.send_informational_headers(frame);
+        queue.drain();
+        result?;
+        Ok(receipt)
+    }
+
     pub fn send_informational_headers(&mut self, frame: frame::Headers) -> Result<(), UserError> {
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;

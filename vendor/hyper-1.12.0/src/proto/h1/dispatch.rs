@@ -54,6 +54,8 @@ pub(crate) trait Dispatch {
         -> crate::Result<()>;
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ()>>;
     fn should_poll(&self) -> bool;
+    #[cfg(feature="server")]
+    fn poll_write_control(&mut self,_cx:&mut Context<'_>)->Option<crate::ext::ResponseWriteControl>{None}
     #[cfg(feature = "server")]
     fn poll_informational(&mut self, _cx: &mut Context<'_>) -> Poll<InformationalHead> {
         Poll::Pending
@@ -392,6 +394,10 @@ where
     fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         loop {
             #[cfg(feature="server")]
+            if let Some(control)=self.dispatch.poll_write_control(cx){
+                self.conn.install_response_write(control).map_err(crate::Error::new_body_write)?;
+            }
+            #[cfg(feature="server")]
             if self.response_body.is_some(){
                 ready!(self.poll_controlled_response(cx))?;
             }
@@ -415,6 +421,8 @@ where
                 let queued:Option<Box<(MessageHead<T::Outgoing>,Bs)>>=None;
                 let msg = if let Some(message)=queued{Some(Ok(*message))}else{match Pin::new(&mut self.dispatch).poll_msg(cx) {
                     Poll::Pending => {
+                        #[cfg(feature="server")]
+                        if let Some(control)=self.dispatch.poll_write_control(cx){self.conn.install_response_write(control).map_err(crate::Error::new_body_write)?;}
                         #[cfg(feature = "server")]
                         if let Poll::Ready(head) = self.dispatch.poll_informational(cx) {
                             self.write_informational(head)?;
@@ -425,6 +433,8 @@ where
                     }
                     Poll::Ready(msg) => msg,
                 }};
+                #[cfg(feature="server")]
+                if let Some(control)=self.dispatch.poll_write_control(cx){self.conn.install_response_write(control).map_err(crate::Error::new_body_write)?;}
                 if let Some(msg) = msg {
                     #[allow(unused_mut)]
                     let (mut head, body) = msg.map_err(crate::Error::new_user_service)?;
@@ -879,6 +889,7 @@ cfg_server! {
             self.in_flight.is_some()
         }
 
+        fn poll_write_control(&mut self,cx:&mut Context<'_>)->Option<crate::ext::ResponseWriteControl>{self.informational.as_mut().and_then(|rx|rx.poll_write_control(cx))}
         fn poll_informational(&mut self, cx: &mut Context<'_>) -> Poll<InformationalHead> {
             self.informational.as_mut().map_or(Poll::Pending, |rx| rx.poll_take(cx))
         }

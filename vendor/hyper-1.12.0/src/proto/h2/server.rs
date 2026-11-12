@@ -441,6 +441,9 @@ pin_project! {
         state: H2StreamState<F, B>,
         response_head: Option<h2::ext::SendCompletion>,
         write_timer: Time,
+        interim_write: Option<Box<super::response_write::Controlled<B::Data>>>,
+        interim_ack: Option<tokio::sync::oneshot::Sender<()>>,
+        ready_response: Option<Box<Response<B>>>,
         date_header: bool,
         exec: E,
     }
@@ -496,6 +499,9 @@ where
                 continue_on_read,
             },
             response_head: None,
+            interim_write: None,
+            interim_ack: None,
+            ready_response: None,
             write_timer,
             date_header,
             exec,
@@ -518,41 +524,57 @@ impl ContinueOnRead {
         }
     }
 
-    fn poll_send<B: bytes::Buf>(
-        &mut self,
-        cx: &mut Context<'_>,
-        reply: &mut SendResponse<B>,
-    ) -> crate::Result<()> {
-        let demand = match &mut self.demand {
-            Some(demand) => demand,
-            None => return Ok(()),
-        };
+    fn poll_take(&mut self, cx: &mut Context<'_>) -> Option<Response<()>> {
+        let demand = self.demand.as_mut()?;
         if let Poll::Ready(result) = Pin::new(demand).poll(cx) {
             self.demand = None;
             if result.is_ok() && !self.sent {
                 let mut response = Response::new(());
                 *response.status_mut() = ::http::StatusCode::CONTINUE;
-                reply
-                    .send_informational(response)
-                    .map_err(crate::Error::new_h2)?;
-                self.sent = true;
+                return Some(response);
             }
         }
-        Ok(())
+        None
     }
+
 }
 
-fn send_informational<B: bytes::Buf>(
-    reply: &mut SendResponse<B>,
-    mut head: crate::ext::InformationalHead,
-    continuation: &mut ContinueOnRead,
+fn install_control<D: bytes::Buf + 'static>(
+    slot: &mut Option<Box<super::response_write::Controlled<D>>>,
+    control: crate::ext::ResponseWriteControl, timer: &Time,
+    reply: &mut SendResponse<SendBuf<D>>,
 ) -> crate::Result<()> {
-    let is_continue = head.response.status() == ::http::StatusCode::CONTINUE;
+    let result = (|| {
+    if let Some(active) = slot.as_ref() {
+        if active.owner().same_control(&control) { return Ok(()); }
+        return Err(crate::Error::new_body_write("HTTP/2 write control already installed"));
+    }
+    if std::any::TypeId::of::<D>() != std::any::TypeId::of::<Bytes>() {
+        return Err(crate::Error::new_body_write("HTTP/2 controlled response requires Bytes data"));
+    }
+    let owner = control.claim().map_err(crate::Error::new_body_write)?;
+    *slot = Some(Box::new(super::response_write::Controlled::new(owner, timer.clone(), None, false)));
+    Ok(())
+    })();
+    if result.is_err() { reply.send_reset(Reason::CANCEL); }
+    result
+}
+
+fn send_informational<D: bytes::Buf + 'static>(
+    reply: &mut SendResponse<SendBuf<D>>, mut response: Response<()>,
+    ack: Option<tokio::sync::oneshot::Sender<()>>, continuation: &mut ContinueOnRead,
+    controlled: &mut Option<Box<super::response_write::Controlled<D>>>,
+    pending_ack: &mut Option<tokio::sync::oneshot::Sender<()>>, timer: &Time,
+) -> crate::Result<()> {
+    if let Some(control) = response.extensions_mut().remove::<crate::ext::ResponseWriteControl>() {
+        install_control(controlled, control, timer, reply)?;
+    }
+    let is_continue = response.status() == ::http::StatusCode::CONTINUE;
     if is_continue && continuation.expected && continuation.sent {
-        let _ = head.ack.send(());
+        if let Some(ack) = ack { let _ = ack.send(()); }
         return Ok(());
     }
-    let fields = head.response.headers_mut();
+    let fields = response.headers_mut();
     // Remove every Connection nomination, not just the first field value.
     // The map is bounded by the per-stream informational header budget.
     let nominated: Vec<_> = fields
@@ -569,11 +591,19 @@ fn send_informational<B: bytes::Buf>(
     fields.remove(::http::header::TE);
     fields.remove(::http::header::CONTENT_LENGTH);
     fields.remove(::http::header::TRANSFER_ENCODING);
-    reply
-        .send_informational(head.response)
-        .map_err(crate::Error::new_h2)?;
+    if let Some(writer) = controlled.as_mut() {
+        writer.owner().start_boundary(0, timer.now()).map_err(crate::Error::new_body_write)?;
+        let receipt = reply.send_informational_observed_with_policy(
+            response, writer.owner().retention(),
+            Some(super::response_write::compiled_policy(writer.owner()).map_err(crate::Error::new_body_write)?),
+        ).map_err(crate::Error::new_h2)?;
+        writer.set_header(receipt, false);
+        *pending_ack = ack;
+    } else {
+        reply.send_informational(response).map_err(crate::Error::new_h2)?;
+        if let Some(ack) = ack { let _ = ack.send(()); }
+    }
     continuation.sent |= is_continue;
-    let _ = head.ack.send(());
     Ok(())
 }
 
@@ -622,9 +652,32 @@ where
                     informational,
                     continue_on_read,
                 } => {
-                    let res = match h.poll(cx) {
+                    if let Some(writer) = me.interim_write.as_mut() {
+                        if let Poll::Ready(reason) = me.reply.poll_reset(cx).map_err(crate::Error::new_h2)? {
+                            return Poll::Ready(Err(crate::Error::new_h2(reason.into())));
+                        }
+                        match writer.poll_header(cx) {
+                            Poll::Ready(Ok(())) => {
+                                if let Some(ack) = me.interim_ack.take() { let _ = ack.send(()); }
+                            }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                    // Binding is metadata only; it never starts a write boundary.
+                    if let Some(control) = informational.as_mut().and_then(|rx| rx.poll_write_control(cx)) {
+                        install_control(me.interim_write, control, me.write_timer, me.reply)?;
+                        continue;
+                    }
+                    let res = match me.ready_response.take().map(|response| Poll::Ready(Ok(*response)))
+                        .unwrap_or_else(|| h.poll(cx)) {
                         Poll::Ready(Ok(r)) => r,
                         Poll::Pending => {
+                            if let Some(control) = informational.as_mut().and_then(|rx| rx.poll_write_control(cx)) {
+                                install_control(me.interim_write, control, me.write_timer, me.reply)?;
+                                // Arm even hard-only policy without an information head.
+                                continue;
+                            }
                             // Response is not yet ready, so we want to check if the client has sent a
                             // RST_STREAM frame which would cancel the current request.
                             if let Poll::Ready(reason) =
@@ -634,11 +687,24 @@ where
                                 return Poll::Ready(Err(crate::Error::new_h2(reason.into())));
                             }
                             if let Some(rx) = informational {
-                                if let Poll::Ready(head) = rx.poll_take(cx) {
-                                    send_informational(me.reply, head, continue_on_read)?;
+                                if let Poll::Ready(crate::ext::InformationalHead { response, ack, .. }) = rx.poll_take(cx) {
+                                    send_informational(me.reply, response, Some(ack), continue_on_read,
+                                        me.interim_write, me.interim_ack, me.write_timer)?;
+                                    if me.interim_write.is_some() { continue; }
                                 }
                             }
-                            continue_on_read.poll_send(cx, me.reply)?;
+                            if let Some(response) = continue_on_read.poll_take(cx) {
+                                send_informational(me.reply, response, None, continue_on_read,
+                                    me.interim_write, me.interim_ack, me.write_timer)?;
+                                if me.interim_write.is_some() { continue; }
+                            }
+                            // The application may add a nested scoped policy while
+                            // being polled. Re-read after it returns Pending, too.
+                            if let Some(writer) = me.interim_write.as_mut() {
+                                if let Poll::Ready(Err(e)) = writer.poll_header(cx) {
+                                    return Poll::Ready(Err(e));
+                                }
+                            }
                             return Poll::Pending;
                         }
                         Poll::Ready(Err(e)) => {
@@ -649,12 +715,32 @@ where
                         }
                     };
 
-                    if let Some(mut rx) = informational.take() {
-                        if let Some(head) = rx.close_take() {
-                            send_informational(me.reply, head, continue_on_read)?;
+                    if let Some(control) = informational.as_mut().and_then(|rx| rx.poll_write_control(cx)) {
+                        install_control(me.interim_write, control, me.write_timer, me.reply)?;
+                    }
+                    if let Some(writer) = me.interim_write.as_mut() {
+                        if let Poll::Ready(Err(e)) = writer.poll_header(cx) {
+                            return Poll::Ready(Err(e));
                         }
                     }
-                    continue_on_read.poll_send(cx, me.reply)?;
+                    if let Some(mut rx) = informational.take() {
+                        if let Some(crate::ext::InformationalHead { response, ack, .. }) = rx.close_take() {
+                            send_informational(me.reply, response, Some(ack), continue_on_read,
+                                me.interim_write, me.interim_ack, me.write_timer)?;
+                            if me.interim_write.is_some() {
+                                *me.ready_response = Some(Box::new(res));
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(response) = continue_on_read.poll_take(cx) {
+                        send_informational(me.reply, response, None, continue_on_read,
+                            me.interim_write, me.interim_ack, me.write_timer)?;
+                        if me.interim_write.is_some() {
+                            *me.ready_response = Some(Box::new(res));
+                            continue;
+                        }
+                    }
 
                     let (head, body) = res.into_parts();
                     let mut res = ::http::Response::from_parts(head, ());
@@ -672,6 +758,10 @@ where
 
                     if let Some(connect_parts) = connect_parts.take() {
                         if res.status().is_success() {
+                            if me.interim_write.is_some() || res.extensions().get::<crate::ext::ResponseWriteControl>().is_some() {
+                                me.reply.send_reset(Reason::CANCEL);
+                                return Poll::Ready(Err(crate::Error::new_body_write("HTTP/2 controlled CONNECT tunnel is not supported")));
+                            }
                             if headers::content_length_parse_all(res.headers())
                                 .map_or(false, |len| len != 0)
                             {
@@ -704,19 +794,10 @@ where
                         .extensions_mut()
                         .remove::<crate::ext::ResponseWriteControl>()
                     {
-                        let owner = match control.claim() {
-                            Ok(owner) => owner,
-                            Err(e) => {
-                                me.reply.send_reset(Reason::CANCEL);
-                                return Poll::Ready(Err(crate::Error::new_body_write(e)));
-                            }
-                        };
-                        if std::any::TypeId::of::<B::Data>() != std::any::TypeId::of::<Bytes>() {
-                            me.reply.send_reset(Reason::CANCEL);
-                            return Poll::Ready(Err(crate::Error::new_body_write(
-                                "HTTP/2 controlled response requires Bytes data",
-                            )));
-                        }
+                        install_control(me.interim_write, control, me.write_timer, me.reply)?;
+                    }
+                    if let Some(mut writer) = me.interim_write.take() {
+                        let owner = writer.owner();
                         let ended = body.is_end_stream();
                         if !ended {
                             if let Some(len) = body.size_hint().exact() {
@@ -732,18 +813,12 @@ where
                                 res,
                                 ended,
                                 owner.retention(),
-                                Some(super::response_write::compiled_policy(&owner).map_err(crate::Error::new_body_write)?),
+                                Some(super::response_write::compiled_policy(owner).map_err(crate::Error::new_body_write)?),
                             )
                             .map_err(crate::Error::new_h2)?;
+                        writer.set_header(head, ended);
                         me.state.set(H2StreamState::Body {
-                            pipe: PipeToSendStream::new_controlled(
-                                body,
-                                body_tx,
-                                owner,
-                                me.write_timer.clone(),
-                                head,
-                                ended,
-                            ),
+                            pipe: PipeToSendStream::with_controlled(body, body_tx, writer),
                         });
                         continue;
                     }
@@ -807,11 +882,16 @@ where
 {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.poll2(cx).map(|res| {
-            if let Err(_e) = res {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.as_mut().poll2(cx) {
+            Poll::Ready(Err(_e)) => {
+                let me = self.project();
+                if me.interim_write.is_some() { me.reply.send_reset(Reason::CANCEL); }
                 debug!("stream error: {}", _e);
+                Poll::Ready(())
             }
-        })
+            Poll::Ready(Ok(())) => Poll::Ready(()),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
