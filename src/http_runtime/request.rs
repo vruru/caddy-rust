@@ -674,11 +674,11 @@ fn take_writer_headers(response: &mut Response<Body>, ctx: &mut Context) -> Head
 }
 
 #[derive(Clone, Copy)]
-struct StaticHeadLength(usize);
+pub(super) struct StaticHeadLength(pub(super) usize);
 // Finite rendered bytes remain available to enclosing templates, but their
 // HEAD-dependent length cannot establish the selected GET representation length.
 #[derive(Clone, Copy)]
-struct RenderedTemplateHead;
+pub(super) struct RenderedTemplateHead;
 
 #[derive(Clone, Copy)]
 struct StaticInterimStatus(u16);
@@ -1366,6 +1366,8 @@ fn handlers<'a>(
                     browse,
                 } => match super::files::serve(
                     ctx,
+                    inner,
+                    server,
                     root.as_deref(),
                     hide,
                     index_names,

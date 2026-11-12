@@ -76,6 +76,40 @@ pub(super) struct Finished {
     pub(super) rendered_head: bool,
 }
 
+/// Custom directory templates use the same bounded worker tree, virtual
+/// request recursion and lazy request-body bridge as ordinary templates.
+pub(super) async fn browse(ctx:&mut Context,inner:&Arc<super::Inner>,server:&Arc<super::ActiveServer>,root:PathBuf,file:PathBuf,source:super::browse::ListingSource,headers:&mut HeaderMap)->Result<Bytes,TemplateFailure>{
+    let unavailable=||TemplateFailure(StatusCode::SERVICE_UNAVAILABLE);
+    let broken=||TemplateFailure(StatusCode::INTERNAL_SERVER_ERROR);
+    if !bounded_headers(headers)||!bounded_headers(ctx.req().headers()){return Err(broken());}
+    let inherited=ctx.req().extensions().get::<pool::Inherited>().cloned();
+    let memory=if inherited.is_none(){Some(ctx.resources.templates.reserve().map_err(|_|unavailable())?)}else{None};
+    let control=inherited.as_ref().map_or_else(||render::Control::for_browse(CancellationToken::new()),|i|i.tree.control.clone());
+    let _stop=if inherited.is_none(){Some(StopOnDrop(control.cancel.clone()))}else{None};
+    let request=render::RequestData::capture(ctx).map_err(|_|broken())?;
+    let root_owner=if inherited.is_none(){Some(ctx.resources.templates.admit_immediate(control.clone(),memory.ok_or_else(broken)?).await.map_err(|e|match e{BudgetError::Overloaded=>unavailable(),BudgetError::WorkerFailed=>broken()})?)}else{None};
+    let tree=if let Some(i)=&inherited{i.tree.clone()}else{root_owner.as_ref().ok_or_else(broken)?.tree()};
+    let depth=inherited.as_ref().map_or(0,|i|i.depth);
+    let virtual_include=virtual_request::make(inner.clone(),server.clone(),ctx.business.clone(),request.clone(),tree.clone(),depth,ctx.local.clone());
+    let mut reads=request.form.attach().map_err(|_|broken())?;
+    let reading_control=control.clone();let resources=ctx.resources.clone();let mut output_headers=headers.clone();
+    let owner=tree.clone();
+    let job=resources.templates.run(tree,move||{
+        let result=render::execute_browse(root,request,&mut output_headers,file,control,Some(virtual_include),source)
+            .map(|bytes|Bytes::from_owner(BufferedBytes{bytes,_tree:owner}));
+        (result,output_headers)
+    });
+    tokio::pin!(job);
+    let result=loop{tokio::select!{
+        Some(read)=reads.recv()=>{let result=read_form_body(ctx.req_mut().body_mut(),&reading_control).await;let _=read.reply.send(result);}
+        result=&mut job=>break result,
+    }};
+    if let Some(owner)=&root_owner{owner.finish();}
+    let(result,output_headers)=result.map_err(|e|match e{BudgetError::Overloaded=>unavailable(),BudgetError::WorkerFailed=>broken()})?;
+    *headers=output_headers;
+    result
+}
+
 pub(super) async fn finish(
     plan: &Arc<TemplatePlan>,
     headers: &mut HeaderMap,

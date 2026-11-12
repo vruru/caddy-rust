@@ -22,32 +22,69 @@ const WORK_UNITS: u32 = (32 << 20) / 4096;
 
 #[derive(Clone)]
 pub(crate) struct BrowsePlan {
+    pub(crate) template_file: String,
     pub(crate) file_limit: i64,
     pub(crate) reveal_symlinks: bool,
     pub(crate) sort: Vec<String>,
 }
 
 #[derive(Serialize)]
-struct Item {
-    name: String,
-    size: u64,
-    url: String,
+pub(super) struct Item {
+    pub(super) name: String,
+    pub(super) size: u64,
+    pub(super) url: String,
     #[serde(rename = "mod_time", serialize_with = "serialize_time")]
-    modified: DateTime<Utc>,
-    mode: u32,
-    is_dir: bool,
-    is_symlink: bool,
+    pub(super) modified: DateTime<Utc>,
+    pub(super) mode: u32,
+    pub(super) is_dir: bool,
+    pub(super) is_symlink: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
-    symlink_path: String,
+    pub(super) symlink_path: String,
     #[serde(skip)]
     lower: String,
+    #[serde(skip)]
+    pub(super) raw_name: Vec<u8>,
+    #[serde(skip)]
+    pub(super) raw_symlink_path: Vec<u8>,
 }
 
-struct Listing {
-    title: String,
-    items: Vec<Item>,
-    can_go_up: bool,
-    last_modified: SystemTime,
+impl Item {
+    pub(super) fn zero()->Self{Self{name:String::new(),size:0,url:String::new(),modified:DateTime::from_timestamp(-62135596800,0).expect("Go zero time"),mode:0,is_dir:false,is_symlink:false,symlink_path:String::new(),lower:String::new(),raw_name:Vec::new(),raw_symlink_path:Vec::new()}}
+}
+
+pub(super) struct Listing {
+    pub(super) title: String,
+    pub(super) items: Vec<Item>,
+    pub(super) backing_capacity: usize,
+    pub(super) can_go_up: bool,
+    pub(super) last_modified: SystemTime,
+    pub(super) path: String,
+    pub(super) num_dirs: i64,
+    pub(super) num_files: i64,
+    pub(super) total_size: i64,
+    pub(super) total_following_size: i64,
+    pub(super) offset: usize,
+    pub(super) limit: usize,
+    pub(super) sort: Vec<u8>,
+    pub(super) order: Vec<u8>,
+    pub(super) layout: Vec<u8>,
+}
+
+// Declaration order is deliberate: abort drops owned source data before the
+// directory credit. The worker retires the credit only after Tree accounting
+// and the actual host view have both taken ownership.
+pub(super) struct ListingSource {
+    pub(super) listing: Option<Listing>,
+    pub(super) memory: Option<tokio::sync::OwnedSemaphorePermit>,
+    pub(super) bytes: usize,
+}
+impl Listing {
+    fn allocation_bytes(&self)->io::Result<usize>{
+        let mut bytes=std::mem::size_of::<Self>().checked_add(self.items.capacity().checked_mul(std::mem::size_of::<Item>()).ok_or_else(||io::Error::other("listing capacity overflow"))?).ok_or_else(||io::Error::other("listing capacity overflow"))?;
+        for size in [self.title.capacity(),self.path.capacity(),self.sort.capacity(),self.order.capacity(),self.layout.capacity()] {bytes=bytes.checked_add(size).ok_or_else(||io::Error::other("listing capacity overflow"))?;}
+        for item in &self.items {for size in [item.name.capacity(),item.url.capacity(),item.symlink_path.capacity(),item.lower.capacity(),item.raw_name.capacity(),item.raw_symlink_path.capacity()] {bytes=bytes.checked_add(size).ok_or_else(||io::Error::other("listing capacity overflow"))?;}}
+        Ok(bytes)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -59,9 +96,9 @@ enum Format {
 
 struct Options {
     format: Format,
-    sort: String,
-    order: String,
-    layout: String,
+    sort: Vec<u8>,
+    order: Vec<u8>,
+    layout: Vec<u8>,
     offset: usize,
     limit: usize,
     cookies: Vec<HeaderValue>,
@@ -80,11 +117,11 @@ fn serialize_time<S: serde::Serializer>(value: &DateTime<Utc>, s: S) -> Result<S
     s.serialize_str(&text)
 }
 
-fn uri_entry(name: &str, dir: bool) -> String {
+fn uri_entry(name: &[u8], dir: bool) -> String {
     // Go URL.String encodes path characters; './' also keeps names containing
     // ':' relative. Encode each component and keep the directory slash.
     let mut out = String::from("./");
-    for byte in name.bytes() {
+    for byte in name.iter().copied() {
         if byte.is_ascii_alphanumeric() || b"-._~$&+,;=:@".contains(&byte) {
             out.push(char::from(byte));
         } else {
@@ -126,98 +163,45 @@ pub(super) fn mode(meta: &fs::Metadata) -> u32 {
         }
 }
 
-fn known_sort(s: &str) -> bool {
-    matches!(s, "name" | "namedirfirst" | "size" | "time")
-}
-
-fn known_order(s: &str) -> bool {
-    matches!(s, "asc" | "desc")
-}
+fn known_sort(s: &[u8]) -> bool {matches!(s,b"name"|b"namedirfirst"|b"size"|b"time")}
+fn known_order(s: &[u8]) -> bool {matches!(s,b"asc"|b"desc")}
 
 fn options(headers: &HeaderMap, query: &str, tls: bool, plan: &BrowsePlan) -> Options {
-    let mut format = Format::Html;
+    let mut format=Format::Html;
     for value in headers.get_all(header::ACCEPT) {
-        let value = String::from_utf8_lossy(value.as_bytes()).to_ascii_lowercase();
-        if value.contains("application/json") {
-            format = Format::Json;
-            break;
-        }
-        if value.contains("text/plain") {
-            format = Format::Text;
-        }
+        let value=gotmpl::go_utf8_text(value.as_bytes()).chars().map(|c|c.to_lowercase().next().unwrap_or(c)).collect::<String>();
+        if value.contains("application/json"){format=Format::Json;break;}
+        if value.contains("text/plain"){format=Format::Text;}
     }
-    let cookie = |name: &str| {
-        headers
-            .get_all(header::COOKIE)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .flat_map(|v| v.split(';'))
-            .filter_map(|v| v.trim().split_once('='))
-            .find_map(|(k, v)| (k.trim() == name).then(|| v.trim_matches('"').to_owned()))
+    let cookie=|name:&[u8]|{
+        headers.get_all(header::COOKIE).iter().flat_map(|field|field.as_bytes().split(|b|*b==b';')).find_map(|part|{
+            let part=part.trim_ascii();let at=part.iter().position(|b|*b==b'=')?;
+            if part[..at].trim_ascii()!=name{return None;}
+            let value=&part[at+1..];
+            let value=if value.len()>=2&&value.first()==Some(&b'"')&&value.last()==Some(&b'"'){&value[1..value.len()-1]}else{value};
+            value.iter().all(|b|*b>=0x20&&*b<0x7f&&!b"\";\\".contains(b)).then(||value.to_vec())
+        })
     };
-    let query = url::form_urlencoded::parse(query.as_bytes()).collect::<Vec<_>>();
-    let param = |key| {
-        query
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_ref())
-            .unwrap_or_default()
-    };
-    let mut sort = "";
-    let mut order = "";
-    for field in plan.sort.iter().take(2) {
-        if known_sort(field) {
-            sort = field;
-        }
-        if known_order(field) {
-            order = field;
-        }
+    // Reuse the strict byte parser used by request Query. Retain only the six
+    // first values needed here, including invalid-UTF8 values; malformed pairs
+    // are skipped exactly as URL.Query does rather than decoded lossily.
+    let mut query_values=std::collections::BTreeMap::<&str,Vec<u8>>::new();
+    for part in query.as_bytes().split(|b|*b==b'&') {
+        let Some((key,value))=super::query_match::query_pair(part)else{continue;};
+        let key=match key.as_ref(){b"sort"=>"sort",b"order"=>"order",b"layout"=>"layout",b"offset"=>"offset",b"limit"=>"limit",_=>continue};
+        query_values.entry(key).or_insert_with(||value.into_owned());
     }
-    if !param("sort").is_empty() {
-        sort = param("sort");
+    let param=|key:&str|query_values.get(key).map_or(&b""[..],Vec::as_slice);
+    let mut sort=&b""[..];let mut order=&b""[..];
+    for field in plan.sort.iter().take(2){if known_sort(field.as_bytes()){sort=field.as_bytes();}if known_order(field.as_bytes()){order=field.as_bytes();}}
+    if !param("sort").is_empty(){sort=param("sort");}
+    if !param("order").is_empty(){order=param("order");}
+    let mut cookies=Vec::new();
+    for(name,value,known)in[("sort",sort,known_sort(sort)),("order",order,known_order(order))]{
+        if known {let value=std::str::from_utf8(value).expect("known ASCII browse option");let secure=if tls{"; Secure"}else{""};if let Ok(value)=HeaderValue::from_str(&format!("{name}={value}; HttpOnly{secure}; SameSite=Lax")){cookies.push(value);}}
     }
-    if !param("order").is_empty() {
-        order = param("order");
-    }
-    let mut cookies = Vec::new();
-    for (name, value, known) in [
-        ("sort", sort, known_sort(sort)),
-        ("order", order, known_order(order)),
-    ] {
-        if known {
-            let secure = if tls { "; Secure" } else { "" };
-            if let Ok(v) =
-                HeaderValue::from_str(&format!("{name}={value}; HttpOnly{secure}; SameSite=Lax"))
-            {
-                cookies.push(v);
-            }
-        }
-    }
-    let layout = match param("layout") {
-        "" | "list" | "grid" => param("layout"),
-        _ => "list",
-    };
-    Options {
-        format,
-        sort: if sort.is_empty() {
-            cookie("sort").unwrap_or_else(|| "namedirfirst".into())
-        } else {
-            sort.into()
-        },
-        order: if order.is_empty() {
-            cookie("order").unwrap_or_else(|| "asc".into())
-        } else {
-            order.into()
-        },
-        layout: layout.into(),
-        offset: param("offset").parse().unwrap_or(0),
-        limit: param("limit").parse().unwrap_or(0),
-        cookies,
-        since: headers
-            .get(header::IF_MODIFIED_SINCE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| httpdate::parse_http_date(v).ok()),
-    }
+    let layout=match param("layout"){b""|b"list"|b"grid"=>param("layout"),_=>b"list"};
+    Options{format,sort:if sort.is_empty(){cookie(b"sort").unwrap_or_else(||b"namedirfirst".to_vec())}else{sort.to_vec()},order:if order.is_empty(){cookie(b"order").unwrap_or_else(||b"asc".to_vec())}else{order.to_vec()},layout:layout.to_vec(),offset:std::str::from_utf8(param("offset")).ok().and_then(|s|s.parse().ok()).unwrap_or(0),limit:std::str::from_utf8(param("limit")).ok().and_then(|s|s.parse().ok()).unwrap_or(0),cookies,since:headers.get(header::IF_MODIFIED_SINCE).and_then(|v|v.to_str().ok()).and_then(|v|httpdate::parse_http_date(v).ok())}
 }
 
 fn scan(
@@ -232,6 +216,7 @@ fn scan(
         v => usize::try_from(v).unwrap_or(MAX_ENTRIES).min(MAX_ENTRIES),
     };
     let mut names_bytes = 0usize;
+    let mut metadata_bytes=0usize;
     for (index, result) in fs::read_dir(path)?
         .take(limit + usize::from(plan.file_limit < 0))
         .enumerate()
@@ -240,6 +225,7 @@ fn scan(
             return Err(io::Error::other("directory entry limit exceeded"));
         }
         let entry = result?;
+        listing.backing_capacity=index+1;
         let path = entry.path();
         if hidden(&path) {
             continue;
@@ -252,19 +238,22 @@ fn scan(
         let is_symlink = meta.is_symlink();
         let target = is_symlink.then(|| fs::metadata(&path).ok()).flatten();
         let is_dir = meta.is_dir() || target.as_ref().is_some_and(fs::Metadata::is_dir);
-        let mut name = entry.file_name().to_string_lossy().into_owned();
-        let url = uri_entry(&name, is_dir);
+        let mut raw_name = entry.file_name().as_encoded_bytes().to_vec();
+        let mut name = gotmpl::go_utf8_text(&raw_name).into_owned();
+        let url = uri_entry(&raw_name, is_dir);
         if is_dir {
             name.push('/');
+            raw_name.push(b'/');
         }
-        let symlink_path = if is_symlink && plan.reveal_symlinks {
-            fs::read_link(&path)
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
+        let raw_symlink_path = if is_symlink && plan.reveal_symlinks {
+            fs::read_link(&path).ok().map(|p|p.as_os_str().as_encoded_bytes().to_vec()).unwrap_or_default()
+        } else {Vec::new()};
+        let symlink_path = gotmpl::go_utf8_text(&raw_symlink_path).into_owned();
+        if is_dir {listing.num_dirs+=1;} else {
+            listing.num_files+=1;
+            listing.total_size=listing.total_size.wrapping_add(meta.len() as i64);
+            listing.total_following_size=listing.total_following_size.wrapping_add(target.as_ref().unwrap_or(&meta).len() as i64);
+        }
         names_bytes = names_bytes
             .saturating_add(name.len())
             .saturating_add(url.len())
@@ -272,6 +261,16 @@ fn scan(
         if names_bytes > MAX_OUTPUT {
             return Err(io::Error::other("directory metadata byte limit exceeded"));
         }
+        // The permit covers32MiB for the native listing, separately from a
+        // custom template's32MiB host graph. Include actual owned capacities,
+        // the next Vec growth and a conservative lowercase-cache capacity.
+        let next_capacity=if listing.items.len()==listing.items.capacity(){listing.items.capacity().max(8).saturating_mul(2).min(limit).max(listing.items.len()+1)}else{listing.items.capacity()};
+        let retained=name.capacity().checked_add(url.capacity()).and_then(|v|v.checked_add(symlink_path.capacity())).and_then(|v|v.checked_add(raw_name.capacity())).and_then(|v|v.checked_add(raw_symlink_path.capacity())).and_then(|v|name.len().checked_mul(8)?.checked_add(v)).ok_or_else(||io::Error::other("directory metadata size overflow"))?;
+        let next_metadata=metadata_bytes.checked_add(retained).ok_or_else(||io::Error::other("directory metadata size overflow"))?;
+        let peak=next_capacity.checked_mul(2*std::mem::size_of::<Item>()).and_then(|v|v.checked_add(next_metadata)).and_then(|v|v.checked_add(2*MAX_OUTPUT+(8<<20)+32768)).ok_or_else(||io::Error::other("directory metadata size overflow"))?;
+        if peak>WORK_UNITS as usize*4096{return Err(io::Error::other("directory metadata allocation budget exceeded"));}
+        if next_capacity>listing.items.capacity(){listing.items.try_reserve_exact(next_capacity-listing.items.len()).map_err(io::Error::other)?;}
+        metadata_bytes=next_metadata;
         listing.items.push(Item {
             name,
             size: target.as_ref().unwrap_or(&meta).len(),
@@ -282,13 +281,14 @@ fn scan(
             is_symlink,
             symlink_path,
             lower: String::new(),
+            raw_name, raw_symlink_path,
         });
     }
     Ok(listing)
 }
 
-fn sort_and_paginate(listing: &mut Listing, options: &Options) {
-    if matches!(options.sort.as_str(), "name" | "namedirfirst" | "size") {
+fn sort_and_paginate(listing: &mut Listing, options: &Options, preserve_backing: bool) {
+    if matches!(options.sort.as_slice(), b"name" | b"namedirfirst" | b"size") {
         for item in &mut listing.items {
             item.lower = item
                 .name
@@ -299,27 +299,31 @@ fn sort_and_paginate(listing: &mut Listing, options: &Options) {
     }
     if known_sort(&options.sort) {
         listing.items.sort_by(|a, b| {
-            let order = match options.sort.as_str() {
-                "name" => a.lower.cmp(&b.lower),
-                "namedirfirst" => b.is_dir.cmp(&a.is_dir).then_with(|| a.lower.cmp(&b.lower)),
-                "size" if a.is_dir && b.is_dir => a.lower.cmp(&b.lower),
-                "size" => b.is_dir.cmp(&a.is_dir).then_with(|| a.size.cmp(&b.size)),
-                "time" => a.modified.cmp(&b.modified),
+            let order = match options.sort.as_slice() {
+                b"name" => a.lower.cmp(&b.lower),
+                b"namedirfirst" => b.is_dir.cmp(&a.is_dir).then_with(|| a.lower.cmp(&b.lower)),
+                b"size" if a.is_dir && b.is_dir => a.lower.cmp(&b.lower),
+                b"size" => b.is_dir.cmp(&a.is_dir).then_with(|| a.size.cmp(&b.size)),
+                b"time" => a.modified.cmp(&b.modified),
                 _ => Ordering::Equal,
             };
-            if options.order == "desc" {
+            if options.order == b"desc" {
                 order.reverse()
             } else {
                 order
             }
         });
     }
-    if options.offset <= listing.items.len() {
-        listing.items.drain(..options.offset);
+    if options.offset>0 && options.offset <= listing.items.len() {
+        if !preserve_backing {listing.items.drain(..options.offset);}
+        listing.offset=options.offset;
     }
-    if options.limit != 0 {
-        listing.items.truncate(options.limit);
+    let visible=listing.items.len().saturating_sub(if preserve_backing{listing.offset}else{0});
+    if options.limit>0 && options.limit<=visible {
+        if !preserve_backing {listing.items.truncate(options.limit);}
+        listing.limit=options.limit;
     }
+    listing.sort=options.sort.clone();listing.order=options.order.clone();listing.layout=options.layout.clone();
 }
 
 struct Output(Vec<u8>);
@@ -342,7 +346,7 @@ impl Write for Output {
     }
 }
 
-fn human_size(size: u64) -> String {
+pub(super) fn human_size(size: u64) -> String {
     if size < 1024 {
         return format!("{size} B");
     }
@@ -377,9 +381,9 @@ fn render_text(out: &mut impl Write, listing: &Listing) -> io::Result<()> {
         + 1)
     .div_ceil(TAB);
     let width2 = (sizes.iter().map(String::len).max().unwrap_or(0).max(4) + 1).div_ceil(TAB);
-    let mut row = |name: &str, size: &str, modified: &str| {
-        write!(out, "{name}")?;
-        for _ in 0..width1.saturating_sub(name.chars().count() / TAB) {
+    let mut row = |name: &[u8], size: &str, modified: &str| {
+        out.write_all(name)?;
+        for _ in 0..width1.saturating_sub(gotmpl::go_utf8_text(name).chars().count() / TAB) {
             out.write_all(b"\t")?;
         }
         write!(out, "{size}")?;
@@ -388,11 +392,11 @@ fn render_text(out: &mut impl Write, listing: &Listing) -> io::Result<()> {
         }
         writeln!(out, "{modified}")
     };
-    row("Name", "Size", "Modified")?;
-    row("----", "----", "--------")?;
+    row(b"Name", "Size", "Modified")?;
+    row(b"----", "----", "--------")?;
     for (item, size) in listing.items.iter().zip(&sizes) {
         row(
-            &item.name,
+            &item.raw_name,
             size,
             &item.modified.format("%B %-d, %Y at %H:%M:%S").to_string(),
         )?;
@@ -447,7 +451,7 @@ fn render(mut listing: Listing, options: &Options) -> io::Result<Rendered> {
             modified: None,
         });
     }
-    sort_and_paginate(&mut listing, options);
+    sort_and_paginate(&mut listing, options, false);
     let mut out = Output(Vec::new());
     match options.format {
         Format::Json => {
@@ -469,11 +473,17 @@ fn render(mut listing: Listing, options: &Options) -> io::Result<Rendered> {
 
 pub(super) async fn serve(
     ctx: &mut Context,
+    inner: &std::sync::Arc<super::Inner>,
+    server: &std::sync::Arc<super::ActiveServer>,
+    root: PathBuf,
     path: PathBuf,
     parent: fs::Metadata,
     plan: &BrowsePlan,
     hidden: super::files::HiddenPaths,
 ) -> anyhow::Result<Response<Body>> {
+    let memory=ctx.resources.directory_listing_bytes.clone().try_acquire_many_owned(WORK_UNITS).map_err(|_|failure(StatusCode::SERVICE_UNAVAILABLE))?;
+    let option_bytes=ctx.req().headers().iter().filter(|(name,_)|**name==header::ACCEPT||**name==header::COOKIE).try_fold(ctx.req().uri().query().map_or(0,str::len),|n,(_,value)|n.checked_add(value.as_bytes().len())).ok_or_else(||failure(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE))?;
+    if option_bytes>1<<20{return Err(failure(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE));}
     let path_display = ctx.req().uri().path();
     let title = super::request::decoded_path(path_display)?
         .trim_end_matches('/')
@@ -485,8 +495,11 @@ pub(super) async fn serve(
     let listing = Listing {
         title,
         items: Vec::new(),
+        backing_capacity:0,
         can_go_up: super::request::clean_path(path_display, true) != "/",
         last_modified: parent.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        path: {let p=super::request::clean_path(path_display,true);let p=p.trim_end_matches('/');if p.is_empty(){"/".into()}else{p.into()}},
+        num_dirs:0,num_files:0,total_size:0,total_following_size:0,offset:0,limit:0,sort:Vec::new(),order:Vec::new(),layout:Vec::new(),
     };
     let options = options(
         ctx.req().headers(),
@@ -494,21 +507,22 @@ pub(super) async fn serve(
         ctx.tls,
         plan,
     );
+    let custom=matches!(options.format,Format::Html)&&!plan.template_file.is_empty();
     let format = options.format;
     let cookies = options.cookies.clone();
     let plan = plan.clone();
-    let memory = ctx
-        .resources
-        .directory_listing_bytes
-        .clone()
-        .try_acquire_many_owned(WORK_UNITS)
-        .map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE))?;
-    let (rendered, mut memory) = ctx
+    enum Prepared {Rendered(Rendered),Custom(Listing,PathBuf,usize)}
+    let (prepared, mut memory) = ctx
         .resources
         .directory_listing
         .run(move || {
-            let listing = scan(&path, &plan, listing, |item| hidden.matches(item))?;
-            render(listing, &options).map(|rendered| (rendered, memory))
+            let mut listing = scan(&path, &plan, listing, |item| hidden.matches(item))?;
+            let unchanged=options.since.is_some_and(|since|super::files::seconds(listing.last_modified)<=super::files::seconds(since));
+            if custom&&!unchanged {
+                sort_and_paginate(&mut listing,&options, true);
+                let bytes=listing.allocation_bytes()?;
+                Ok((Prepared::Custom(listing,PathBuf::from(plan.template_file),bytes),memory))
+            } else {render(listing,&options).map(|rendered|(Prepared::Rendered(rendered),memory))}
         })
         .await
         .map_err(|e| budget_failure(ctx, e))?
@@ -521,6 +535,30 @@ pub(super) async fn serve(
                 file_io_failure(ctx, &e)
             }
         })?;
+    let rendered=match prepared {
+        Prepared::Rendered(rendered)=>rendered,
+        Prepared::Custom(listing,file,bytes)=>{
+            let stamp=DateTime::<Utc>::from(listing.last_modified).format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+            let mut headers=std::mem::take(&mut ctx.immediate);
+            headers.append(header::VARY,HeaderValue::from_static("Accept, Accept-Encoding"));
+            headers.insert(header::LAST_MODIFIED,HeaderValue::from_str(&stamp)?);
+            for cookie in &cookies {headers.append(header::SET_COOKIE,cookie.clone());}
+            let source=ListingSource{listing:Some(listing),memory:Some(memory),bytes};
+            let body=match super::templates::browse(ctx,inner,server,root,file,source,&mut headers).await {
+                Ok(body)=>body,
+                Err(error)=>{ctx.immediate=headers;return Err(failure(error.0));}
+            };
+            let length=body.len();
+            let mut response=simple(StatusCode::OK,body);
+            headers.insert(header::CONTENT_TYPE,HeaderValue::from_static("text/html; charset=utf-8"));
+            *response.headers_mut()=headers;
+            if ctx.req().method()==http::Method::HEAD {
+                response.extensions_mut().insert(super::request::StaticHeadLength(length));
+                response.extensions_mut().insert(super::request::RenderedTemplateHead);
+            }
+            return Ok(response);
+        }
+    };
     struct ListedBytes(Vec<u8>, tokio::sync::OwnedSemaphorePermit);
     impl AsRef<[u8]> for ListedBytes {
         fn as_ref(&self) -> &[u8] {
@@ -528,6 +566,8 @@ pub(super) async fn serve(
             &self.0
         }
     }
+    let prepared_length=rendered.body.len();
+    let prepared_status=rendered.status;
     let used = u32::try_from(rendered.body.capacity().div_ceil(4096))
         .unwrap_or(MAX_OUTPUT_UNITS)
         .max(1);
@@ -540,13 +580,18 @@ pub(super) async fn serve(
         bytes::Bytes::from_owner(ListedBytes(rendered.body, memory))
     };
     let mut res = simple(rendered.status, body);
+    if ctx.req().method()==http::Method::HEAD&&prepared_status==StatusCode::OK {
+        // This Vec was fully produced above; no body hint or stream is read to
+        // discover a length. Enclosing templates may consume this finite entity.
+        res.extensions_mut().insert(super::request::StaticHeadLength(prepared_length));
+    }
     let headers = res.headers_mut();
-    headers.append(
-        header::VARY,
-        HeaderValue::from_static("Accept, Accept-Encoding"),
-    );
-    if let Some(modified) = rendered.modified {
-        headers.insert(header::LAST_MODIFIED, HeaderValue::from_str(&modified)?);
+    headers.append(header::VARY,HeaderValue::from_static("Accept, Accept-Encoding"));
+    if let Some(modified)=&rendered.modified {
+        headers.insert(header::LAST_MODIFIED,HeaderValue::from_str(modified)?);
+        for cookie in &cookies {headers.append(header::SET_COOKIE,cookie.clone());}
+    }
+    if rendered.modified.is_some() {
         headers.insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static(match format {
@@ -555,9 +600,6 @@ pub(super) async fn serve(
                 Format::Html => "text/html; charset=utf-8",
             }),
         );
-        for cookie in cookies {
-            headers.append(header::SET_COOKIE, cookie);
-        }
     }
     Ok(res)
 }
@@ -578,7 +620,7 @@ fn escape_html(s: &str) -> String {
 }
 fn render_html(out: &mut impl Write, listing: &Listing, opts: &Options) -> io::Result<()> {
     let title = escape_html(&listing.title);
-    let layout = if opts.layout == "grid" {
+    let layout = if opts.layout == b"grid" {
         "grid"
     } else {
         "list"
@@ -600,7 +642,7 @@ ul.grid li{{display:flex;flex-direction:column;border:1px solid #9995;border-rad
         writeln!(out, r#"<a href="../">Up</a>"#)?;
     }
     for (field, label) in [("name", "Name"), ("size", "Size"), ("time", "Modified")] {
-        let order = if opts.sort == field && opts.order != "desc" {
+        let order = if opts.sort == field.as_bytes() && opts.order != b"desc" {
             "desc"
         } else {
             "asc"

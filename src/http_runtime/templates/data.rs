@@ -228,7 +228,7 @@ fn mode_string(value:i64)->String {
     for(i,byte)in b"rwxrwxrwx".iter().enumerate(){out.push(if value&(1<<(8-i))!=0{*byte as char}else{'-'});}
     out
 }
-fn mode_value(mode:u32)->Value{
+pub(super) fn mode_value(mode:u32)->Value{
     const TYPE_MASK:u32=(1<<31)|(1<<27)|(1<<26)|(1<<25)|(1<<24)|(1<<21)|(1<<19);
     static TYPE:std::sync::LazyLock<Arc<gotmpl::Int64Type>>=std::sync::LazyLock::new(||{
         let mut methods=BTreeMap::<Arc<str>,gotmpl::Int64Method>::new();

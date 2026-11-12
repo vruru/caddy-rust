@@ -1357,10 +1357,7 @@ fn parse_handler(
                             "template_file",
                             "browse template file",
                         )?;
-                        ensure!(
-                            template.is_empty(),
-                            "custom browse templates require the template runtime"
-                        );
+
                         let limit = fields
                             .get("file_limit")
                             .filter(|v| !v.is_null())
@@ -1376,6 +1373,7 @@ fn parse_handler(
                             "browse file_limit exceeds the native maximum"
                         );
                         Ok::<_, anyhow::Error>(crate::http_runtime::browse::BrowsePlan {
+                            template_file: template,
                             file_limit: limit,
                             reveal_symlinks: boolean(
                                 fields.get("reveal_symlinks").filter(|v| !v.is_null()),

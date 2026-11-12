@@ -1,5 +1,7 @@
 //! Per-render template namespaces. Files and host functions execute only on the
 //! template worker; namespaces and header locks never span template execution.
+#[path="browse_context.rs"]
+mod browse_context;
 #[path = "sprig.rs"]
 mod sprig;
 #[path = "data.rs"]
@@ -99,6 +101,34 @@ pub(crate) fn execute_named(plan:&Arc<TemplatePlan>,root:PathBuf,request:Request
     if let Ok(rendered_headers)=response_headers.lock(){*headers=rendered_headers.clone();}
     result.map_err(|_|control.failure())
 }
+pub(super) fn execute_browse(root:PathBuf,request:RequestData,headers:&mut HeaderMap,file:PathBuf,control:Arc<Control>,virtual_include:Option<VirtualInclude>,mut source:crate::http_runtime::browse::ListingSource)->Result<Vec<u8>,TemplateFailure>{
+    let mut run=||->RenderResult<(String,Vec<u8>,Fields)>{
+        control.check()?;
+        Control::take(&control.files,1)?;
+        let opened=crate::http_config::helpers::open_regular_file(&file).map_err(|_|error("opening browse template failed"))?;
+        let metadata=opened.metadata().map_err(|_|error("browse template metadata failed"))?;
+        if metadata.len()>1<<20{return Err(error("browse template source exceeds byte limit"));}
+        // Read against the full pre-admitted capacity, including a sentinel
+        // byte. A concurrent file growth cannot create an uncharged Vec peak.
+        control.reserve_host_bytes((1<<20)+1)?;
+        let mut input=Vec::with_capacity((1<<20)+1);
+        opened.take((1<<20)+1).read_to_end(&mut input).map_err(|_|error("reading browse template failed"))?;
+        if input.len()>1<<20{return Err(error("browse template source exceeds byte limit"));}
+        control.check()?;
+        let name=file.file_name().and_then(|s|s.to_str()).ok_or_else(||error("invalid browse template basename"))?.to_owned();
+        // Transfer already-paid directory allocations into this live Tree
+        // before releasing the directory permit. Failure keeps source+credit
+        // together until the source is actually dropped.
+        control.reserve_host_bytes(source.bytes)?;
+        let listing=source.listing.take().ok_or_else(||error("browse source already transferred"))?;
+        let extra=browse_context::fields(listing,&control)?;
+        drop(source.memory.take());
+        Ok((name,input,extra))
+    };
+    let(name,input,extra)=run().map_err(|_|control.failure())?;
+    let plan=Arc::new(TemplatePlan{root:String::new(),mime_types:Vec::new(),delimiters:["{{".into(),"}}".into()]});
+    execute_named(&plan,root,request,headers,&name,input,control,virtual_include,extra)
+}
 pub(super) fn execute(plan:&Arc<TemplatePlan>,root:PathBuf,request:RequestData,headers:&mut HeaderMap,input:Vec<u8>,cancel:CancellationToken)->Result<Vec<u8>,TemplateFailure>{
     let name=request.uri.path().to_owned();execute_named(plan,root,request,headers,&name,input,Control::new(cancel),None,Fields::new())
 }
@@ -141,6 +171,8 @@ impl Frame {
         let output=template.execute_to_bytes(&data)?;self.control.charge_bytes(output.len())?;Ok(output)
     }
     fn context(&self)->RenderResult<Value> {
+        let browse=!self.extra.is_empty();
+        if browse {self.control.reserve_host_bytes(8192)?;}
         let mut fields=self.extra.clone();
         fields.insert("Req".into(),self.request.value(false,&self.control)?);
         fields.insert("OriginalReq".into(),self.request.value(true,&self.control)?);
@@ -150,7 +182,19 @@ impl Frame {
         for name in ["Cookie","Host","RemoteIP","ClientIP"] {
             let request=self.request.clone();methods.insert(name.into(),Arc::new(move|args|request.method(name,args)));
         }
-        Ok(Value::Object(Arc::new(Object{fields,methods,..Object::default()})))
+        if browse {
+            // The exported embedded TemplateContext is a value, while browse
+            // fields are promoted from its separate listing pointer.
+            let mut inner=Fields::new();
+            for name in ["Req","OriginalReq","Args","RespHeader"] {
+                inner.insert(name.into(),fields.get(name).cloned().ok_or_else(||error("missing embedded template field"))?);
+            }
+            let custom=Value::Slice(gotmpl::TypedSlice::nil("[]template.FuncMap"));
+            inner.insert("CustomFuncs".into(),custom.clone());
+            fields.insert("CustomFuncs".into(),custom);
+            fields.insert("TemplateContext".into(),Value::Object(Arc::new(Object{fields:inner,methods:methods.clone(),go_type:Some("templates.TemplateContext"),..Object::default()})));
+        }
+        Ok(Value::Object(Arc::new(Object{fields,methods,go_type:if browse{Some("*fileserver.templateContext")}else{None},..Object::default()})))
     }
     fn path(&self,name:&str)->RenderResult<PathBuf>{
         if name.contains('\0'){return Err(error("invalid template file path"));}

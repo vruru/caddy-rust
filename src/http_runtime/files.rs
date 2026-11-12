@@ -12,6 +12,8 @@ use std::{
 
 pub(super) async fn serve(
     ctx: &mut Context,
+    inner: &Arc<super::Inner>,
+    server: &Arc<super::ActiveServer>,
     root: Option<&str>,
     hide: &[String],
     indices: &[String],
@@ -87,7 +89,7 @@ pub(super) async fn serve(
                         &format!("{}/", ctx.original_uri.path()),
                     )?));
                 }
-                return super::browse::serve(ctx, path, metadata, browse, hidden)
+                return super::browse::serve(ctx, inner, server, std::path::PathBuf::from(root), path, metadata, browse, hidden)
                     .await
                     .map(Some);
             }

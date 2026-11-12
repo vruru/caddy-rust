@@ -18,7 +18,7 @@ The project currently covers a specific subset of functionalities:
 *   **Compatibility**: Correct useful extensions remain supported even where the baseline rejects them. Resource bounds and repairs to upstream bugs are documented differences; accepting a configuration alone does not establish correct execution.
 
 **Known Gaps**:
-Remaining standard modules/fields, remaining listener/address combinations, distributed tracing, ACME server, push/timeouts, complete template mutability, custom browsing, TLS 1.0/1.1 support, Go PKIX edge cases, and full issuer/CA-loader capabilities are not yet implemented.
+Remaining standard modules/fields, remaining listener/address combinations, distributed tracing, ACME server, push/timeouts, complete template mutability and remaining host methods, TLS 1.0/1.1 support, Go PKIX edge cases, and full issuer/CA-loader capabilities are not yet implemented.
 
 ## Build
 

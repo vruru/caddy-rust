@@ -118,7 +118,7 @@ their configuration and behavior require native implementations.
 
 Known development gaps still include remaining listener/address combinations,
 distributed tracing, the ACME server handler, push and timeout
-handlers, remaining template receiver methods and custom directory templates,
+handlers and remaining template receiver methods,
 TLS 1.0/1.1, full Go PKIX edge semantics and remaining issuer/trust-loader
 capabilities. This list is not a claim that all other field combinations are
 fully verified. The 135-module baseline is an inventory, not a support registry.
@@ -365,13 +365,67 @@ H2 otherwise sends handler data and synthesizes a new CL after header cleanup.
 The informational writer uses the same centralized header rules.
 
 RFC 9110 reference: https://www.rfc-editor.org/rfc/rfc9110.html#section-8.6
-Default native browse UI differs intentionally. Its independent HEAD metadata
-bug is tracked for the browse layer. Single native 100/102 interim responses are
-retained despite a baseline fixture emitting duplicates. No complete custom
-browse, HTTP or production acceptance is claimed by this patch.
+Default native browse UI differs intentionally. Prepared listing HEAD metadata
+is handled by the browse layer described below. Single native 100/102 interim
+responses are retained despite a baseline fixture emitting duplicates. These
+response fixes do not establish complete HTTP or production acceptance.
 
 Successful CONNECT cleanup here applies to the currently supported static
 response path. It does not establish CONNECT tunnel forwarding. DATA on an
 established H2/H3 CONNECT tunnel belongs to the tunnel transport, not an HTTP
 message body; future tunnel support requires an explicit transport owner and
 must not route tunnel data through this ordinary bodyless finalizer.
+
+
+Custom directory templates and prepared browse HEAD
+---------------------------------------------------
+
+file_server browse.template_file is executed natively with the same bounded
+renderer worker tree, current request/header context, include/import namespace,
+virtual request bridge and TLS factory as ordinary templates. Browse uses
+text/template semantics, preserving literal bytes and caller-selected HTML.
+All public browse/item fields and directory helpers are projected. A file's Tpl
+points to the browse-only context. Pagination retains its original slice backing,
+including zero-valued unused slots after hidden entries; legitimate reslicing
+can recover values outside the visible length.
+
+JSON and text Accept selections take priority and bypass the custom template.
+The existing native default HTML UI is retained. Fully prepared native listing
+bytes supply trusted HEAD representation lengths for HTML, JSON and text;
+custom template HEAD executes its actual method and side effects while omitting
+an unproved GET representation length, using the existing HEADc4 marker.
+
+Directory scanning reserves its existing 32MiB work credit before option-owned
+buffers. The metadata worker measures retained listing capacities. On a genuine
+renderer worker, its Control first charges these bytes, the source moves into
+the owned host view, then the directory permit is retired outside locks. The
+source wrapper drops listing data before its permit on errors. A custom root
+uses immediate CPU admission: it cannot hold unrelated directory credit while
+waiting in the ordinary two-second CPU queue. Overload returns 503. The ordinary
+admission queue is unchanged. Custom output is wrapped in the existing owned
+Vec+Tree byte owner on the worker before crossing the result channel, so delayed
+responses, aliases and cancellation retain the actual Tree credit to the last
+owner; future completion alone cannot refund it.
+
+Native bounds include at most 100000 directory entries, 8MiB listing/custom
+output, 1MiB custom source, one million template work units, thirty-second
+cooperative execution checks, bounded header/options input and existing worker
+queues. Detailed host/source charges can reject earlier than those individual
+ceilings. These are bounded admission/accounting policies, not a proof of a
+64MiB hard engine memory cap or full process RSS bound. A retained-local-string
+counterexample in the generic engine remains separate work; no counter increase
+or post-result length charge repairs that defect. Full TemplateContext/Go stdlib
+object methods, complete feature combinations and production gates remain explicit.
+
+Directory-entry ModTime and HumanModTime are always UTC, independently of the
+process timezone. This preserves the directory listing contract without changing
+general template Date/Time local-time behavior, including the year-one zero
+time in unused slice-backing entries.
+
+Plaintext browse preserves raw invalid UTF-8 filename bytes while keeping normal
+column alignment. The Go tabwriter reserves byte 0xff as Escape; feeding a real
+filename containing that byte into it can make later TAB/LF delimiters lose their
+table meaning. Native treats the filename as data and retains alignment. This is
+an intentional repair, distinct from the native default HTML UI, and is not
+represented as byte equality with the baseline. See the
+[upstream tabwriter implementation](https://github.com/golang/go/blob/go1.27.3/src/text/tabwriter/tabwriter.go).

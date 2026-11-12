@@ -34,7 +34,11 @@ impl Budget {
         if self.closed.load(Ordering::Acquire){return Err(BudgetError::WorkerFailed);}
         self.memory.clone().try_acquire_owned().map_err(|_|{self.rejected.fetch_add(1,Ordering::Relaxed);BudgetError::Overloaded})
     }
-    pub(super) async fn admit(&self,control:Arc<Control>,memory:OwnedSemaphorePermit)->Result<RootTree,BudgetError>{
+    pub(super) async fn admit(&self,control:Arc<Control>,memory:OwnedSemaphorePermit)->Result<RootTree,BudgetError>{self.admit_with_queue(control,memory,true).await}
+    // A prepared custom listing still owns directory credit. It must never
+    // wait in the ordinary CPU queue while retaining that unrelated resource.
+    pub(super) async fn admit_immediate(&self,control:Arc<Control>,memory:OwnedSemaphorePermit)->Result<RootTree,BudgetError>{self.admit_with_queue(control,memory,false).await}
+    async fn admit_with_queue(&self,control:Arc<Control>,memory:OwnedSemaphorePermit,queue:bool)->Result<RootTree,BudgetError>{
         // Token precedes the closed check, so wait cannot observe zero while a
         // concurrent accepted root is still between admission and registration.
         let admission=self.tasks.token();
@@ -42,6 +46,7 @@ impl Budget {
         let root=match self.roots.clone().try_acquire_owned(){
             Ok(permit)=>permit,
             Err(_)=>{
+                if !queue {self.rejected.fetch_add(1,Ordering::Relaxed);return Err(BudgetError::Overloaded);}
                 let queued=self.waiting.clone().try_acquire_owned().map_err(|_|BudgetError::Overloaded)?;
                 let until=(std::time::Instant::now()+Duration::from_secs(2)).min(control.deadline());
                 let permit=tokio::select!{
