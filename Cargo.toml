@@ -15,6 +15,7 @@ native-write-policy = { path = "vendor/native-write-policy" }
 opentelemetry = { version = "=0.33.1", default-features = false, features = ["metrics", "trace"] }
 opentelemetry_sdk = { version = "=0.33.1", default-features = false, features = ["trace", "metrics", "experimental_metrics_custom_reader", "experimental_metrics_bound_instruments"] }
 opentelemetry-otlp = { version = "=0.33.1", default-features = false, features = ["trace", "metrics", "http-proto", "grpc-tonic", "gzip-http", "gzip-tonic", "tls-provider-agnostic", "tls-roots"] }
+native-ssl-tls = { path = "vendor/native-ssl-tls" }
 opentelemetry-http = { version = "=0.33.1", default-features = false }
 opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic", "metrics", "trace"] }
 tonic = { version = "=0.14.9", default-features = false, features = ["codegen", "gzip"] }
@@ -91,7 +92,7 @@ libc = "0.2"
 hostname = "0.4"
 chrono = { version = "0.4", features = ["clock"] }
 
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "http2", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "http2", "socks", "native-ssl"] }
 webpki = { package = "rustls-webpki", version = "0.103", features = ["ring", "std", "aws-lc-rs"] }
 
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }

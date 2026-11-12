@@ -391,6 +391,7 @@ dependencies = [
  "memchr",
  "mime_guess",
  "native-write-policy",
+ "native-ssl-tls",
  "openssl",
  "opentelemetry",
  "opentelemetry-http",
@@ -1786,6 +1787,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "native-ssl-tls"
+version = "0.1.0"
+dependencies = [
+ "foreign-types",
+ "openssl",
+ "openssl-sys",
+ "rustls",
+ "tokio",
+ "tokio-openssl",
+ "tokio-util",
+]
+
+[[package]]
 name = "native-write-policy"
 version = "0.1.0"
 
@@ -2574,6 +2588,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "native-ssl-tls",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -3257,6 +3272,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "tokio-openssl"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59df6849caa43bb7567f9a36f863c447d95a11d5903c9cc334ba32576a27eadd"
+dependencies = [
+ "openssl",
+ "openssl-sys",
+ "tokio",
 ]
 
 [[package]]

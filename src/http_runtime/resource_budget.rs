@@ -220,6 +220,7 @@ pub struct ResourceDiagnostics {
 
 pub(crate) struct Resources {
     pub(super) transfer_deadlines: native_write_policy::Pool,
+    pub(crate) ssl_verify:Arc<native_ssl_tls::VerificationScope>,
     pub(super) proxy_health_events_coalesced: Arc<AtomicU64>,
     pub(super) cel_body_bytes: Arc<Semaphore>,
     pub(crate) client_cert_bytes: Arc<Semaphore>,
@@ -356,6 +357,7 @@ impl Resources {
         )?;
         Ok(Self {
             transfer_deadlines: native_write_policy::Pool::new(cpu.saturating_mul(8<<20).clamp(32<<20,256<<20)),
+            ssl_verify:native_ssl_tls::VerificationScope::new(),
             proxy_health_events_coalesced: Arc::new(AtomicU64::new(0)),
             cel_body_bytes: Arc::new(Semaphore::new(super::cel_body::POOL_UNITS)),
             tls_event_bytes:Arc::new(Semaphore::new(super::tls_events::POOL_UNITS)),
@@ -422,6 +424,7 @@ impl Resources {
         })
     }
     pub(crate) fn close(&self) {
+        self.ssl_verify.close();
         self.cel_compile.tasks.close();
         self.proxy_cleanup.close();
         self.proxy_dns.close();
@@ -441,6 +444,7 @@ impl Resources {
         self.fastcgi_admission.diagnostics.close();
     }
     pub(crate) async fn wait(&self) {
+        self.ssl_verify.wait().await;
         self.cel_compile.tasks.wait().await;
         self.proxy_cleanup.wait().await;
         self.proxy_dns.shutdown().await;

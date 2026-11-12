@@ -16,6 +16,7 @@ enum Plan {
     Http { endpoints: Vec<Url>, tls: Tls },
 }
 struct Tls {
+    renegotiation:native_ssl_tls::Renegotiation,
     ca: Option<Box<Plan>>,
     insecure: bool,
     name: Option<String>,
@@ -174,18 +175,15 @@ fn plan(
                 .map(|v| crate::http_config::helpers::duration(&v, "HTTP CA TLS handshake timeout"))
                 .transpose()?
                 .filter(|v| !v.is_zero());
-            if let Some(v) = tls.remove("renegotiation").filter(|v| !v.is_null()) {
-                match v.as_str() {
-                    Some("never" | "") => {}
-                    Some("once" | "freely") => {
-                        return Err(anyhow!("HTTP CA TLS renegotiation is not yet supported"));
-                    }
-                    _ => return Err(anyhow!("invalid HTTP CA TLS renegotiation level")),
-                }
-            }
+            let renegotiation=match tls.remove("renegotiation").filter(|v|!v.is_null()){
+                None=>native_ssl_tls::Renegotiation::Never,
+                Some(Value::String(v))=>native_ssl_tls::Renegotiation::parse(&v).map_err(anyhow::Error::msg)?,
+                _=>return Err(anyhow!("HTTP CA TLS renegotiation must be a string")),
+            };
             Ok(Plan::Http {
                 endpoints: urls,
                 tls: Tls {
+                    renegotiation,
                     ca,
                     insecure,
                     name,
@@ -433,6 +431,7 @@ impl Context {
                         None => None,
                     };
                     let cancel = self.cancel.clone();
+                    let ssl_verify=self.services.ssl_verify.clone();
                     let client = crate::cert_cpu::run(
                         self.services.context.resources.cpu.clone(),
                         cancel,
@@ -443,14 +442,15 @@ impl Context {
                                 p.value
                             });
                             let config =
-                                crate::http_runtime::ca_source_client_tls(ca, tls.insecure)?;
+                                crate::http_runtime::ca_source_prepared_tls(ca, tls.insecure,tls.renegotiation,Some(&ssl_verify))?;
                             let mut builder = reqwest::Client::builder()
-                                .use_preconfigured_tls(config)
+                                .use_preconfigured_tls(config.rustls)
                                 .redirect(reqwest::redirect::Policy::none())
                                 .connect_timeout(Duration::from_secs(10))
                                 .timeout(Duration::from_secs(30))
                                 .pool_max_idle_per_host(0)
                                 .http2_max_header_list_size(65536);
+                            if let Some(native)=config.native{builder=builder.prepared_openssl_tls(native);}
                             if let Some(name) = tls.name {
                                 builder = builder.tls_server_name_override(name);
                             }

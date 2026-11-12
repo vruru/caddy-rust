@@ -80,6 +80,10 @@ retain their licenses in their original registry distributions. The Apache-2.0
 license text is also provided in LICENSE. No upstream project endorses this
 implementation or its compatibility claims.
 
+The explicit outgoing SSL connector additionally uses tokio-openssl 0.6.5,
+dual-licensed MIT/Apache-2.0, retaining its license texts in the original registry
+distribution. `vendor/native-ssl-tls` contains first-party Apache-2.0 source.
+
 Caddy and CertMagic
 ------------------
 

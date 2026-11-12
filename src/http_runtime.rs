@@ -161,7 +161,7 @@ pub(crate) mod timeout_io;
 mod trailer_policy;
 #[path = "http_runtime/upstream_tls.rs"]
 mod upstream_tls;
-pub(crate) use upstream_tls::ca_source_client_tls;
+pub(crate) use upstream_tls::{ca_source_client_tls,ca_source_prepared_tls};
 pub(crate) mod metrics_client;
 pub use upstream_tls::NativeTrustDiagnostics;
 
@@ -681,6 +681,7 @@ async fn prepare_servers(
         let client_plan = server.clone();
         let proxy_hosts = resources.proxy_hosts.clone();
         let proxy_dns = resources.proxy_dns.clone();
+        let ssl_verify=resources.ssl_verify.clone();
         let clients = tokio::task::spawn_blocking(move || {
             let mut clients = HashMap::new();
             proxy::prepare_clients(
@@ -689,6 +690,7 @@ async fn prepare_servers(
                 &proxy_hosts,
                 &proxy_dns,
                 logging_available,
+                &ssl_verify,
             )?;
             proxy::prepare_clients(
                 &client_plan.errors,
@@ -696,6 +698,7 @@ async fn prepare_servers(
                 &proxy_hosts,
                 &proxy_dns,
                 logging_available,
+                &ssl_verify,
             )?;
             for route in client_plan.named_routes.values() {
                 proxy::prepare_clients(
@@ -704,6 +707,7 @@ async fn prepare_servers(
                     &proxy_hosts,
                     &proxy_dns,
                     logging_available,
+                &ssl_verify,
                 )?;
             }
             Ok::<_, anyhow::Error>(clients)
@@ -750,6 +754,7 @@ async fn prepare_servers(
             let client_plan = plan.clone();
             let proxy_hosts = resources.proxy_hosts.clone();
             let proxy_dns = resources.proxy_dns.clone();
+        let ssl_verify=resources.ssl_verify.clone();
             let clients = tokio::task::spawn_blocking(move || {
                 let mut clients = HashMap::new();
                 proxy::prepare_clients(
@@ -758,6 +763,7 @@ async fn prepare_servers(
                     &proxy_hosts,
                     &proxy_dns,
                     logging_available,
+                &ssl_verify,
                 )?;
                 proxy::prepare_clients(
                     &client_plan.errors,
@@ -765,6 +771,7 @@ async fn prepare_servers(
                     &proxy_hosts,
                     &proxy_dns,
                     logging_available,
+                &ssl_verify,
                 )?;
                 for route in client_plan.named_routes.values() {
                     proxy::prepare_clients(
@@ -773,6 +780,7 @@ async fn prepare_servers(
                         &proxy_hosts,
                         &proxy_dns,
                         logging_available,
+                &ssl_verify,
                     )?;
                 }
                 Ok::<_, anyhow::Error>(clients)

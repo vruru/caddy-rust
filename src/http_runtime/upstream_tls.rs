@@ -62,13 +62,15 @@ pub(super) fn native_roots() -> &'static rustls::RootCertStore {
 pub(super) struct PreparedTransport {
     http: [HttpConnector<super::http_dial::FamilyResolver>; 3],
     tls: Option<Arc<ClientConfig>>,
+    native: Option<Arc<native_ssl_tls::ClientConfig>>,
+    http1_native: bool,
     read: Option<Duration>,
     write: Option<Duration>,
     handshake: Option<Duration>,
     connect_timeout: Duration,
 }
 impl PreparedTransport {
-    pub(super) fn prepare(config: &ProxyConfig) -> Result<Self> {
+    pub(super) fn prepare(config: &ProxyConfig,scope:&Arc<native_ssl_tls::VerificationScope>) -> Result<Self> {
         let http = [
             super::http_dial::Family::Any,
             super::http_dial::Family::V4,
@@ -85,12 +87,14 @@ impl PreparedTransport {
         let tls = config
             .tls
             .as_ref()
-            .map(|t| provision(t, config.enable_http2))
-            .transpose()?
-            .map(Arc::new);
+            .map(|t| provision_inner(t, config.enable_http2,false,Some(scope)))
+            .transpose()?;
+        let (tls,native)=match tls{Some(t)=>(Some(Arc::new(t.rustls)),t.native),None=>(None,None)};
         Ok(Self {
             http,
             tls,
+            native,
+            http1_native:false,
             read: config.read_timeout,
             write: config.write_timeout,
             handshake: config.tls.as_ref().and_then(|t| t.handshake_timeout),
@@ -101,10 +105,11 @@ impl PreparedTransport {
         let family=super::http_dial::Family::Any;
         let mut http=HttpConnector::new_with_resolver(super::http_dial::FamilyResolver::new(family));
         http.enforce_http(false);http.set_connect_timeout(Some(timeout));http.set_nodelay(true);
-        FixedDialConnector{http,family,tls,read:Some(timeout),write:Some(timeout),handshake:Some(timeout),dial,server_name:None,unix_path:None,connect_timeout:timeout}
+        FixedDialConnector{http,family,tls,native:None,http1_native:false,read:Some(timeout),write:Some(timeout),handshake:Some(timeout),dial,server_name:None,unix_path:None,connect_timeout:timeout}
     }
     pub(super) fn http1(&self) -> Self {
         let mut result = self.clone();
+        result.http1_native=true;
         if let Some(tls) = &result.tls {
             let mut tls = (**tls).clone();
             // Go persistConn.addTLS and Caddy's dynamic DialTLS both clear
@@ -135,6 +140,8 @@ impl PreparedTransport {
             } else {
                 None
             },
+            native: if dial.scheme_str()==Some("https"){self.native.clone()}else{None},
+            http1_native:self.http1_native,
             read: self.read,
             write: self.write,
             handshake: self.handshake,
@@ -220,8 +227,8 @@ fn provider_roots(raw:&serde_json::Value,depth:usize,budget:&mut u64,count:&mut 
     }
     Ok(())
 }
-fn provision(tls:&ProxyTls,enable_http2:bool)->Result<ClientConfig>{provision_inner(tls,enable_http2,false)}
-fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool) -> Result<ClientConfig> {
+pub(crate) struct PreparedTls {pub(crate) rustls:ClientConfig,pub(crate) native:Option<Arc<native_ssl_tls::ClientConfig>>}
+fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool,scope:Option<&Arc<native_ssl_tls::VerificationScope>>) -> Result<PreparedTls> {
     ensure!(
         tls.client_certificate_file.is_some() == tls.client_certificate_key_file.is_some(),
         "client_certificate_file and client_certificate_key_file must be set together"
@@ -287,31 +294,25 @@ fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool)
         provider.kx_groups = groups;
         Arc::new(provider)
     };
-    let builder = ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()?
-        .with_root_certificates(roots);
-    let mut config = if let (Some(cert), Some(key)) = (
-        &tls.client_certificate_file,
-        &tls.client_certificate_key_file,
-    ) {
-        let certificates = certificates(&read_material(cert, &mut budget)?)?;
-        let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(read_material(
-            key,
-            &mut budget,
-        )?))
-        .map_err(|_| anyhow::anyhow!("invalid upstream client private key PEM"))?
-        .ok_or_else(|| anyhow::anyhow!("upstream client private key missing or encrypted"))?;
-        builder
-            .with_client_auth_cert(certificates, key)
-            .map_err(|_| anyhow::anyhow!("invalid upstream client certificate/key pair"))?
-    } else {
-        builder.with_no_client_auth()
-    };
-    if tls.insecure_skip_verify {
-        config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(InsecureVerifier { provider }));
-    }
+    let verifier:Arc<dyn ServerCertVerifier>=if tls.insecure_skip_verify||roots.is_empty(){
+        Arc::new(InsecureVerifier{provider:provider.clone(),skip_chain:tls.insecure_skip_verify})
+    }else{rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots),provider.clone()).build()?};
+    let builder=ClientConfig::builder_with_provider(provider.clone()).with_safe_default_protocol_versions()?.dangerous().with_custom_certificate_verifier(verifier.clone());
+    let identity=if let(Some(cert),Some(key))=(&tls.client_certificate_file,&tls.client_certificate_key_file){
+        let certs=certificates(&read_material(cert,&mut budget)?)?;
+        let key=rustls_pemfile::private_key(&mut std::io::Cursor::new(read_material(key,&mut budget)?))
+            .map_err(|_|anyhow::anyhow!("invalid upstream client private key PEM"))?.ok_or_else(||anyhow::anyhow!("upstream client private key missing or encrypted"))?;
+        Some((certs,key))
+    }else{None};
+    let alpn=if enable_http2{vec![b"h2".to_vec(),b"http/1.1".to_vec()]}else{Vec::new()};
+    let native=if tls.renegotiation!=native_ssl_tls::Renegotiation::Never{
+        let groups=provider.kx_groups.iter().map(|g|match u16::from(g.name()){
+            29=>Ok("X25519"),23=>Ok("P-256"),24=>Ok("P-384"),25=>Ok("P-521"),4588=>Ok("X25519MLKEM768"),4587=>Ok("SecP256r1MLKEM768"),4589=>Ok("SecP384r1MLKEM1024"),_=>Err(anyhow::anyhow!("TLS group is unavailable to renegotiation engine"))
+        }).collect::<Result<Vec<_>>>()?.join(":");
+        let config=native_ssl_tls::ClientConfig::new(verifier,tls.renegotiation,&alpn,&groups,identity.as_ref().map(|(c,k)|(c.as_slice(),k.secret_der())))?;
+        Some(Arc::new(match scope{Some(scope)=>config.with_verification_scope(scope.clone()),None=>config}))
+    }else{None};
+    let mut config=match identity{Some((certs,key))=>builder.with_client_auth_cert(certs,key).map_err(|_|anyhow::anyhow!("invalid upstream client certificate/key pair"))?,None=>builder.with_no_client_auth()};
     // Go HTTPTransport leaves ClientSessionCache nil, so it does not resume.
     config.resumption = rustls::client::Resumption::disabled();
     config.alpn_protocols = if enable_http2 {
@@ -319,10 +320,11 @@ fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool)
     } else {
         Vec::new()
     };
-    Ok(config)
+    Ok(PreparedTls{rustls:config,native})
 }
 #[derive(Debug)]
 struct InsecureVerifier {
+    skip_chain:bool,
     provider: Arc<rustls::crypto::CryptoProvider>,
 }
 impl ServerCertVerifier for InsecureVerifier {
@@ -334,7 +336,7 @@ impl ServerCertVerifier for InsecureVerifier {
         _: &[u8],
         _: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
+        if self.skip_chain{Ok(ServerCertVerified::assertion())}else{Err(rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer))}
     }
     fn verify_tls12_signature(
         &self,
@@ -369,13 +371,36 @@ impl ServerCertVerifier for InsecureVerifier {
     }
 }
 
-pub(super) type Output = MaybeHttpsStream<TimeoutIo<super::http_dial_io::DialIo>>;
+type Dial=TimeoutIo<super::http_dial_io::DialIo>;
+pub(super) enum Output{
+    Rustls(MaybeHttpsStream<Dial>),
+    Native(TokioIo<native_ssl_tls::Stream<TokioIo<Dial>>>),
+}
+impl hyper_util::client::legacy::connect::Connection for Output{
+    fn connected(&self)->hyper_util::client::legacy::connect::Connected{
+        match self{Self::Rustls(s)=>s.connected(),Self::Native(s)=>{
+            let connected=s.inner().get_ref().inner().connected();
+            if s.inner().ssl().selected_alpn_protocol()==Some(b"h2"){connected.negotiated_h2()}else{connected}
+        }}
+    }
+}
+impl hyper::rt::Read for Output{
+    fn poll_read(self:Pin<&mut Self>,cx:&mut Context<'_>,buf:hyper::rt::ReadBufCursor<'_>)->Poll<std::io::Result<()>>{match self.get_mut(){Self::Rustls(s)=>Pin::new(s).poll_read(cx,buf),Self::Native(s)=>Pin::new(s).poll_read(cx,buf)}}
+}
+impl hyper::rt::Write for Output{
+    fn poll_write(self:Pin<&mut Self>,cx:&mut Context<'_>,buf:&[u8])->Poll<std::io::Result<usize>>{match self.get_mut(){Self::Rustls(s)=>Pin::new(s).poll_write(cx,buf),Self::Native(s)=>Pin::new(s).poll_write(cx,buf)}}
+    fn poll_flush(self:Pin<&mut Self>,cx:&mut Context<'_>)->Poll<std::io::Result<()>>{match self.get_mut(){Self::Rustls(s)=>Pin::new(s).poll_flush(cx),Self::Native(s)=>Pin::new(s).poll_flush(cx)}}
+    fn poll_shutdown(self:Pin<&mut Self>,cx:&mut Context<'_>)->Poll<std::io::Result<()>>{match self.get_mut(){Self::Rustls(s)=>Pin::new(s).poll_shutdown(cx),Self::Native(s)=>Pin::new(s).poll_shutdown(cx)}}
+}
+
 
 #[derive(Clone)]
 pub(super) struct FixedDialConnector {
     pub(super) http: HttpConnector<super::http_dial::FamilyResolver>,
     family: super::http_dial::Family,
     pub(super) tls: Option<Arc<ClientConfig>>,
+    native:Option<Arc<native_ssl_tls::ClientConfig>>,
+    http1_native:bool,
     pub(super) read: Option<Duration>,
     pub(super) write: Option<Duration>,
     pub(super) handshake: Option<Duration>,
@@ -412,6 +437,8 @@ impl Service<Uri> for FixedDialConnector {
     fn call(&mut self, _uri: Uri) -> Self::Future {
         let mut http = self.http.clone();
         let tls = self.tls.clone();
+        let native=self.native.clone();
+        let http1_native=self.http1_native;
         let read = self.read;
         let write = self.write;
         let handshake = self.handshake;
@@ -442,7 +469,7 @@ impl Service<Uri> for FixedDialConnector {
             let io = TimeoutIo::new(tcp, read, write);
 
             match tls {
-                None => Ok(MaybeHttpsStream::Http(io)),
+                None => Ok(Output::Rustls(MaybeHttpsStream::Http(io))),
                 Some(cfg) => {
                     let server_name = match server_name {
                         Some(s) => s,
@@ -456,6 +483,11 @@ impl Service<Uri> for FixedDialConnector {
                         }
                     };
 
+                    if let Some(native)=native{
+                        let connect=native.connect_with_alpn(server_name,TokioIo::new(io),if http1_native{Some(&[])}else{None});
+                        let stream=match handshake{Some(d)if !d.is_zero()=>timeout(d,connect).await.map_err(|_|std::io::Error::new(std::io::ErrorKind::TimedOut,"TLS handshake timeout"))??,_=>connect.await?};
+                        return Ok(Output::Native(TokioIo::new(stream)));
+                    }
                     let tls_connector = TlsConnector::from(cfg);
                     let tokio_io = TokioIo::new(io);
                     let connect_future = tls_connector.connect(server_name, tokio_io);
@@ -475,7 +507,7 @@ impl Service<Uri> for FixedDialConnector {
                             .map_err(|e| Box::new(e) as Self::Error)?,
                     };
 
-                    Ok(MaybeHttpsStream::Https(TokioIo::new(stream)))
+                    Ok(Output::Rustls(MaybeHttpsStream::Https(TokioIo::new(stream))))
                 }
             }
         })
@@ -484,7 +516,8 @@ impl Service<Uri> for FixedDialConnector {
 
 /// Real configuration-time HTTP CA-fetch trust uses the same prepared client
 /// TLS policy as proxy traffic, with no client identity or per-port exception.
-pub(crate) fn ca_source_client_tls(ca:Option<serde_json::Value>,insecure:bool)->Result<ClientConfig>{
-    let options=ProxyTls{curves:Vec::new(),ca,except_ports:Vec::new(),server_name:None,insecure_skip_verify:insecure,root_ca_pem_files:Vec::new(),root_ca_pool:Vec::new(),client_certificate_file:None,client_certificate_key_file:None,handshake_timeout:None};
-    provision_inner(&options,true,true)
+pub(crate) fn ca_source_client_tls(ca:Option<serde_json::Value>,insecure:bool)->Result<ClientConfig>{Ok(ca_source_prepared_tls(ca,insecure,native_ssl_tls::Renegotiation::Never,None)?.rustls)}
+pub(crate) fn ca_source_prepared_tls(ca:Option<serde_json::Value>,insecure:bool,renegotiation:native_ssl_tls::Renegotiation,scope:Option<&Arc<native_ssl_tls::VerificationScope>>)->Result<PreparedTls>{
+    let options=ProxyTls{renegotiation,curves:Vec::new(),ca,except_ports:Vec::new(),server_name:None,insecure_skip_verify:insecure,root_ca_pem_files:Vec::new(),root_ca_pool:Vec::new(),client_certificate_file:None,client_certificate_key_file:None,handshake_timeout:None};
+    provision_inner(&options,true,true,scope)
 }

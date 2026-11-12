@@ -152,3 +152,16 @@ representation and does not require response DATA. Nonempty HEAD DATA,
 conflicting Content-Length fields, and truncated ordinary GET responses still
 fail their own stream without resetting a valid parent response. This client
 correctness fix does not by itself implement the native HTTP/2 push handler.
+
+## Explicit outgoing SSL transport
+
+`native-ssl-tls` is first-party Apache-2.0 functional source. It uses the complete
+OpenSSL SSL record/session engine through the existing pinned OpenSSL bindings
+and `tokio-openssl` 0.6.5; it does not implement cryptographic record protection.
+The reqwest copy adds an opt-in prepared SSL connector for explicit outgoing
+renegotiation, retaining separate HTTPS-proxy and origin names and ALPN. Default
+Rustls paths are preserved. Native trust validation uses exact-wire certificate
+bytes and the public retry-verification boundary on a bounded CPU lane; raw
+observations, abandoned worker results and service shutdown retain their actual
+owners. See COMPATIBILITY.md for limits and unfinished server/client-identity
+capabilities.

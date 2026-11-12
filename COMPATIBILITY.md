@@ -118,7 +118,7 @@ their configuration and behavior require native implementations.
 
 Known development gaps still include remaining listener/address combinations,
 the ACME server handler, HTTP/2 push and remaining template receiver methods,
-TLS 1.2 CBC suites, client renegotiation, full Go PKIX edge semantics and remaining issuer/trust-loader
+TLS 1.2 CBC suites, full Go PKIX edge semantics and remaining issuer/trust-loader
 capabilities. This list is not a claim that all other field combinations are
 fully verified. The 135-module baseline is an inventory, not a support registry.
 
@@ -755,8 +755,7 @@ Active upstream health checks use that prepared transport; handshakes perform no
 CA-provider I/O. An explicitly empty pool trusts no roots, and cannot silently
 fall back to system trust or a previous generation. Conflicting legacy root-CA
 fields are rejected before publication. A failed candidate retains the working
-configuration. Unknown/unprepared providers still fail explicitly. TLS renegotiation and
-remaining issuer/PKIX behavior remain separate work; this addition does not claim complete TLS compatibility.
+configuration. Unknown/unprepared providers still fail explicitly. Remaining issuer/PKIX behavior remains separate work; this addition does not claim complete TLS compatibility.
 
 
 Mutable template request URL views
@@ -893,8 +892,8 @@ Failure or cancellation cancels and drains started sibling work through the
 owned service task before returning. A failed candidate keeps the old site;
 handshakes and health probes use the published pool without source I/O.
 Persistent prepared trust retains its existing output accounting boundary;
-these temporary credits are not a whole-process/RSS limit. Rustls TLS
-renegotiation `once` and `freely` remain explicitly unsupported.
+these temporary credits are not a whole-process/RSS limit. Explicit TLS
+renegotiation uses the prepared compatibility transport described below.
 
 ### Native request URL provenance and rewrite path components
 
@@ -941,7 +940,7 @@ facts and shared-client issuance/trust regressions cover this behavior.
 The pinned baseline only recognizes TLS1.2/TLS1.3 as server protocols. Legacy
 TLS1.0/TLS1.1 names fall back to modern defaults and do not enable those wire
 versions; they are not an unimplemented baseline feature. TLS1.2 CBC suites,
-client renegotiation once/freely, automated client certificates and remaining
+automated client certificates and remaining
 issuer features remain separate unfinished work. PKI KeyPair formats other
 than empty/pem_file are likewise not implemented by the pinned baseline.
 
@@ -989,3 +988,39 @@ without erasing an outer server hard deadline. Requests and upgrade actors
 retain their concrete generation and allocation owners through reload and stop.
 See docs/TIMEOUTS.md for units, defaults and scope bounds. These paths do not
 waive any outstanding full-project acceptance gate.
+
+### Explicit outgoing TLS renegotiation
+
+Upstream HTTP transports and HTTPS CA sources accept `never`, `once` and
+`freely`. Default/`never` retains Rustls; explicit `once`/`freely` selects the
+complete OpenSSL SSL transport with the same prepared native trust verifier,
+configured client identity and outgoing key-exchange profile. Direct, Unix,
+SOCKS and CONNECT paths preserve their transport identity. HTTPS proxy TLS
+uses its own hostname; origin overrides do not replace that hostname. HTTP/1
+upgrade clears ALPN, and HTTP/2 renegotiation is rejected. Each completed
+renegotiation must retain the exact initial leaf DER, including when a new
+leaf uses the same trusted signing key. Count limits use actual Finished
+messages; an abbreviated or ignored request is not counted as a full exchange.
+
+Initial certificate path/name/time validation uses OpenSSL's public retry-verify
+boundary and the original native verifier on a bounded CPU worker. Network
+readiness remains asynchronous and OpenSSL's path verifier is replaced, rather
+than evaluating the untrusted chain twice. Verification CPU/queue admission is
+shared across clients (running: available CPUs capped at 32; waiting: eight
+per CPU, bounded to 32..256). Runtime/service scopes close admission and wait
+for real workers and abandoned results. The CPU permit is released when the
+completed worker's result is taken; a separate handshake entry token spans
+the returned result until the handshake exits. Established streams retain their
+certificate observations independently. Closing the scope fences admission
+under its mutex, then wakes cancellation/task waiters outside that mutex.
+Exact-wire certificate observations
+have a separate aggregate 64 MiB credit pool, a 1 MiB message limit and at most
+64 certificates. This is not a whole-process/OpenSSL heap limit.
+
+Protocol, suite, ALPN, peer certificates, stapled OCSP bytes, session reuse and
+exporter values exposed by this outgoing transport come from its live SSL
+connection; this does not add OCSP-revocation policy to native upstream trust.
+No incoming TLS snapshot or default server/HTTP3 provider is replaced. TLS1.2
+CBC policy and automated managed client identities remain separate unfinished
+work. The generic configuration still rejects invalid renegotiation levels
+before publication, and a failed HTTPS CA preparation retains the old site.

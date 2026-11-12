@@ -1,0 +1,14 @@
+[package]
+name="native-ssl-tls"
+version="0.1.0"
+edition="2024"
+rust-version="1.100.0"
+license="Apache-2.0"
+[dependencies]
+openssl={version="=0.10.82",features=["vendored"]}
+openssl-sys="=0.9.118"
+foreign-types="0.3"
+tokio={version="1",features=["io-util","rt","sync","macros"]}
+tokio-openssl="=0.6.5"
+rustls={version="=0.23.46",default-features=false,features=["std","tls12"]}
+tokio-util={version="0.7",features=["rt"]}

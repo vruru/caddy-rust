@@ -65,6 +65,7 @@ features = [
 ]
 
 [features]
+native-ssl = ["__rustls", "dep:native-ssl-tls"]
 __rustls = [
     "dep:hyper-rustls",
     "dep:tokio-rustls",
@@ -507,3 +508,7 @@ version = "0.3"
 level = "warn"
 priority = 0
 check-cfg = ["cfg(reqwest_unstable)"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.native-ssl-tls]
+path="../native-ssl-tls"
+optional=true

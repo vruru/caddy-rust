@@ -1847,6 +1847,7 @@ fn parse_proxy(
                     t,
                     &[
                         "server_name",
+                        "renegotiation",
                         "curves",
                         "insecure_skip_verify",
                         "root_ca_pem_files",
@@ -1866,7 +1867,10 @@ fn parse_proxy(
                         && t.get("root_ca_pem_files").map(|v|strings(v,path)).transpose()?.is_none_or(|v|v.is_empty()),
                         "conflicting upstream Root CA pool configuration");
                 }
+                let renegotiation=t.get("renegotiation").filter(|v|!v.is_null()).map(|v|string(v,path)).transpose()?.unwrap_or_default();
+                let renegotiation=native_ssl_tls::Renegotiation::parse(&renegotiation).map_err(anyhow::Error::msg)?;
                 tls = Some(ProxyTls {
+                    renegotiation,
                     ca,
                     curves: t.get("curves").filter(|v|!v.is_null()).map(|v|strings(v,path)).transpose()?.unwrap_or_default(),
                     except_ports: t

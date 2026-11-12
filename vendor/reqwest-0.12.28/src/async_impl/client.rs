@@ -169,6 +169,8 @@ struct Config {
     tls_sni: bool,
     #[cfg(feature = "__rustls")]
     tls_crypto_provider: Option<Arc<rustls::crypto::CryptoProvider>>,
+    #[cfg(feature="native-ssl")]
+    openssl_tls: Option<Arc<native_ssl_tls::ClientConfig>>,
     #[cfg(feature = "__rustls")]
     tls_server_name_override: Option<String>,
     #[cfg(feature = "__rustls")]
@@ -304,6 +306,8 @@ impl ClientBuilder {
                 tls_sni: true,
                 #[cfg(feature = "__rustls")]
                 tls_crypto_provider: None,
+                #[cfg(feature="native-ssl")]
+                openssl_tls: None,
                 #[cfg(feature = "__rustls")]
                 tls_server_name_override: None,
                 #[cfg(feature = "__rustls")]
@@ -936,6 +940,8 @@ impl ClientBuilder {
             config.tls_server_name_override.map(rustls_pki_types::ServerName::try_from).transpose().map_err(crate::error::builder)?,
             config.tls_handshake_timeout,
         ).map_err(crate::error::builder)?;
+        #[cfg(feature="native-ssl")]
+        connector_builder.set_openssl_tls(config.openssl_tls).map_err(crate::error::builder)?;
         connector_builder.set_timeout(config.connect_timeout);
         connector_builder.set_verbose(config.connection_verbose);
         connector_builder.set_keepalive(config.tcp_keepalive);
@@ -2054,6 +2060,13 @@ impl ClientBuilder {
         self.config.tls_crypto_provider = Some(provider);
         self
     }
+    /// Install an explicitly prepared OpenSSL TLS policy for origin and HTTPS
+    /// proxy connections. Each TLS layer retains its own destination name.
+    #[cfg(feature="native-ssl")]
+    pub fn prepared_openssl_tls(mut self,config:Arc<native_ssl_tls::ClientConfig>)->ClientBuilder{
+        self.config.openssl_tls=Some(config);self
+    }
+
 
     /// Override origin SNI and certificate-name verification without changing
     /// the request URL, Host, proxy CONNECT destination, or proxy TLS name.

@@ -207,6 +207,7 @@ struct State {
 }
 
 pub struct CertificateServices {
+    ssl_verify:Arc<native_ssl_tls::VerificationScope>,
     plan: CertificatePlan,
     context: PrepareContext,
     restore: Option<RetainedCertificates>,
@@ -280,6 +281,7 @@ impl CertificateServices {
         let on_demand = Arc::new(on_demand::OnDemand::new(cache_receiver,
             context.leaf_guard.key_deny().clone()));
         let this = Arc::new(Self {
+            ssl_verify:native_ssl_tls::VerificationScope::new(),
             plan,
             context,
             restore,
@@ -472,6 +474,7 @@ impl CertificateServices {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             self.context.cancel.cancel();
+            self.ssl_verify.close();
             self.activate
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -479,6 +482,7 @@ impl CertificateServices {
             self.tasks.close();
         }
         self.tasks.wait().await;
+        self.ssl_verify.wait().await;
         let pki = self
             .state
             .lock()

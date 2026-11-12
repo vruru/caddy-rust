@@ -191,6 +191,7 @@ pub(crate) struct ProxyConfig {
 
 #[derive(Clone)]
 pub(crate) struct ProxyTls {
+    pub(crate) renegotiation: native_ssl_tls::Renegotiation,
     pub(crate) curves: Vec<String>,
     pub(crate) ca: Option<serde_json::Value>,
     pub(crate) except_ports: Vec<String>,
