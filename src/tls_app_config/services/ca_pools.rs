@@ -201,17 +201,9 @@ impl CertificateServices {
                         let mut ids = BTreeSet::new();
                         let mut found = false;
                         let mut references = 0;
-                        for server in &config.servers {
-                            for policy in &server.tls_policies {
-                                if let Some(value) = policy
-                                    .client_auth
-                                    .as_ref()
-                                    .and_then(|auth| auth.ca.as_ref())
-                                {
-                                    scan(value, 0, &mut ids, &mut found, &mut references)?;
-                                }
-                            }
-                        }
+                        super::ca_consumers::each(&config, &mut |value| {
+                            scan(value, 0, &mut ids, &mut found, &mut references)
+                        })?;
                         Ok((config, ids, found))
                     },
                 )
@@ -256,17 +248,9 @@ impl CertificateServices {
                 let result =
                     crate::cert_cpu::run(this.context.resources.cpu.clone(), token, move || {
                         let mut referenced_pem = 0usize;
-                        for server in &config.servers {
-                            for policy in &server.tls_policies {
-                                if let Some(value) = policy
-                                    .client_auth
-                                    .as_ref()
-                                    .and_then(|auth| auth.ca.as_ref())
-                                {
-                                    input_bound(value, &snapshots, &mut referenced_pem)?;
-                                }
-                            }
-                        }
+                        super::ca_consumers::each(&config, &mut |value| {
+                            input_bound(value, &snapshots, &mut referenced_pem)
+                        })?;
                         let input = snapshots.values().try_fold(0usize, |sum, s| {
                             sum.checked_add(s.root_certificate_pem.len())
                                 .and_then(|n| n.checked_add(s.intermediate_chain_pem.len()))
@@ -282,17 +266,9 @@ impl CertificateServices {
                         let _credit = crate::cert_transient::reserve(scratch)?;
                         let mut count = 0usize;
                         let mut bytes = 0usize;
-                        for server in &mut config.servers {
-                            for policy in &mut Arc::make_mut(server).tls_policies {
-                                if let Some(value) = policy
-                                    .client_auth
-                                    .as_mut()
-                                    .and_then(|auth| auth.ca.as_mut())
-                                {
-                                    transform(value, &snapshots, &mut count, &mut bytes)?;
-                                }
-                            }
-                        }
+                        super::ca_consumers::each_mut(&mut config, &mut |value| {
+                            transform(value, &snapshots, &mut count, &mut bytes)
+                        })?;
                         Ok(config)
                     })
                     .await;

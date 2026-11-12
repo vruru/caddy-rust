@@ -189,6 +189,7 @@ pub(crate) struct ProxyConfig {
 
 #[derive(Clone)]
 pub(crate) struct ProxyTls {
+    pub(crate) ca: Option<serde_json::Value>,
     pub(crate) except_ports: Vec<String>,
     pub(crate) server_name: Option<String>,
     pub(crate) insecure_skip_verify: bool,

@@ -1829,6 +1829,7 @@ fn parse_proxy(
                         "insecure_skip_verify",
                         "root_ca_pem_files",
                         "root_ca_pool",
+                        "ca",
                         "except_ports",
                         "client_certificate_file",
                         "client_certificate_key_file",
@@ -1836,7 +1837,15 @@ fn parse_proxy(
                     ],
                     path,
                 )?;
+                let ca = t.get("ca").filter(|v|!v.is_null()).cloned();
+                if let Some(ca)=&ca {object(ca,path)?;}
+                if ca.is_some() {
+                    ensure!(t.get("root_ca_pool").map(|v|strings(v,path)).transpose()?.is_none_or(|v|v.is_empty())
+                        && t.get("root_ca_pem_files").map(|v|strings(v,path)).transpose()?.is_none_or(|v|v.is_empty()),
+                        "conflicting upstream Root CA pool configuration");
+                }
                 tls = Some(ProxyTls {
+                    ca,
                     except_ports: t
                         .get("except_ports")
                         .map(|v| strings(v, path))

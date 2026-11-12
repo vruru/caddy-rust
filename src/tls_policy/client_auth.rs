@@ -291,9 +291,13 @@ fn decode(raw: &str, budget: &mut Budget) -> Result<CertificateDer<'static>> {
         raw.len() <= MAX_ONE_CERTIFICATE * 2,
         "client certificate too large"
     );
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(raw)
-        .map_err(|_| anyhow::anyhow!("invalid client certificate base64"))?;
+    // Go StdEncoding ignores CR/LF and accepts non-zero unused pad bits.
+    let decoder=base64::engine::general_purpose::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        base64::engine::general_purpose::GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true),
+    );
+    let encoded=raw.bytes().filter(|b|!matches!(b,b'\r'|b'\n')).collect::<Vec<_>>();
+    let bytes=decoder.decode(encoded).map_err(|_|anyhow::anyhow!("invalid client certificate base64"))?;
     budget.accept(&bytes)?;
     Ok(CertificateDer::from(bytes))
 }
@@ -345,6 +349,9 @@ fn pem_line(mut line: &[u8]) -> &[u8] {
 
 /// Storage/HTTP CA sources share exactly the file-provider PEM semantics.
 /// Run on the caller's bounded CPU lane with owned input and output allowance.
+pub(crate) fn source_inline(raw:&str)->Result<CertificateDer<'static>>{
+    decode(raw,&mut Budget{count:0,bytes:0})
+}
 pub(crate) fn source_certificates(data:&[u8])->Result<Vec<CertificateDer<'static>>>{
     parse_pem(data,PemSource::Ca,&mut Budget{count:0,bytes:0})
 }

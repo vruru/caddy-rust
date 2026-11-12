@@ -719,8 +719,7 @@ scratch uses the existing shared pool and is released by the actual CPU
 worker. Persistent prepared configuration/trust outputs retain their existing
 control/output ownership boundary; this is not a whole-process heap bound.
 A failed reload keeps the previous working TLS configuration. This entry
-covers server client-authentication pools; other consumers of CA providers,
-and the HTTP client-authentication provider, remain separate gaps.
+covers server client-authentication pools; HTTP CA providers remain a separate gap; upstream consumers are described below.
 
 
 Server client-authentication storage CA sources
@@ -741,5 +740,21 @@ explicit limits. Actual input and transformation scratch retain their shared
 credits until the real worker releases them. Prepared trust output then enters
 the existing configuration ownership boundary; this is not a whole-process RSS
 bound. System-root scanning propagates resource exhaustion instead of silently
-skipping a valid root. HTTP providers and upstream-provider consumers remain
-separate integration work.
+skipping a valid root. HTTP CA providers remain separate integration work.
+
+
+Reverse-proxy TLS trust-provider consumers
+-----------------------------------------
+
+The upstream TLS `ca` provider now follows the same generation preparation
+transaction as server client-authentication providers. PKI and storage inputs
+resolve before transport provisioning; inline, file, system and combined pools
+compile on the existing bounded provisioning lane. The typed traversal includes
+main, error, named, nested subroute and intercepted/proxy-response route trees.
+Active upstream health checks use that prepared transport; handshakes perform no
+CA-provider I/O. An explicitly empty pool trusts no roots, and cannot silently
+fall back to system trust or a previous generation. Conflicting legacy root-CA
+fields are rejected before publication. A failed candidate retains the working
+configuration. Unknown/unprepared providers still fail explicitly. HTTP CA
+sources, TLS renegotiation and remaining issuer/PKIX behavior remain separate
+work; this addition does not claim complete TLS compatibility.

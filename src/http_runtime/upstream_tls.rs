@@ -169,6 +169,57 @@ fn certificates(bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
     );
     Ok(certs)
 }
+/// CA provider modules share file/inline decoding with server client auth.
+/// This runs only in transport provisioning, never from connector/handshake.
+fn provider_roots(raw:&serde_json::Value,depth:usize,budget:&mut u64,count:&mut usize,roots:&mut rustls::RootCertStore)->Result<()>{
+    use crate::http_config::helpers::{object,deny_unknown};
+    ensure!(depth<8,"upstream CA provider nesting too deep");
+    let obj=object(raw,"upstream CA provider")?;
+    let mut add=|cert:CertificateDer<'static>|->Result<()>{
+        *count=count.checked_add(1).ok_or(crate::cert_transient::ResourceDenied)?;
+        ensure!(*count<=4096,"upstream CA certificate count exceeds bounds");
+        roots.add(cert).map_err(|_|anyhow::anyhow!("invalid upstream root CA certificate"))?;Ok(())
+    };
+    match obj.get("provider").and_then(serde_json::Value::as_str){
+        Some("inline")=>{
+            deny_unknown(obj,&["provider","trusted_ca_certs"],"upstream inline CA pool")?;
+            if let Some(value)=obj.get("trusted_ca_certs").filter(|v|!v.is_null()){
+                let values=value.as_array().ok_or_else(||anyhow::anyhow!("upstream inline CA certificates must be an array"))?;
+                ensure!(values.len()<=4096,"upstream inline CA count exceeds bounds");
+                for value in values{
+                    let value=value.as_str().ok_or_else(||anyhow::anyhow!("upstream inline CA certificate must be a string"))?;
+                    let cert=crate::tls_policy::source_inline(value)?;
+                    ensure!(cert.len()as u64<=*budget,"upstream TLS material size limit exceeded");*budget-=cert.len()as u64;add(cert)?;
+                }
+            }
+        },
+        Some("file")=>{
+            deny_unknown(obj,&["provider","pem_files"],"upstream file CA pool")?;
+            if let Some(value)=obj.get("pem_files").filter(|v|!v.is_null()){
+                let files=value.as_array().ok_or_else(||anyhow::anyhow!("upstream CA files must be an array"))?;
+                ensure!(files.len()<=256,"upstream CA file count exceeds bounds");
+                for path in files{
+                    let path=path.as_str().ok_or_else(||anyhow::anyhow!("upstream CA file must be a string"))?;
+                    let bytes=read_material(path,budget)?;
+                    for cert in crate::tls_policy::source_certificates(&bytes)?{add(cert)?;}
+                }
+            }
+        },
+        Some("system")=>{
+            deny_unknown(obj,&["provider"],"upstream system CA pool")?;
+            ensure!(depth==0,"system pool cannot export certificates to combined pool");
+            *roots=native_roots().clone();
+        },
+        Some("combined")=>{
+            deny_unknown(obj,&["provider","sources"],"upstream combined CA pool")?;
+            let sources=obj.get("sources").and_then(serde_json::Value::as_array).ok_or_else(||anyhow::anyhow!("upstream combined CA sources required"))?;
+            ensure!(!sources.is_empty()&&sources.len()<=256,"upstream combined CA source count exceeds bounds");
+            for source in sources{provider_roots(source,depth+1,budget,count,roots)?;}
+        },
+        _=>anyhow::bail!("unsupported or unprepared upstream CA provider"),
+    }
+    Ok(())
+}
 fn provision(tls: &ProxyTls, enable_http2: bool) -> Result<ClientConfig> {
     ensure!(
         tls.client_certificate_file.is_some() == tls.client_certificate_key_file.is_some(),
@@ -176,7 +227,10 @@ fn provision(tls: &ProxyTls, enable_http2: bool) -> Result<ClientConfig> {
     );
     let mut budget = 64 * 1024 * 1024;
     let mut roots = rustls::RootCertStore::empty();
-    if tls.root_ca_pool.is_empty() && tls.root_ca_pem_files.is_empty() {
+    if let Some(module)=&tls.ca {
+        ensure!(tls.root_ca_pool.is_empty()&&tls.root_ca_pem_files.is_empty(),"conflicting upstream Root CA pool configuration");
+        provider_roots(module,0,&mut budget,&mut 0,&mut roots)?;
+    } else if tls.root_ca_pool.is_empty() && tls.root_ca_pem_files.is_empty() {
         roots = native_roots().clone();
     } else {
         for encoded in &tls.root_ca_pool {
@@ -217,7 +271,7 @@ fn provision(tls: &ProxyTls, enable_http2: bool) -> Result<ClientConfig> {
         }
     }
     ensure!(
-        tls.insecure_skip_verify || !roots.is_empty(),
+        tls.ca.is_some() || tls.insecure_skip_verify || !roots.is_empty(),
         "upstream trust roots unavailable"
     );
     let provider = crate::crypto::provider();

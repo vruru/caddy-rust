@@ -1,7 +1,7 @@
 //! Typed ordered TLS connection policies; provisioning performs no hot-path I/O.
 pub(crate) mod certificate_selection;
 mod client_auth;
-pub(crate) use client_auth::source_certificates;
+pub(crate) use client_auth::{source_certificates,source_inline};
 mod client_paths;
 mod provision;
 

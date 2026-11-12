@@ -7,8 +7,7 @@ use std::{path::PathBuf, sync::atomic::AtomicUsize};
 
 #[derive(Clone)]
 struct Location {
-    server: usize,
-    policy: usize,
+    consumer: usize,
     path: Vec<usize>,
 }
 struct Request {
@@ -114,24 +113,8 @@ fn collect(
     }
     Ok(())
 }
-fn at<'a>(
-    config: &'a mut crate::http_config::PreparedConfig,
-    location: &Location,
-) -> Result<&'a mut Value> {
-    let server = config
-        .servers
-        .get_mut(location.server)
-        .ok_or_else(|| anyhow!("client trust server location changed"))?;
-    let policy = Arc::make_mut(server)
-        .tls_policies
-        .get_mut(location.policy)
-        .ok_or_else(|| anyhow!("client trust policy location changed"))?;
-    let mut value = policy
-        .client_auth
-        .as_mut()
-        .and_then(|auth| auth.ca.as_mut())
-        .ok_or_else(|| anyhow!("client trust provider location changed"))?;
-    for index in &location.path {
+fn at<'a>(mut value: &'a mut Value, path: &[usize]) -> Result<&'a mut Value> {
+    for index in path {
         value = value
             .get_mut("sources")
             .and_then(Value::as_array_mut)
@@ -156,25 +139,23 @@ impl CertificateServices {
                     move || {
                         let mut requests = Vec::new();
                         let mut total_keys = 0;
-                        for (si, server) in config.servers.iter().enumerate() {
-                            for (pi, policy) in server.tls_policies.iter().enumerate() {
-                                if let Some(value) =
-                                    policy.client_auth.as_ref().and_then(|a| a.ca.as_ref())
-                                {
-                                    collect(
-                                        value,
-                                        0,
-                                        &mut Location {
-                                            server: si,
-                                            policy: pi,
-                                            path: Vec::new(),
-                                        },
-                                        &mut requests,
-                                        &mut total_keys,
-                                    )?;
-                                }
-                            }
-                        }
+                        let mut consumer = 0usize;
+                        super::ca_consumers::each(&config, &mut |value| {
+                            collect(
+                                value,
+                                0,
+                                &mut Location {
+                                    consumer,
+                                    path: Vec::new(),
+                                },
+                                &mut requests,
+                                &mut total_keys,
+                            )?;
+                            consumer = consumer
+                                .checked_add(1)
+                                .ok_or(crate::cert_transient::ResourceDenied)?;
+                            Ok(())
+                        })?;
                         Ok((config, requests))
                     },
                 )
@@ -273,17 +254,34 @@ impl CertificateServices {
                 let result =
                     crate::cert_cpu::run(this.context.resources.cpu.clone(), token, move || {
                         let mut config = config;
-                        for resolved in resolved {
-                            let Resolved {
-                                location,
-                                module,
-                                _credit,
-                            } = resolved;
-                            *at(&mut config, &location)? = module;
-                            // The fully prepared inline value now belongs to the existing config
-                            // control/output boundary. Decoder/input staging is no longer its owner.
-                            drop(_credit);
-                        }
+                        let mut resolved = resolved.into_iter().peekable();
+                        let mut consumer = 0usize;
+                        super::ca_consumers::each_mut(&mut config, &mut |value| {
+                            while let Some(next) = resolved.peek() {
+                                if next.location.consumer != consumer {
+                                    break;
+                                }
+                                let Resolved {
+                                    location,
+                                    module,
+                                    _credit,
+                                } = resolved.next().ok_or_else(|| {
+                                    anyhow!("client trust output location changed")
+                                })?;
+                                *at(value, &location.path)? = module;
+                                // Actual inline assignment hands final control data to
+                                // the existing prepared-config output boundary.
+                                drop(_credit);
+                            }
+                            consumer = consumer
+                                .checked_add(1)
+                                .ok_or(crate::cert_transient::ResourceDenied)?;
+                            Ok(())
+                        })?;
+                        ensure!(
+                            resolved.peek().is_none(),
+                            "client trust consumer location changed"
+                        );
                         Ok(config)
                     })
                     .await;
