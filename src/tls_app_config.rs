@@ -23,6 +23,7 @@ mod permission;
 mod pki_parse;
 #[path = "tls_app_config/resident_cache.rs"]
 mod resident_cache;
+pub(crate) use resident_cache::Preparation as CertificatePreparation;
 #[path = "tls_app_config/schema.rs"]
 mod schema;
 #[path = "tls_app_config/services.rs"]

@@ -54,7 +54,7 @@ impl Signature {
 /// unlinked inode numbers being reused during a grouped snapshot check.
 pub(super) struct PinnedRead {
     file: File,
-    bytes: Zeroizing<Vec<u8>>,
+    bytes:crate::cert_transient::Bytes,
     signature: Signature,
     uid: u32,
     private: bool,
@@ -72,9 +72,10 @@ impl PinnedRead {
         );
         Ok(())
     }
-    pub fn into_bytes(self) -> Zeroizing<Vec<u8>> {
-        self.bytes
+    pub fn into_bytes(self) -> Result<Zeroizing<Vec<u8>>> {
+        self.bytes.into_untracked()
     }
+    pub fn into_owned_bytes(self)->crate::cert_transient::Bytes {self.bytes}
 }
 
 pub(super) fn random_id() -> Result<String> {
@@ -330,10 +331,19 @@ impl Root {
 
     pub fn load(&self, key: &str, private: bool) -> Result<Option<Zeroizing<Vec<u8>>>> {
         self.load_pinned(key, private)
-            .map(|value| value.map(PinnedRead::into_bytes))
+            .and_then(|value| value.map(PinnedRead::into_bytes).transpose())
     }
 
     pub fn load_pinned(&self, key: &str, private: bool) -> Result<Option<PinnedRead>> {
+        self.load_pinned_with_credit(key,private,None)
+    }
+    pub fn load_owned(&self,key:&str,private:bool,lifetime:crate::cert_transient::Lifetime)->Result<Option<crate::cert_transient::Bytes>> {
+        self.load_pinned_with_credit(key,private,Some(lifetime)).map(|value|value.map(PinnedRead::into_owned_bytes))
+    }
+    pub fn load_pinned_owned(&self,key:&str,private:bool,lifetime:crate::cert_transient::Lifetime)->Result<Option<PinnedRead>> {
+        self.load_pinned_with_credit(key,private,Some(lifetime))
+    }
+    fn load_pinned_with_credit(&self, key:&str,private:bool,lifetime:Option<crate::cert_transient::Lifetime>)->Result<Option<PinnedRead>> {
         let Some((parent, name)) = self.parent(key, false)? else {
             return Ok(None);
         };
@@ -356,9 +366,11 @@ impl Root {
         let file = File::from(fd);
         // Never grow a private-key buffer: realloc would leave its previous
         // allocation outside Zeroizing ownership. Read exactly the bounded size.
-        let mut bytes = Zeroizing::new(vec![0u8; st.st_size as usize]);
+        // Admit the opened FD's actual bounded size before allocating. The
+        // payload itself retains credit through an unconsumed worker result.
+        let mut bytes=crate::cert_transient::Bytes::allocate(st.st_size as usize,lifetime)?;
         let mut reader = &file;
-        reader.read_exact(&mut bytes).map_err(|error| {
+        reader.read_exact(bytes.as_mut_slice()).map_err(|error| {
             if error.kind() == std::io::ErrorKind::UnexpectedEof {
                 anyhow!("storage file changed during read")
             } else {

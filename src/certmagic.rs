@@ -337,9 +337,7 @@ pub(crate) fn signing_key(
         }
         _ => return Err(issue(id, "unsupported private key label")),
     };
-    let signer = crate::crypto::provider()
-        .key_provider
-        .load_private_key(key.clone_key())
+    let signer = crate::crypto::provider().key_provider.load_private_key(key.clone_key())
         .map_err(|_| issue(id, "unsupported or invalid private key"))?;
     let alg = algorithm(signer.algorithm(), id)?;
     ensure!(
@@ -356,6 +354,22 @@ fn algorithm(alg: rustls::SignatureAlgorithm, id: &str) -> Result<&'static str> 
         rustls::SignatureAlgorithm::ED25519 => Ok("Ed25519"),
         _ => Err(issue(id, "unsupported key algorithm")),
     }
+}
+
+/// Check only the public/private key binding, using the complete original
+/// SubjectPublicKeyInfo bytes after bounded, strict X.509 decoding. WebPKI's
+/// unrelated 64-KiB signed-certificate parser limit is not a key mismatch.
+pub(crate) fn check_keys_match(certified:&rustls::sign::CertifiedKey,id:&str)->Result<()> {
+    let public=certified.key.public_key()
+        .ok_or_else(||issue(id,"signing public key unavailable"))?;
+    let der=certified.cert.first().ok_or_else(||issue(id,"empty certificate chain"))?;
+    let (remaining,leaf)=crate::cert_transient::parse_certificate(der.as_ref())?;
+    ensure!(remaining.is_empty(),"storage item {id}: trailing X.509 material");
+    crate::cert_transient::check_unique_extensions(&leaf)
+        .map_err(|error|error.context(format!("storage item {id}: certificate extensions")))?;
+    ensure!(public.as_ref()==leaf.public_key().raw,
+        "storage item {id}: certificate/private key mismatch");
+    Ok(())
 }
 
 fn inspect_certificate(id: &str, cert: &[u8], key: &[u8], meta: &[u8]) -> Result<Value> {
@@ -377,9 +391,7 @@ fn inspect_certificate(id: &str, cert: &[u8], key: &[u8], meta: &[u8]) -> Result
     let signer = signing_key(key, id)?;
     let algorithm = algorithm(signer.algorithm(), id)?;
     let certified = rustls::sign::CertifiedKey::new(chain, signer);
-    certified
-        .keys_match()
-        .map_err(|_| issue(id, "certificate/private key mismatch or unverifiable pair"))?;
+    check_keys_match(&certified,id)?;
     let (_, leaf) = x509_parser::parse_x509_certificate(&blocks[0].1)
         .map_err(|_| issue(id, "invalid leaf certificate"))?;
     let before = leaf.validity().not_before.timestamp();

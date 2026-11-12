@@ -422,6 +422,7 @@ impl OcspManager {
             .unwrap_or(false);
         let leaf_sha256 = leaf_hash(&certificate);
         let summary = OcspCertificate {
+            preparation: None,
             identity: certificate.identity,
             generation: certificate.generation,
             names: certificate.names.clone(),
@@ -1419,12 +1420,26 @@ async fn verify_owned(
     budget: Option<Arc<OcspNetworkBudget>>,
     cpu: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<(VerifiedStatus, Option<LiveKeyCompromiseFact>)> {
+    verify_owned_prepared(raw,leaf,issuer,max_age,admission,budget,cpu,None).await
+}
+async fn verify_owned_prepared(
+    raw: Vec<u8>,
+    leaf: Vec<u8>,
+    issuer: Vec<u8>,
+    max_age: Duration,
+    admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    budget: Option<Arc<OcspNetworkBudget>>,
+    cpu: tokio::sync::OwnedSemaphorePermit,
+    preparation: Option<Arc<crate::tls_app_config::CertificatePreparation>>,
+) -> Result<(VerifiedStatus, Option<LiveKeyCompromiseFact>)> {
     tokio::task::spawn_blocking(move || {
+        // Tuple field order destroys actual copied inputs before admission.
+        let input = ((raw,leaf,issuer),preparation);
         let _cpu = cpu;
         let now = now()?;
         let _admission = admission;
         let _budget = budget;
-        verify::verify_response_observation(&raw, &leaf, &issuer, now, max_age)
+        verify::verify_response_observation(&input.0.0, &input.0.1, &input.0.2, now, max_age)
     })
     .await?
 }

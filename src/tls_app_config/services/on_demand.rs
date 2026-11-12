@@ -2124,6 +2124,10 @@ impl CertificateServices {
                 self.context.resources.cpu.clone(),
                 cancel.clone(),
                 move || {
+                    // Must outlive every resolver/capacity/cache lock in this
+                    // publication, including an unwinding post-commit error.
+                    let mut preparation_publication =
+                        super::super::resident_cache::PreparationPublication::default();
                     let group = work_group;
                     material.validate_at(now()?, false)?;
                     leaf_guard.key_deny().check_spki_der(&material.spki_der)?;
@@ -2158,7 +2162,10 @@ impl CertificateServices {
                             ensure!(active(), "certificate publication cancelled");
                             Ok(())
                         });
-                        if result.is_ok() { changed.notify_one(); }
+                        if result.is_ok() {
+                            preparation_publication.accepted(material.preparation.as_ref());
+                            changed.notify_one();
+                        }
                         return result;
                     }
                     let previous = group
@@ -2238,11 +2245,14 @@ impl CertificateServices {
                                 ensure!(active(), "certificate acquisition cancelled");
                                 let plan = plan.ok_or_else(|| anyhow!("missing borrowed cache plan"))?;
                                 if ledger_previous.is_none() {
-                                    return state.capacity.reuse(&binding, || cache.commit(plan));
+                                    return state.capacity.reuse(&binding, || {
+                                        cache.commit_prepared(plan, None, &mut preparation_publication)
+                                    });
                                 }
                                 if state.capacity.admit(&material.names, &binding, ledger_previous,
                                     capacity, |victim| {
-                                        cache.commit_replacing(plan, shared_victim(victim))
+                                        cache.commit_prepared(plan, shared_victim(victim),
+                                            &mut preparation_publication)
                                     })? {
                                     state.cleanup_changed.notify_one();
                                 }
@@ -2264,7 +2274,8 @@ impl CertificateServices {
                                     capacity, |victim| {
                                         let victim = shared_victim(victim);
                                         if let Some(plan) = plan {
-                                            cache.commit_replacing(plan, victim)?;
+                                            cache.commit_prepared(plan, victim,
+                                                &mut preparation_publication)?;
                                         } else if let Some(epoch) = &epoch {
                                             cache.retire_projection(epoch, victim)?;
                                         }
@@ -2280,6 +2291,11 @@ impl CertificateServices {
                             } else { error }
                         })?
                     };
+                    // A local projection has no physical-cache commit hook.
+                    // Reaching this point means the resolver accepted this
+                    // exact material; retained deduplicated candidates are not
+                    // marked merely because they shared a chain identity.
+                    preparation_publication.accepted(material.preparation.as_ref());
                     *group
                         .residency
                         .lock()

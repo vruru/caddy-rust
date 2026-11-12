@@ -6,6 +6,16 @@
 mod signer;
 mod network_proxy;
 mod order_parameters;
+mod chain_preference;
+mod certificate_links;
+mod certificate_chains;
+pub(crate) mod chain_memory;
+pub(crate) mod chain_deep_shape;
+pub(crate) mod chain_validation;
+pub(crate) mod chain_shape;
+pub(crate) use chain_memory::{Lease as ChainMemoryLease,Pools as ChainMemoryPools};
+pub(crate) use chain_memory::shared as shared_chain_memory;
+pub use chain_preference::{CertificateChain,ChainPreference};
 pub use order_parameters::OrderParameters;
 pub use network_proxy::NetworkProxy;
 pub use signer::{AccountSigner, KeyType};
@@ -158,6 +168,7 @@ pub struct AcmeWire {
 }
 struct WireInner {
     cpu: Arc<Semaphore>,
+    chain_memory:Arc<ChainMemoryPools>,
     client: reqwest::Client,
     directory_url: Url,
     directory: Directory,
@@ -186,6 +197,7 @@ struct WireResponse {
     status: StatusCode,
     headers: reqwest::header::HeaderMap,
     body: Vec<u8>,
+    body_memory:Option<ChainMemoryLease>,
 }
 
 impl AcmeWire {
@@ -195,6 +207,9 @@ impl AcmeWire {
         Self::connect_with_cpu(options,cpu,cancel).await
     }
     pub(crate) async fn connect_with_cpu(options: WireOptions, cpu: Arc<Semaphore>, cancel: &CancellationToken) -> Result<Self> {
+        Self::connect_with_resources(options,cpu,shared_chain_memory(),cancel).await
+    }
+    pub(crate) async fn connect_with_resources(options:WireOptions,cpu:Arc<Semaphore>,chain_memory:Arc<ChainMemoryPools>,cancel:&CancellationToken)->Result<Self> {
         ensure!(
             !options.request_timeout.is_zero()
                 && options.request_timeout <= Duration::from_secs(3600),
@@ -264,6 +279,7 @@ impl AcmeWire {
             inner: Arc::new(WireInner {
                 client,
                 cpu,
+                chain_memory,
                 directory_url,
                 directory,
                 trusted,
@@ -453,10 +469,26 @@ impl AcmeWire {
         cancel: &CancellationToken,
     ) -> Result<WireResponse> {
         let url = self.endpoint(raw)?;
+        self.signed_url(signer,kid,url,payload,cancel).await
+    }
+
+    // Internal transport only. Certificate delegates always pass an empty
+    // POST-as-GET payload; other operations enter through endpoint() above.
+    async fn signed_url(
+        &self, signer:&Arc<AccountSigner>, kid:Option<&str>, url:Url,
+        payload:Option<&Value>, cancel:&CancellationToken,
+    )->Result<WireResponse> {
+        self.signed_url_with_memory(signer,kid,url,payload,None,cancel).await
+    }
+    async fn signed_certificate_url(&self,signer:&Arc<AccountSigner>,kid:&str,url:Url,cancel:&CancellationToken)->Result<WireResponse> {
+        self.signed_url_with_memory(signer,Some(kid),url,None,Some(self.inner.chain_memory.clone()),cancel).await
+    }
+    async fn signed_url_with_memory(&self,signer:&Arc<AccountSigner>,kid:Option<&str>,url:Url,payload:Option<&Value>,memory:Option<Arc<ChainMemoryPools>>,cancel:&CancellationToken)->Result<WireResponse> {
         if let Some(kid) = kid {
             self.endpoint(kid)?;
         }
         for attempt in 0..3 {
+            let body_credit=memory.as_ref().map(|p|p.payload.reserve(MAX_BODY)).transpose()?;
             let nonce = self.nonce(cancel).await?;
             let mut protected = json!({"alg":signer.algorithm(),"nonce":nonce,"url":url.as_str()});
             if let Some(kid) = kid {
@@ -478,11 +510,14 @@ impl AcmeWire {
             let body = serde_json::to_vec(
                 &json!({"protected":protected,"payload":payload,"signature":URL_SAFE_NO_PAD.encode(signature)}),
             )?;
-            let response = send(
+            let response = send_with_memory(
                 &self.inner.client,
                 Method::POST,
                 url.clone(),
                 Some(body),
+                "application/jose+json",
+                memory.clone(),
+                body_credit,
                 cancel,
             )
             .await?;
@@ -493,10 +528,7 @@ impl AcmeWire {
                 }
             }
             if response.status.as_u16() == 400
-                && serde_json::from_slice::<Value>(&response.body)
-                    .ok()
-                    .and_then(|v| v["type"].as_str().map(str::to_owned))
-                    .as_deref()
+                && problem_type(&response.body).as_deref()
                     == Some("urn:ietf:params:acme:error:badNonce")
                 && attempt < 2
             {
@@ -914,23 +946,17 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     Some(Duration::from_secs(seconds.clamp(1, 604800)))
 }
 
+fn problem_type(body:&[u8])->Option<String> {
+    // Error details are optional. Do not build an arbitrary JSON Value tree
+    // from a certificate endpoint's untrusted error body.
+    if body.len()>65536{return None}
+    #[derive(Deserialize)]struct Problem {#[serde(default)] r#type:Option<String>}
+    serde_json::from_slice::<Problem>(body).ok()?.r#type
+}
 fn problem_kind(body: &[u8]) -> String {
-    let value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-    let kind = value["type"]
-        .as_str()
-        .unwrap_or("unknown")
-        .rsplit(':')
-        .next()
-        .unwrap_or("unknown");
-    if kind.len() <= 64
-        && kind
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        kind.to_owned()
-    } else {
-        "unknown".to_owned()
-    }
+    let value=problem_type(body);
+    let kind=value.as_deref().unwrap_or("unknown").rsplit(':').next().unwrap_or("unknown");
+    if kind.len()<=64&&kind.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_'||b==b'-'){kind.to_owned()}else{"unknown".to_owned()}
 }
 
 fn check_status(response: &WireResponse) -> Result<()> {
@@ -975,6 +1001,9 @@ async fn send_with_type(
     content_type: &str,
     cancel: &CancellationToken,
 ) -> Result<WireResponse> {
+    send_with_memory(client,method,url,body,content_type,None,None,cancel).await
+}
+async fn send_with_memory(client:&reqwest::Client,method:Method,url:Url,body:Option<Vec<u8>>,content_type:&str,memory:Option<Arc<ChainMemoryPools>>,body_credit:Option<ChainMemoryLease>,cancel:&CancellationToken)->Result<WireResponse> {
     let is_post = method == Method::POST;
     if cancel.is_cancelled() {
         return Err(ProtocolError {
@@ -1010,7 +1039,7 @@ async fn send_with_type(
     }
     let status = response.status();
     let headers = response.headers().clone();
-    let mut body = Vec::new();
+    let mut body = chain_memory::Collector::new(memory,body_credit,response.content_length().map(|n|n as usize))?;
     loop {
         let chunk = tokio::select! { biased; _=cancel.cancelled()=>return Err(ProtocolError{status:status.as_u16(),kind:"cancelled".to_owned(),uncertain:is_post,retry_after:None}.into()), chunk=response.chunk()=>chunk.map_err(|_| ProtocolError{status:status.as_u16(),kind:"responseTransport".to_owned(),uncertain:is_post,retry_after:None})? };
         let Some(chunk) = chunk else { break };
@@ -1023,21 +1052,36 @@ async fn send_with_type(
             }
             .into());
         }
-        body.extend_from_slice(&chunk);
+        body.append(&chunk)?;
     }
+    let (body,body_memory)=body.into_parts();
     Ok(WireResponse {
         is_post,
         status,
         headers,
         body,
+        body_memory,
     })
 }
 
 /// RFC 9773 certID: base64url(AKI) + '.' + base64url(DER INTEGER contents).
 /// A leading positive-sign octet is significant and must not be stripped.
 pub fn ari_certificate_id(chain_pem: &[u8]) -> Result<Option<String>> {
+    Ok(ari_certificate_id_owned(chain_pem)?.map(|id|Arc::try_unwrap(id.0).ok().expect("fresh ARI owner").value))
+}
+#[derive(Clone)]
+pub(crate) struct AriCertificateId(Arc<AriCertificateIdData>);
+struct AriCertificateIdData {
+    value:String,
+    _memory:chain_memory::Lease,
+}
+impl std::ops::Deref for AriCertificateId {
+    type Target=str;
+    fn deref(&self)->&str{&self.0.value}
+}
+pub(crate) fn ari_certificate_id_owned(chain_pem: &[u8]) -> Result<Option<AriCertificateId>> {
     use x509_parser::extensions::ParsedExtension;
-    let blocks = crate::certmagic::pem_blocks(chain_pem, "ari-certificate")?;
+    let blocks = crate::cert_transient::certificate_blocks(chain_pem)?;
     let first = blocks
         .first()
         .ok_or_else(|| anyhow!("empty ARI certificate material"))?;
@@ -1045,8 +1089,7 @@ pub fn ari_certificate_id(chain_pem: &[u8]) -> Result<Option<String>> {
         first.0 == "CERTIFICATE",
         "ARI material is not a certificate"
     );
-    let (remaining, cert) = x509_parser::parse_x509_certificate(&first.1)
-        .map_err(|_| anyhow!("invalid ARI certificate"))?;
+    let (remaining, cert) = crate::cert_transient::parse_certificate(&first.1)?;
     ensure!(remaining.is_empty(), "trailing ARI certificate data");
     let mut aki = None;
     for extension in cert.extensions() {
@@ -1057,11 +1100,14 @@ pub fn ari_certificate_id(chain_pem: &[u8]) -> Result<Option<String>> {
     }
     let Some(aki) = aki else { return Ok(None) };
     let serial = cert.raw_serial();
-    Ok(Some(format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(aki),
-        URL_SAFE_NO_PAD.encode(serial)
-    )))
+    let len=base64::encoded_len(aki.len(),false)
+        .and_then(|n|base64::encoded_len(serial.len(),false).and_then(|m|n.checked_add(m)))
+        .and_then(|n|n.checked_add(1)).ok_or(crate::cert_transient::ResourceDenied)?;
+    let memory=chain_memory::shared().payload.reserve(len).map_err(|_|crate::cert_transient::ResourceDenied)?;
+    let mut value=String::new();value.try_reserve_exact(len).map_err(|_|crate::cert_transient::ResourceDenied)?;
+    URL_SAFE_NO_PAD.encode_string(aki,&mut value);value.push('.');URL_SAFE_NO_PAD.encode_string(serial,&mut value);
+    ensure!(value.len()==len && value.capacity()==len,"unexpected ARI encoding capacity");
+    Ok(Some(AriCertificateId(Arc::new(AriCertificateIdData{value,_memory:memory}))))
 }
 
 fn uncertain(status: StatusCode, kind: &str) -> anyhow::Error {

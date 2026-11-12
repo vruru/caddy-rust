@@ -6,6 +6,65 @@ use crate::tls_resolver::CertificateResidency;
 use anyhow::{Result, ensure};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+// This is a separate, transient preparation-output allowance. The cache's
+// BYTE_CAPACITY below counts admitted snapshots; it cannot prepay allocations
+// which happen before a candidate has been validated and admitted.
+const PREPARATION_CAPACITY: usize = 64 * 1024 * 1024;
+static PREPARATION_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) struct Preparation {
+    bytes: usize,
+    released: AtomicBool,
+}
+
+impl Preparation {
+    pub(crate) fn reserve(bytes: usize) -> Result<Arc<Self>> {
+        ensure!(bytes <= PREPARATION_CAPACITY, crate::cert_transient::ResourceDenied);
+        PREPARATION_BYTES.try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            used.checked_add(bytes).filter(|next| *next <= PREPARATION_CAPACITY)
+        }).map_err(|_| crate::cert_transient::ResourceDenied)?;
+        Ok(Arc::new(Self { bytes, released: AtomicBool::new(false) }))
+    }
+
+    pub(crate) fn release(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            let before = PREPARATION_BYTES.fetch_sub(self.bytes, Ordering::AcqRel);
+            debug_assert!(before >= self.bytes, "certificate preparation accounting underflow");
+        }
+    }
+}
+
+impl Drop for Preparation {
+    fn drop(&mut self) { self.release(); }
+}
+
+/// Declare before entering the resolver/capacity/cache publication locks.
+/// Recording acceptance never returns credits or wakes another worker. Drop
+/// transfers only the exact accepted material's allowance after those locks
+/// have unwound, including on cancellation or a later publication error.
+#[derive(Default)]
+pub(super) struct PreparationPublication {
+    accepted: Option<Arc<Preparation>>,
+}
+
+impl PreparationPublication {
+    pub(super) fn accepted(&mut self, preparation: Option<&Arc<Preparation>>) {
+        let Some(preparation) = preparation else { return; };
+        match &self.accepted {
+            Some(previous) => assert!(Arc::ptr_eq(previous, preparation),
+                "one certificate publication accepted different preparations"),
+            None => self.accepted = Some(preparation.clone()),
+        }
+    }
+}
+
+impl Drop for PreparationPublication {
+    fn drop(&mut self) {
+        if let Some(preparation) = &self.accepted { preparation.release(); }
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct Receipt {
@@ -298,6 +357,18 @@ impl ResidentCache {
     /// Runs only after resolver validation; the hook performs no I/O or await.
     pub(super) fn commit(&self, plan: Publication) -> Result<()> {
         self.commit_replacing(plan, None)
+    }
+
+    pub(super) fn commit_prepared(
+        &self,
+        plan: Publication,
+        victim: Option<(&[String], &Arc<CertificateResidency>)>,
+        publication: &mut PreparationPublication,
+    ) -> Result<()> {
+        let preparation = plan.entry.material.preparation.clone();
+        self.commit_replacing(plan, victim)?;
+        publication.accepted(preparation.as_ref());
+        Ok(())
     }
 
     pub(super) fn commit_replacing(

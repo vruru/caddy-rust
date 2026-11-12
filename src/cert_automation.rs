@@ -4,19 +4,21 @@
 //! FileStorage's legacy stale-lock protocol is not a distributed fencing
 //! service; deployments must keep only one active certificate-manager runtime.
 
+mod job_codec;
+
 use crate::{
     acme_wire::{
         AccountSession, AccountSigner, AcmeWire, AriWindow, Identifier, KeyType, Order,
-        ProtocolError, WireOptions, ari_certificate_id,
+        ProtocolError, WireOptions, ari_certificate_id_owned,
     },
     certstore::{
-        CertificateBundle, FsStore, RecoveryReport, StorageLease, StoredAccount, account_lock_name,
+        CertificateBundle, OwnedCertificateBundle, FsStore, RecoveryReport, StorageLease, StoredAccount, account_lock_name,
         account_primary, issuer_key, names_key,
     },
     challenge::{ChallengeLease, ChallengeRegistry},
     tls_resolver::{CertificateInput, HotCertificateResolver},
 };
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -84,6 +86,7 @@ pub struct AcmeIssuerConfig {
     pub leaf_key_type: KeyType,
     pub certificate_lifetime_ns: i64,
     pub profile: String,
+    pub preferred_chains:crate::acme_wire::ChainPreference,
     pub challenge_types: Vec<ChallengeType>,
     pub terms_of_service_agreed: bool,
     pub eab: Option<ExternalAccountBinding>,
@@ -104,6 +107,7 @@ impl AcmeIssuerConfig {
             leaf_key_type: KeyType::P256,
             certificate_lifetime_ns: 0,
             profile: String::new(),
+            preferred_chains:Default::default(),
             challenge_types: vec![ChallengeType::Http01, ChallengeType::TlsAlpn01],
             terms_of_service_agreed: true,
             eab: None,
@@ -216,7 +220,7 @@ pub enum CachedProbe {
     Missing,
     Material {
         usable: Option<ManagedCertificate>,
-        bundle: CertificateBundle,
+        bundle: OwnedCertificateBundle,
     },
 }
 
@@ -225,6 +229,7 @@ pub struct CertificateManager {
     inner: Arc<ManagerInner>,
 }
 struct ManagerInner {
+    chain_memory:Arc<crate::acme_wire::ChainMemoryPools>,
     must_staple: bool,
     reuse_private_keys: bool,
     lifecycle_events: Option<Arc<crate::events::EventsApp>>,
@@ -261,6 +266,7 @@ struct CaState {
 /// Process-shared issuance limits. Root configuration generations and distinct
 /// automation policies must reuse this object instead of multiplying budgets.
 pub struct AutomationResources {
+    chain_memory:Arc<crate::acme_wire::ChainMemoryPools>,
     global: Arc<Semaphore>,
     permission_global: Arc<Semaphore>,
     local: Arc<Semaphore>,
@@ -282,6 +288,7 @@ impl AutomationResources {
             "ACME concurrency outside bounds"
         );
         Ok(Self {
+            chain_memory:crate::acme_wire::shared_chain_memory(),
             global: Arc::new(Semaphore::new(max_concurrent)),
             permission_global: Arc::new(Semaphore::new(max_concurrent)),
             local: Arc::new(Semaphore::new(
@@ -343,6 +350,7 @@ impl AutomationResources {
         frame(&mut hash, config.wire.directory.as_bytes());
         frame(&mut hash, config.email.as_bytes());
         frame(&mut hash, config.profile.as_bytes());
+        frame(&mut hash,&serde_json::to_vec(&config.preferred_chains)?);
         hash.update(config.certificate_lifetime_ns.to_be_bytes());
         frame(
             &mut hash,
@@ -414,15 +422,48 @@ struct NetworkPermit<'a> {
     _issuer: tokio::sync::SemaphorePermit<'a>,
 }
 
-#[derive(Serialize, Deserialize)]
+// Selected-chain handoff owns the extra physical copy and its payload credit.
+struct DownloadedBundle {
+    bundle:CertificateBundle,
+    _memory:crate::acme_wire::ChainMemoryLease,
+    metadata_memory:Option<crate::cert_transient::Credit>,
+}
+impl DownloadedBundle {
+    fn new(chain:&[u8],key:&[u8],names:&[String],url:Option<&str>,ca:&str,account:&str)->Result<Self>{
+        let metadata_bound=crate::cert_json_shape::certificate_metadata_bound(names,url,ca,account)?;
+        let bytes=chain.len().checked_add(key.len())
+            .and_then(|n|n.checked_add(metadata_bound))
+            .ok_or(crate::cert_transient::ResourceDenied)?;
+        let memory=crate::acme_wire::shared_chain_memory().payload.reserve(bytes).map_err(|_|crate::cert_transient::ResourceDenied)?;
+        let metadata=json!({"sans":names,"issuer_data":{"url":url,"ca":ca,"account":account}});
+        Ok(Self{bundle:CertificateBundle{chain_pem:chain.to_vec(),private_key_pem:Zeroizing::new(key.to_vec()),metadata},_memory:memory,metadata_memory:None})
+    }
+    fn update_ari(&mut self,ari:&AriWindow,info:&MaterialInfo,ratio:f64)->Result<()>{
+        let allowance=crate::cert_json_shape::ari_edit_allowance(&self.bundle.metadata,ari.certificate_id.len())?;
+        let updated=crate::cert_transient::edited_json(&self.bundle.metadata,allowance,|metadata|write_ari(metadata,ari,info,ratio))?;
+        let(value,memory)=updated.into_parts();drop(std::mem::replace(&mut self.bundle.metadata,value));
+        drop(std::mem::replace(&mut self.metadata_memory,memory));Ok(())
+    }
+}
+impl std::ops::Deref for DownloadedBundle {type Target=CertificateBundle;fn deref(&self)->&CertificateBundle{&self.bundle}}
+// The existing material/store validation lane is distinct from owned PEM:
+// its copies and decoder temporaries borrow the shared 64 MiB scratch pool.
+struct MaterialCopy {bundle:CertificateBundle,names:Vec<String>,_credit:crate::acme_wire::chain_memory::Scratch}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct Job {
     version: u8,
+    #[serde(deserialize_with="job_codec::names")]
     names: Vec<String>,
     #[serde(default)]
+    #[serde(deserialize_with="job_codec::optional_names")]
     renewal_names: Option<Vec<String>>,
+    #[serde(deserialize_with="job_codec::text")]
     directory: String,
+    #[serde(deserialize_with="job_codec::text")]
     account_location: String,
     #[serde(default)]
+    #[serde(deserialize_with="job_codec::text")]
     config_email: String,
     #[serde(default)]
     leaf_key_type: KeyType,
@@ -433,30 +474,43 @@ struct Job {
     #[serde(default)]
     certificate_lifetime_ns: i64,
     #[serde(default)]
+    #[serde(deserialize_with="job_codec::profile")]
     profile: String,
     #[serde(default)]
+    #[serde(deserialize_with="job_codec::text")]
     attempt_id: String,
     #[serde(default)]
     abandoned: bool,
+    #[serde(deserialize_with="job_codec::text")]
     phase: String,
+    #[serde(deserialize_with="job_codec::csr")]
     csr_der: Vec<u8>,
+    #[serde(deserialize_with="job_codec::key")]
     private_key_pem: String,
     #[serde(default)]
+    #[serde(deserialize_with="job_codec::optional_text")]
     initial_key_hash: Option<String>,
     #[serde(default)]
+    #[serde(deserialize_with="job_codec::optional_text")]
     requested_not_after: Option<String>,
     #[serde(default)]
+    #[serde(deserialize_with="job_codec::optional_text")]
     order_url: Option<String>,
     #[serde(default)]
+    #[serde(deserialize_with="job_codec::optional_text")]
     certificate_url: Option<String>,
     #[serde(default)]
-    downloaded_pem: Option<String>,
+    #[serde(with="job_codec::pem")]
+    downloaded_pem: Option<Arc<crate::acme_wire::chain_memory::Buffer>>,
     #[serde(default)]
+    #[serde(deserialize_with="job_codec::optional_text")]
     stored_leaf_sha256: Option<String>,
     #[serde(default)]
     replaces_disabled: bool,
     #[serde(default)]
     poll_after_unix: i64,
+    #[serde(skip)]
+    restored_memory:Option<Arc<crate::acme_wire::chain_memory::Lease>>,
 }
 impl Drop for Job {
     fn drop(&mut self) {
@@ -567,7 +621,7 @@ struct Replacement {
     not_after: i64,
     forced: bool,
     renewal_names: Option<Vec<String>>,
-    certificate_id: Option<String>,
+    certificate_id: Option<crate::acme_wire::AriCertificateId>,
     previous_leaf: String,
     directory: String,
     account: String,
@@ -605,22 +659,25 @@ impl CertificateManager {
         names: &[String],
         cancel: &CancellationToken,
     ) -> Result<MaterialInfo> {
-        let bundle = CertificateBundle {
+        let bound=crate::cert_transient::clone_input_bound(&bundle.chain_pem,&bundle.private_key_pem,names)?;
+        let credit=crate::acme_wire::chain_memory::scratch(bound,cancel.clone()).await?;
+        let input=MaterialCopy {bundle:CertificateBundle {
             chain_pem: bundle.chain_pem.clone(),
             private_key_pem: bundle.private_key_pem.clone(),
             metadata: Value::Null,
-        };
-        let names = names.to_vec();
+        },names:names.to_vec(),_credit:credit};
         let deny=self.inner.resolver.leaf_guard().key_deny().clone();
-        self.cpu(cancel, move || material_info(&bundle,&names,&deny)).await
+        self.cpu(cancel, move || {let input=input;material_info(&input.bundle,&input.names,&deny)}).await
     }
     async fn certificate_id(
         &self,
         pem: &[u8],
         cancel: &CancellationToken,
-    ) -> Result<Option<String>> {
-        let pem = pem.to_vec();
-        self.cpu(cancel, move || ari_certificate_id(&pem)).await
+    ) -> Result<Option<crate::acme_wire::AriCertificateId>> {
+        let credit=crate::acme_wire::chain_memory::scratch(pem.len().checked_add(16384).ok_or(crate::cert_transient::ResourceDenied)?,cancel.clone()).await?;
+        let pem=pem.to_vec();
+        let input=(pem,credit);
+        self.cpu(cancel, move || {let input=input;ari_certificate_id_owned(&input.0)}).await
     }
     async fn account_signer(
         &self,
@@ -689,6 +746,7 @@ impl CertificateManager {
             );
             issuer_key(&issuer.wire.directory)?;
             ensure!(issuer.profile.len() <= 1024, "ACME profile exceeds bounds");
+            issuer.preferred_chains.validate()?;
         }
         ensure!(
             options.max_concurrent == resources.max_concurrent
@@ -717,6 +775,7 @@ impl CertificateManager {
         let (events, _) = broadcast::channel(256);
         Ok(Self {
             inner: Arc::new(ManagerInner {
+                chain_memory:resources.chain_memory.clone(),
                 must_staple:false,
                 reuse_private_keys:false,
                 lifecycle_events: None,
@@ -833,14 +892,7 @@ impl CertificateManager {
         resolution: OrderResolution,
         cancel: CancellationToken,
     ) -> Result<()> {
-        let initial: Job = serde_json::from_value(
-            self.inner
-                .store
-                .journal_load(job_id)
-                .await?
-                .ok_or_else(|| anyhow!("ACME recovery checkpoint not found"))?,
-        )
-        .map_err(|_| anyhow!("invalid ACME recovery checkpoint"))?;
+        let initial: Job = self.load_job(job_id).await?.ok_or_else(||anyhow!("ACME recovery checkpoint not found"))?;
         let names = normalize_names(&initial.names)?;
         let lease = self
             .inner
@@ -848,14 +900,7 @@ impl CertificateManager {
             .lock(&format!("issue_cert_{}", names[0]), cancel.clone())
             .await?;
         let result = async {
-            let mut job: Job = serde_json::from_value(
-                self.inner
-                    .store
-                    .journal_load(job_id)
-                    .await?
-                    .ok_or_else(|| anyhow!("ACME recovery checkpoint disappeared"))?,
-            )
-            .map_err(|_| anyhow!("invalid ACME recovery checkpoint"))?;
+            let mut job: Job = self.load_job(job_id).await?.ok_or_else(||anyhow!("ACME recovery checkpoint disappeared"))?;
             ensure!(
                 job.version == 1
                     && job.names == names
@@ -899,9 +944,10 @@ impl CertificateManager {
                     let wire = issuer
                         .wire
                         .get_or_try_init(|| {
-                            AcmeWire::connect_with_cpu(
+                            AcmeWire::connect_with_resources(
                                 issuer.config.wire.clone(),
                                 self.inner.local.clone(),
+                                self.inner.chain_memory.clone(),
                                 &cancel,
                             )
                         })
@@ -1157,9 +1203,10 @@ impl CertificateManager {
             let wire = match issuer
                 .wire
                 .get_or_try_init(|| {
-                    AcmeWire::connect_with_cpu(
+                    AcmeWire::connect_with_resources(
                         issuer.config.wire.clone(),
                         self.inner.local.clone(),
+                                self.inner.chain_memory.clone(),
                         &cancel,
                     )
                 })
@@ -1292,15 +1339,15 @@ impl CertificateManager {
     async fn initial_key(&self,issuer:&str,key:&str,cancel:&CancellationToken)
         ->Result<Option<(crate::certstore::InitialPrivateKey,ReusableKey)>> {
         if !self.inner.reuse_private_keys {return Ok(None);}
-        let (_,initial)=self.inner.store.load_certificate_for_key_reuse(issuer,key).await?;
+        let (_,initial)=self.inner.store.load_certificate_for_key_reuse_owned(issuer,key).await?;
         let Some(initial)=initial else{return Ok(None);};
         let pem=initial.pem();let deny=self.inner.resolver.leaf_guard().key_deny().clone();
         let reusable=self.cpu(cancel,move||prepare_reusable_key(pem,&deny)).await?;
         Ok(Some((initial,reusable)))
     }
-    async fn read_issuer_certificate(&self,issuer:&str,key:&str,cancel:&CancellationToken)->Result<Option<CertificateBundle>> {
-        if !self.inner.reuse_private_keys {return self.inner.store.load_certificate(issuer,key).await;}
-        let (bundle,initial)=self.inner.store.load_certificate_for_key_reuse(issuer,key).await?;
+    async fn read_issuer_certificate(&self,issuer:&str,key:&str,cancel:&CancellationToken)->Result<Option<OwnedCertificateBundle>> {
+        if !self.inner.reuse_private_keys {return self.inner.store.load_certificate_owned(issuer,key).await;}
+        let (bundle,initial)=self.inner.store.load_certificate_for_key_reuse_owned(issuer,key).await?;
         if let Some(initial)=initial {
             let pem=initial.pem();let deny=self.inner.resolver.leaf_guard().key_deny().clone();
             self.cpu(cancel,move||prepare_reusable_key(pem,&deny)).await?;
@@ -1319,11 +1366,12 @@ impl CertificateManager {
     }
     async fn save_issued_certificate(&self,issuer:&str,key:&str,bundle:&CertificateBundle,
         lease:&StorageLease,initial_hash:Option<&str>)->Result<()> {
+        let store=self.inner.store.clone();
         if let Some(expected)=initial_hash {
-            let (current,initial)=self.inner.store.load_certificate_for_key_reuse(issuer,key).await?;
+            let (current,initial)=store.load_certificate_for_key_reuse_owned(issuer,key).await?;
             if let Some(initial)=initial {
                 ensure!(initial.digest()==expected,"initial certificate private key changed during issuance");
-                return self.inner.store.save_certificate_with_initial_key(issuer,key,bundle,lease,&initial).await;
+                return store.save_certificate_with_initial_key(issuer,key,bundle,lease,&initial).await;
             }
             // A committed leg may have survived its final checkpoint. Never
             // overwrite a different generation installed by an external writer.
@@ -1331,7 +1379,7 @@ impl CertificateManager {
                 && current.private_key_pem.as_slice()==bundle.private_key_pem.as_slice()),
                 "initial certificate bootstrap generation changed");
             Ok(())
-        } else {self.inner.store.save_certificate(issuer,key,bundle,lease).await}
+        } else {store.save_certificate(issuer,key,bundle,lease).await}
     }
     async fn load_state(
         &self,
@@ -1341,13 +1389,12 @@ impl CertificateManager {
     ) -> Result<(Option<ManagedCertificate>, Option<Replacement>)> {
         if let Some(attempt) = self.load_attempt(names).await?
             && let Some(job_id) = attempt.current_job_id.as_ref()
-            && let Some(value) = self.inner.store.journal_load(job_id).await?
-            && let Some(directory) = value["directory"].as_str()
+            && let Some(directory) = self.load_job_directory(job_id).await?
             && let Some(issuer) = self
                 .inner
                 .issuers
                 .iter()
-                .find(|i| i.config.wire.directory == directory)
+                .find(|i| i.config.wire.directory.as_str() == &*directory)
             && self
                 .recover_candidate(names, issuer, lease, cancel)
                 .await
@@ -1384,9 +1431,7 @@ impl CertificateManager {
                 && marker.directory == issuer.config.wire.directory,
             "issuer ACME reservation scope changed"
         );
-        let job: Job = serde_json::from_value(self.inner.store.journal_load(&marker.job_id).await?
-            .ok_or_else(|| anyhow!("issuer ACME order checkpoint missing"))?)
-            .map_err(|_| anyhow!("invalid issuer ACME checkpoint"))?;
+        let job: Job = self.load_job(&marker.job_id).await?.ok_or_else(||anyhow!("issuer ACME order checkpoint missing"))?;
         validate_reservation_job(&marker, &job)?;
         if !marker.active {
             return Ok(None);
@@ -1408,7 +1453,7 @@ impl CertificateManager {
             ensure!(job.names.len() == 1, "Name0 renewal checkpoint has multiple storage subjects");
             let issuer = issuer_key(&job.directory)?;
             let name = names_key(&job.names)?;
-            let old = self.inner.store.load_certificate(&issuer, &name).await?
+            let old = self.inner.store.load_certificate_owned(&issuer, &name).await?
                 .ok_or_else(|| anyhow!("Name0 renewal checkpoint lost its signed resource"))?;
             ensure!(crate::certstore::name0_renewal_names(&old, &name)?.as_ref() == Some(sans),
                 "Name0 renewal checkpoint changed signed subject scope");
@@ -1438,14 +1483,7 @@ impl CertificateManager {
                 && marker.directory == issuer_state.config.wire.directory,
             "active ACME reservation scope changed"
         );
-        let mut job: Job = serde_json::from_value(
-            self.inner
-                .store
-                .journal_load(&marker.job_id)
-                .await?
-                .ok_or_else(|| anyhow!("active ACME order checkpoint missing"))?,
-        )
-        .map_err(|_| anyhow!("invalid active ACME checkpoint"))?;
+        let mut job: Job = self.load_job(&marker.job_id).await?.ok_or_else(||anyhow!("active ACME order checkpoint missing"))?;
         validate_reservation_job(&marker, &job)?;
         self.validate_job_renewal_scope(&job).await?;
         if marker.active {
@@ -1502,11 +1540,7 @@ impl CertificateManager {
             }
         }
         if let Some(chain) = job.downloaded_pem.as_ref() {
-            let bundle = CertificateBundle {
-                chain_pem: chain.as_bytes().to_vec(),
-                private_key_pem: Zeroizing::new(job.private_key_pem.as_bytes().to_vec()),
-                metadata: json!({"sans":job.renewal_names.as_deref().unwrap_or(names),"issuer_data":{"url":job.certificate_url,"ca":job.directory,"account":job.account_location}}),
-            };
+            let bundle = DownloadedBundle::new(chain.as_slice(),job.private_key_pem.as_bytes(),job.renewal_names.as_deref().unwrap_or(names),job.certificate_url.as_deref(),&job.directory,&job.account_location)?;
             let info = self.inspect_material(&bundle, names, cancel).await?;
             let denied = match self.inner.resolver.leaf_guard().key_deny().check_spki_der(&info.spki_der) {
                 Ok(()) => false,
@@ -1564,7 +1598,7 @@ impl CertificateManager {
     ) -> Result<(
         Option<ManagedCertificate>,
         Option<Replacement>,
-        Option<CertificateBundle>,
+        Option<OwnedCertificateBundle>,
     )> {
         let key = names_key(names)?;
         let selection = {
@@ -1602,7 +1636,7 @@ impl CertificateManager {
                 .await;
                 let Some((bundle, info)) = (match material {
                     Ok(value) => value,
-                    Err(error) if mode != LoadMode::Online => return Err(error),
+                    Err(error) if mode != LoadMode::Online || crate::cert_transient::is_resource(&error) => return Err(error),
                     Err(_) => {
                         let _ = self.inner.events.send(AutomationEvent {
                             names: names.to_vec(),
@@ -1626,7 +1660,7 @@ impl CertificateManager {
                             && info.not_before <= now()
                             && info.not_after > now()
                             && fallback.as_ref().is_none_or(
-                                |(_, _, old): &(usize, CertificateBundle, MaterialInfo)| {
+                                |(_, _, old): &(usize, OwnedCertificateBundle, MaterialInfo)| {
                                     info.not_before > old.not_before
                                 },
                             )
@@ -1636,7 +1670,7 @@ impl CertificateManager {
                         continue;
                     }
                     if best.as_ref().is_none_or(
-                        |(_, _, old): &(usize, CertificateBundle, MaterialInfo)| {
+                        |(_, _, old): &(usize, OwnedCertificateBundle, MaterialInfo)| {
                             info.not_before > old.not_before
                         },
                     ) {
@@ -1707,9 +1741,10 @@ impl CertificateManager {
                     let wire = issuer
                         .wire
                         .get_or_try_init(|| {
-                            AcmeWire::connect_with_cpu(
+                            AcmeWire::connect_with_resources(
                                 issuer.config.wire.clone(),
                                 self.inner.local.clone(),
+                                self.inner.chain_memory.clone(),
                                 cancel,
                             )
                         })
@@ -1725,13 +1760,13 @@ impl CertificateManager {
                     Ok(Some(updated)) => {
                         // Caddy may have persisted an equivalent SAN set in a
                         // different order. Native leases use normalized first SAN.
-                        if renewal_names.is_none() { bundle.metadata["sans"] = json!(names); }
-                        write_ari(
-                            &mut bundle.metadata,
-                            &updated,
-                            &info,
-                            self.inner.options.renewal_window_ratio,
-                        )?;
+                        let sans_allowance=names.iter().map(|name|name.len()+std::mem::size_of::<Value>()).sum::<usize>()+4096;
+                        let allowance=crate::cert_json_shape::ari_edit_allowance(&bundle.metadata,updated.certificate_id.len())?
+                            .checked_add(sans_allowance).ok_or(crate::cert_transient::ResourceDenied)?;
+                        bundle.update_metadata(allowance,|metadata|{
+                            if renewal_names.is_none(){metadata["sans"]=json!(names);}
+                            write_ari(metadata,&updated,&info,self.inner.options.renewal_window_ratio)
+                        })?;
                         let lease = lease
                             .ok_or_else(|| anyhow!("online cache update requires storage lease"))?;
                         lease.check().await?;
@@ -2280,9 +2315,10 @@ impl CertificateManager {
         let wire = issuer
             .wire
             .get_or_try_init(|| {
-                AcmeWire::connect_with_cpu(
+                AcmeWire::connect_with_resources(
                     issuer.config.wire.clone(),
                     self.inner.local.clone(),
+                                self.inner.chain_memory.clone(),
                     cancel,
                 )
             })
@@ -2328,9 +2364,7 @@ impl CertificateManager {
         let computed_id=digest(order_identity.as_bytes());
         let id = reservation.map(|r| r.job_id.clone()).unwrap_or(computed_id);
         let mut _job_key_reservation: Option<Arc<crate::key_compromise::KeyState>>=None;
-        let mut job = if let Some(value) = self.inner.store.journal_load(&id).await? {
-            let job: Job = serde_json::from_value(value)
-                .map_err(|_| anyhow!("invalid ACME order checkpoint"))?;
+        let mut job = if let Some(job) = self.load_job(&id).await? {
             ensure!(
                 job.version == 1
                     && job.directory == wire.directory_url()
@@ -2381,6 +2415,7 @@ impl CertificateManager {
                 stored_leaf_sha256: None,
                 replaces_disabled: false,
                 poll_after_unix: 0,
+                restored_memory:None,
             };
             self.save_job(&id, &job, lease).await?;
             job
@@ -2642,15 +2677,20 @@ impl CertificateManager {
             ensure!(resource.value.status=="valid","ACME certificate polling deadline exceeded");
             job.certificate_url=resource.value.certificate;
             if job.downloaded_pem.is_none() {
-                let certificate=account.download(job.certificate_url.as_deref().ok_or_else(||anyhow!("valid ACME order has no certificate URL"))?,cancel).await?;
-                job.downloaded_pem=Some(String::from_utf8(certificate).map_err(|_|anyhow!("ACME certificate response is not PEM"))?);
+                let chains=account.download_order_chains(&url,issuer.config.preferred_chains.wants_names(),cancel).await?;
+                let preference=issuer.config.preferred_chains.clone();
+                let selection_credit=crate::acme_wire::chain_memory::scratch(65536,cancel.clone()).await?;
+                let selected=self.cpu(cancel,move||{let _credit=selection_credit;preference.select(chains)}).await?;
+                job.certificate_url=Some(selected.url);
+                let certificate=selected.chain_pem;
+                job.downloaded_pem=Some(certificate);
                 job.phase="downloaded".to_owned();self.save_job(&id,&job,lease).await?;
             }
-            let mut bundle=CertificateBundle {chain_pem:job.downloaded_pem.as_ref().ok_or_else(||anyhow!("ACME certificate missing"))?.as_bytes().to_vec(),private_key_pem:Zeroizing::new(job.private_key_pem.as_bytes().to_vec()),metadata:json!({"sans":issuance_names,"issuer_data":{"url":job.certificate_url,"ca":wire.directory_url(),"account":account.location()}})};
+            let mut bundle=DownloadedBundle::new(job.downloaded_pem.as_ref().ok_or_else(||anyhow!("ACME certificate missing"))?.as_slice(),job.private_key_pem.as_bytes(),&issuance_names,job.certificate_url.as_deref(),wire.directory_url(),account.location())?;
             let info=self.inspect_material(&bundle,names,cancel).await?;
             self.inner.resolver.leaf_guard().key_deny().check_spki_der(&info.spki_der)?;
             ensure!(info.not_before<=now() && info.not_after>now(),"issued certificate is not currently valid");
-            if let Some(cert_id)=self.certificate_id(&bundle.chain_pem,cancel).await? && let Ok(Some(ari))=wire.renewal_info(&cert_id,cancel).await {write_ari(&mut bundle.metadata,&ari,&info,self.inner.options.renewal_window_ratio)?;}
+            if let Some(cert_id)=self.certificate_id(&bundle.chain_pem,cancel).await? && let Ok(Some(ari))=wire.renewal_info(&cert_id,cancel).await {bundle.update_ari(&ari,&info,self.inner.options.renewal_window_ratio)?;}
             job.stored_leaf_sha256=Some(info.leaf_sha256.clone());job.phase="store_intent".to_owned();self.save_job(&id,&job,lease).await?;
             lease.check().await?;self.save_issued_certificate(&issuer_name,&names_key(names)?,&bundle,lease,job.initial_key_hash.as_deref()).await?;
             lifecycle.obtained(self.inner.lifecycle_events.as_ref(),&issuer_name,names,&job.csr_der,cancel).await;
@@ -2688,10 +2728,24 @@ impl CertificateManager {
         job.poll_after_unix = 0;
         Ok(())
     }
+    async fn load_job_directory(&self,id:&str)->Result<Option<crate::cert_transient::Text>> {
+        #[derive(Deserialize)]struct Header {#[serde(deserialize_with="job_codec::text")] directory:String}
+        self.inner.store.journal_decode_admitted(id,|raw|{
+            let _credit=job_codec::decode_credit(raw.len())?;
+            let header:Header=serde_json::from_slice(raw).context("invalid ACME job header")?;
+            crate::cert_transient::Text::admit(header.directory)
+        }).await
+    }
+    async fn load_job(&self,id:&str)->Result<Option<Job>> {
+        self.inner.store.journal_decode_admitted(id,|raw|{
+            job_codec::decode(raw)
+        }).await
+    }
     async fn save_job(&self, id: &str, job: &Job, lease: &StorageLease) -> Result<()> {
         let operation = async {
-            self.store_checkpoint(id, serde_json::to_value(job)?, lease)
-                .await?;
+            let snapshot=job_codec::snapshot(job,lease.name()).await?;
+            let encoded=self.cpu(&CancellationToken::new(),move||job_codec::encode(snapshot)).await?;
+            self.inner.store.journal_store_encoded_fenced(id,encoded,lease).await?;
             let marker_id = reservation_id(&job.names, &job.directory)?;
             let active = !["prepared", "stored"].contains(&job.phase.as_str());
             if let Some(value) = self.inner.store.journal_load(&marker_id).await? {
@@ -2804,10 +2858,8 @@ impl CertificateManager {
             return Ok(());
         }
         if let Some(id) = attempt.current_job_id
-            && let Some(value) = self.inner.store.journal_load(&id).await?
+            && let Some(mut job) = self.load_job(&id).await?
         {
-            let mut job: Job = serde_json::from_value(value)
-                .map_err(|_| anyhow!("invalid abandoned ACME checkpoint"))?;
             job.abandoned = true;
             self.save_job(&id, &job, lease).await?;
         }
@@ -2836,16 +2888,20 @@ impl CertificateManager {
             return Ok(());
         }
         for attempt in 0..8 {
+            let bound=crate::cert_transient::clone_input_bound(&bundle.chain_pem,&bundle.private_key_pem,names)?;
+            let credit=crate::acme_wire::chain_memory::scratch(bound,cancel.clone()).await?;
             let names_owned = names.to_vec();
             let chain = bundle.chain_pem.clone();
             let key = bundle.private_key_pem.clone();
+            let input=(chain,key,names_owned,credit);
             let resolver = self.inner.resolver.clone();
             match self
                 .cpu(cancel, move || {
+                    let input=input;
                     Ok(resolver.upsert(&CertificateInput {
-                        names: &names_owned,
-                        certificate_pem: &chain,
-                        private_key_pem: &key,
+                        names: &input.2,
+                        certificate_pem: &input.0,
+                        private_key_pem: &input.1,
                     }))
                 })
                 .await?
@@ -3165,28 +3221,34 @@ pub(crate) fn generate_csr_with_options(names:&[String],kind:KeyType,deny:&crate
 }
 fn material_info(bundle: &CertificateBundle, names: &[String], deny:&crate::key_compromise::KeyDeny) -> Result<MaterialInfo> {
     use x509_parser::extensions::GeneralName;
-    let blocks = crate::certmagic::pem_blocks(&bundle.chain_pem, "managed-certificate")?;
-    let mut chain = Vec::new();
+    let blocks = crate::cert_transient::certificate_blocks(&bundle.chain_pem)?;
+    {
+    let bytes=blocks.iter().try_fold(0usize,|n,(_,der)|n.checked_add(der.len()).ok_or(crate::cert_transient::ResourceDenied))?
+        .checked_add(blocks.len()*std::mem::size_of::<rustls::pki_types::CertificateDer<'static>>()).ok_or(crate::cert_transient::ResourceDenied)?;
+    let _copies=crate::acme_wire::chain_memory::try_scratch(bytes).map_err(|_|crate::cert_transient::ResourceDenied)?;
+    let mut chain = Vec::with_capacity(blocks.len());
     for (label, der) in &blocks {
         ensure!(
             label == "CERTIFICATE",
             "invalid managed certificate PEM label"
         );
-        let (remaining, _) = x509_parser::parse_x509_certificate(der)
-            .map_err(|_| anyhow!("invalid managed certificate DER"))?;
+        let (remaining, _) = crate::cert_transient::parse_certificate(der).context("invalid managed certificate DER")?;
         ensure!(remaining.is_empty(), "trailing managed certificate DER");
         chain.push(rustls::pki_types::CertificateDer::from(der.to_vec()));
     }
-    let signer = crate::certmagic::signing_key(&bundle.private_key_pem, "managed-certificate")?;
-    rustls::sign::CertifiedKey::new(chain, signer)
-        .keys_match()
-        .map_err(|_| anyhow!("managed certificate key mismatch"))?;
-    let (_, cert) = x509_parser::parse_x509_certificate(&blocks[0].1)
-        .map_err(|_| anyhow!("invalid managed leaf certificate"))?;
+    let _key_output=crate::cert_transient::reserve(crate::cert_transient::key_decode_bound(&bundle.private_key_pem)?)?;
+    let signer = crate::cert_transient::signing_key(&bundle.private_key_pem, "managed-certificate")?;
+    crate::certmagic::check_keys_match(&rustls::sign::CertifiedKey::new(chain, signer),"managed-certificate")?;
+    }
+    let (_, cert) = crate::cert_transient::parse_certificate(&blocks[0].1).context("invalid managed leaf certificate")?;
     let san = cert
         .subject_alternative_name()
         .map_err(|_| anyhow!("invalid managed certificate SAN"))?
         .ok_or_else(|| anyhow!("managed certificate SAN missing"))?;
+    let count=san.value.general_names.iter().filter(|v|matches!(v,GeneralName::DNSName(_))).count();
+    let text=san.value.general_names.iter().try_fold(0usize,|n,v|if let GeneralName::DNSName(name)=v{n.checked_add(name.len()).ok_or(crate::cert_transient::ResourceDenied)}else{Ok(n)})?;
+    let compare_bound=crate::cert_transient::vec_slots(count)?.checked_mul(std::mem::size_of::<String>()).and_then(|n|n.checked_add(text)).ok_or(crate::cert_transient::ResourceDenied)?;
+    let _compare=crate::acme_wire::chain_memory::try_scratch(compare_bound).map_err(|_|crate::cert_transient::ResourceDenied)?;
     let actual = san
         .value
         .general_names

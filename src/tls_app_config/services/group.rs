@@ -787,8 +787,8 @@ impl CertificateServices {
         outcome
     }
 
-    async fn remember_material(&self, group: &Arc<Group>, mut material: Material) -> Result<()> {
-        material.names = group.names.clone();
+    async fn remember_material(&self, group: &Arc<Group>, material: Arc<Material>) -> Result<()> {
+        ensure!(material.names == group.names, "managed material aliases changed before retention");
         material.validate_at(now()?, false)?;
         reject_revoked(&material, &self.context.leaf_guard, true)?;
         *group.spki.lock().map_err(|_| anyhow!("certificate key state unavailable"))? = Some(material.spki_der.clone());
@@ -812,7 +812,7 @@ impl CertificateServices {
             );
         }
         let material = if group.identity {
-            Arc::new(material)
+            material
         } else {
             self.on_demand
                 .bound_material(&group.names, material.identity)
@@ -901,6 +901,13 @@ impl CertificateServices {
         lease: Option<&crate::certstore::StorageLease>,
         cancel: CancellationToken,
     ) -> Result<()> {
+        enum ProbeMaterial {
+            Legacy(CertificateBundle),Owned(crate::certstore::OwnedCertificateBundle),
+        }
+        impl std::ops::Deref for ProbeMaterial {
+            type Target=CertificateBundle;
+            fn deref(&self)->&CertificateBundle{match self{Self::Legacy(bundle)=>bundle,Self::Owned(bundle)=>bundle}}
+        }
         let bundle = match &group.issuer {
             GroupIssuer::Acme(manager) => {
                 match manager.probe_cached(&group.names, cancel.clone()).await? {
@@ -916,14 +923,14 @@ impl CertificateServices {
                         if let Some(info) = usable {
                             group.renew_at.store(info.renew_at_unix, Ordering::Release);
                         }
-                        Some(bundle)
+                        Some(ProbeMaterial::Owned(bundle))
                     }
                 }
             }
             GroupIssuer::Internal { ca, .. } => {
                 let key=names_key(&group.names)?;
                 if group.store.fs.certificate_recovery_pending(ca,&key,&format!("issue_cert_{}",group.names[0])).await? {None}
-                else {self.read_group_issuer_material(group,ca,&key,cancel.clone()).await?.0}
+                else {self.read_group_issuer_material(group,ca,&key,cancel.clone()).await?.0.map(ProbeMaterial::Legacy)}
             }
         };
         let Some(bundle) = bundle else {
@@ -939,11 +946,13 @@ impl CertificateServices {
                 Ordering::Release,
             );
         }
-        let mut material = self
-            .parse_material(bundle.chain_pem, bundle.private_key_pem, cancel.clone())
-            .await?;
-        material.names = group.names.clone();
-        self.prime_material_status(Arc::new(material.clone()), group.identity, cancel.clone()).await?;
+        let mut material=match bundle{
+            ProbeMaterial::Owned(bundle)=>self.parse_owned_material(bundle,group.clone(),cancel.clone()).await?,
+            ProbeMaterial::Legacy(bundle)=>self.parse_material(bundle.chain_pem,bundle.private_key_pem,cancel.clone()).await?,
+        };
+        if material.names != group.names { material.names = group.names.clone(); }
+        let material=Arc::new(material);
+        self.prime_material_status(material.clone(), group.identity, cancel.clone()).await?;
         *group.spki.lock().map_err(|_| anyhow!("certificate key state unavailable"))? = Some(material.spki_der.clone());
         let (begin, end) = material.times()?;
         let leaf = self.context.leaf_guard.intern(material.leaf_id, end)?;
@@ -976,7 +985,7 @@ impl CertificateServices {
         let ari_after = group.ari_after.load(Ordering::Acquire);
         self.publish_group(
             group,
-            Arc::new(material.clone()),
+            material.clone(),
             due,
             ari_after,
             PublishIntent::Insert,
@@ -993,7 +1002,7 @@ impl CertificateServices {
         cached_first: bool,
         target: Option<&RenewalTarget>,
         cancel: CancellationToken,
-    ) -> Result<(i64, Material)> {
+    ) -> Result<(i64, Arc<Material>)> {
         let intent = if cached_first || group.identity || target.is_some() {
             PublishIntent::Insert
         } else {
@@ -1050,13 +1059,13 @@ impl CertificateServices {
                     let bundle = group
                         .store
                         .fs
-                        .load_certificate(&info.issuer_key, &names_key(&group.names)?)
+                        .load_certificate_owned(&info.issuer_key, &names_key(&group.names)?)
                         .await?
                         .ok_or_else(|| anyhow!("managed certificate is missing"))?;
                     let ari_after =
                         cert_automation::ari_refresh_time(&bundle.metadata).unwrap_or(0);
                     let mut material = self
-                        .parse_material(bundle.chain_pem, bundle.private_key_pem, cancel.clone())
+                        .parse_owned_material(bundle,group.clone(),cancel.clone())
                         .await?;
                     ensure!(
                         material
@@ -1068,8 +1077,9 @@ impl CertificateServices {
                         "managed certificate changed before publication; retry required"
                     );
                     material.validate_at(now()?, false)?;
-                    material.names = group.names.clone();
-                    self.prime_material_status(Arc::new(material.clone()), group.identity,
+                    if material.names != group.names { material.names = group.names.clone(); }
+        let material=Arc::new(material);
+                    self.prime_material_status(material.clone(), group.identity,
                         cancel.clone()).await?;
                     if self.context.leaf_guard.key_deny().check_spki_der(&material.spki_der).is_err()
                         || self.context.leaf_guard.intern(material.leaf_id, material.times()?.1)?
@@ -1082,7 +1092,7 @@ impl CertificateServices {
                     lease.check().await?;
                     self.publish_group(
                         group,
-                        Arc::new(material.clone()),
+                        material.clone(),
                         info.renew_at_unix,
                         ari_after,
                         intent_for(&material)?,
@@ -1139,8 +1149,9 @@ impl CertificateServices {
                                 cancel.clone(),
                             )
                             .await?;
-                        material.names = group.names.clone();
-                        self.prime_material_status(Arc::new(material.clone()), group.identity, cancel.clone()).await?;
+                        if material.names != group.names { material.names = group.names.clone(); }
+        let material=Arc::new(material);
+                        self.prime_material_status(material.clone(), group.identity, cancel.clone()).await?;
                         if self.context.leaf_guard.key_deny().check_spki_der(&material.spki_der)
                             .is_err_and(|error| error.is::<crate::key_compromise::KeyCompromised>()) {
                             let archived = group.store.fs.archive_compromised_key(ca, &key,
@@ -1155,7 +1166,7 @@ impl CertificateServices {
                         }
                         if group.policy.reuse_private_keys && material.key_allowed(self.context.leaf_guard.key_deny()) {
                             _reuse_key_state=Some(material.register_key(self.context.leaf_guard.key_deny())?);
-                            reuse_key=Some(material.key.clone());
+                            reuse_key=Some(zeroize::Zeroizing::new(material.key.to_vec()));
                         }
                         if material.key_allowed(self.context.leaf_guard.key_deny()) && !self.context.leaf_guard.intern(material.leaf_id, material.times()?.1)?.revocation()?.is_some_and(|r| r.version.reason == Some(1)) {
                             renewal_names = preserved;
@@ -1172,7 +1183,7 @@ impl CertificateServices {
                         {
                             self.publish_group(
                                 group,
-                                Arc::new(material.clone()),
+                                material.clone(),
                                 due,
                                 i64::MAX,
                                 intent_for(&material)?,
@@ -1209,7 +1220,8 @@ impl CertificateServices {
                     let mut material = self
                         .parse_material(chain_pem.clone(), private_key_pem.clone(), cancel.clone())
                         .await?;
-                    material.names = group.names.clone();
+                    if material.names != group.names { material.names = group.names.clone(); }
+        let material=Arc::new(material);
                     material.validate_at(now()?, false)?;
                     let bundle = CertificateBundle {
                         chain_pem,
@@ -1225,7 +1237,7 @@ impl CertificateServices {
                     let due = self.current_renewal_time(&material, &group.policy)?;
                     self.publish_group(
                         group,
-                        Arc::new(material.clone()),
+                        material.clone(),
                         due,
                         i64::MAX,
                         intent_for(&material)?,

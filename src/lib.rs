@@ -52,3 +52,7 @@ pub(crate) mod json_float;
 pub mod net_address;
 
 pub(crate) mod proxy_protocol;
+
+mod cert_transient;
+
+mod cert_json_shape;

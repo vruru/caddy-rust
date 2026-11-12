@@ -681,6 +681,13 @@ impl CertificateServices {
             material.register_key(&deny)?;Ok(material)
         }).await
     }
+    async fn parse_owned_material(&self,bundle:crate::certstore::OwnedCertificateBundle,group:Arc<Group>,cancel:CancellationToken)->Result<Material>{
+        let deny=self.context.leaf_guard.key_deny().clone();
+        super::loaders::blocking(self.context.resources.cpu.clone(),cancel,move||{
+            let material=Material::from_owned(bundle,&group.names)?;
+            material.register_key(&deny)?;Ok(material)
+        }).await
+    }
     async fn publish_material(
         &self,
         material: Arc<Material>,

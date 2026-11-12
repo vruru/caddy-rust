@@ -6,7 +6,7 @@
 use crate::challenge::{ACME_ALPN, ChallengeRegistry, normalize_domain};
 use crate::leaf_guard::{LeafGuard, LeafState, Observation, leaf_id};
 use crate::tls_policy::certificate_selection::{CertificateFacts, CertificateFilter};
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use rustls::{
     ProtocolVersion, SignatureScheme,
     pki_types::CertificateDer,
@@ -211,6 +211,8 @@ pub struct OcspCertificate {
     pub(crate) leaf_state: Arc<LeafState>,
     pub(crate) leaf_sha256: [u8; 32],
     pub(crate) key_state: Arc<crate::key_compromise::KeyState>,
+    // Last so all owned buffers die before their independent probe allowance.
+    pub(crate) preparation: Option<Arc<crate::tls_app_config::CertificatePreparation>>,
 }
 pub(crate) struct OcspDescriptor {
     pub(crate) identity: [u8; 32],
@@ -268,10 +270,71 @@ struct LoadedCertificate {
     not_before: i64,
     not_after: i64,
     size: usize,
-    signature_profile: SignatureProfile,
+    signature_profile: Arc<SignatureProfile>,
     facts: Arc<CertificateFacts>,
     management_name: Arc<str>,
     san_names: Arc<Vec<String>>,
+    // Content stage follows every immutable clone; rejected candidates keep
+    // admission until the last real content owner is destroyed.
+    preparation: Arc<crate::tls_app_config::CertificatePreparation>,
+}
+
+struct ResolverPreparations {
+    tokens:Vec<Arc<crate::tls_app_config::CertificatePreparation>>,
+    accepted:bool,
+    _credit:crate::acme_wire::chain_memory::Scratch,
+}
+impl ResolverPreparations {
+    fn new(count:usize)->Result<Self>{
+        let bytes=count.checked_mul(std::mem::size_of::<Arc<crate::tls_app_config::CertificatePreparation>>())
+            .and_then(|n|n.checked_add(64)).ok_or(crate::cert_transient::ResourceDenied)?;
+        let credit=crate::cert_transient::reserve(bytes)?;
+        let mut tokens=Vec::new();tokens.try_reserve_exact(count).map_err(|_|crate::cert_transient::ResourceDenied)?;
+        Ok(Self{tokens,accepted:false,_credit:credit})
+    }
+    fn push(&mut self,preparation:&Arc<crate::tls_app_config::CertificatePreparation>){
+        assert!(self.tokens.len()<self.tokens.capacity());self.tokens.push(preparation.clone());
+    }
+}
+impl Drop for ResolverPreparations{
+    fn drop(&mut self){if self.accepted {for token in &self.tokens {token.release();}}}
+}
+
+/// Prepay the temporary native snapshot maps/vectors before cloning them.
+/// Accepted indexes transfer to the existing resolver alias/inventory bounds;
+/// this does not turn those logical limits into a total resident-RSS semaphore.
+fn index_credit<'a>(base:Option<&Snapshot>,incoming:impl Iterator<Item=&'a [String]>,extra_certificates:usize)
+    ->Result<crate::acme_wire::chain_memory::Scratch>{
+    use crate::cert_transient::{ResourceDenied,reserve};
+    fn add(a:usize,b:usize)->Result<usize>{a.checked_add(b).ok_or_else(||ResourceDenied.into())}
+    fn mul(a:usize,b:usize)->Result<usize>{a.checked_mul(b).ok_or_else(||ResourceDenied.into())}
+    fn table(n:usize,record:usize)->Result<usize>{
+        if n==0{return Ok(0)}
+        // hashbrown's 7/8 load factor and power-of-two buckets; old+new
+        // allocation coexist at growth. Include control bytes and alignment.
+        let buckets=add(mul(n,8)?/7,4)?.checked_next_power_of_two().ok_or(ResourceDenied)?;
+        add(mul(add(buckets,buckets/2)?,add(record,1)?)?,64)
+    }
+    let mut aliases=base.map_or(0,|s|s.names.len());
+    let mut capacity=base.map_or(0,|s|s.names.capacity());
+    let mut refs=0usize;let mut text=0usize;
+    if let Some(base)=base {for(name,certificates)in &base.names{
+        refs=add(refs,certificates.len())?;
+        text=add(text,mul(name.len(),add(1,certificates.len())?)?)?;
+    }}
+    for names in incoming{aliases=add(aliases,names.len())?;refs=add(refs,names.len())?;
+        for name in names{text=add(text,mul(name.len(),2)?)?}}
+    capacity=capacity.max(aliases);
+    let certificates=add(base.map_or(0,|s|s.inventory.len()),extra_certificates)?;
+    let mut bytes=add(16384,text)?;
+    bytes=add(bytes,table(capacity,std::mem::size_of::<(String,Vec<Arc<LoadedCertificate>>)>() )?)?;
+    // Inventory, identity index, validation set and prune-staple maps are
+    // all smaller than this record; six table peaks cover their overlap.
+    bytes=add(bytes,mul(6,table(certificates,std::mem::size_of::<(u64,InventoryEntry)>())?)?)?;
+    bytes=add(bytes,mul(add(mul(refs,3)?,mul(aliases,12)?)?,std::mem::size_of::<Arc<LoadedCertificate>>())?)?;
+    bytes=add(bytes,mul(add(mul(refs,3)?,mul(certificates,12)?)?,std::mem::size_of::<String>())?)?;
+    bytes=add(bytes,mul(certificates,std::mem::size_of::<LoadedCertificate>()+64)?)?;
+    reserve(bytes)
 }
 
 /// Public inventory retains only the immutable base key, never an optional
@@ -294,6 +357,7 @@ impl InventoryEntry {
     }
     fn certificate(&self) -> OcspCertificate {
         OcspCertificate {
+            preparation: None,
             identity: self.identity,
             generation: self.generation,
             names: self.names.clone(),
@@ -419,12 +483,14 @@ impl HotCertificateResolver {
             inputs.len() <= MAX_CERTIFICATES,
             "certificate count limit exceeded"
         );
+        let mut preparations=ResolverPreparations::new(inputs.len())?;
         let base = self
             .certificates
             .read()
             .map_err(|_| anyhow!("certificate state unavailable"))?
             .clone();
         let now = clock_now()?;
+        let _indexes=index_credit(None,inputs.iter().map(|input|input.names),inputs.len())?;
         let mut bytes = 0usize;
         let mut next: HashMap<String, Vec<Arc<LoadedCertificate>>> = HashMap::new();
         for input in inputs {
@@ -434,6 +500,7 @@ impl HotCertificateResolver {
                 .ok_or_else(|| anyhow!("certificate data limit exceeded"))?;
             ensure!(bytes <= MAX_TOTAL_BYTES, "certificate data limit exceeded");
             let (names, mut cert) = load_certificate(input, &self.leaf_guard)?;
+            preparations.push(&cert.preparation);
             cert.managed_key_veto = self.managed_keys;
             if cert.managed_key_veto && cert.key_state.banned() { return Err(crate::key_compromise::KeyCompromised.into()); }
             cert.instance_generation = self.instance_generation()?;
@@ -477,6 +544,7 @@ impl HotCertificateResolver {
         );
         drop(guard);
         drop(previous);
+        preparations.accepted=true;
         Ok(())
     }
 
@@ -661,6 +729,7 @@ impl HotCertificateResolver {
         cancel: Option<&tokio_util::sync::CancellationToken>,
         commit: impl FnOnce() -> Result<()>,
     ) -> Result<Option<ScopedCertificate>> {
+        let mut preparations=ResolverPreparations::new(1)?;
         let check_active = || {
             ensure!(
                 cancel.is_none_or(|token| !token.is_cancelled()),
@@ -674,6 +743,7 @@ impl HotCertificateResolver {
         };
         check_active()?;
         let (names, mut cert) = load_certificate(input, &self.leaf_guard)?;
+        preparations.push(&cert.preparation);
         cert.managed_key_veto = self.managed_keys;
         cert.instance_generation = self.instance_generation()?;
         cert.owner = owner.clone();
@@ -696,6 +766,7 @@ impl HotCertificateResolver {
                 .read()
                 .map_err(|_| anyhow!("certificate state unavailable"))?
                 .clone();
+            let _indexes=index_credit(Some(&base),std::iter::once(names.as_slice()),1)?;
             let now = clock_now()?;
             let mut candidate_cert = cert.clone();
             inherit_staple(&mut candidate_cert, &base.names, now);
@@ -772,6 +843,7 @@ impl HotCertificateResolver {
             let previous = std::mem::replace(&mut *guard, candidate);
             drop(guard);
             drop(previous);
+            preparations.accepted=true;
             return Ok(receipt);
         }
         Err(CertificatePublicationConflict.into())
@@ -1537,24 +1609,35 @@ fn load_certificate(
             && input.private_key_pem.len() <= MAX_KEY_BYTES,
         "certificate material outside bounds"
     );
-    let blocks = crate::certmagic::pem_blocks(input.certificate_pem, "tls-candidate")?;
+    let blocks = crate::cert_transient::certificate_blocks(input.certificate_pem)?;
+    let mut output=65536usize;
+    for (_,der) in &blocks {
+        // Two certified-chain DER copies, serial/SPKI/organization/SAN owned
+        // facts and their conversion buffers. The same pinned typed shape
+        // bounds collection records; primitive UTF-8 conversions are <=4x DER.
+        let shape=crate::acme_wire::chain_deep_shape::full_cost(der)?;
+        output=output.checked_add(der.len().checked_mul(4).ok_or(crate::cert_transient::ResourceDenied)?)
+            .and_then(|n|shape.checked_mul(2).and_then(|shape|n.checked_add(shape)))
+            .ok_or(crate::cert_transient::ResourceDenied)?;
+    }
+    for name in input.names {output=output.checked_add(name.len().checked_mul(8).ok_or(crate::cert_transient::ResourceDenied)?+8*std::mem::size_of::<String>()).ok_or(crate::cert_transient::ResourceDenied)?;}
+    output=output.checked_add(crate::cert_transient::key_decode_bound(input.private_key_pem)?).ok_or(crate::cert_transient::ResourceDenied)?;
+    let preparation=crate::tls_app_config::CertificatePreparation::reserve(output)?;
     let mut chain = Vec::with_capacity(blocks.len());
     for (label, der) in &blocks {
         ensure!(label == "CERTIFICATE", "unexpected certificate PEM label");
-        let (remaining, _) = x509_parser::parse_x509_certificate(der)
-            .map_err(|_| anyhow!("invalid certificate DER"))?;
+        let (remaining, _) = crate::cert_transient::parse_certificate(der)
+            .context("invalid certificate DER")?;
         ensure!(remaining.is_empty(), "trailing certificate DER");
         chain.push(CertificateDer::from(der.to_vec()));
     }
-    let preferred = crate::certmagic::signing_key(input.private_key_pem, "tls-candidate")?;
+    let preferred = crate::cert_transient::signing_key(input.private_key_pem, "tls-candidate")?;
     let key = crate::crypto::tls12_signer(&preferred, input.private_key_pem)?;
     let identity = certificate_chain_identity(&chain);
     let certified = CertifiedKey::new(chain, key);
-    certified
-        .keys_match()
-        .map_err(|_| anyhow!("certificate and private key do not match"))?;
-    let (_, leaf) = x509_parser::parse_x509_certificate(&blocks[0].1)
-        .map_err(|_| anyhow!("invalid leaf certificate"))?;
+    crate::certmagic::check_keys_match(&certified,"tls-candidate")?;
+    let (_, leaf) = crate::cert_transient::parse_certificate(&blocks[0].1)
+        .context("invalid leaf certificate")?;
     ensure!(
         leaf.validity().is_valid(),
         "certificate is not currently valid"
@@ -1655,13 +1738,14 @@ fn load_certificate(
             owner: None,
             residency: None,
             staple: None,
-            signature_profile,
+            signature_profile:Arc::new(signature_profile),
             facts,
             management_name,
             san_names: Arc::new(san_names),
             size,
             not_before: leaf.validity().not_before.timestamp(),
             not_after: leaf.validity().not_after.timestamp(),
+            preparation,
         },
     ))
 }
@@ -1679,16 +1763,14 @@ fn inherit_staple(
     let Some(staple) = names
         .values()
         .flatten()
-        .filter(|old| old.identity == cert.identity)
+        .filter(|old| old.identity == cert.identity && old.signature_profile==cert.signature_profile)
         .filter_map(|old| old.staple.as_ref())
         .filter(|staple| staple.valid_until > now)
         .max_by_key(|staple| staple.valid_until)
     else {
         return;
     };
-    if let Some(bytes) = &staple.key.ocsp {
-        cert.staple = Some(make_staple(cert, bytes, staple.valid_until));
-    }
+    if staple.key.ocsp.is_some() {cert.staple=Some(staple.clone());}
 }
 // Optional status data must never prevent publication of required certificate
 // material. Certificate publication may evict cached staples; OCSP attachment

@@ -429,3 +429,53 @@ table meaning. Native treats the filename as data and retains alignment. This is
 an intentional repair, distinct from the native default HTML UI, and is not
 represented as byte equality with the baseline. See the
 [upstream tabwriter implementation](https://github.com/golang/go/blob/go1.27.3/src/text/tabwriter/tabwriter.go).
+
+
+### Preferred ACME chains and certificate data ownership
+
+ACME issuer `preferred_chains` supports `smallest` (ascending or descending
+encoded-chain size), `any_common_name`, and `root_common_name`. Selection keeps
+stable candidate order for ties; an unmatched preference falls back to the
+first size-ranked candidate. A preference chooses a chain rather than adding
+trust. Certificate-download capabilities originate in authenticated ACME order
+or certificate responses, are limited to HTTP(S), and cannot authorize account,
+order, challenge, or arbitrary application requests. Cross-origin certificate
+links retain normal server verification and the configured proxy policy, reject
+redirects, credentials, fragments and HTTPS downgrades, and must yield the same
+leaf DER. Malformed optional alternatives preserve a valid primary chain.
+
+The default runtime shares a 32 MiB live certificate/input payload allowance,
+8 MiB network reallocation staging allowance, and 64 MiB decoding/serialization
+scratch allowance across issuers, configuration generations and default
+standalone wire clients. A separate shared 64 MiB preparation-output allowance
+covers unpublished native certificate material until actual resolver/cache
+acceptance or destruction. These are admission limits for the named Rust data
+and transformations, not a whole-process RSS or crypto-provider heap bound.
+Existing resident/manual/status capacities remain separate; accepted snapshots
+and independently retained legacy cache values retain their existing accounting
+boundaries.
+
+Downloaded checkpoint bodies share their complete data/credit owner when
+cloned. Raw reads reserve before allocation; bounded typed checkpoint restoration
+transfers its output credit before the IO worker returns. For example, the
+checkpoint directory String is parsed under the raw/decode credit and then
+transferred to its payload owner, with the old decode credit retained until that
+transfer completes. Cancelled callers and completed but unconsumed worker
+results retain the actual data owner. Per-object DER shape admission covers the
+pinned parser's supported extension structures, and native SAN/JSON working
+copies use their own prepayments. Resource exhaustion is treated as a transient
+failure, without classifying valid stored material as corrupt or issuing a
+replacement merely because inspection lacked resources.
+
+The Rust `CachedProbe::Material` handoff now uses read-only
+`OwnedCertificateBundle`; clones share the complete owner. The three public
+`CertificateBundle` fields remain unchanged. This is a Rust library API shape
+adjustment, not a promise of source or binary ABI compatibility. Key binding
+compares the complete original SPKI after strict X.509/duplicate-extension
+checks, avoiding an unrelated WebPKI whole-certificate size limit while still
+rejecting mismatched keys and malformed DER.
+
+Alternate-chain traversal currently remains sequential, including optional
+alternatives not needed by the default preference. Bounded concurrent optional
+fetching and recovery through a complete matching alternate when mandatory
+primary-chain `up` links fail remain separate compatibility work.

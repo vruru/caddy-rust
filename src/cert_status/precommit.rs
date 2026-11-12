@@ -75,21 +75,28 @@ impl OcspManager {
             !certificate.chain_der.is_empty(),
             "OCSP certificate chain empty"
         );
-        let chain=certificate.chain_der.clone();
-        let cpu=tokio::select!{biased;_=cancel.cancelled()=>return Err(anyhow!("OCSP cache probe cancelled")),slot=self.inner.cpu_slots.clone().acquire_owned()=>slot.map_err(|_|anyhow!("OCSP CPU dispatch stopped"))?};
-        let (inspection,slot)=tokio::task::spawn_blocking(move || {
-            let _cpu=cpu;
-            let inspection=inspect_certificate(&chain)?;
-            Ok::<_,anyhow::Error>((inspection,slot))
-        }).await??;
-        ensure!(!cancel.is_cancelled(),"OCSP cache probe cancelled");
-        let quiet=inspection.quiet;
+        let chain = certificate.chain_der.clone();
+        let preparation = certificate.preparation.clone();
+        let cpu = tokio::select! {biased;_=cancel.cancelled()=>return Err(anyhow!("OCSP cache probe cancelled")),slot=self.inner.cpu_slots.clone().acquire_owned()=>slot.map_err(|_|anyhow!("OCSP CPU dispatch stopped"))?};
+        let (inspection, slot, _inspection_input) = tokio::task::spawn_blocking(move || {
+            // The returned result owns this pair too: a completed, unconsumed
+            // JoinHandle must not leave allocated inspection data uncredited.
+            let input = (chain, preparation);
+            let _cpu = cpu;
+            let inspection = inspect_certificate(&input.0)?;
+            Ok::<_, anyhow::Error>((inspection, slot, input))
+        })
+        .await??;
+        ensure!(!cancel.is_cancelled(), "OCSP cache probe cancelled");
+        let quiet = inspection.quiet;
         if inspection.responder.is_none() {
             if inspection.must_staple {
                 self.emit(&certificate, "ocsp_must_staple_unavailable", None, false);
             }
-            self.inner.resolver.set_ocsp(&certificate.identity,certificate.generation,None)?;
-            self.record(&certificate,None,None)?;
+            self.inner
+                .resolver
+                .set_ocsp(&certificate.identity, certificate.generation, None)?;
+            self.record(&certificate, None, None)?;
             return Ok(CacheRestore::NotApplicable);
         }
         if certificate.chain_der.len() < 2 {
@@ -107,7 +114,7 @@ impl OcspManager {
         ensure!(!cancel.is_cancelled(), "OCSP cache probe cancelled");
         // The owned slot moves into the actual blocking verifier. Dropping a
         // caller's waiter cannot release CPU admission before crypto finishes.
-        let verified = verify_owned(
+        let verified = verify_owned_prepared(
             raw.to_vec(),
             certificate.chain_der[0].clone(),
             certificate.chain_der[1].clone(),
@@ -115,6 +122,7 @@ impl OcspManager {
             Some(slot),
             None,
             acquire_cpu(self.inner.cpu_slots.clone(), &cancel).await?,
+            certificate.preparation.clone(),
         )
         .await;
         let (status, proof) = match verified {

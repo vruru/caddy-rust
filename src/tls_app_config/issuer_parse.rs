@@ -101,15 +101,12 @@ fn acme(value: &Value, path: &str) -> Result<Issuer> {
             ObjectKind::PreferredChains,
             &object.at("preferred_chains"),
         )?;
-        if chains.boolean("smallest")?.unwrap_or(false)
-            || !chains.strings("root_common_name")?.is_empty()
-            || !chains.strings("any_common_name")?.is_empty()
-        {
-            return Err(ConfigError::unsupported(
-                object.at("preferred_chains"),
-                "acme_alternate_chains",
-            ));
-        }
+        config.preferred_chains=crate::acme_wire::ChainPreference {
+            smallest:chains.boolean("smallest")?,
+            root_common_name:chains.strings("root_common_name")?.into_iter().map(str::to_owned).collect(),
+            any_common_name:chains.strings("any_common_name")?.into_iter().map(str::to_owned).collect(),
+        };
+        config.preferred_chains.validate().map_err(|_|ConfigError::invalid(object.at("preferred_chains")))?;
     }
     if let Some(proxy)=object.raw_value("network_proxy") {
         let path=object.at("network_proxy");

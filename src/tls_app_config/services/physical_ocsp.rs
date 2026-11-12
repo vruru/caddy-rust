@@ -105,7 +105,18 @@ impl CertificateServices {
         let certificate = crate::cert_cpu::run(self.context.resources.cpu.clone(),
             cancel.clone(), move || {
                 let key = material.certified_key()?;
+                let chain_bytes=key.cert.iter().try_fold(0usize,|sum,der|sum.checked_add(der.len())
+                    .ok_or_else(||anyhow!("OCSP preparation size overflow")))?;
+                let names_bytes=material.names.iter().try_fold(0usize,|sum,name|sum.checked_add(name.len()+std::mem::size_of::<String>())
+                    .ok_or_else(||anyhow!("OCSP preparation size overflow")))?;
+                let cost=chain_bytes.checked_mul(8).and_then(|n|n.checked_add(names_bytes.checked_mul(4)?))
+                    .and_then(|n|n.checked_add(8192)).ok_or_else(||anyhow!("OCSP preparation size overflow"))?;
+                // A separate probe owner is not released by a concurrent cache
+                // publication of the same Material. It follows actual copied
+                // chain/result/verification owners until they are destroyed.
+                let preparation=super::super::resident_cache::Preparation::reserve(cost)?;
                 Ok(crate::tls_resolver::OcspCertificate {
+                    preparation: Some(preparation),
                     identity: material.identity, generation: 0,
                     names: material.names.clone(), management_name: material.management_name.clone(),
                     chain_der: key.cert.iter().map(|der| der.as_ref().to_vec()).collect(),

@@ -12,7 +12,7 @@ mod io;
 mod lease;
 pub use lease::StorageLease;
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use io::Root;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -129,15 +129,47 @@ pub struct CertificateBundle {
     pub metadata: Value,
 }
 
+/// Read-only library handoff: cloning shares the complete data+admission owner.
+/// This intentionally does not expose mutable deref or an unmetered extraction.
+#[derive(Clone)]
+pub struct OwnedCertificateBundle(Arc<OwnedCertificateData>);
+struct OwnedCertificateData {
+    bundle:CertificateBundle,
+    memory:[Option<crate::cert_transient::Credit>;3],
+}
+impl std::ops::Deref for OwnedCertificateBundle {
+    type Target=CertificateBundle;
+    fn deref(&self)->&CertificateBundle{&self.0.bundle}
+}
+impl OwnedCertificateBundle {
+    fn new(bundle:CertificateBundle,memory:[Option<crate::cert_transient::Credit>;3])->Self{
+        Self(Arc::new(OwnedCertificateData{bundle,memory}))
+    }
+    pub(crate) fn update_metadata(&mut self,allowance:usize,edit:impl FnOnce(&mut Value)->Result<()>)->Result<()>{
+        let inner=Arc::get_mut(&mut self.0).ok_or_else(||anyhow!("certificate metadata snapshot is shared"))?;
+        let updated=crate::cert_transient::edited_json(&inner.bundle.metadata,allowance,edit)?;
+        let (value,memory)=updated.into_parts();
+        let old=std::mem::replace(&mut inner.bundle.metadata,value);
+        drop(old);
+        let old_memory=std::mem::replace(&mut inner.memory[2],memory);
+        drop(old_memory);
+        Ok(())
+    }
+    fn into_untracked(self)->Result<CertificateBundle>{
+        ensure!(self.0.memory.iter().all(Option::is_none),"admitted certificate requires owned result");
+        let inner=Arc::try_unwrap(self.0).map_err(|_|anyhow!("untracked certificate result unexpectedly shared"))?;
+        Ok(inner.bundle)
+    }
+}
 /// A stable, exact key-only legacy generation. It is never deserialized or
 /// created from certificate metadata. Only the explicit key-reuse load path
 /// can obtain this capability; ordinary partial-resource reads stay strict.
 #[derive(Clone)]
 pub(crate) struct InitialPrivateKey {
-    core:Arc<Core>,base:String,key:Zeroizing<Vec<u8>>,digest:String,
+    core:Arc<Core>,base:String,key:Arc<crate::cert_transient::Bytes>,digest:String,
 }
 impl InitialPrivateKey {
-    pub(crate) fn pem(&self)->Zeroizing<Vec<u8>> {self.key.clone()}
+    pub(crate) fn pem(&self)->Zeroizing<Vec<u8>> {Zeroizing::new(self.key.as_slice().to_vec())}
     pub(crate) fn digest(&self)->&str {&self.digest}
 }
 #[derive(Serialize, Deserialize)]
@@ -166,27 +198,94 @@ enum Kind {
 
 #[derive(Serialize, Deserialize, Clone)]
 struct TxPart {
+    #[serde(deserialize_with="tx_text64")]
     suffix: String,
+    #[serde(default,deserialize_with="tx_optional_hash")]
     old_hash: Option<String>,
+    #[serde(deserialize_with="tx_text64")]
     new_hash: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize)]
 struct Transaction {
     version: u32,
+    #[serde(deserialize_with="tx_text8192")]
     store_id: String,
     data_dev: u64,
     data_ino: u64,
+    #[serde(deserialize_with="tx_text8192")]
     id: String,
     kind: Kind,
+    #[serde(deserialize_with="tx_text8192")]
     issuer: String,
+    #[serde(deserialize_with="tx_text8192")]
     name: String,
+    #[serde(deserialize_with="tx_text8192")]
     lock_name: String,
+    #[serde(deserialize_with="tx_text8192")]
     lease_owner: String,
     phase: Phase,
     #[serde(default)]
     key_only_bootstrap: bool,
+    #[serde(deserialize_with="tx_parts")]
     parts: Vec<TxPart>,
+    #[serde(skip)]
+    memory: Option<crate::acme_wire::chain_memory::Scratch>,
+}
+
+fn tx_text<'de,D:serde::Deserializer<'de>,const N:usize>(d:D)->std::result::Result<String,D::Error>{
+    struct V<const N:usize>;
+    impl<'de,const N:usize> serde::de::Visitor<'de> for V<N>{
+        type Value=String;
+        fn expecting(&self,f:&mut std::fmt::Formatter)->std::fmt::Result{write!(f,"a transaction string of at most {N} bytes")}
+        fn visit_str<E:serde::de::Error>(self,s:&str)->std::result::Result<String,E>{
+            if s.len()>N{return Err(E::custom("transaction field exceeds supported size"))}Ok(s.to_owned())
+        }
+    }d.deserialize_str(V::<N>)
+}
+fn tx_text64<'de,D:serde::Deserializer<'de>>(d:D)->std::result::Result<String,D::Error>{tx_text::<D,64>(d)}
+fn tx_text8192<'de,D:serde::Deserializer<'de>>(d:D)->std::result::Result<String,D::Error>{tx_text::<D,8192>(d)}
+fn tx_optional_hash<'de,D:serde::Deserializer<'de>>(d:D)->std::result::Result<Option<String>,D::Error>{
+    struct V;impl<'de>serde::de::Visitor<'de>for V{
+        type Value=Option<String>;
+        fn expecting(&self,f:&mut std::fmt::Formatter)->std::fmt::Result{f.write_str("a transaction hash or null")}
+        fn visit_none<E:serde::de::Error>(self)->std::result::Result<Self::Value,E>{Ok(None)}
+        fn visit_unit<E:serde::de::Error>(self)->std::result::Result<Self::Value,E>{Ok(None)}
+        fn visit_some<D:serde::Deserializer<'de>>(self,d:D)->std::result::Result<Self::Value,D::Error>{tx_text64(d).map(Some)}
+    }d.deserialize_option(V)
+}
+fn tx_parts<'de,D:serde::Deserializer<'de>>(d:D)->std::result::Result<Vec<TxPart>,D::Error>{
+    struct V;impl<'de>serde::de::Visitor<'de>for V{
+        type Value=Vec<TxPart>;
+        fn expecting(&self,f:&mut std::fmt::Formatter)->std::fmt::Result{f.write_str("at most three transaction parts")}
+        fn visit_seq<A:serde::de::SeqAccess<'de>>(self,mut a:A)->std::result::Result<Self::Value,A::Error>{
+            let mut result=Vec::with_capacity(3);
+            for _ in 0..3 {let Some(part)=a.next_element()?else{return Ok(result)};result.push(part)}
+            if a.next_element::<serde::de::IgnoredAny>()?.is_some(){return Err(serde::de::Error::custom("too many transaction parts"))}Ok(result)
+        }
+    }d.deserialize_seq(V)
+}
+fn decode_transaction(raw:&[u8])->Result<Transaction>{
+    use crate::cert_transient::{ResourceDenied,reserve};
+    // Final typed storage is <=6*8192+9*64 plus fixed record/three-part
+    // containers. Escaped-input scratch may overlap old+new capacity.
+    let final_bound=raw.len().checked_add(4096).ok_or(ResourceDenied)?.min(65536);
+    let memory=reserve(final_bound)?;
+    let scratch=reserve(raw.len().checked_mul(3).and_then(|n|n.checked_add(8192)).ok_or(ResourceDenied)?)?;
+    let mut tx:Transaction=serde_json::from_slice(raw).context("invalid storage transaction journal")?;
+    tx.memory=Some(memory);drop(scratch);Ok(tx)
+}
+impl Transaction {
+    fn clone_admitted(&self)->Result<Self>{
+        let strings=[&self.store_id,&self.id,&self.issuer,&self.name,&self.lock_name,&self.lease_owner];
+        let bytes=strings.into_iter().map(|s|s.len()).sum::<usize>()
+            +self.parts.iter().map(|p|p.suffix.len()+p.new_hash.len()+p.old_hash.as_ref().map_or(0,String::len)).sum::<usize>()
+            +self.parts.len()*std::mem::size_of::<TxPart>()+4096;
+        let memory=crate::cert_transient::reserve(bytes)?;
+        Ok(Self{version:self.version,store_id:self.store_id.clone(),data_dev:self.data_dev,data_ino:self.data_ino,id:self.id.clone(),kind:self.kind,
+            issuer:self.issuer.clone(),name:self.name.clone(),lock_name:self.lock_name.clone(),lease_owner:self.lease_owner.clone(),phase:self.phase,
+            key_only_bootstrap:self.key_only_bootstrap,parts:self.parts.clone(),memory:Some(memory)})
+    }
 }
 
 fn hash(bytes: &[u8]) -> String {
@@ -400,6 +499,8 @@ impl FsStore {
         })
     }
 
+
+
     async fn blocking<T, F>(&self, operation: F) -> Result<T>
     where
         T: Send + 'static,
@@ -538,11 +639,15 @@ impl FsStore {
         self.blocking(move |c| c.data.load(&key, key.ends_with(".key")))
             .await
     }
-    async fn read_group(
-        &self,
-        keys: Vec<String>,
-        transaction_key: String,
-    ) -> Result<Vec<Option<Zeroizing<Vec<u8>>>>> {
+    async fn read_group(&self,keys:Vec<String>,transaction_key:String)->Result<Vec<Option<Zeroizing<Vec<u8>>>>>{
+        self.read_group_pinned(keys,transaction_key,false).await?.into_iter()
+            .map(|value|value.map(io::PinnedRead::into_bytes).transpose()).collect()
+    }
+    async fn read_group_owned(&self,keys:Vec<String>,transaction_key:String,budgeted:bool)->Result<Vec<Option<crate::cert_transient::Bytes>>>{
+        Ok(self.read_group_pinned(keys,transaction_key,budgeted).await?.into_iter()
+            .map(|value|value.map(io::PinnedRead::into_owned_bytes)).collect())
+    }
+    async fn read_group_pinned(&self,keys:Vec<String>,transaction_key:String,budgeted:bool)->Result<Vec<Option<io::PinnedRead>>>{
         self.blocking(move |c| {
             let before = keys
                 .iter()
@@ -552,10 +657,12 @@ impl FsStore {
                 !pending_core(&c, &transaction_key)?,
                 "storage transaction recovery required"
             );
-            let pinned = keys
-                .iter()
-                .map(|k| c.data.load_pinned(k, k.ends_with(".key")))
-                .collect::<Result<Vec<_>>>()?;
+            let pinned=keys.iter().map(|k|{
+                if budgeted {
+                    let lifetime=if k.ends_with(".json"){crate::cert_transient::Lifetime::Temporary}else{crate::cert_transient::Lifetime::Persistent};
+                    c.data.load_pinned_owned(k,k.ends_with(".key"),lifetime)
+                }else{c.data.load_pinned(k,k.ends_with(".key"))}
+            }).collect::<Result<Vec<_>>>()?;
             ensure!(
                 pinned.iter().zip(&before).all(|(value, signature)| value
                     .as_ref()
@@ -578,12 +685,8 @@ impl FsStore {
             for value in pinned.iter().flatten() {
                 value.verify()?;
             }
-            Ok(pinned
-                .into_iter()
-                .map(|value| value.map(io::PinnedRead::into_bytes))
-                .collect())
-        })
-        .await
+            Ok(pinned)
+        }).await
     }
     pub async fn store(&self, key: &str, bytes: &[u8]) -> Result<()> {
         ensure!(
@@ -631,6 +734,50 @@ impl FsStore {
         })
         .await
     }
+    pub(crate) async fn journal_decode_admitted<T,F>(&self,job_id:&str,decode:F)->Result<Option<T>>
+    where T:Send+'static,F:FnOnce(&[u8])->Result<T>+Send+'static {
+        let key=job_key(job_id)?;
+        self.blocking(move|c|{
+            let raw=c.state.load_owned(&key,true,crate::cert_transient::Lifetime::Temporary)?;
+            raw.as_ref().map(|raw|decode(raw.as_slice())).transpose()
+        }).await
+    }
+    /// Encoded ownership includes its credit; never copy PEM into a Value.
+    pub(crate) async fn journal_store_encoded_fenced<B>(&self,job_id:&str,encoded:B,lease:&StorageLease)->Result<()>
+    where B:AsRef<[u8]>+Send+'static {
+        use crate::cert_transient::{Lifetime,ResourceDenied};
+        // Fixed control strings/field visitor state are prepaid independently
+        // of the encoded PEM bytes. Actual old raw input has its own owner.
+        let control=crate::acme_wire::chain_memory::try_scratch(16384).map_err(|_|ResourceDenied)?;
+        ensure!(lease.name().len()<=4096,"journal lease name exceeds supported scope");
+        let key=job_key(job_id)?;
+        struct WriteInput<B>{encoded:B,name:String,_control:crate::acme_wire::chain_memory::Scratch}
+        let input=WriteInput{encoded,name:lease.name().to_owned(),_control:control};
+        fn validate_binding(raw:&[u8],name:&str)->Result<()>{
+            fn scope<'de,D:serde::Deserializer<'de>>(d:D)->std::result::Result<String,D::Error>{
+                struct V;impl<'de>serde::de::Visitor<'de>for V{
+                    type Value=String;
+                    fn expecting(&self,f:&mut std::fmt::Formatter)->std::fmt::Result{f.write_str("a bounded native lease scope")}
+                    fn visit_str<E:serde::de::Error>(self,s:&str)->std::result::Result<String,E>{
+                        if s.len()>4096{return Err(E::custom("journal lease scope too long"))}Ok(s.to_owned())
+                    }
+                }d.deserialize_str(V)
+            }
+            #[derive(Deserialize)]struct Binding{#[serde(deserialize_with="scope")]lease_name:String}
+            let cost=raw.len().checked_mul(3).and_then(|n|n.checked_add(8192)).ok_or(ResourceDenied)?;
+            let _credit=crate::acme_wire::chain_memory::try_scratch(cost).map_err(|_|ResourceDenied)?;
+            let binding:Binding=serde_json::from_slice(raw).map_err(|_|anyhow!("invalid job journal JSON"))?;
+            ensure!(binding.lease_name==name,"journal lease scope mismatch");Ok(())
+        }
+        self.fenced(lease,move|c|{
+            let input=input;
+            validate_binding(input.encoded.as_ref(),&input.name)?;
+            if let Some(existing)=c.state.load_owned(&key,true,Lifetime::Temporary)?{
+                validate_binding(existing.as_slice(),&input.name)?;
+            }
+            c.state.store(&key,input.encoded.as_ref())
+        }).await
+    }
     /// Create an unleased bootstrap record once. Live ACME jobs and every
     /// update require journal_store_fenced; this helper cannot overwrite them.
     pub async fn journal_store(&self, job_id: &str, value: &Value) -> Result<()> {
@@ -670,7 +817,7 @@ impl FsStore {
         let scope = self.scope.clone();
         lease
             .mutate(move || {
-                let _permit = permit;
+                    let _permit = permit;
                 if let Some(group) = &scope {
                     group.verify()?;
                 }
@@ -725,7 +872,7 @@ impl FsStore {
             "account and certificate material require the transaction API"
         );
         let key = key.to_owned();
-        let bytes = Zeroizing::new(bytes.to_vec());
+        let bytes = crate::cert_transient::Bytes::copy(bytes,crate::cert_transient::Lifetime::Temporary)?;
         self.fenced(lease, move |c| c.data.store(&key, &bytes))
             .await
     }
@@ -745,7 +892,7 @@ impl FsStore {
     async fn write_group_part(&self, key: &str, bytes: &[u8], lease: &StorageLease) -> Result<()> {
         self.check_group_material(key)?;
         let key = key.to_owned();
-        let bytes = Zeroizing::new(bytes.to_vec());
+        let bytes = crate::cert_transient::Bytes::copy(bytes,crate::cert_transient::Lifetime::Temporary)?;
         self.fenced(lease, move |c| c.data.store(&key, &bytes))
             .await
     }
@@ -762,7 +909,7 @@ impl FsStore {
         ensure!(self.state_load(&key.replace(".json",".quarantine")).await?.is_none(),
             "quarantined storage transaction requires operator review");
         let Some(raw)=self.state_load(&key).await? else {return Ok(false)};
-        let tx:Transaction=serde_json::from_slice(&raw).map_err(|_|anyhow!("invalid storage transaction journal"))?;
+        let tx=decode_transaction(&raw)?;
         self.validate_transaction(&key,&tx)?;
         ensure!(matches!(tx.kind,Kind::Certificate) && tx.issuer==issuer && tx.name==name && tx.lock_name==expected_lock,
             "certificate transaction scope changed");
@@ -863,8 +1010,7 @@ impl FsStore {
             "quarantined storage transaction requires operator review"
         );
         if let Some(bytes) = self.state_load(&key).await? {
-            let tx: Transaction = serde_json::from_slice(&bytes)
-                .map_err(|_| anyhow!("invalid storage transaction journal"))?;
+            let tx=decode_transaction(&bytes)?;
             self.validate_transaction(&key, &tx)?;
             ensure!(
                 matches!(tx.kind, Kind::Account)
@@ -960,49 +1106,48 @@ impl FsStore {
     }
     async fn load_certificate_generation(&self,issuer:&str,name:&str,allow_initial_key:bool)
         ->Result<(Option<CertificateBundle>,Option<InitialPrivateKey>)> {
-        let base = cert_path(issuer, name)?;
-        let mut values = self
-            .read_group(
-                vec![
-                    format!("{base}.key"),
-                    format!("{base}.crt"),
-                    format!("{base}.json"),
-                ],
-                self.tx_key(Kind::Certificate, issuer, name)?,
-            )
-            .await?;
-        let meta = values
-            .pop()
-            .ok_or_else(|| anyhow!("incomplete grouped read"))?;
-        let crt = values
-            .pop()
-            .ok_or_else(|| anyhow!("incomplete grouped read"))?;
-        let key = values
-            .pop()
-            .ok_or_else(|| anyhow!("incomplete grouped read"))?;
-        match (key, crt, meta) {
-            (None, None, None) => Ok((None,None)),
+        let (bundle,initial)=self.load_certificate_generation_inner(issuer,name,allow_initial_key,false).await?;
+        Ok((bundle.map(OwnedCertificateBundle::into_untracked).transpose()?,initial))
+    }
+    pub(crate) async fn load_certificate_owned(&self,issuer:&str,name:&str)->Result<Option<OwnedCertificateBundle>>{
+        let (bundle,initial)=self.load_certificate_generation_inner(issuer,name,false,true).await?;
+        ensure!(initial.is_none(),"unexpected initial certificate key");Ok(bundle)
+    }
+    pub(crate) async fn load_certificate_for_key_reuse_owned(&self,issuer:&str,name:&str)
+        ->Result<(Option<OwnedCertificateBundle>,Option<InitialPrivateKey>)> {
+        self.load_certificate_generation_inner(issuer,name,true,true).await
+    }
+    async fn load_certificate_generation_inner(&self,issuer:&str,name:&str,allow_initial_key:bool,budgeted:bool)
+        ->Result<(Option<OwnedCertificateBundle>,Option<InitialPrivateKey>)> {
+        let base=cert_path(issuer,name)?;
+        let mut values=self.read_group_owned(vec![format!("{base}.key"),format!("{base}.crt"),format!("{base}.json")],self.tx_key(Kind::Certificate,issuer,name)?,budgeted).await?;
+        let meta=values.pop().ok_or_else(||anyhow!("incomplete grouped read"))?;
+        let crt=values.pop().ok_or_else(||anyhow!("incomplete grouped read"))?;
+        let key=values.pop().ok_or_else(||anyhow!("incomplete grouped read"))?;
+        match (key,crt,meta){
+            (None,None,None)=>Ok((None,None)),
             (Some(key),None,None) if allow_initial_key=>{
-                ensure!(!key.is_empty() && key.len()<=128*1024,"initial certificate key size limit exceeded");
+                ensure!(!key.is_empty()&&key.len()<=128*1024,"initial certificate key size limit exceeded");
                 let digest=hash(&key);
-                Ok((None,Some(InitialPrivateKey{core:self.core.clone(),base,key,digest})))
+                Ok((None,Some(InitialPrivateKey{core:self.core.clone(),base,key:Arc::new(key),digest})))
             },
-            (Some(key), Some(crt), Some(meta)) => {
-                let metadata = serde_json::from_slice(&meta)
-                    .map_err(|_| anyhow!("invalid certificate metadata JSON"))?;
-                validate_certificate(&crt, &key, &metadata)?;
-                ensure!(
-                    safe(&names_key(&metadata_names(&metadata)?)?) == safe(name)
-                        || legacy_name0_sans(&crt, &metadata, name)?.is_some(),
-                    "certificate metadata storage name mismatch"
-                );
-                Ok((Some(CertificateBundle {
-                    chain_pem: crt.to_vec(),
-                    private_key_pem: key,
-                    metadata,
-                }),None))
-            }
-            _ => bail!("partial certificate material; recovery required, reissuance refused"),
+            (Some(key),Some(crt),Some(meta))=>{
+                let lifetime=budgeted.then_some(crate::cert_transient::Lifetime::Persistent);
+                let metadata=crate::cert_transient::json_value(&meta,lifetime)?;
+                drop(meta);
+                validate_certificate(&crt,&key,&metadata)?;
+                {
+                    let _names=crate::cert_transient::reserve(crate::cert_transient::metadata_names_work(&metadata)?)?;
+                    ensure!(safe(&names_key(&metadata_names(&metadata)?)?)==safe(name)
+                        ||legacy_name0_sans(&crt,&metadata,name)?.is_some(),"certificate metadata storage name mismatch");
+                }
+                let (metadata,metadata_credit)=metadata.into_parts();
+                let (key,key_credit)=key.into_parts();
+                let (mut crt,crt_credit)=crt.into_parts();
+                let bundle=CertificateBundle{chain_pem:std::mem::take(&mut *crt),private_key_pem:key,metadata};
+                Ok((Some(OwnedCertificateBundle::new(bundle,[key_credit,crt_credit,metadata_credit])),None))
+            },
+            _=>bail!("partial certificate material; recovery required, reissuance refused"),
         }
     }
 
@@ -1016,9 +1161,10 @@ impl FsStore {
         let base = cert_path(issuer, name)?;
         let scoped = self.scoped(&self.tx_key(Kind::Certificate, issuer, name)?,
             &base, lease).await?;
-        let Some(bundle) = scoped.load_certificate(issuer, name).await? else {
+        let Some(bundle) = scoped.load_certificate_owned(issuer, name).await? else {
             return Ok(false);
         };
+        let _names=crate::cert_transient::reserve(crate::cert_transient::metadata_names_work(&bundle.metadata)?)?;
         let normalize = |names: &[String]| -> Result<Vec<String>> {
             let mut names = names.iter().map(|name| crate::tls_resolver::normalize_certificate_name(name))
                 .collect::<Result<Vec<_>>>()?;
@@ -1033,23 +1179,24 @@ impl FsStore {
         let name0 = authorized.first().ok_or_else(|| anyhow!("archive metadata has no SAN"))?;
         ensure!(lease.belongs(&scoped.core, &format!("issue_cert_{name0}")),
             "compromised key archive lease scope mismatch");
-        let blocks = crate::certmagic::pem_blocks(&bundle.chain_pem, "compromised-key-archive")?;
+        let blocks = crate::cert_transient::certificate_blocks(&bundle.chain_pem)?;
         let first = blocks.first().ok_or_else(|| anyhow!("archive certificate is missing"))?;
-        let (tail, leaf) = x509_parser::parse_x509_certificate(&first.1)
-            .map_err(|_| anyhow!("invalid compromised archive leaf"))?;
+        let (tail, leaf) = crate::cert_transient::parse_certificate(&first.1).context("invalid compromised archive leaf")?;
         ensure!(tail.is_empty(), "trailing compromised archive leaf DER");
         let actual_spki: [u8; 32] = Sha256::digest(leaf.public_key().raw).into();
         if actual_spki != expected_spki { return Ok(false); }
         let primary = format!("{base}.key.compromised");
         let fallback = format!("{primary}.{}", hash(leaf.public_key().raw));
-        let private_key = bundle.private_key_pem;
+        drop(leaf);drop(blocks);
         scoped.fenced(lease, move |c| {
-            let destination = match c.data.load(&primary, true)? {
+            let bundle=bundle;
+            let private_key=&bundle.private_key_pem;
+            let destination = match c.data.load_owned(&primary, true,crate::cert_transient::Lifetime::Temporary)? {
                 Some(existing) if existing.as_slice() == private_key.as_slice() => return Ok(()),
                 Some(_) => fallback,
                 None => primary,
             };
-            if let Some(existing) = c.data.load(&destination, true)? {
+            if let Some(existing) = c.data.load_owned(&destination, true,crate::cert_transient::Lifetime::Temporary)? {
                 ensure!(existing.as_slice() == private_key.as_slice(),
                     "compromised private key archive collision");
                 return Ok(());
@@ -1077,7 +1224,7 @@ impl FsStore {
         scoped.fenced(lease,move|c|{
             let now=c.data.load(&format!("{base}.key"),true)?.ok_or_else(||anyhow!("initial private key disappeared"))?;
             ensure!(hash(&now)==expected,"initial private key changed before archive");
-            let signer=crate::certmagic::signing_key(&key,"initial-key-archive")?;
+            let signer=crate::cert_transient::signing_key(&key,"initial-key-archive")?;
             let public=signer.public_key().ok_or_else(||anyhow!("initial key public value unavailable"))?;
             ensure!(<[u8;32]>::from(Sha256::digest(public.as_ref()))==expected_spki,"initial key archive SPKI changed");
             let primary=format!("{base}.key.compromised");let fallback=format!("{primary}.{}",hash(public.as_ref()));
@@ -1111,13 +1258,17 @@ impl FsStore {
     async fn save_certificate_generation(&self,issuer:&str,name:&str,bundle:&CertificateBundle,
         lease:&StorageLease,initial_key_hash:Option<&str>)->Result<()> {
         validate_certificate(&bundle.chain_pem, &bundle.private_key_pem, &bundle.metadata)?;
-        let blocks = crate::certmagic::pem_blocks(&bundle.chain_pem, "certificate-candidate")?;
-        let (_, leaf) = x509_parser::parse_x509_certificate(&blocks[0].1)
-            .map_err(|_| anyhow!("invalid leaf certificate"))?;
+        let blocks = crate::cert_transient::certificate_blocks(&bundle.chain_pem)?;
+        let (_, leaf) = crate::cert_transient::parse_certificate(&blocks[0].1).context("invalid leaf certificate")?;
         ensure!(
             leaf.validity().is_valid(),
             "new certificate is not currently valid"
         );
+        // Validation has finished. Do not retain decoder/AST scratch while
+        // waiting for another storage-group owner or for fenced disk IO.
+        drop(leaf);
+        drop(blocks);
+        let _names=crate::cert_transient::reserve(crate::cert_transient::metadata_names_work(&bundle.metadata)?)?;
         let sans = metadata_names(&bundle.metadata)?;
         let canonical = safe(&names_key(&sans)?) == safe(name);
         ensure!(initial_key_hash.is_none() || canonical,
@@ -1136,24 +1287,20 @@ impl FsStore {
         // actual old signed resource, held under the same group gate as commit.
         let scoped = self.scoped(&self.tx_key(Kind::Certificate, issuer, name)?, &base, lease).await?;
         if let Some(sans) = legacy {
-            let old = scoped.load_certificate(issuer, name).await?
+            let old = scoped.load_certificate_owned(issuer, name).await?
                 .ok_or_else(|| anyhow!("Name0 replacement requires existing signed resource"))?;
             ensure!(legacy_name0_sans(&old.chain_pem, &old.metadata, name)? == Some(sans),
                 "Name0 replacement changed signed subject scope");
         }
+        let key_copy=crate::cert_transient::Bytes::copy(&bundle.private_key_pem,crate::cert_transient::Lifetime::Temporary)?;
+        let chain_copy=crate::cert_transient::Bytes::copy(&bundle.chain_pem,crate::cert_transient::Lifetime::Temporary)?;
+        let metadata_copy=crate::cert_transient::encode_json(&bundle.metadata)?;
         scoped.commit_scoped(
             Kind::Certificate,
             issuer,
             name,
             &base,
-            &[
-                ("key", Zeroizing::new(bundle.private_key_pem.to_vec())),
-                ("crt", Zeroizing::new(bundle.chain_pem.clone())),
-                (
-                    "json",
-                    Zeroizing::new(serde_json::to_vec(&bundle.metadata)?),
-                ),
-            ],
+            &[("key",key_copy.as_slice()),("crt",chain_copy.as_slice()),("json",metadata_copy.as_slice())],
             lease,
             initial_key_hash,
         )
@@ -1172,7 +1319,7 @@ impl FsStore {
         let key = self.tx_key(kind, issuer, name)?;
         let scoped = self.scoped(&key, base, lease).await?;
         scoped
-            .commit_scoped(kind, issuer, name, base, values, lease, None)
+            .commit_scoped(kind, issuer, name, base, &values.iter().map(|(suffix,bytes)|(*suffix,bytes.as_slice())).collect::<Vec<_>>(), lease, None)
             .await
     }
     async fn commit_scoped(
@@ -1181,7 +1328,7 @@ impl FsStore {
         issuer: &str,
         name: &str,
         base: &str,
-        values: &[(&str, Zeroizing<Vec<u8>>)],
+        values: &[(&str, &[u8])],
         lease: &StorageLease,
         initial_key_hash:Option<&str>,
     ) -> Result<()> {
@@ -1194,7 +1341,8 @@ impl FsStore {
         let mut old = Vec::new();
         let mut parts = Vec::new();
         for (suffix, new) in values {
-            let value = self.load(&format!("{base}.{suffix}")).await?;
+            let path=format!("{base}.{suffix}");
+            let value=self.blocking(move|c|c.data.load_owned(&path,path.ends_with(".key"),crate::cert_transient::Lifetime::Temporary)).await?;
             parts.push(TxPart {
                 suffix: suffix.to_string(),
                 old_hash: value.as_ref().map(|v| hash(v)),
@@ -1217,8 +1365,7 @@ impl FsStore {
             Kind::Account => {
                 if let [Some(key), Some(meta)] = old.as_slice() {
                     validate_account(
-                        &serde_json::from_slice(meta)
-                            .map_err(|_| anyhow!("invalid old account metadata"))?,
+                        &*crate::cert_transient::json_value(meta,Some(crate::cert_transient::Lifetime::Temporary)).context("invalid old account metadata")?,
                         key,
                     )?;
                 }
@@ -1228,24 +1375,22 @@ impl FsStore {
                     validate_certificate(
                         crt,
                         key,
-                        &serde_json::from_slice(meta)
-                            .map_err(|_| anyhow!("invalid old certificate metadata"))?,
+                        &*crate::cert_transient::json_value(meta,Some(crate::cert_transient::Lifetime::Temporary)).context("invalid old certificate metadata")?,
                     )?;
                 }
             }
         }
-        if old.iter().zip(values).all(|(old, (suffix, new))| {
-            old.as_ref().is_some_and(|old| {
-                if *suffix == "json" {
-                    serde_json::from_slice::<Value>(old).ok()
-                        == serde_json::from_slice::<Value>(new).ok()
-                } else {
-                    old.as_slice() == new.as_slice()
-                }
-            })
-        }) {
-            return Ok(());
+        let mut identical=true;
+        for (old,(suffix,new)) in old.iter().zip(values) {
+            let Some(old)=old else {identical=false;break};
+            if *suffix=="json" {
+                let left=crate::cert_transient::json_value(old,Some(crate::cert_transient::Lifetime::Temporary))?;
+                let right=crate::cert_transient::json_value(new,Some(crate::cert_transient::Lifetime::Temporary))?;
+                if *left!=*right {identical=false;break}
+            } else if old.as_slice()!=*new {identical=false;break}
         }
+        if identical {return Ok(())}
+        let tx_memory=crate::cert_transient::reserve(issuer.len()+name.len()+lease.name().len()+8192)?;
         let mut tx = Transaction {
             version: 1,
             store_id: self.core.id.clone(),
@@ -1260,6 +1405,7 @@ impl FsStore {
             phase: Phase::Staging,
             key_only_bootstrap,
             parts,
+            memory:Some(tx_memory),
         };
         self.write_transaction(&tx_key, &tx, lease).await?;
         for ((suffix, new), old) in values.iter().zip(&old) {
@@ -1288,13 +1434,13 @@ impl FsStore {
     async fn state_store(&self, key: &str, bytes: &[u8], lease: &StorageLease) -> Result<()> {
         self.check_group_state(key)?;
         let key = key.to_owned();
-        let bytes = Zeroizing::new(bytes.to_vec());
+        let bytes = crate::cert_transient::Bytes::copy(bytes,crate::cert_transient::Lifetime::Temporary)?;
         self.fenced(lease, move |c| c.state.store(&key, &bytes))
             .await
     }
-    async fn state_load(&self, key: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
+    async fn state_load(&self, key: &str) -> Result<Option<crate::cert_transient::Bytes>> {
         let key = key.to_owned();
-        self.blocking(move |c| c.state.load(&key, true)).await
+        self.blocking(move |c| c.state.load_owned(&key, true, crate::cert_transient::Lifetime::Temporary)).await
     }
     async fn state_delete(&self, key: &str, lease: &StorageLease) -> Result<()> {
         self.check_group_state(key)?;
@@ -1307,7 +1453,7 @@ impl FsStore {
         tx: &Transaction,
         lease: &StorageLease,
     ) -> Result<()> {
-        let bytes = Zeroizing::new(serde_json::to_vec(tx)?);
+        let bytes = crate::cert_transient::encode_json(tx)?;
         self.state_store(key, &bytes, lease).await
     }
 
@@ -1360,9 +1506,11 @@ impl FsStore {
                 .state_load(key)
                 .await?
                 .ok_or_else(|| anyhow!("quarantine changed during scan"))?;
-            let scope = serde_json::from_slice::<Transaction>(&bytes)
-                .ok()
-                .and_then(|tx| self.verified_scope(&canonical, &tx).ok());
+            let scope=match decode_transaction(&bytes){
+                Ok(tx)=>self.verified_scope(&canonical,&tx).ok(),
+                Err(error) if crate::cert_transient::is_resource(&error)=>return Err(error),
+                Err(_)=>None,
+            };
             report.issues.push(
                 self.recovery_issue(&canonical, scope, RecoveryClass::Quarantined)
                     .await?,
@@ -1486,9 +1634,10 @@ impl FsStore {
             }
             return Ok(RecoveryOutcome::Unchanged);
         };
-        let tx = match serde_json::from_slice::<Transaction>(&bytes) {
+        let tx = match decode_transaction(&bytes) {
             Ok(tx) => tx,
-            Err(_) => {
+            Err(error) => {
+                if crate::cert_transient::is_resource(&error){return Err(error)}
                 return Ok(RecoveryOutcome::Issue(
                     self.recovery_issue(&key, None, RecoveryClass::InvalidJournal)
                         .await?,
@@ -1497,7 +1646,8 @@ impl FsStore {
         };
         let scope = match self.verified_scope(&key, &tx) {
             Ok(scope) => scope,
-            Err(_) => {
+            Err(error) => {
+                if crate::cert_transient::is_resource(&error){return Err(error)}
                 return Ok(RecoveryOutcome::Issue(
                     self.recovery_issue(&key, None, RecoveryClass::InvalidJournal)
                         .await?,
@@ -1633,8 +1783,7 @@ impl FsStore {
         let Some(bytes) = self.state_load(&key).await? else {
             return Ok(());
         };
-        let tx: Transaction = serde_json::from_slice(&bytes)
-            .map_err(|_| anyhow!("invalid storage transaction journal"))?;
+        let tx=decode_transaction(&bytes)?;
         self.validate_transaction(&key, &tx)?;
         ensure!(
             lease.belongs(&self.core, &tx.lock_name),
@@ -1747,8 +1896,7 @@ impl FsStore {
         let Some(latest) = self.state_load(key).await? else {
             return Ok(());
         };
-        let latest: Transaction = serde_json::from_slice(&latest)
-            .map_err(|_| scoped_fault(RecoveryClass::InvalidJournal))?;
+        let latest=decode_transaction(&latest).map_err(|error|if crate::cert_transient::is_resource(&error){error}else{scoped_fault(RecoveryClass::InvalidJournal)})?;
         self.validate_transaction(key, &latest)
             .map_err(|_| scoped_fault(RecoveryClass::ScopeChanged))?;
 
@@ -1798,7 +1946,7 @@ impl FsStore {
                 self.quarantine(key, lease).await?;
                 return Err(scoped_fault(RecoveryClass::Quarantined));
             }
-            let mut terminal = tx.clone();
+            let mut terminal = tx.clone_admitted()?;
             terminal.phase = Phase::RolledBack;
             return self.cleanup_transaction(key, &terminal, lease).await;
         }
@@ -1824,7 +1972,7 @@ impl FsStore {
         let validation = (|| -> Result<()> {
             match tx.kind {
                 Kind::Account => {
-                    let metadata: Value = serde_json::from_slice(&new[1])?;
+                    let metadata=crate::cert_transient::json_value(&new[1],Some(crate::cert_transient::Lifetime::Temporary))?;
                     if all_new {
                         validate_account(&metadata, &new[0])?;
                     }
@@ -1833,15 +1981,16 @@ impl FsStore {
                         "transaction account path mismatch"
                     );
                     ensure!(
-                        account_lock_name(&serde_json::from_slice(&new[1])?)? == tx.lock_name,
+                        account_lock_name(&metadata)? == tx.lock_name,
                         "transaction account lock mismatch"
                     );
                 }
                 Kind::Certificate => {
-                    let metadata: Value = serde_json::from_slice(&new[2])?;
+                    let metadata=crate::cert_transient::json_value(&new[2],Some(crate::cert_transient::Lifetime::Temporary))?;
                     if all_new {
                         validate_certificate(&new[1], &new[0], &metadata)?;
                     }
+                    let _names=crate::cert_transient::reserve(crate::cert_transient::metadata_names_work(&metadata)?)?;
                     let sans = metadata_names(&metadata)?;
                     if safe(&names_key(&sans)?) == safe(&tx.name) {
                         ensure!(tx.lock_name == format!("issue_cert_{}", sans[0]),
@@ -1851,8 +2000,8 @@ impl FsStore {
                             .ok_or_else(|| anyhow!("transaction Name0 scope mismatch"))?;
                         let old_key = old[0].as_ref().ok_or_else(|| anyhow!("missing Name0 anchor key"))?;
                         let old_crt = old[1].as_ref().ok_or_else(|| anyhow!("missing Name0 anchor leaf"))?;
-                        let old_meta: Value = serde_json::from_slice(old[2].as_ref()
-                            .ok_or_else(|| anyhow!("missing Name0 anchor metadata"))?)?;
+                        let old_meta=crate::cert_transient::json_value(old[2].as_ref()
+                            .ok_or_else(|| anyhow!("missing Name0 anchor metadata"))?,Some(crate::cert_transient::Lifetime::Temporary))?;
                         validate_certificate(old_crt, old_key, &old_meta)?;
                         ensure!(legacy_name0_sans(old_crt, &old_meta, &tx.name)? == Some(scope)
                             && tx.lock_name == format!("issue_cert_{}", tx.name),
@@ -1862,7 +2011,8 @@ impl FsStore {
             }
             Ok(())
         })();
-        if validation.is_err() {
+        if let Err(error)=validation {
+            if crate::cert_transient::is_resource(&error){return Err(error)}
             return Err(scoped_fault(RecoveryClass::InvalidMaterial));
         }
         if !all_new {
@@ -1878,7 +2028,7 @@ impl FsStore {
                 }
             }
         }
-        let mut terminal = tx.clone();
+        let mut terminal = tx.clone_admitted()?;
         terminal.phase = if all_new {
             Phase::Committed
         } else {
@@ -1994,11 +2144,12 @@ fn staged_key(key: &str, id: &str, suffix: &str, direction: &str) -> Result<Stri
 /// CertMagic's ARI writer uses actual Name0 as the directory while persisting
 /// the full signed SAN set. This only recognizes that exact existing shape.
 fn legacy_name0_sans(crt: &[u8], metadata: &Value, name: &str) -> Result<Option<Vec<String>>> {
-    let blocks = crate::certmagic::pem_blocks(crt, "Name0-resource")?;
+    let blocks = crate::cert_transient::certificate_blocks(crt)?;
     let first = blocks.first().ok_or_else(|| anyhow!("Name0 resource has no leaf"))?;
-    let (tail, leaf) = x509_parser::parse_x509_certificate(&first.1)
-        .map_err(|_| anyhow!("invalid Name0 resource leaf"))?;
+    let (tail, leaf) = crate::cert_transient::parse_certificate(&first.1).context("invalid Name0 resource leaf")?;
     ensure!(tail.is_empty(), "trailing Name0 leaf DER");
+    let _names=crate::cert_transient::reserve(crate::cert_transient::leaf_names_work(&leaf)?
+        .checked_add(crate::cert_transient::metadata_names_work(metadata)?).ok_or(crate::cert_transient::ResourceDenied)?)?;
     let actual_name0 = crate::tls_resolver::certificate_management_name(&leaf)?;
     if actual_name0.as_ref() != name { return Ok(None); }
     let normalize = |names: Vec<String>| -> Result<Vec<String>> {
@@ -2041,7 +2192,8 @@ fn metadata_names(metadata: &Value) -> Result<Vec<String>> {
 }
 
 fn validate_account(metadata: &Value, key: &[u8]) -> Result<()> {
-    crate::certmagic::signing_key(key, "account-candidate")?;
+    let _key_output=crate::cert_transient::reserve(crate::cert_transient::key_decode_bound(key)?)?;
+    crate::cert_transient::signing_key(key, "account-candidate")?;
     let object = metadata
         .as_object()
         .ok_or_else(|| anyhow!("account metadata must be an object"))?;
@@ -2085,22 +2237,23 @@ fn validate_certificate(crt: &[u8], key: &[u8], metadata: &Value) -> Result<()> 
         crt.len() <= 4 * 1024 * 1024 && key.len() <= 128 * 1024,
         "certificate material size limit exceeded"
     );
-    let blocks = crate::certmagic::pem_blocks(crt, "certificate-candidate")?;
-    let mut chain = Vec::new();
+    let blocks = crate::cert_transient::certificate_blocks(crt)?;
+    let copy_cost=blocks.iter().try_fold(0usize,|n,(_,der)|n.checked_add(der.len()).ok_or(crate::cert_transient::ResourceDenied))?
+        .checked_add(blocks.len()*std::mem::size_of::<rustls::pki_types::CertificateDer<'static>>()).ok_or(crate::cert_transient::ResourceDenied)?;
+    let _copies=crate::cert_transient::reserve(copy_cost)?;
+    let _names=crate::cert_transient::reserve(crate::cert_transient::metadata_names_work(metadata)?)?;
+    let mut chain = Vec::with_capacity(blocks.len());
     for (tag, der) in &blocks {
         ensure!(tag == "CERTIFICATE", "unexpected certificate PEM label");
-        let (rest, _) = x509_parser::parse_x509_certificate(der)
-            .map_err(|_| anyhow!("invalid certificate DER"))?;
+        let (rest, _) = crate::cert_transient::parse_certificate(der).context("invalid certificate DER")?;
         ensure!(rest.is_empty(), "trailing certificate DER");
         chain.push(rustls::pki_types::CertificateDer::from(der.to_vec()));
     }
-    let signer = crate::certmagic::signing_key(key, "certificate-candidate")?;
+    let _key_output=crate::cert_transient::reserve(crate::cert_transient::key_decode_bound(key)?)?;
+    let signer = crate::cert_transient::signing_key(key, "certificate-candidate")?;
     let certified = rustls::sign::CertifiedKey::new(chain, signer);
-    certified
-        .keys_match()
-        .map_err(|_| anyhow!("certificate and private key do not match"))?;
-    let (_, leaf) = x509_parser::parse_x509_certificate(&blocks[0].1)
-        .map_err(|_| anyhow!("invalid leaf certificate"))?;
+    crate::certmagic::check_keys_match(&certified,"certificate-candidate")?;
+    let (_, leaf) = crate::cert_transient::parse_certificate(&blocks[0].1).context("invalid leaf certificate")?;
     ensure!(
         leaf.validity().not_before <= leaf.validity().not_after,
         "invalid certificate validity interval"
@@ -2109,6 +2262,7 @@ fn validate_certificate(crt: &[u8], key: &[u8], metadata: &Value) -> Result<()> 
         .subject_alternative_name()
         .map_err(|_| anyhow!("invalid certificate SAN"))?
         .ok_or_else(|| anyhow!("certificate has no SAN"))?;
+    let _leaf_names=crate::cert_transient::reserve(crate::cert_transient::leaf_names_work(&leaf)?)?;
     let actual: Vec<String> = san
         .value
         .general_names
