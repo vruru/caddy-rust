@@ -324,6 +324,7 @@ impl Root {
         {
             return Err(AdminError::new(409, "backend_generation_fenced"));
         }
+        let mut metrics_attempt=crate::metrics::process::ReloadAttempt::new(self.http.metrics_process());
         let restore_only = transaction.restore_only;
         let mut prepared = self.offload(move || prepare(transaction.config)).await?;
         let raw_events = prepared.events;
@@ -488,6 +489,7 @@ impl Root {
             let retired = self.active.swap(Some(next));
             *self.retained.lock().unwrap_or_else(|e| e.into_inner()) = retained;
             services.activate();
+            metrics_attempt.success();
             if let Some(worker) = ticket_worker {
                 let _ = worker.send(());
             }
@@ -543,6 +545,8 @@ impl Root {
 }
 
 impl AdminBackend for NativeBackend {
+    fn metrics_registry(&self)->Option<Arc<crate::metrics::Registry>>{Some(self.inner.http.metrics_registry())}
+
     fn check_available(&self) -> Result<(), AdminError> {
         if self.inner.phase.load(Ordering::Acquire) == FORCED {
             Err(AdminError::new(503, "backend_runtime_halted"))

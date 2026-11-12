@@ -10,7 +10,7 @@ use std::{
 };
 use tokio::time::Sleep;
 
-pub(super) struct TimeoutIo<T> {
+pub(crate) struct TimeoutIo<T> {
     inner: T,
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
@@ -18,7 +18,7 @@ pub(super) struct TimeoutIo<T> {
     write_timer: Option<Pin<Box<Sleep>>>,
 }
 impl<T> TimeoutIo<T> {
-    pub(super) fn new(inner: T, read: Option<Duration>, write: Option<Duration>) -> Self {
+    pub(crate) fn new(inner: T, read: Option<Duration>, write: Option<Duration>) -> Self {
         Self {
             inner,
             read_timeout: read.filter(|d| !d.is_zero()),

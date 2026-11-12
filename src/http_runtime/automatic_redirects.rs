@@ -44,7 +44,7 @@ pub(super) fn fallback(http_port:u16,https_port:u16)->Route{
 fn make(http_port:u16,https_port:u16,target:u16,matchers:Vec<Matcher>)->Route{
     let port=if [80,443,http_port,https_port].contains(&target){String::new()}else{format!(":{target}")};
     let location=format!("https://{{http.request.host}}{port}{{http.request.uri}}");
-    Route {trace_modules:vec![super::handler_trace::Module::redirect(&location)],group:None,
+    Route { metrics: true,trace_modules:vec![super::handler_trace::Module::redirect(&location)],group:None,
         matchers:vec![matchers],handlers:vec![Handler::StaticResponse{
             status:"308".into(),body:String::new(),headers:HeaderOps{
                 set:vec![("Location".into(),vec![location])],..Default::default()},close:true}],

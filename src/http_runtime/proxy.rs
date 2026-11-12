@@ -31,6 +31,8 @@ struct ClientCache {
     clients: HashMap<String, (HyperClient, u64)>,
 }
 impl ProxyClient {
+    pub(super) fn metric_probes(&self)->Vec<(Arc<str>,crate::metrics::upstream::Probe)>{self.selection.metric_probes()}
+
     pub(super) fn client_for(
         &self,
         dial: &str,
@@ -268,12 +270,14 @@ impl PreparedResponse {
                 .ok_or_else(|| anyhow::anyhow!("missing downstream upgrade"))?;
             let drain = ctx.drain.clone();
             let business = ctx.business.clone();
+            let metrics=ctx.metrics.as_ref().map(|group|(group.clone(),group.retain_tunnel()));
             let hard_stop = business.generation().hard_stop.clone();
             let admission = self.lease.take().expect("HTTP upgrade lease");
             inner.upgrades.spawn(async move {
                 let _admission = admission;
                 let _hold_client = setup.client;
                 let _business = business;
+                let _metrics=metrics;
                 let tunnel = async {
                     if let (Ok(downstream), Ok(upstream)) = tokio::join!(downstream, setup.upstream)
                     {

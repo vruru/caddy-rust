@@ -14,6 +14,7 @@ use types::*;
 
 #[derive(Clone)]
 pub struct PreparedConfig {
+    pub(crate) metrics: Option<crate::metrics::config::Config>,
     pub(crate) events: Option<Arc<crate::events::EventsApp>>,
     pub(crate) http_port: u16,
     pub(crate) https_port: u16,
@@ -40,6 +41,7 @@ pub(crate) use header_alias::HeaderAliases;
 
 #[derive(Clone)]
 pub(crate) struct ServerConfig {
+    pub(crate) name: Arc<str>,
     pub(crate) access_logs: Option<AccessLogConfig>,
     pub(crate) header_aliases: HeaderAliases,
     pub(crate) listener_stack:Arc<crate::http_runtime::listener_stack::Stack>,
@@ -221,6 +223,7 @@ pub fn validate_json(value: &Value) -> Result<PreparedConfig> {
         http,
         &[
             "servers",
+            "metrics",
             "http_port",
             "https_port",
             "grace_period",
@@ -257,12 +260,21 @@ pub fn validate_json(value: &Value) -> Result<PreparedConfig> {
         "/apps/http/servers",
     )?;
     ensure!(raw.len() <= 1024, "server count exceeded");
+    let mut metrics = http.get("metrics").filter(|v|!v.is_null()).map(crate::metrics::config::Config::parse).transpose()?;
+    // Merge deprecated per-server switches before provisioning every server.
+    for value in raw.values() {
+        if let Some(value)=value.get("metrics").filter(|v|!v.is_null()) {
+            let legacy=crate::metrics::config::Config::parse(value)?;
+            let current=metrics.get_or_insert_with(Default::default);current.merge(legacy);
+        }
+    }
     let mut servers = Vec::new();
     let mut compiled_tls_memory = 0usize;
     let mut regex_remaining = 64 << 20;
     let mut listen = std::collections::HashSet::new();
-    for value in raw.values() {
-        let config = parse_server(value, &mut regex_remaining,http_port,https_port)?;
+    for (name,value) in raw {
+        let mut config = parse_server(value, &mut regex_remaining,http_port,https_port)?;
+        config.name=Arc::from(if name.is_empty(){"UNKNOWN"}else{name.as_str()});
         compiled_tls_memory = compiled_tls_memory.saturating_add(
             config
                 .tls_policies
@@ -280,6 +292,7 @@ pub fn validate_json(value: &Value) -> Result<PreparedConfig> {
         servers.push(Arc::new(config));
     }
     Ok(PreparedConfig {
+        metrics,
         events: None,
         http_port,https_port,
         explicit_tls_subjects: Default::default(),
@@ -367,6 +380,7 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
             "idle_timeout",
             "logs",
             "named_routes",
+            "metrics",
         ],
         path,
     )?;
@@ -561,6 +575,7 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
     )?;
     Ok(ServerConfig {
         listener_stack:Arc::new(crate::http_runtime::listener_stack::Stack::ordered(listener_operations,tls_wrapper)),
+        name: Arc::from("UNKNOWN"),
         access_logs,
         header_aliases,
         listen,
@@ -583,7 +598,7 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
         errors: if let Some(v) = m.get("errors") {
             let e = object(v, path)?;
             deny_unknown(e, &["routes"], path)?;
-            parse_routes(e.get("routes"), 0, false, regex_remaining)?
+            parse_routes(e.get("routes"), 1, false, regex_remaining)?
         } else {
             vec![]
         },
@@ -693,6 +708,7 @@ fn parse_route(
         .unwrap_or_default();
     let (handlers, trace_modules)=handlers.into_iter().unzip();
     Ok(Route {
+        metrics: depth==0,
         trace_modules,
         group: m.get("group").map(|v| string(v, path)).transpose()?,
         matchers: parse_matcher_sets(m.get("match"), depth + 1, regex_remaining)?,
@@ -976,6 +992,10 @@ fn parse_handler(
                 value: optional_handler_string(m, "value", path)?,
                 early: boolean(m.get("early").filter(|value| !value.is_null()), false, path)?,
             }))
+        }
+        "metrics" => {
+            deny_unknown(m, &["handler","disable_openmetrics"], path)?;
+            Handler::Metrics { disable_openmetrics: boolean(m.get("disable_openmetrics").filter(|v| !v.is_null()),false,path)? }
         }
         "static_response" => {
             deny_unknown(

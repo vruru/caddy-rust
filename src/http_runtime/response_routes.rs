@@ -219,6 +219,7 @@ async fn intercept_inner(
     server: &Arc<ActiveServer>,
 ) -> Result<Flow> {
     let deferred_mark = ctx.deferred.len();
+    let metrics_mark=ctx.metrics.as_ref().map(|group|group.mark());
     let log_mark = log_append::mark(ctx);
     let flow = continue_chain(next, ctx, inner, server).await?;
     let Flow::Response(mut original) = flow else {
@@ -248,6 +249,7 @@ async fn intercept_inner(
     // independent end and cannot execute the original downstream chain again.
     // The original entity's length applies only when that entity is retained.
     // Replacement writers and transforms must start without its framing.
+    let discarded_metrics=ctx.metrics.as_ref().zip(metrics_mark).and_then(|(group,mark)|group.scope(mark));
     ctx.immediate = std::mem::take(original.headers_mut());
     let inherited_length = ctx.immediate.remove(http::header::CONTENT_LENGTH);
     let replacement = chained_routes(routes, ctx, inner, server, &Next::End).await?;
@@ -271,7 +273,18 @@ async fn intercept_inner(
     materialize(&mut replacement, deferred_mark, log_mark, ctx).await?;
 
     match first_payload(replacement.body_mut()).await? {
-        BodyWrites::Data => {}
+        BodyWrites::Data => {
+            if let Some(mut scope)=discarded_metrics{
+                if original.extensions().get::<crate::metrics::discarded::PreparedEntity>().is_some(){
+                    let body=std::mem::replace(original.body_mut(),full(Bytes::new()));
+                    crate::metrics::discarded::observe(body,scope,&inner.tasks,ctx.business.generation().hard_stop.clone(),ctx.business.clone());
+                }else{
+                    // Native can replace before reading an upstream entity.
+                    // Metrics must not turn that cancellation into a download.
+                    scope.abandon();
+                }
+            }
+        }
         BodyWrites::Empty(trailers) => {
             let body = std::mem::replace(original.body_mut(), full(Bytes::new()));
             *replacement.body_mut() = if let Some(trailers) = trailers {

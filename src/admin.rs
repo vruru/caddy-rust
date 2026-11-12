@@ -41,6 +41,7 @@ mod pki;
 pub use pki::PkiInfo;
 #[path="admin/upstreams.rs"]
 mod upstreams;
+mod metrics;
 pub use upstreams::UpstreamStatus;
 #[path = "admin/source.rs"]
 mod source;
@@ -113,6 +114,8 @@ pub struct AdaptedConfig {
     pub warnings: Vec<Value>,
 }
 pub trait AdminBackend: Send + Sync + 'static {
+    fn metrics_registry(&self)->Option<Arc<crate::metrics::Registry>>{None}
+
     /// Cheap synchronous availability fence; never wait for a transaction or IO.
     /// A forced root must stop control-plane reads before asynchronous cleanup.
     fn check_available(&self) -> Result<(), AdminError> {

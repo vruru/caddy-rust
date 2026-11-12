@@ -21,6 +21,7 @@ struct LazyMap {
     defaults: Vec<serde_json::Value>,
 }
 pub(super) struct Context {
+    pub(super) metrics: Option<Arc<crate::metrics::observe::Group>>,
     pub(super) request_started: std::time::Instant,
     pub(super) typed_vars: HashMap<String, Arc<serde_json::Value>>,
     pub(super) cel_body: Option<Bytes>,
@@ -67,6 +68,7 @@ enum DeferredResponse {
     Headers(HeaderOps),
     Encode(super::encode_response::ResponseEncoding),
     LogBody(usize),
+    Metrics(Arc<crate::metrics::observe::Observation>),
 }
 impl Context {
     // 保留 id：永不分配给配置 generation；类型按 BusinessGeneration::new 调整
@@ -102,6 +104,7 @@ impl Context {
         let request_content_length=request.headers().get(http::header::CONTENT_LENGTH).and_then(|v|v.to_str().ok()).and_then(|v|v.parse().ok()).unwrap_or(if original_framing.chunked || !request.body().is_end_stream(){-1}else{0});
         let zero = SocketAddr::from(([0, 0, 0, 0], 0));
         Ok(Context {
+            metrics: None,
             request_started: std::time::Instant::now(),
             typed_vars: HashMap::new(),
             cel_body: None,
@@ -464,6 +467,7 @@ where
         body.boxed_unsync()
     };
     let mut ctx = Context {
+        metrics: crate::metrics::observe::Group::new(server.metrics.clone(),0),
         request_started: std::time::Instant::now(),
         typed_vars: HashMap::new(),
         cel_body: None,
@@ -579,8 +583,27 @@ where
     let final_method=ctx.request.as_ref().map(|request|request.method()).unwrap_or(&ctx.original_method);
     let is_head=final_method==Method::HEAD;
     let is_connect=final_method==Method::CONNECT;
+    if response.status().is_informational()
+        || matches!(response.status(),StatusCode::NO_CONTENT|StatusCode::NOT_MODIFIED)
+        || (is_connect&&response.status().is_success())
+    {
+        // Every transport must see a genuinely empty body. H2 otherwise sends
+        // the handler bytes and synthesizes their length after header cleanup.
+        *response.body_mut()=full(Bytes::new());
+    }
     if is_head    {
-        if !response
+        if ctx.metrics.is_some() && response.extensions().get::<StaticHeadLength>().is_some(){
+            // Count the finite logical writes of a static HEAD representation,
+            // including its selected codec, while sending no response body.
+            while let Some(frame)=response.body_mut().frame().await{if frame.is_err(){break;}tokio::task::consume_budget().await;}
+        }
+        let rendered_head=response.extensions().get::<RenderedTemplateHead>().is_some();
+        if rendered_head {
+            // Rendering with HEAD can differ from GET and can have side
+            // effects. Do not rerun it as GET or infer a representation length.
+            response.headers_mut().remove(http::header::CONTENT_LENGTH);
+        }
+        if !rendered_head && !response
             .headers()
             .contains_key(http::header::CONTENT_LENGTH)
             && !response
@@ -652,6 +675,10 @@ fn take_writer_headers(response: &mut Response<Body>, ctx: &mut Context) -> Head
 
 #[derive(Clone, Copy)]
 struct StaticHeadLength(usize);
+// Finite rendered bytes remain available to enclosing templates, but their
+// HEAD-dependent length cannot establish the selected GET representation length.
+#[derive(Clone, Copy)]
+struct RenderedTemplateHead;
 
 #[derive(Clone, Copy)]
 struct StaticInterimStatus(u16);
@@ -882,7 +909,14 @@ fn chained_routes<'a>(
             } else {
                 Next::Routes(&list[index + 1..], next)
             };
-            match handlers(&route.handlers, &route.trace_modules, ctx, inner, server, &after).await? {
+            let observed=if route.metrics {ctx.metrics.as_ref().and_then(|group|group.begin(server.plan.name.clone(),route.trace_modules.first().map_or_else(||Arc::from(""),|m|m.metric_name()),&ctx.authority,ctx.tls,ctx.req().method().as_str()))}else{None};
+            if let Some((_,observation))=&observed{ctx.deferred.push(DeferredResponse::Metrics(observation.clone()));}
+            let result=handlers(&route.handlers, &route.trace_modules, ctx, inner, server, &after).await;
+            if let Err(error)=&result && let Some(group)=&ctx.metrics {
+                group.error_from(observed.as_ref().map(|(marker,_)|*marker),error.downcast_ref::<HttpError>().map(|e|e.status.as_u16()),approximate_request_size(ctx));
+            }
+            if result.is_ok() && let Some((_,observation))=&observed{observation.returned(approximate_request_size(ctx));}
+            match result? {
                 Flow::Continue if route.terminal => return Ok(Flow::Stop),
                 Flow::Continue => {}
                 flow => return Ok(flow),
@@ -905,6 +939,17 @@ fn handlers<'a>(
                 && let Some(logging)=server.logging.as_deref()
                 && let Some(module)=traces.get(index) {module.emit(logging);}
             match handler {
+                Handler::Metrics{disable_openmetrics}=>{
+                    let mut response=server.metrics.scrape(ctx.req().headers(),!*disable_openmetrics).await;
+                    response.extensions_mut().insert(crate::metrics::discarded::PreparedEntity);
+                    // A scrape is already a bounded, encoded in-memory entity.
+                    // Mark it so HEAD observes these logical bytes without
+                    // polling an arbitrary streaming response.
+                    if ctx.req().method()==Method::HEAD && let Some(length)=response.body().size_hint().exact().and_then(|n|usize::try_from(n).ok()){
+                        response.extensions_mut().insert(StaticHeadLength(length));
+                    }
+                    return Ok(Flow::Response(response));
+                }
                 Handler::StaticError { status, message } => {
                     let code = if status.is_empty() {
                         StatusCode::INTERNAL_SERVER_ERROR
@@ -984,6 +1029,7 @@ fn handlers<'a>(
                     }
                     let head_length = static_head_length(ctx, &bytes);
                     let mut response = simple(status, bytes);
+                    response.extensions_mut().insert(crate::metrics::discarded::PreparedEntity);
                     *response.headers_mut() = std::mem::take(&mut ctx.immediate);
                     // Framing comes after response writers have examined the
                     // actual application headers. Hyper can use the exact
@@ -1011,9 +1057,22 @@ fn handlers<'a>(
                             ctx.immediate=headers;return Err(error);
                         }
                         log_append::unwind(ctx,log_mark,Some(&headers)).await;
+                        let finite_head=response.extensions().get::<StaticHeadLength>().is_some();
                         let body=std::mem::replace(response.body_mut(),full(Bytes::new()));
-                        match super::templates::finish(plan,&mut headers,body,ctx,inner,server).await{
-                            Ok(body)=>*response.body_mut()=body,
+                        match super::templates::finish(plan,&mut headers,body,ctx,inner,server,finite_head).await{
+                            Ok(finished)=>{
+                                let body=finished.body;
+                                if finished.rendered_head {
+                                    response.extensions_mut().insert(RenderedTemplateHead);
+                                    headers.remove(http::header::CONTENT_LENGTH);
+                                }
+                                if finite_head{
+                                    if let Some(length)=body.size_hint().exact().and_then(|n|usize::try_from(n).ok()){
+                                        response.extensions_mut().insert(StaticHeadLength(length));
+                                    }else{response.extensions_mut().remove::<StaticHeadLength>();}
+                                }
+                                *response.body_mut()=body;
+                            },
                             Err(error)=>{ctx.immediate=headers;return Err(failure(error.0));}
                         }
                     }else{
@@ -1631,6 +1690,7 @@ fn static_informational<'a>(
         };
         let head_length = static_head_length(ctx, &body);
         let mut response = simple(final_status, body);
+        response.extensions_mut().insert(crate::metrics::discarded::PreparedEntity);
         if let Some(head_length) = head_length {
             response.extensions_mut().insert(head_length);
         }
@@ -1758,6 +1818,8 @@ async fn write_informational(
     let mut response = Response::new(());
     *response.status_mut() = status;
     *response.headers_mut() = fields;
+    // Interim responses use the same protocol field rules as final responses.
+    super::response_length::apply(response.headers_mut(),status,false,false,None);
     let suppressed = match sender {
         InformationalOutput::Http(sender) => match sender.send(response).await {
             Ok(()) => false,
@@ -2069,6 +2131,7 @@ fn finalize_transforms<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         let status = response.status();
+        let observed_head=ctx.metrics.is_some() && ctx.req().method()==Method::HEAD && response.extensions().get::<StaticHeadLength>().is_some();
         let interim = response
             .extensions()
             .get::<StaticInterimStatus>()
@@ -2086,17 +2149,32 @@ fn finalize_transforms<'a>(
                 }
                 DeferredResponse::Headers(_) => {}
                 DeferredResponse::Encode(encoding) if explicit => {
+                    // Async codecs are not a prepared in-memory entity. A
+                    // discarded representation must not start extra work.
+                    response.extensions_mut().remove::<crate::metrics::discarded::PreparedEntity>();
                     body = encoding
-                        .finish(status, interim, headers, body, &ctx.resources.compression)
+                        .finish_observed(status, interim, headers, body, &ctx.resources.compression,observed_head)
                         .await;
                 }
                 DeferredResponse::Encode(_) => {}
                 DeferredResponse::LogBody(index) => {
                     log_append::capture_response(ctx, *index, headers, &mut body, explicit).await;
                 }
+                DeferredResponse::Metrics(observation)=>{
+                    observation.complete(status.as_u16(),explicit);
+                    body=crate::metrics::observe::attach_body(body,observation.clone());
+                }
             }
         }
         *response.body_mut() = body;
         Ok(())
     })
+}
+
+fn approximate_request_size(ctx:&Context)->u64 {
+    let Some(request)=ctx.request.as_ref() else{return ctx.request_content_length.max(0) as u64};
+    let proto=match request.version(){Version::HTTP_09=>8,Version::HTTP_10|Version::HTTP_11=>8,Version::HTTP_2|Version::HTTP_3=>8,_=>8};
+    let mut size=request.uri().to_string().len().saturating_add(request.method().as_str().len()).saturating_add(proto).saturating_add(ctx.authority.len()) as u64;
+    for name in request.headers().keys(){if name==http::header::HOST{continue;}size=size.saturating_add(name.as_str().len() as u64);for value in request.headers().get_all(name){size=size.saturating_add(value.as_bytes().len() as u64);}}
+    size.saturating_add(ctx.request_content_length.max(0) as u64)
 }

@@ -117,7 +117,7 @@ accepting their module name. Go plugins have no cross-language binary ABI;
 their configuration and behavior require native implementations.
 
 Known development gaps still include remaining listener/address combinations,
-metrics/OTLP and distributed tracing, the ACME server handler, push and timeout
+distributed tracing, the ACME server handler, push and timeout
 handlers, remaining template receiver methods and custom directory templates,
 TLS 1.0/1.1, full Go PKIX edge semantics and remaining issuer/trust-loader
 capabilities. This list is not a claim that all other field combinations are
@@ -325,3 +325,53 @@ The control backlink is weak and a foreign or unbound worker cannot bypass
 admission. This revision isolates `ProbablyPrime`; other arithmetic retains
 its previous execution stage and work fees. It adds no production CPU quota
 or affinity and does not change the runtime's use of available CPUs.
+
+
+Response templates, content coding, and bodyless messages
+--------------------------------------------------------
+
+Only an existing private StaticHeadLength marker from a prepared static entity
+allows the templates layer to consume HEAD source bytes. Arbitrary body size
+hints do not establish that provenance, and unknown/streaming HEAD bodies are
+not read to discover a length. Finite inner output stays available to enclosing
+templates, including empty output.
+
+The actual HEAD method remains visible and its template side effects execute.
+A separate marker records that HEAD rendering occurred. Such a response omits
+Content-Length at finalization, including after deferred headers, and cannot
+use the HTTP/3 exact-size fallback to invent zero. It is not re-executed as GET:
+that could repeat side effects. This intentionally repairs a baseline defect.
+For `{{.Req.Method}}-BODY`, GET has eight bytes while HEAD evaluation produces
+nine. Go's CL9 does not establish the selected GET representation length required
+by RFC 9110 section 8.6; native HEAD transmits no body and omits optional CL.
+Plain static responses, MIME bypass and opaque encoded files retain their
+existing trusted representation metadata.
+
+A non-identity Content-Encoding makes the entity opaque at the template layer.
+Its bytes, validators and representation metadata pass through unchanged. There
+is no automatic decompression, recompression or middleware reordering. Identity
+retains ordinary template handling. This repairs the baseline's possible rewrite
+of literal template syntax in gzip STORE or raw zstd blocks without updating
+codec lengths/checksums. Native preserves the original valid encoded entity.
+Compression bytes, streaming framing and omitted optional encoded HEAD lengths
+remain observable differences, even when both bodies independently decode.
+
+The shared finalizer clears CL/TE for 1xx, 204 and successful CONNECT. It also
+conservatively omits optional 304 length metadata because it has no trusted
+selected-200 representation length provenance. A suppressed body does not prove
+that length. Legal 304 Content-Type metadata is retained. The request consumer
+supplies a genuinely empty body for these bodyless messages before any transport:
+H2 otherwise sends handler data and synthesizes a new CL after header cleanup.
+The informational writer uses the same centralized header rules.
+
+RFC 9110 reference: https://www.rfc-editor.org/rfc/rfc9110.html#section-8.6
+Default native browse UI differs intentionally. Its independent HEAD metadata
+bug is tracked for the browse layer. Single native 100/102 interim responses are
+retained despite a baseline fixture emitting duplicates. No complete custom
+browse, HTTP or production acceptance is claimed by this patch.
+
+Successful CONNECT cleanup here applies to the currently supported static
+response path. It does not establish CONNECT tunnel forwarding. DATA on an
+established H2/H3 CONNECT tunnel belongs to the tunnel transport, not an HTTP
+message body; future tunnel support requires an explicit transport owner and
+must not route tunnel data through this ordinary bodyless finalizer.

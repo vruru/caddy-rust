@@ -164,6 +164,7 @@ impl RetiringBinding {
     }
 }
 struct RetirementOwner {
+    metrics: Arc<crate::metrics::Registry>,
     group: Arc<retirement::AdmissionGroup>,
     bindings: Vec<Arc<RetiringBinding>>,
 }
@@ -217,6 +218,7 @@ async fn retire_generation(
     } else {
         activity.wait_idle().await;
     }
+    owner.metrics.stop_exporter().await;
     if let Some(control) = control.upgrade() {
         let removed = {
             let mut state = control.lock();
@@ -359,6 +361,7 @@ impl HttpStage {
             self.guard.armed = false;
             (previous, old_listeners)
         };
+        self.inner.current.load().metrics.activate();
         self.guard.control.changed.notify_waiters();
         previous.activity.superseded.cancel();
         drop(previous);
@@ -371,6 +374,7 @@ impl HttpRuntime {
     pub async fn validate_prepared(&self, config: &PreparedConfig) -> Result<()> {
         let prepared = prepare_servers(
             config,
+            &self.inner.metrics_process,
             &self.inner.registry,
             &self.inner.managed,
             &self.inner.challenge_resolver,
@@ -415,6 +419,7 @@ impl HttpRuntime {
         );
         let prepared = prepare_servers(
             config,
+            &self.inner.metrics_process,
             &self.inner.registry,
             managed,
             &self.inner.challenge_resolver,
@@ -430,7 +435,7 @@ impl HttpRuntime {
         tokio::select! {
             biased;
             _ = self.inner.stopped.cancelled() => anyhow::bail!("HTTP runtime is stopping"),
-            result = prepared => result.map(|(_,names)|names)
+            result = prepared => result.map(|(_,names,_)|names)
         }
     }
     /// Compatibility wrapper for standalone callers. Integrated reloads supply
@@ -568,6 +573,7 @@ impl HttpRuntime {
         };
         let prepared = prepare_servers(
             &config,
+            &self.inner.metrics_process,
             &self.inner.registry,
             &managed,
             &self.inner.challenge_resolver,
@@ -580,7 +586,7 @@ impl HttpRuntime {
             },
             &self.inner.resources,
         );
-        let (servers, managed_names) = tokio::select! {
+        let (servers, managed_names, metrics) = tokio::select! {
             biased;
             _ = guard.cancel.cancelled() => anyhow::bail!("HTTP candidate was stopped"),
             result = prepared => result?,
@@ -740,7 +746,7 @@ impl HttpRuntime {
                 bindings.push(binding);
             }
             (
-                Arc::new(RetirementOwner { group, bindings }),
+                Arc::new(RetirementOwner { metrics: current.metrics.clone(), group, bindings }),
                 retiring,
                 overridden,
             )
@@ -759,6 +765,7 @@ impl HttpRuntime {
         );
         let proxy_cleanup = self.inner.resources.proxy_cleanup.reserve(owners).await?;
         let next = Arc::new(Generation {
+            metrics,
             id: generation,
             activity: activity.clone(),
             servers,
@@ -1002,6 +1009,7 @@ async fn stop_runtime(inner: Arc<Inner>, lifecycle: Arc<Lifecycle>, signal: Http
         }
     };
     tokio::join!(finish_admission, drain_current);
+    current.metrics.stop_exporter().await;
 }
 
 type Launch = (

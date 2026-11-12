@@ -9,6 +9,7 @@ The project currently covers a specific subset of functionalities:
 *   **HTTP/Admin**: Transactional endpoints, Host/origin/remote authorization, conditional configurations, and ETag support.
 *   **Transports**: H1, H2, and H3 streaming uploads and downloads, range-conditional responses, compression, reverse proxying (including FastCGI and WebSocket), and load balancing with dynamic upstream health checks.
 *   **TLS & Certificates**: TLS 1.2/1.3, managed and manual certificate support, on-demand ACME (HTTP-01, TLS-ALPN-01), local PKI, OCSP, session tickets, external certificate retrieval (HTTP, Tailscale), generation-scoped Must-Staple requests and private-key reuse.
+*   **Metrics**: Generation-scoped Prometheus/OpenMetrics scraping, HTTP/protobuf and gRPC OTLP, console export, real runtime facts, and bounded observation/export lifetimes.
 *   **Templates & Logic**: Native Go-template, Goldmark and CEL behavior has differential coverage; remaining host methods and edge cases are tracked explicitly.
 
 **Runtime Characteristics**:
@@ -17,7 +18,7 @@ The project currently covers a specific subset of functionalities:
 *   **Compatibility**: Correct useful extensions remain supported even where the baseline rejects them. Resource bounds and repairs to upstream bugs are documented differences; accepting a configuration alone does not establish correct execution.
 
 **Known Gaps**:
-Remaining standard modules/fields, remaining listener/address combinations, metrics/OTLP, distributed tracing, ACME server, push/timeouts, complete template mutability, custom browsing, TLS 1.0/1.1 support, Go PKIX edge cases, and full issuer/CA-loader capabilities are not yet implemented.
+Remaining standard modules/fields, remaining listener/address combinations, distributed tracing, ACME server, push/timeouts, complete template mutability, custom browsing, TLS 1.0/1.1 support, Go PKIX edge cases, and full issuer/CA-loader capabilities are not yet implemented.
 
 ## Build
 
@@ -30,6 +31,7 @@ cargo build --locked --release --features native-run
 For compatibility details, refer to:
 *   `COMPATIBILITY.md`
 *   `docs/SESSION-TICKETS.md`
+*   `docs/METRICS.md`
 *   `vendor/VENDOR.md`
 *   `THIRD-PARTY-NOTICES`
 

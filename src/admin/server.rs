@@ -1061,11 +1061,14 @@ async fn handle(
         "unknown"
     };
     let pathhash = files::basename_hash(std::ffi::OsStr::new(&raw_path));
+    let metrics=inner.upgrade().and_then(|inner|inner.backend.metrics_registry());
+    let raw_method=request.method().as_str().to_owned();
     let result = dispatch(request, inner, policy, peer).await;
     let status = result
         .as_ref()
         .map(|r| r.status().as_u16())
         .unwrap_or_else(|e| e.status);
+    if let Some(metrics)=metrics && let Some(path)=super::metrics::registered_path(&raw_path){metrics.admin(path,&raw_method,Some(status));if result.is_err(){metrics.admin(path,&raw_method,None);}}
     eprintln!(
         "admin method={method} route={route} pathhash={pathhash} opid={opid} status={status}"
     );
@@ -1204,6 +1207,7 @@ async fn dispatch(
             );
             response
         }
+        (_, "/metrics")=>super::metrics::collect(&inner,request.headers(),grant.as_ref(),local.as_ref()).await?,
         (_, "/reverse_proxy/upstreams") => {
             if method!="GET"{return Err(AdminError::new(405,"method_not_allowed"));}
             let data=controller.upstreams_authorized(grant.clone(),local.clone()).await?;

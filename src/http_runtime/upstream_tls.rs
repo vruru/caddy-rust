@@ -45,7 +45,7 @@ pub(super) fn diagnostics() -> NativeTrustDiagnostics {
         rejected_root_blocks: REJECTED_ROOTS.load(Ordering::Relaxed),
     }
 }
-fn native_roots() -> &'static rustls::RootCertStore {
+pub(super) fn native_roots() -> &'static rustls::RootCertStore {
     NATIVE_ROOTS.get_or_init(|| {
         NATIVE_LOADS.fetch_add(1, Ordering::Relaxed);
         let native = rustls_native_certs::load_native_certs();
@@ -96,6 +96,12 @@ impl PreparedTransport {
             handshake: config.tls.as_ref().and_then(|t| t.handshake_timeout),
             connect_timeout:config.dial_timeout,
         })
+    }
+    pub(super) fn metrics(dial:Uri,tls:Option<Arc<ClientConfig>>,timeout:Duration)->FixedDialConnector{
+        let family=super::http_dial::Family::Any;
+        let mut http=HttpConnector::new_with_resolver(super::http_dial::FamilyResolver::new(family));
+        http.enforce_http(false);http.set_connect_timeout(Some(timeout));http.set_nodelay(true);
+        FixedDialConnector{http,family,tls,read:Some(timeout),write:Some(timeout),handshake:Some(timeout),dial,server_name:None,unix_path:None,connect_timeout:timeout}
     }
     pub(super) fn http1(&self) -> Self {
         let mut result = self.clone();

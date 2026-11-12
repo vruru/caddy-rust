@@ -17,6 +17,7 @@ pub(crate) struct Module {
     copy_bytes: usize,
 }
 impl Module {
+    pub(crate) fn metric_name(&self)->Arc<str>{self.name.clone()}
     pub(crate) fn redirect(location: &str) -> Self {
         let value = json!({"status_code":308,"headers":{"Location":[location]},"close":true});
         Self {

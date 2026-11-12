@@ -114,7 +114,7 @@ mod retirement;
 use retirement::{BusinessGeneration, BusinessGuard};
 pub use retirement::{HttpRetirement, RetirementOutcome};
 #[path = "http_runtime/resource_budget.rs"]
-mod resource_budget;
+pub(crate) mod resource_budget;
 pub use resource_budget::{BudgetSnapshot, ResourceDiagnostics, ResourceLimits};
 #[path = "http_runtime/accepted_encodings.rs"]
 pub(crate) mod accepted_encodings;
@@ -152,11 +152,12 @@ mod rewrite_uri;
 #[path = "http_runtime/sniff.rs"]
 mod sniff;
 #[path = "http_runtime/timeout_io.rs"]
-mod timeout_io;
+pub(crate) mod timeout_io;
 #[path = "http_runtime/trailer_policy.rs"]
 mod trailer_policy;
 #[path = "http_runtime/upstream_tls.rs"]
 mod upstream_tls;
+pub(crate) mod metrics_client;
 pub use upstream_tls::NativeTrustDiagnostics;
 
 use crate::{
@@ -192,6 +193,9 @@ pub struct HttpRuntime {
     control: Arc<lifecycle::Lifecycle>,
 }
 impl HttpRuntime {
+    pub fn metrics_registry(&self)->Arc<crate::metrics::Registry>{self.inner.current.load().metrics.clone()}
+    pub fn metrics_process(&self)->Arc<crate::metrics::Process>{self.inner.metrics_process.clone()}
+
     /// Process-level native CA load and skipped-root counts, without material.
     pub fn native_upstream_trust_diagnostics(&self) -> NativeTrustDiagnostics {
         upstream_tls::diagnostics()
@@ -213,6 +217,7 @@ impl HttpRuntime {
     }
 }
 struct Inner {
+    metrics_process: Arc<crate::metrics::Process>,
     connections: Arc<connection_budget::Budgets>,
     tls_executor: std::sync::OnceLock<tls_executor::TlsExecutor>,
     tls_executor_init: std::sync::Mutex<()>,
@@ -229,6 +234,7 @@ struct Inner {
     stopped: CancellationToken,
 }
 struct Generation {
+    metrics: Arc<crate::metrics::Registry>,
     id: u64,
     proxy_cleanup: Option<proxy_cleanup::Reservation>,
     activity: Arc<BusinessGeneration>,
@@ -254,6 +260,7 @@ impl Generation {
 }
 #[derive(Clone)]
 struct ActiveServer {
+    metrics: Arc<crate::metrics::Registry>,
     events: Option<Arc<crate::events::EventsApp>>,
     logging: Option<Arc<crate::logging::Logging>>,
     plan: Arc<ServerConfig>,
@@ -354,7 +361,9 @@ impl HttpRuntime {
     ) -> Self {
         let activity =
             BusinessGeneration::new(0, crate::http_config::HttpShutdownPolicy::default());
+        let metrics_process=crate::metrics::Process::new();
         let initial = Generation {
+            metrics: crate::metrics::Registry::initial(metrics_process.clone()),
             id: 0,
             proxy_cleanup: None,
             activity: activity.clone(),
@@ -370,6 +379,7 @@ impl HttpRuntime {
         ));
         Self {
             inner: Arc::new(Inner {
+                metrics_process,
                 current: ArcSwap::from_pointee(initial),
                 quic_limits: h3::Limits::new(),
                 tls_executor: std::sync::OnceLock::new(),
@@ -553,12 +563,13 @@ struct ServingMaterial<'a> {
 
 async fn prepare_servers(
     config: &PreparedConfig,
+    process: &Arc<crate::metrics::Process>,
     registry: &ChallengeRegistry,
     managed: &Arc<HotCertificateResolver>,
     challenges: &Arc<HotCertificateResolver>,
     material: ServingMaterial<'_>,
     resources: &Arc<resource_budget::Resources>,
-) -> Result<(HashMap<SocketAddr, Arc<ActiveServer>>, Vec<Vec<String>>)> {
+) -> Result<(HashMap<SocketAddr, Arc<ActiveServer>>, Vec<Vec<String>>, Arc<crate::metrics::Registry>)> {
     let ServingMaterial {
         manual,
         provider,
@@ -567,6 +578,12 @@ async fn prepare_servers(
         validate_only,
     } = material;
     let logging_available = logging.is_some() || validate_only;
+    let mut allowed=crate::metrics::allowed::Inputs::default();
+    if config.metrics.is_some_and(|c|c.per_host&&!c.observe_catchall_hosts){
+        for server in &config.servers{for route in &server.routes{for group in &route.matchers{for matcher in group{if let Matcher::Host(hosts)=matcher{for host in hosts{if !host.contains(['*','{']){allowed.push(host,process);tokio::task::consume_budget().await;}}}}}}}
+    }
+    let process=process.clone();let metrics_config=config.metrics;let https=config.servers.iter().any(|s|s.tls);
+    let metrics=resources.metadata.run(move||{let allowed=allowed.build(&process);crate::metrics::Registry::prepare(process,metrics_config,allowed,https)}).await.map_err(|_|anyhow::anyhow!("metrics provisioning worker unavailable"))??;
     let standalone;
     let manual = if let Some(manual) = manual {
         ensure!(
@@ -681,7 +698,9 @@ async fn prepare_servers(
         })
         .await
         .map_err(|_| anyhow::anyhow!("candidate proxy provisioning task failed"))??;
+        for client in clients.values(){metrics.upstreams(client.metric_probes());}
         let active = ActiveServer {
+            metrics: metrics.clone(),
             events: config.events.clone(),
             logging: logging.cloned(),
             plan: server.clone(),
@@ -750,6 +769,7 @@ async fn prepare_servers(
             output.insert(
                 address,
                 Arc::new(ActiveServer {
+                    metrics: metrics.clone(),
                     events: config.events.clone(),
                     logging: logging.cloned(),
                     plan,
@@ -764,6 +784,7 @@ async fn prepare_servers(
         } else {
             routes.push(automatic_redirects::fallback(config.http_port, config.https_port));
             let plan = ServerConfig {
+                name: Arc::from("remaining_auto_https_redirects"),
                 access_logs: None,
                 named_routes: Default::default(),
                 header_aliases: Default::default(),
@@ -792,6 +813,7 @@ async fn prepare_servers(
             output.insert(
                 address,
                 Arc::new(ActiveServer {
+                    metrics: metrics.clone(),
                     events: config.events.clone(),
                     logging: logging.cloned(),
                     plan: Arc::new(plan),
@@ -808,6 +830,7 @@ async fn prepare_servers(
     Ok((
         output,
         actual_managed.into_iter().map(|n| vec![n]).collect(),
+        metrics,
     ))
 }
 fn plain_transport_compatible(old: &ServerConfig, next: &ServerConfig) -> bool {

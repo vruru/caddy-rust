@@ -39,6 +39,7 @@ mod go_regexp;
 #[path = "http_runtime/http_redirect/url.rs"]
 pub(crate) mod go_url_compat;
 pub mod logging;
+pub mod metrics;
 
 pub mod tls_policy;
 

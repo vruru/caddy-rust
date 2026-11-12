@@ -7,6 +7,8 @@ use std::{
 
 fn main() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if let Some(code)=caddy_compat_native::metrics::native_console_entry(&args){std::process::exit(code);}
+    if let Err(error)=caddy_compat_native::metrics::register_native_console_helper(){eprintln!("Error: {error:#}");std::process::exit(1);}
     // SAFETY: this entry has not initialized crypto libraries, workers, runtimes
     // or other threads. Env files are applied only inside this startup boundary.
     match unsafe { cli::dispatch_early(&args) } {

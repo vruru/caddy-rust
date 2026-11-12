@@ -71,6 +71,11 @@ fn bounded_headers(headers: &HeaderMap) -> bool {
         .is_some()
 }
 
+pub(super) struct Finished {
+    pub(super) body: Body,
+    pub(super) rendered_head: bool,
+}
+
 pub(super) async fn finish(
     plan: &Arc<TemplatePlan>,
     headers: &mut HeaderMap,
@@ -78,14 +83,25 @@ pub(super) async fn finish(
     ctx: &mut Context,
     inner: &Arc<super::Inner>,
     server: &Arc<super::ActiveServer>,
-) -> Result<Body, TemplateFailure> {
+    finite_head:bool,
+) -> Result<Finished, TemplateFailure> {
+    // A content coding makes the body an opaque encoded entity. Parsing its
+    // bytes as template source can rewrite STORE blocks without updating the
+    // codec length/checksum. Identity carries no coding and remains renderable.
+    if headers.get_all(header::CONTENT_ENCODING).iter().any(|field| {
+        field.as_bytes().split(|byte| *byte == b',').any(|coding| {
+            !coding.trim_ascii().eq_ignore_ascii_case(b"identity")
+        })
+    }) {
+        return Ok(Finished { body, rendered_head: false });
+    }
     // Go tests only the first Content-Type value, case-sensitive substring.
     let content_type = headers.get(header::CONTENT_TYPE).map_or(b"".as_slice(), HeaderValue::as_bytes);
     if !plan.mime_types.iter().any(|mime| {
         let mime = mime.as_bytes();
         mime.is_empty() || content_type.windows(mime.len()).any(|window| window == mime)
     }) {
-        return Ok(body);
+        return Ok(Finished { body, rendered_head: false });
     }
 
     let unavailable = || TemplateFailure(StatusCode::SERVICE_UNAVAILABLE);
@@ -110,7 +126,9 @@ pub(super) async fn finish(
     let head=ctx.req().method()==http::Method::HEAD;
     let collected = tokio::time::timeout(BODY_TIMEOUT, async {
         let mut input = Vec::new();let mut trailers=None;
-        if head{return Ok((input,trailers));}
+        // Only an already prepared finite entity may be consumed for HEAD.
+        // Streaming or unrecognized HEAD sources keep the existing no-read path.
+        if head&&!finite_head{return Ok((input,trailers));}
         while let Some(frame) = body.frame().await {
             let frame = frame.map_err(|error| {
                 if super::request_body::limit_error(error.as_ref()) {
@@ -165,7 +183,8 @@ pub(super) async fn finish(
     }
     *headers = rendered_headers;
     let body=full(Bytes::from_owner(output));
-    Ok(if let Some(trailers)=trailers{body.with_trailers(async move{Some(Ok(trailers))}).boxed_unsync()}else{body})
+    let body=if let Some(trailers)=trailers{body.with_trailers(async move{Some(Ok(trailers))}).boxed_unsync()}else{body};
+    Ok(Finished { body, rendered_head: head })
 }
 
 pub(super) fn finish_empty(headers:&mut HeaderMap)->Body{

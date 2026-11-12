@@ -1,5 +1,6 @@
 #[derive(Clone)]
 pub(crate) struct Route {
+    pub(crate) metrics: bool,
     pub(crate) group: Option<String>,
     pub(crate) matchers: Vec<MatcherSet>,
     pub(crate) handlers: Vec<Handler>,
@@ -79,6 +80,7 @@ pub(crate) struct HeaderOps {
 
 #[derive(Clone)]
 pub(crate) enum Handler {
+    Metrics { disable_openmetrics: bool },
     Templates(std::sync::Arc<crate::http_runtime::templates::TemplatePlan>),
     StaticError {
         status: String,

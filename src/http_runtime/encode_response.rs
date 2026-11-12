@@ -164,6 +164,13 @@ pub(super) struct ResponseEncoding {
 }
 
 impl ResponseEncoding {
+    pub(super) async fn finish_observed(&self,status:StatusCode,interim:Option<u16>,headers:&mut HeaderMap,body:Body,compression:&CompressionBudget,logical_static_head:bool)->Body{
+        if logical_static_head && self.method==Method::HEAD{
+            let encoding=Self{plan:self.plan.clone(),codec:self.codec,method:Method::GET};
+            encoding.finish(status,interim,headers,body,compression).await
+        }else{self.finish(status,interim,headers,body,compression).await}
+    }
+
     pub(super) async fn finish(
         &self,
         status: StatusCode,

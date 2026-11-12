@@ -363,6 +363,14 @@ pub(super) struct Selected {
 }
 
 impl PreparedSelection {
+    pub(super) fn metric_probes(&self)->Vec<(Arc<str>,crate::metrics::upstream::Probe)>{
+        self.pool.iter().map(|endpoint|{
+            let host=endpoint.host.clone();let active=endpoint.active.clone();let passive=endpoint.passive.clone();
+            let probe:crate::metrics::upstream::Probe=Arc::new(move||active.healthy() && passive.as_ref().is_none_or(|cfg|cfg.max_fails>=0 && host.fails(tokio::time::Instant::now())<(cfg.max_fails as u64)));
+            (Arc::from(endpoint.config.dial.as_str()),probe)
+        }).collect()
+    }
+
     pub(super) fn new(registry: &HostRegistry, policy: &Selection, upstreams: &[Upstream]) -> Self {
         Self {
             pool: registry.resolve(upstreams),
