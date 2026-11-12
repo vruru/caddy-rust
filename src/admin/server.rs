@@ -1051,6 +1051,10 @@ async fn handle(
         "load"
     } else if raw_path == "/adapt" {
         "adapt"
+    } else if raw_path.starts_with("/pki/") {
+        "pki"
+    } else if raw_path == "/reverse_proxy/upstreams" {
+        "upstreams"
     } else if raw_path == "/stop" {
         "stop"
     } else {
@@ -1198,6 +1202,23 @@ async fn dispatch(
                 header::ETAG,
                 http::HeaderValue::from_bytes(tag.as_bytes()).map_err(|_| io_failure())?,
             );
+            response
+        }
+        (_, "/reverse_proxy/upstreams") => {
+            if method!="GET"{return Err(AdminError::new(405,"method_not_allowed"));}
+            let data=controller.upstreams_authorized(grant.clone(),local.clone()).await?;
+            let mut response=reply_bytes(200,data);
+            response.headers_mut().insert(header::CONTENT_TYPE,http::HeaderValue::from_static("application/json"));
+            response
+        }
+        (_,p) if super::pki::route(p).is_some() => {
+            if method!="GET"{return Err(AdminError::new(405,"method_not_allowed"));}
+            let (id,pem)=match super::pki::route(p).ok_or_else(||AdminError::new(404,"resource_not_found"))?{
+                super::pki::Route::Info(id)=>(id,false),super::pki::Route::Certificates(id)=>(id,true),
+            };
+            let data=controller.pki_authorized(id,pem,grant.clone(),local.clone()).await?;
+            let mut response=reply_bytes(200,data);
+            response.headers_mut().insert(header::CONTENT_TYPE,http::HeaderValue::from_static(if pem{"application/pem-certificate-chain"}else{"application/json"}));
             response
         }
         ("POST", "/stop") => {

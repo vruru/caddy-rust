@@ -7,6 +7,8 @@ impl CertificateServices {
         self.tasks.spawn(async move {
             eviction.run_cache_evictions().await;
         });
+        let revoked = self.clone();
+        self.tasks.spawn(async move { revoked.run_revoked_business().await; });
         if self.restore.is_some() {
             // Restore-only preparation is deliberately memory-only. Rebuild the
             // maintenance handles only after commit, without tying activation
@@ -34,6 +36,11 @@ impl CertificateServices {
             let changed = self.maintenance_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
+            if self.reconcile_physical_ocsp().await.is_err() {
+                let _ = self.events.send(CertificateEvent {
+                    kind: "ocsp_maintenance_prepare_failed", names: Vec::new(),
+                });
+            }
             let (groups, pki, ocsp) = {
                 let state = self.state.lock().await;
                 (
@@ -96,6 +103,7 @@ impl CertificateServices {
             tokio::select! { biased;
                 _ = self.context.cancel.cancelled() => break,
                 _ = &mut changed => {},
+                _ = tokio::time::sleep(self.plan.ocsp_interval) => {},
             }
         }
     }
@@ -108,9 +116,14 @@ impl CertificateServices {
                     .material
                     .iter()
                     .filter_map(|item| {
-                        item.managed_names
-                            .as_ref()
-                            .map(|names| (names.clone(), item.identity, item.material.clone()))
+                        item.managed_names.as_ref().map(|names| {
+                            (
+                                names.clone(),
+                                item.identity,
+                                item.material.clone(),
+                                item.origin.clone(),
+                            )
+                        })
                     })
                     .collect::<Vec<_>>(),
                 state.bound.clone().unwrap_or_default(),
@@ -124,21 +137,24 @@ impl CertificateServices {
                 return;
             }
             let completed = stream::iter(pending)
-                .map(|(names, identity, material)| {
+                .map(|(names, identity, material, origin)| {
                     let this = self.clone();
                     let bound = &bound;
                     async move {
                         let result: Result<()> = async {
                             let group = this
-                                .group(
+                                .group_with_origin(
                                     names.clone(),
                                     identity,
                                     bound,
                                     this.context.cancel.child_token(),
+                                    origin.clone(),
                                 )
                                 .await?;
                             let (_, end) = material.times()?;
                             let leaf = this.context.leaf_guard.intern(material.leaf_id, end)?;
+                            *group.spki.lock().map_err(|_| anyhow!("certificate key state unavailable"))? =
+                                Some(material.spki_der.clone());
                             *group
                                 .leaf_state
                                 .lock()
@@ -148,7 +164,7 @@ impl CertificateServices {
                             Ok(())
                         }
                         .await;
-                        (names, identity, material, result)
+                        (names, identity, material, origin, result)
                     }
                 })
                 .buffer_unordered(8)
@@ -156,8 +172,8 @@ impl CertificateServices {
                 .await;
             pending = completed
                 .into_iter()
-                .filter_map(|(names, identity, material, result)| {
-                    result.err().map(|_| (names, identity, material))
+                .filter_map(|(names, identity, material, origin, result)| {
+                    result.err().map(|_| (names, identity, material, origin))
                 })
                 .collect();
             let completed = stream::iter(authorities_pending)
@@ -242,6 +258,9 @@ impl CertificateServices {
     async fn run_group(self: Arc<Self>, group: Arc<Group>) {
         let cancel = group.cancel.clone();
         let mut failures = 0u32;
+        let mut key_changes = self.context.leaf_guard.key_deny().subscribe();
+        let key_pending = || group.spki.lock().map(|spki| spki.as_ref().is_some_and(|spki|
+            self.context.leaf_guard.key_deny().check_spki_der(spki).is_err())).unwrap_or(true);
         loop {
             if cancel.is_cancelled() {
                 break;
@@ -271,9 +290,15 @@ impl CertificateServices {
                 .leaf_state
                 .lock()
                 .map(|leaf| leaf.as_ref().is_some_and(|leaf| leaf.needs_renewal()))
-                .unwrap_or(true);
+                .unwrap_or(true) || key_pending();
             let result = if let Err(error) = refreshed {
                 Err(error)
+            } else if pending && !group.identity {
+                // The service-owned physical worker resolves current Name0
+                // policy and exact old receipt. A historical publisher job
+                // cannot renew the revoked chain under its old policy.
+                Ok(now().unwrap_or(i64::MAX).saturating_add(
+                    self.plan.renew_interval.as_secs().max(1) as i64))
             } else if cached_deadline > now().unwrap_or(i64::MAX) && !pending {
                 Ok(cached_deadline)
             } else {
@@ -309,6 +334,7 @@ impl CertificateServices {
                 tokio::select! { biased;
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep_until(deadline) => break,
+                    _ = key_changes.changed() => { if key_pending() { break; } },
                     _ = &mut changed => {
                         let pending = group.leaf_state.lock().map(|state| state.as_ref().is_some_and(|leaf| leaf.needs_renewal())).unwrap_or(true);
                         if pending { break; }

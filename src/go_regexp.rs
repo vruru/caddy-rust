@@ -136,6 +136,38 @@ impl GoRegexp {
     pub(crate) fn memory_usage(&self) -> usize {
         self.memory
     }
+    /// Go FindAllStringIndex for bounded template functions. Empty matches
+    /// abutting a previous match are suppressed; offsets remain UTF-8 boundaries.
+    pub(crate) fn find_all_ranges(
+        &self, input: &str, count: i64, cap: usize, budget: &ReplaceBudget,
+    ) -> std::result::Result<Vec<Range<usize>>, OperationError> {
+        budget.check()?;
+        if count == 0 { return Ok(Vec::new()); }
+        if input.len() > MAX_INPUT_BYTES || self.search_memory > budget.scratch {
+            return Err(OperationError::ByteLimit);
+        }
+        let mut captures=self.native.create_captures();
+        let mut cache=self.native.create_cache();
+        let mut matches=Vec::new();
+        let mut at=0usize;
+        let mut previous_end=None;
+        while at<=input.len() && (count<0 || matches.len()<(count as usize)) {
+            budget.check()?;
+            if !self.search_captures(input,at,&mut cache,&mut captures,budget)? {break;}
+            let found=captures.get_group(0).ok_or(OperationError::MatchInvariant)?;
+            let empty=found.start==found.end;
+            let accept=!empty || previous_end!=Some(found.start);
+            previous_end=Some(found.end);
+            if accept {
+                if matches.len()>=cap{return Err(OperationError::ByteLimit);}
+                matches.push(found.start..found.end);
+            }
+            at=if empty {
+                found.end+input.get(found.end..).ok_or(OperationError::MatchInvariant)?.chars().next().map_or(1,char::len_utf8)
+            }else{found.end};
+        }
+        Ok(matches)
+    }
     /// First-match captures for bounded handshake inputs. The caller runs this
     /// within its TLS CPU lane and supplies the existing workspace allowance.
     pub(crate) fn first_match(
@@ -184,6 +216,23 @@ impl GoRegexp {
             }
         }
         Ok(Some(result))
+    }
+    /// Boolean match of Go's byte input: each invalid UTF-8 byte is one RuneError.
+    /// Reuse normalization and the same bounded native search as replacement.
+    pub(crate) fn is_match_bytes(
+        &self,
+        original: &[u8],
+        budget: &ReplaceBudget,
+    ) -> std::result::Result<bool, OperationError> {
+        budget.check()?;
+        let scratch = budget
+            .scratch
+            .checked_sub(self.search_memory)
+            .ok_or(OperationError::ByteLimit)?;
+        let input = Normalized::new(original, &ReplaceBudget::new(scratch, budget.deadline))?;
+        let mut captures = self.native.create_captures();
+        let mut cache = self.native.create_cache();
+        self.search_captures(&input.text, 0, &mut cache, &mut captures, budget)
     }
     /// A bounded-width expression can safely scan large inputs in overlapping
     /// windows. The whole input is retained for assertions (anchors and word

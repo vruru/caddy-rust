@@ -426,6 +426,12 @@ impl ExpectClientHello {
         // Choose a certificate.
         let certkey = {
             let client_hello = ClientHello {
+                legacy_version: client_hello.client_version,
+                offered_signature_schemes: client_hello.signature_schemes.as_deref(),
+                offered_versions: client_hello.supported_versions.as_ref().map(|versions|
+                    &versions.native_offered[..usize::from(versions.native_len)]),
+                offered_ec_point_formats: client_hello.ec_point_formats.as_ref().map(|formats|
+                    &formats.native_offered[..usize::from(formats.native_len)]),
                 negotiated_version: Some(version),
                 server_name: &cx.data.sni,
                 offered_server_name: client_hello

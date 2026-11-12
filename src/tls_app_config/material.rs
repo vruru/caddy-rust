@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::{Result, anyhow, ensure};
 use rustls::{pki_types::CertificateDer, sign::CertifiedKey};
-use std::sync::Arc;
+use std::sync::{Arc,OnceLock};
 use zeroize::Zeroizing;
 
 #[derive(Clone, Copy)]
@@ -17,11 +17,16 @@ pub(super) enum Validity {
 #[derive(Clone)]
 pub(super) struct Material {
     pub names: Vec<String>,
+    san_names: Vec<String>,
     pub certificate: Vec<u8>,
     pub key: Zeroizing<Vec<u8>>,
     pub tags: Vec<String>,
     pub identity: [u8; 32],
     pub leaf_id: [u8; 32],
+    pub management_name: Arc<str>,
+    pub spki_id: [u8; 32],
+    pub spki_der: Arc<[u8]>,
+    key_state: OnceLock<Arc<crate::key_compromise::KeyState>>,
     not_before: i64,
     not_after: i64,
     certified: Arc<CertifiedKey>,
@@ -74,6 +79,8 @@ impl Material {
         }
 
         let leaf_id = crate::leaf_guard::leaf_id(&blocks[0].1);
+        let management_name = crate::tls_resolver::certificate_management_name(&leaf)?;
+        let spki_id = crate::leaf_guard::leaf_id(leaf.public_key().raw);
 
         // Compute certified key once to validate match and derive chain
         let chain: Vec<CertificateDer<'static>> = blocks
@@ -90,12 +97,17 @@ impl Material {
         let identity = crate::tls_resolver::certificate_chain_identity(&certified.cert);
 
         Ok(Self {
+            san_names: names.clone(),
             names,
             certificate,
             key,
             tags: Vec::new(),
             identity,
             leaf_id,
+            key_state: OnceLock::new(),
+            management_name,
+            spki_id,
+            spki_der: Arc::from(leaf.public_key().raw),
             not_before,
             not_after,
             certified,
@@ -103,6 +115,32 @@ impl Material {
             client_auth,
             issuer_names,
         })
+    }
+
+    pub(super) fn key_allowed(&self, deny:&crate::key_compromise::KeyDeny)->bool {
+        self.key_state.get().is_some_and(|key|deny.owns_state(key)&&!key.banned())
+    }
+    pub(super) fn register_key(&self, deny: &crate::key_compromise::KeyDeny)
+        -> Result<Arc<crate::key_compromise::KeyState>> {
+        if let Some(key)=self.key_state.get() {
+            ensure!(deny.owns_state(key), "certificate material belongs to another key registry");
+            return Ok(key.clone());
+        }
+        let key=deny.register_spki(self.spki_der.clone())?;
+        match self.key_state.set(key.clone()) {
+            Ok(())=>Ok(key),
+            Err(_) => {
+                let prior=self.key_state.get().ok_or_else(||anyhow!("certificate key reservation disappeared"))?;
+                ensure!(deny.owns_state(prior), "certificate material belongs to another key registry");
+                Ok(prior.clone())
+            },
+        }
+    }
+    pub(super) fn san_names(&self) -> &[String] { &self.san_names }
+    pub(super) fn retained_san_bytes(&self) -> usize {
+        self.san_names.capacity() * std::mem::size_of::<String>()
+            + self.san_names.iter().map(String::capacity).sum::<usize>()
+            + self.management_name.len()
     }
 
     pub(super) fn times(&self) -> Result<(i64, i64)> {

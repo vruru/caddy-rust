@@ -149,6 +149,38 @@ async fn close_original(
 }
 
 pub(super) async fn apply(ctx: &mut Context, plan: &RequestBodyConfig) -> Result<()> {
+    if !plan.set.is_empty() || plan.max_size > 0 { ctx.cel_body = None; }
+    if !plan.set.is_empty() && ctx.cel_body_failure.take().is_some() && !ctx.fastcgi_body_claimed {
+        // Explicit replacement discards a failed capture's poison, never the
+        // metadata of an unclaimed live body.
+        *ctx.req_mut().body_mut() = full(Bytes::new());
+        ctx.body_limit = None;
+    }
+    if ctx.fastcgi_body_claimed && (!plan.set.is_empty() || plan.max_size > 0) {
+        let source = ctx
+            .req()
+            .extensions()
+            .get::<super::proxy_replay::ReplaySource>()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("request body ownership unavailable"))?;
+        *ctx.req_mut().body_mut() = match source.take_unconsumed() {
+            Ok(body) => body,
+            Err(_) if !plan.set.is_empty() => {
+                // An explicit replacement supersedes the spent original;
+                // it never exposes that original as an empty snapshot.
+                source.discard();
+                full(Bytes::new())
+            }
+            Err(error) => return Err(error.into()),
+        };
+        ctx.req_mut()
+            .extensions_mut()
+            .remove::<super::proxy_replay::ReplaySource>();
+        ctx.req_mut()
+            .extensions_mut()
+            .remove::<super::fastcgi::PreparedLength>();
+        ctx.fastcgi_body_claimed = false;
+    }
     if !plan.set.is_empty() {
         if let Some(state) = ctx.body_limit.take() {
             // Close on a Go MaxBytesReader delegates directly to the old

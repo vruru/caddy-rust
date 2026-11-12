@@ -1,5 +1,7 @@
 //! Typed ordered TLS connection policies; provisioning performs no hot-path I/O.
+pub(crate) mod certificate_selection;
 mod client_auth;
+mod client_paths;
 mod provision;
 
 use std::collections::BTreeMap;
@@ -155,7 +157,7 @@ impl ClientAuthMode {
 pub struct ConnectionPolicy {
     pub(crate) identity: [u8; 32],
     pub matcher: Vec<Matcher>,
-    pub any_tag: Option<Vec<String>>,
+    pub(crate) certificate_selection: Option<Arc<certificate_selection::CertificateFilter>>,
     pub protocol_min: Option<ProtocolVersion>,
     pub protocol_max: Option<ProtocolVersion>,
     pub cipher_suites: Option<Vec<String>>,
@@ -173,7 +175,7 @@ impl fmt::Debug for ConnectionPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectionPolicy")
             .field("matcher", &self.matcher)
-            .field("any_tag", &self.any_tag)
+            .field("certificate_selection", &self.certificate_selection)
             .field("protocol_min", &self.protocol_min)
             .field("protocol_max", &self.protocol_max)
             .field("cipher_suites", &self.cipher_suites)
@@ -227,11 +229,17 @@ impl ConnectionPolicy {
         }
     }
 
+    pub(crate) fn requires_certificate_tags(&self) -> bool {
+        self.certificate_selection
+            .as_ref()
+            .is_some_and(|filter| filter.requires_tags())
+    }
+
     fn default_empty() -> Self {
         Self {
             identity: <sha2::Sha256 as sha2::Digest>::digest(b"{}").into(),
             matcher: Vec::new(),
-            any_tag: None,
+            certificate_selection: None,
             protocol_min: None,
             protocol_max: None,
             cipher_suites: None,
@@ -325,7 +333,8 @@ fn parse_one_policy(v: &Value) -> Result<ConnectionPolicy> {
     }
 
     let matcher = parse_matchers(obj.get("match"))?;
-    let any_tag = parse_any_tag(obj.get("certificate_selection"))?;
+    let certificate_selection =
+        certificate_selection::parse(obj.get("certificate_selection"))?.map(Arc::new);
 
     let protocol_min = parse_protocol(obj.get("protocol_min"), "protocol_min")?;
     let protocol_max = parse_protocol(obj.get("protocol_max"), "protocol_max")?;
@@ -376,7 +385,7 @@ fn parse_one_policy(v: &Value) -> Result<ConnectionPolicy> {
     Ok(ConnectionPolicy {
         identity: <sha2::Sha256 as sha2::Digest>::digest(serde_json::to_vec(v)?).into(),
         matcher,
-        any_tag,
+        certificate_selection,
         protocol_min,
         protocol_max,
         cipher_suites,
@@ -389,36 +398,6 @@ fn parse_one_policy(v: &Value) -> Result<ConnectionPolicy> {
         insecure_secrets_log,
         handshake_context,
     })
-}
-
-// ─── Certificate Selection / any_tag ─────────────────────────────────────────
-
-fn parse_any_tag(v: Option<&Value>) -> Result<Option<Vec<String>>> {
-    let v = match v {
-        None | Some(Value::Null) => return Ok(None),
-        Some(v) => v,
-    };
-    let obj = require_object(v)?;
-    check_unknown(obj, &["any_tag"], "certificate_selection")?;
-    match obj.get("any_tag") {
-        None => Ok(None),
-        Some(Value::Null) => Ok(None),
-        Some(tag_v) => {
-            let arr = require_array(tag_v, "certificate_selection.any_tag")?;
-            if arr.len() > MAX_ARRAY_LEN {
-                bail!("certificate_selection.any_tag: too many entries (max {MAX_ARRAY_LEN})");
-            }
-            let tags: Vec<String> = arr
-                .iter()
-                .map(|e| {
-                    let s = require_string(e, "certificate_selection.any_tag entry")?;
-                    check_len(s, MAX_STRING_LEN, "certificate_selection.any_tag entry")?;
-                    Ok(s.to_string())
-                })
-                .collect::<Result<_>>()?;
-            Ok(Some(tags))
-        }
-    }
 }
 
 // ─── Match Parsing ────────────────────────────────────────────────────────────

@@ -4,7 +4,7 @@
 pub(super) mod admission;
 mod env;
 mod reply;
-mod spool;
+pub(super) mod spool;
 mod wire;
 
 use super::{
@@ -299,7 +299,11 @@ async fn unix_connect(_path: String) -> Result<Box<dyn Io>> {
 }
 
 async fn root(ctx: &mut Context, config: &FastCgiConfig) -> Result<PathBuf> {
-    let expanded = ctx.expand(config.root.as_deref().unwrap_or("{http.vars.root}"))?;
+    let expanded = crate::http_config::helpers::replace(
+        config.root.as_deref().unwrap_or("{http.vars.root}"),
+        true,
+        |key| Some(ctx.lookup(key).unwrap_or_else(|| ".".to_owned())),
+    )?;
     let path = PathBuf::from(if expanded.is_empty() {
         ".".into()
     } else {
@@ -352,7 +356,6 @@ fn deadline(duration: Option<Duration>) -> Result<Option<Instant>> {
         .transpose()
 }
 
-
 fn has_content(method: &Method, length: Option<u64>) -> bool {
     match length {
         Some(length) => length != 0,
@@ -375,6 +378,116 @@ struct BodyPrefix {
     spool: Option<spool::Spool>,
     length: u64,
     content_length_override: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PreparedLength {
+    config: usize,
+    length: u64,
+    content_length_override: Option<u64>,
+}
+
+/// Locally read prefix storage remains owned until the new one-shot body is
+/// dropped. Merely creating it never upgrades its retry capability to Full.
+struct PrefixedBody {
+    prefix: BodyPrefix,
+    spool_body: Option<Body>,
+    buffered: std::collections::VecDeque<Bytes>,
+    hint: hyper::body::SizeHint,
+}
+
+impl hyper::body::Body for PrefixedBody {
+    type Data = Bytes;
+    type Error = BoxError;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut PollContext<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = &mut *self;
+        let output = if let Some(spool) = &mut this.spool_body {
+            match Pin::new(spool).poll_frame(cx) {
+                Poll::Ready(None) => {
+                    this.spool_body = None;
+                    None
+                }
+                output => Some(output),
+            }
+        } else {
+            None
+        };
+        let output = output.unwrap_or_else(|| {
+            if let Some(bytes) = this.buffered.pop_front() {
+                Poll::Ready(Some(Ok(Frame::data(bytes))))
+            } else {
+                this.prefix.prefix_credits.clear();
+                Pin::new(&mut this.prefix.body).poll_frame(cx)
+            }
+        });
+        if let Poll::Ready(Some(Ok(frame))) = &output {
+            if let Some(bytes) = frame.data_ref() {
+                let n = bytes.len() as u64;
+                let mut hint = hyper::body::SizeHint::new();
+                if let Some(upper) = this.hint.upper() {
+                    hint.set_upper(upper.saturating_sub(n));
+                }
+                hint.set_lower(this.hint.lower().saturating_sub(n));
+                this.hint = hint;
+            }
+        } else if matches!(output, Poll::Ready(None)) {
+            this.hint = hyper::body::SizeHint::with_exact(0);
+        }
+        output
+    }
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.hint
+    }
+    fn is_end_stream(&self) -> bool {
+        self.spool_body.is_none() && self.buffered.is_empty() && self.prefix.body.is_end_stream()
+    }
+}
+
+pub(super) async fn prepare_source(
+    ctx: &mut Context,
+    config: &ProxyConfig,
+    transport: &FastCgiConfig,
+    body: Body,
+) -> Result<super::proxy_replay::ReplaySource> {
+    let replacement = ctx
+        .req()
+        .extensions()
+        .get::<super::request_body::Replacement>()
+        .map(|v| v.length);
+    let known = replacement.or_else(|| body.size_hint().exact());
+    let incremental = super::incremental::is_enabled(ctx.req().headers());
+    let mut source = prefix(ctx, body, known, transport, incremental).await?;
+    let length = PreparedLength {
+        config: config as *const ProxyConfig as usize,
+        length: source.length,
+        content_length_override: source.content_length_override,
+    };
+    let spool_reader = source.spool.take().map(|spool| spool.reader());
+    let stored = spool_reader.as_ref().map_or(0, spool::SpoolReader::len)
+        + source
+            .buffered
+            .iter()
+            .map(|bytes| bytes.len() as u64)
+            .sum::<u64>();
+    let remaining = source.body.size_hint();
+    let mut hint = hyper::body::SizeHint::new();
+    if let Some(upper) = remaining.upper().and_then(|n| n.checked_add(stored)) {
+        hint.set_upper(upper);
+    }
+    hint.set_lower(remaining.lower().saturating_add(stored));
+    let buffered = std::mem::take(&mut source.buffered).into();
+    let body = PrefixedBody {
+        prefix: source,
+        spool_body: spool_reader.map(spool::SpoolReader::into_body),
+        buffered,
+        hint,
+    }
+    .boxed_unsync();
+    ctx.req_mut().extensions_mut().insert(length);
+    Ok(super::proxy_replay::ReplaySource::new(body))
 }
 
 async fn prefix(
@@ -408,9 +521,15 @@ async fn prefix(
                     overwritten = Some(seen);
                     break;
                 }
-                Some(Err(error)) => return Err(failure(if super::request_body::limit_error(error.as_ref()) {
-                    StatusCode::PAYLOAD_TOO_LARGE
-                } else { StatusCode::BAD_REQUEST })),
+                Some(Err(error)) => {
+                    return Err(failure(
+                        if super::request_body::limit_error(error.as_ref()) {
+                            StatusCode::PAYLOAD_TOO_LARGE
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        },
+                    ));
+                }
                 Some(Ok(frame)) => frame,
             };
             if let Ok(mut data) = frame.into_data() {
@@ -475,13 +594,30 @@ async fn prefix(
     })
 }
 
+pub(super) struct ExchangeState {
+    pub(super) transport_started: bool,
+    pub(super) complete_length: Option<u64>,
+    pub(super) transport_began: Option<std::time::Instant>,
+}
+impl ExchangeState {
+    pub(super) fn new(complete_length: Option<u64>) -> Self {
+        Self {
+            transport_started: false,
+            complete_length,
+            transport_began: None,
+        }
+    }
+}
+
 pub(super) async fn serve(
     ctx: &mut Context,
     config: &ProxyConfig,
     transport: &FastCgiConfig,
     dial: String,
     logging: Option<&std::sync::Arc<crate::logging::Logging>>,
+    exchange: &mut ExchangeState,
 ) -> Result<proxy::PreparedResponse> {
+    let probe = ctx.probe;
     let target = Target::parse(&dial)?;
     target.set_placeholders(ctx);
     let path = percent_encoding::percent_decode_str(ctx.req().uri().path()).collect::<Vec<_>>();
@@ -500,16 +636,59 @@ pub(super) async fn serve(
     ctx.body_limit = None;
     let (parts, body) = request.into_parts();
     let incoming_headers = parts.headers.clone();
-    let replacement_length = parts.extensions.get::<super::request_body::Replacement>().map(|body| body.length);
+    let replacement_length = parts
+        .extensions
+        .get::<super::request_body::Replacement>()
+        .map(|body| body.length);
     let known_length = replacement_length.or_else(|| body.size_hint().exact());
+    let prepared = parts
+        .extensions
+        .get::<PreparedLength>()
+        .copied()
+        .filter(|v| v.config == config as *const ProxyConfig as usize);
     ctx.request = Some(Request::from_parts(parts, full(Bytes::new())));
     let is_incremental = super::incremental::is_enabled(&incoming_headers);
-    let mut source = prefix(ctx, body, known_length, transport, is_incremental).await?;
+    let mut source = if let Some(prepared) = prepared {
+        BodyPrefix {
+            body,
+            buffered: Vec::new(),
+            prefix_credits: Vec::new(),
+            spool: None,
+            length: prepared.length,
+            content_length_override: prepared.content_length_override,
+        }
+    } else if let Some(length) = exchange.complete_length {
+        if !probe
+            && is_incremental
+            && transport.explicit_request_buffer
+            && has_content(ctx.req().method(), Some(length))
+        {
+            return Err(failure(StatusCode::NOT_IMPLEMENTED));
+        }
+        BodyPrefix {
+            body,
+            buffered: Vec::new(),
+            prefix_credits: Vec::new(),
+            spool: None,
+            length: if matches!(*ctx.req().method(), Method::HEAD | Method::OPTIONS) {
+                0
+            } else {
+                length
+            },
+            content_length_override: Some(length),
+        }
+    } else {
+        prefix(ctx, body, known_length, transport, is_incremental).await?
+    };
     let mut headers = incoming_headers;
-    if let Some(size) = source.content_length_override.or(replacement_length) {
+    if !probe && let Some(size) = source.content_length_override.or(replacement_length) {
         headers.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
     }
-    let headers = proxy::proxy_headers(ctx, config, headers, false, true)?;
+    let headers = if probe {
+        headers
+    } else {
+        proxy::proxy_headers(ctx, config, headers, false, true, None)?
+    };
     let target_permit = ctx
         .resources
         .fastcgi_admission
@@ -518,7 +697,10 @@ pub(super) async fn serve(
     let budget = ctx.resources.fastcgi.clone();
     let permit = budget.acquire().await.map_err(|e| budget_failure(ctx, e))?;
     let method = ctx.req().method();
-    if !is_incremental && super::incremental::is_enabled(&headers) && has_content(method, known_length) {
+    if !is_incremental
+        && super::incremental::is_enabled(&headers)
+        && has_content(method, known_length)
+    {
         return Err(failure(StatusCode::NOT_IMPLEMENTED));
     }
     let protocol = match ctx.req().version() {
@@ -529,9 +711,13 @@ pub(super) async fn serve(
     };
     let tls = ctx.req().extensions().get::<TlsDetails>().copied();
     let cipher = tls.map(TlsDetails::cipher_name);
-    let host = headers
-        .get(header::HOST)
-        .map_or(ctx.authority.as_bytes(), HeaderValue::as_bytes);
+    let host = if probe {
+        ctx.authority.as_bytes()
+    } else {
+        headers
+            .get(header::HOST)
+            .map_or(ctx.authority.as_bytes(), HeaderValue::as_bytes)
+    };
     let request = env::Request {
         method: method.as_str(),
         path: &path,
@@ -570,12 +756,27 @@ pub(super) async fn serve(
             .ok_or_else(|| failure(StatusCode::BAD_GATEWAY))?;
         overrides.insert(key.clone(), value);
     }
-    let params = env::build(&root, &split, &request, &overrides)
+    if probe {
+        for name in ["REMOTE_ADDR", "REMOTE_HOST", "REMOTE_PORT"] {
+            if !transport.env.contains_key(name) {
+                overrides.insert(name.into(), Vec::new());
+            }
+        }
+    }
+    let mut params = env::build(&root, &split, &request, &overrides)
         .map_err(|_| failure(StatusCode::BAD_REQUEST))?;
+    if probe && !transport.env.contains_key("SERVER_ADDR") {
+        params.remove("SERVER_ADDR");
+    }
     let bodyless = matches!(*method, Method::HEAD | Method::OPTIONS) || source.length == 0;
     let parameters = wire::Parameters::new(&params)?;
+    exchange.transport_started = true;
+    exchange.transport_began = Some(std::time::Instant::now());
     let mut socket = Socket {
-        io: target.connect(ctx, config.dial_timeout).await?,
+        io: target
+            .connect(ctx, config.dial_timeout)
+            .await
+            .map_err(|error| error.context(super::proxy_retry::DialFailure))?,
         _permit: (permit, target_permit),
     };
     let read_limit = deadline(config.read_timeout)?;
@@ -598,9 +799,13 @@ pub(super) async fn serve(
         source.prefix_credits.clear();
         while let Some(frame) = source.body.frame().await {
             if let Ok(data) = frame
-                .map_err(|error| failure(if super::request_body::limit_error(error.as_ref()) {
-                    StatusCode::PAYLOAD_TOO_LARGE
-                } else { StatusCode::BAD_REQUEST }))?
+                .map_err(|error| {
+                    failure(if super::request_body::limit_error(error.as_ref()) {
+                        StatusCode::PAYLOAD_TOO_LARGE
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    })
+                })?
                 .into_data()
             {
                 remaining = send_checked(&mut socket.io, &data, remaining, write_limit).await?;
@@ -651,8 +856,13 @@ pub(super) async fn serve(
         .await?;
     let response_headers = reply.headers;
     let no_body = ctx.req().method() == Method::HEAD
-        || matches!(reply.status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED)
-        || response_headers.get(header::CONTENT_LENGTH).is_some_and(|value| value == "0");
+        || matches!(
+            reply.status,
+            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+        )
+        || response_headers
+            .get(header::CONTENT_LENGTH)
+            .is_some_and(|value| value == "0");
     let reply_body = reply.body;
     let sniff = !no_body
         && !response_headers.contains_key(header::CONTENT_TYPE)
@@ -695,7 +905,12 @@ pub(super) async fn serve(
     *response.status_mut() = reply.status;
     *response.version_mut() = ctx.req().version();
     *response.headers_mut() = response_headers;
-    Ok(proxy::PreparedResponse::fastcgi(response, config.response_headers.clone(), sniff))
+    Ok(proxy::PreparedResponse::fastcgi(
+        response,
+        config.response_headers.clone(),
+        sniff,
+        config.flush_interval,
+    ))
 }
 
 // A completed response does not wait for the FastCGI diagnostic tail. The
@@ -739,4 +954,18 @@ async fn send_checked(
         .ok_or_else(|| failure(StatusCode::BAD_REQUEST))?;
     wire::send_stdin(socket, data, limit).await?;
     Ok(next)
+}
+
+pub(super) async fn probe(
+    request: Request<Body>,
+    resources: Arc<super::resource_budget::Resources>,
+    config: &ProxyConfig,
+    transport: &FastCgiConfig,
+    dial: String,
+    logging: Option<&Arc<crate::logging::Logging>>,
+) -> Result<Response<Body>> {
+    let mut ctx = Context::for_probe(request, resources)?;
+    let mut exchange = ExchangeState::new(ctx.req().body().size_hint().exact());
+    let prepared = serve(&mut ctx, config, transport, dial, logging, &mut exchange).await?;
+    Ok(prepared.response)
 }

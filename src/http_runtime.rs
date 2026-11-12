@@ -10,13 +10,30 @@ mod pressure;
 pub use connection_budget::{ConnectionDiagnostics, ConnectionLimits, ConnectionPoolSnapshot};
 #[path = "http_runtime/auth_cache.rs"]
 pub(crate) mod auth_cache;
+#[path="http_runtime/auth_hash.rs"]
+pub(crate) mod auth_hash;
 #[path = "http_runtime/certificate_provider.rs"]
 mod certificate_provider;
-pub use certificate_provider::ScopedCertificateProvider;
+pub use certificate_provider::{AcquiredCertificate, CertificateRequest, ScopedCertificateProvider};
+pub(crate) use certificate_provider::{WarmSelection, CertificateHello, TransientCertificate};
 #[path = "http_runtime/browse.rs"]
 pub(crate) mod browse;
 #[path = "http_runtime/connection_identity.rs"]
 mod connection_identity;
+#[path = "http_runtime/connection_snapshot.rs"]
+mod connection_snapshot;
+pub(crate) mod pkix_name;
+pub(crate) mod client_cert_facts;
+#[path = "http_runtime/cel_native_cert.rs"]
+mod cel_native_cert;
+mod cel_native_string;
+mod cel_native_map;
+mod cel_native_format;
+mod cel_native_collections;
+#[path="http_runtime/tls_events.rs"]
+mod tls_events;
+pub use tls_events::{ClientHello as EventClientHello,HelloFields as EventClientHelloFields,Address as EventAddress,Transport as EventTransport};
+pub use connection_snapshot::{ConnectionSnapshot, ConnectionMetadata, ConnectionSnapshotError, ConnectionExporter};
 #[path = "http_runtime/connection_sessions.rs"]
 mod connection_sessions;
 #[path = "http_runtime/file_match.rs"]
@@ -29,6 +46,8 @@ pub(crate) mod file_sidecars;
 mod files;
 #[path = "http_runtime/http_redirect.rs"]
 mod http_redirect;
+#[path = "http_runtime/automatic_redirects.rs"]
+mod automatic_redirects;
 #[path = "http_runtime/tls_first_record.rs"]
 mod tls_first_record;
 
@@ -47,6 +66,7 @@ mod lifecycle;
 #[path = "http_runtime/manual_certificates.rs"]
 mod manual_certificates;
 mod tls_policies;
+mod certificate_choice;
 pub use lifecycle::{CommitOutcome, HttpStage, StagedAddress};
 #[path = "http_runtime/listener_lease.rs"]
 mod listener_lease;
@@ -60,8 +80,33 @@ mod path_glob;
 pub(crate) use path_glob::go_path_glob;
 #[path = "http_runtime/proxy.rs"]
 mod proxy;
+#[path = "http_runtime/proxy_buffer.rs"]
+mod proxy_buffer;
+#[path = "http_runtime/proxy_cleanup.rs"]
+mod proxy_cleanup;
+mod proxy_dns_addrselect;
+mod proxy_dns_dial;
+mod proxy_dns_exchange;
+#[path = "http_runtime/proxy_dns_runtime.rs"]
+mod proxy_dns_runtime;
+mod proxy_dns_socket;
+mod proxy_dns_stream;
+#[path = "http_runtime/proxy_dynamic.rs"]
+mod proxy_dynamic;
+#[path = "http_runtime/proxy_flush.rs"]
+mod proxy_flush;
+#[path = "http_runtime/proxy_health.rs"]
+mod proxy_health;
+#[path = "http_runtime/proxy_health_probe.rs"]
+mod proxy_health_probe;
+#[path = "http_runtime/proxy_hosts.rs"]
+mod proxy_hosts;
 #[path = "http_runtime/proxy_policy.rs"]
 pub(crate) mod proxy_policy;
+#[path = "http_runtime/proxy_replay.rs"]
+mod proxy_replay;
+#[path = "http_runtime/proxy_retry.rs"]
+mod proxy_retry;
 #[path = "http_runtime/request_body.rs"]
 mod request_body;
 #[path = "http_runtime/retirement.rs"]
@@ -79,6 +124,10 @@ pub(crate) mod encode_body;
 mod query_match;
 #[path = "http_runtime/request.rs"]
 mod request;
+#[path="http_runtime/response_length.rs"]
+mod response_length;
+#[path="http_runtime/templates.rs"]
+pub(crate) mod templates;
 #[path = "http_runtime/request_regex.rs"]
 mod request_regex;
 #[path = "http_runtime/response_matcher.rs"]
@@ -95,6 +144,8 @@ mod incremental;
 #[path = "http_runtime/zstd_codec.rs"]
 mod zstd_codec;
 
+mod http_dial;
+mod http_dial_io;
 #[path = "http_runtime/rewrite_uri.rs"]
 mod rewrite_uri;
 #[path = "http_runtime/sniff.rs"]
@@ -178,6 +229,7 @@ struct Inner {
 }
 struct Generation {
     id: u64,
+    proxy_cleanup: Option<proxy_cleanup::Reservation>,
     activity: Arc<BusinessGeneration>,
     servers: HashMap<SocketAddr, Arc<ActiveServer>>,
     quic: HashMap<SocketAddr, h3::Listener>,
@@ -201,6 +253,7 @@ impl Generation {
 }
 #[derive(Clone)]
 struct ActiveServer {
+    events: Option<Arc<crate::events::EventsApp>>,
     logging: Option<Arc<crate::logging::Logging>>,
     plan: Arc<ServerConfig>,
     tls: Option<Arc<rustls::ServerConfig>>,
@@ -220,8 +273,9 @@ struct CandidateResolver {
     challenges: Arc<HotCertificateResolver>,
     static_certificates: Arc<HotCertificateResolver>,
     managed: Arc<HotCertificateResolver>,
-    allowed_managed: Vec<String>,
+    allowed_managed: std::collections::HashSet<String>,
     allowed_static: std::collections::HashSet<[u8; 32]>,
+    certificate_selection: Option<Arc<crate::tls_policy::certificate_selection::CertificateFilter>>,
     provider: Option<Arc<dyn ScopedCertificateProvider>>,
 }
 impl fmt::Debug for CandidateResolver {
@@ -242,87 +296,6 @@ impl ResolvesServerCert for CandidateResolver {
             hello.negotiated_version()?,
         )
         .map(|selection| selection.key)
-    }
-}
-impl CandidateResolver {
-    fn select_candidate(
-        &self,
-        sni: Option<&str>,
-        alpn: &[&[u8]],
-        schemes: &[rustls::SignatureScheme],
-    ) -> Option<crate::tls_resolver::CertificateSelection> {
-        self.select_using(sni, alpn, |resolver, sni, allowed| match allowed {
-            Some(identities) => {
-                resolver.select_candidate_filtered(Some(sni), alpn, schemes, identities)
-            }
-            None => resolver.select_candidate(Some(sni), alpn, schemes),
-        })
-    }
-    fn select_for_version(
-        &self,
-        sni: Option<&str>,
-        alpn: &[&[u8]],
-        schemes: &[rustls::SignatureScheme],
-        version: rustls::ProtocolVersion,
-    ) -> Option<crate::tls_resolver::CertificateSelection> {
-        self.select_for_version_with_origin(sni, alpn, schemes, version)
-            .map(|(selection, _)| selection)
-    }
-    fn select_for_version_with_origin(
-        &self,
-        sni: Option<&str>,
-        alpn: &[&[u8]],
-        schemes: &[rustls::SignatureScheme],
-        version: rustls::ProtocolVersion,
-    ) -> Option<(crate::tls_resolver::CertificateSelection, CertificateOrigin)> {
-        let sni = sni?;
-        if alpn.contains(&ACME_ALPN) {
-            return self
-                .challenges
-                .select_for_version(Some(sni), alpn, schemes, version)
-                .map(|key| (key, CertificateOrigin::Proof));
-        }
-        self.static_certificates
-            .select_for_version_filtered(Some(sni), alpn, schemes, version, &self.allowed_static)
-            .map(|key| (key, CertificateOrigin::Manual))
-            .or_else(|| {
-                self.managed_name_allowed(sni)
-                    .then(|| {
-                        self.managed
-                            .select_for_version(Some(sni), alpn, schemes, version)
-                    })
-                    .flatten()
-                    .map(|key| (key, CertificateOrigin::Managed))
-            })
-    }
-    fn managed_name_allowed(&self, sni: &str) -> bool {
-        self.allowed_managed
-            .iter()
-            .any(|name| dns_covers(name, sni))
-            || self
-                .provider
-                .as_ref()
-                .is_some_and(|provider| provider.cached_name(sni))
-    }
-    fn select_using(
-        &self,
-        sni: Option<&str>,
-        alpn: &[&[u8]],
-        mut select: impl FnMut(
-            &HotCertificateResolver,
-            &str,
-            Option<&std::collections::HashSet<[u8; 32]>>,
-        ) -> Option<crate::tls_resolver::CertificateSelection>,
-    ) -> Option<crate::tls_resolver::CertificateSelection> {
-        let sni = sni?;
-        if alpn.contains(&ACME_ALPN) {
-            return select(&self.challenges, sni, None);
-        }
-        select(&self.static_certificates, sni, Some(&self.allowed_static)).or_else(|| {
-            self.managed_name_allowed(sni)
-                .then(|| select(&self.managed, sni, None))
-                .flatten()
-        })
     }
 }
 impl HttpRuntime {
@@ -382,6 +355,7 @@ impl HttpRuntime {
             BusinessGeneration::new(0, crate::http_config::HttpShutdownPolicy::default());
         let initial = Generation {
             id: 0,
+            proxy_cleanup: None,
             activity: activity.clone(),
             servers: HashMap::new(),
             quic: HashMap::new(),
@@ -412,6 +386,26 @@ impl HttpRuntime {
             }),
             control: Arc::new(lifecycle::Lifecycle::new()),
         }
+    }
+    pub(crate) async fn upstream_statuses(&self) -> Result<Vec<crate::admin::UpstreamStatus>> {
+        let hosts=self.inner.resources.proxy_hosts.clone();
+        let generation=self.inner.current.load_full();
+        self.inner.resources.proxy_selection.run(move || {
+            let mut configured=std::collections::HashSet::new();
+            for server in generation.servers.values() {
+                for client in server.clients.values() {
+                    for upstream in &client.config.upstreams {
+                        let address=upstream.dial.as_str();
+                        if !configured.contains(address) {
+                            anyhow::ensure!(configured.len()<65536,"configured upstream status capacity exceeded");
+                            configured.try_reserve(1)?;configured.insert(address);
+                        }
+                    }
+                }
+            }
+            hosts.statuses(&configured)
+        }).await
+            .map_err(|_|anyhow::anyhow!("upstream snapshot worker unavailable"))?
     }
     /// CPU-adaptive HTTP work admission; snapshots contain counts only.
     pub fn resource_diagnostics(&self) -> ResourceDiagnostics {
@@ -595,7 +589,7 @@ async fn prepare_servers(
         .map_err(|_| anyhow::anyhow!("manual inventory worker unavailable"))??;
     let mut retained_client_auth_bytes = 0usize;
     let mut actual_managed = std::collections::BTreeSet::new();
-    let mut redirects = HashMap::<SocketAddr, Vec<Route>>::new();
+    let mut redirect_domains = automatic_redirects::Domains::default();
     let mut output = HashMap::new();
     resources.proxy_hosts.prune();
     for server in &config.servers {
@@ -607,10 +601,6 @@ async fn prepare_servers(
             .flat_map(|certificate| certificate.names.iter())
             .collect::<Vec<_>>();
         let managed_names = if server.manage_certificates
-            && server
-                .tls_policies
-                .iter()
-                .any(|policy| policy.any_tag.as_ref().is_none_or(Vec::is_empty))
         {
             crate::http_config::server_names(server)
                 .into_iter()
@@ -639,36 +629,9 @@ async fn prepare_servers(
                         .any(|s| s.eq_ignore_ascii_case(name))
                 })
                 .collect::<Vec<_>>();
-            if !names.is_empty() {
-                for address in &server.listen {
-                    let redirect_addr = SocketAddr::new(address.ip(), 80);
-                    let port = if address.port() == 443 {
-                        String::new()
-                    } else {
-                        format!(":{}", address.port())
-                    };
-                    redirects.entry(redirect_addr).or_default().push(Route {
-                        group: None,
-                        matchers: vec![vec![Matcher::Host(names.clone())]],
-                        handlers: vec![Handler::StaticResponse {
-                            status: "308".into(),
-                            body: String::new(),
-                            headers: HeaderOps {
-                                set: vec![(
-                                    "Location".into(),
-                                    vec![format!(
-                                        "https://{{http.request.host}}{port}{{http.request.uri}}"
-                                    )],
-                                )],
-                                ..Default::default()
-                            },
-                            close: false,
-                        }],
-                        terminal: true,
-                    });
-                }
-            }
+            redirect_domains.record(&names, &server.listen, config.https_port);
         }
+
         let policies = tls_policies::prepare(
             server,
             tls_policies::Sources {
@@ -687,18 +650,21 @@ async fn prepare_servers(
         let resolver = policies.first().map(|policy| policy.resolver.clone());
         let client_plan = server.clone();
         let proxy_hosts = resources.proxy_hosts.clone();
+        let proxy_dns = resources.proxy_dns.clone();
         let clients = tokio::task::spawn_blocking(move || {
             let mut clients = HashMap::new();
             proxy::prepare_clients(
                 &client_plan.routes,
                 &mut clients,
                 &proxy_hosts,
+                &proxy_dns,
                 logging_available,
             )?;
             proxy::prepare_clients(
                 &client_plan.errors,
                 &mut clients,
                 &proxy_hosts,
+                &proxy_dns,
                 logging_available,
             )?;
             for route in client_plan.named_routes.values() {
@@ -706,6 +672,7 @@ async fn prepare_servers(
                     std::slice::from_ref(route),
                     &mut clients,
                     &proxy_hosts,
+                    &proxy_dns,
                     logging_available,
                 )?;
             }
@@ -714,6 +681,7 @@ async fn prepare_servers(
         .await
         .map_err(|_| anyhow::anyhow!("candidate proxy provisioning task failed"))??;
         let active = ActiveServer {
+            events: config.events.clone(),
             logging: logging.cloned(),
             plan: server.clone(),
             tls,
@@ -727,40 +695,42 @@ async fn prepare_servers(
             output.insert(*addr, Arc::new(active.clone()));
         }
     }
-    for (address, routes) in redirects {
+    for (address, mut routes) in redirect_domains.routes(config.http_port, config.https_port) {
         if let Some(existing) = output.get(&address).cloned() {
             ensure!(
                 !existing.plan.tls,
                 "automatic redirect listener conflicts with TLS"
             );
             let mut plan = (*existing.plan).clone();
-            let split = plan
-                .routes
-                .iter()
-                .position(|route| {
-                    !route
-                        .matchers
-                        .iter()
-                        .flatten()
-                        .any(|m| matches!(m, Matcher::Host(_)))
-                })
-                .unwrap_or(plan.routes.len());
-            plan.routes.splice(split..split, routes);
+            // Automatic named redirects belong after the last explicit Host
+            // route. Without newly managed names, an existing HTTP catch-all
+            // keeps precedence (including manually loaded TLS certificates).
+            if actual_managed.iter().any(|name| !name.ends_with(".ts.net")
+                || config.explicit_tls_subjects.contains(name)) {
+                let split = plan.routes.iter().rposition(|route| route.matchers.iter().flatten()
+                    .any(|matcher| matches!(matcher, Matcher::Host(_))))
+                    .map_or(0, |index| index + 1);
+                plan.routes.splice(split..split, routes);
+            }
+            plan.routes.push(automatic_redirects::fallback(config.http_port, config.https_port));
             let plan = Arc::new(plan);
             let client_plan = plan.clone();
             let proxy_hosts = resources.proxy_hosts.clone();
+            let proxy_dns = resources.proxy_dns.clone();
             let clients = tokio::task::spawn_blocking(move || {
                 let mut clients = HashMap::new();
                 proxy::prepare_clients(
                     &client_plan.routes,
                     &mut clients,
                     &proxy_hosts,
+                    &proxy_dns,
                     logging_available,
                 )?;
                 proxy::prepare_clients(
                     &client_plan.errors,
                     &mut clients,
                     &proxy_hosts,
+                    &proxy_dns,
                     logging_available,
                 )?;
                 for route in client_plan.named_routes.values() {
@@ -768,6 +738,7 @@ async fn prepare_servers(
                         std::slice::from_ref(route),
                         &mut clients,
                         &proxy_hosts,
+                        &proxy_dns,
                         logging_available,
                     )?;
                 }
@@ -778,6 +749,7 @@ async fn prepare_servers(
             output.insert(
                 address,
                 Arc::new(ActiveServer {
+                    events: config.events.clone(),
                     logging: logging.cloned(),
                     plan,
                     tls: None,
@@ -789,6 +761,7 @@ async fn prepare_servers(
                 }),
             );
         } else {
+            routes.push(automatic_redirects::fallback(config.http_port, config.https_port));
             let plan = ServerConfig {
                 access_logs: None,
                 named_routes: Default::default(),
@@ -806,6 +779,7 @@ async fn prepare_servers(
                 client_ip_headers: vec!["X-Forwarded-For".into()],
                 read_header_timeout: Duration::from_secs(60),
                 read_idle_timeout: Duration::from_secs(60),
+                idle_timeout: Some(Duration::from_secs(300)),
                 protocols: vec!["h1".into(), "h2".into()],
                 redirect_http: false,
                 manage_certificates: false,
@@ -816,6 +790,7 @@ async fn prepare_servers(
             output.insert(
                 address,
                 Arc::new(ActiveServer {
+                    events: config.events.clone(),
                     logging: logging.cloned(),
                     plan: Arc::new(plan),
                     tls: None,
@@ -1042,6 +1017,7 @@ async fn accept_loop(
                             admission,
                             negotiated_tls_h2: Some(negotiated_h2),
                             identity: Some(accepted.identity),
+                            tls_snapshot: Some(accepted.snapshot),
                             tls_log,
                             tls_details: Some(tls_details),
                         },
@@ -1071,6 +1047,7 @@ async fn accept_loop(
                             negotiated_tls_h2: None,
                             identity: None,
                             tls_log: None,
+                            tls_snapshot: None,
                             tls_details: None,
                         },
                     )
@@ -1096,19 +1073,7 @@ async fn accept_loop(
                             match result { Ok(Ok(stream)) => stream, _ => return }
                         }
                     };
-                    let Some(executor) = task_inner.tls_executor.get() else {
-                        return;
-                    };
-                    let handshake = executor.execute_proof(
-                        async move {
-                            let stream =
-                                tokio_rustls::TlsAcceptor::from(tls).accept(stream).await?;
-                            drop(stream);
-                            Ok(())
-                        },
-                        proof.cancel.child_token(),
-                        None,
-                    );
+                    let handshake=connection_identity::accept_proof(&task_inner,stream,tls,(peer,local),proof.cancel.child_token());
                     tokio::select! {
                         biased;
                         _ = proof.cancel.cancelled() => {},
@@ -1166,6 +1131,7 @@ struct ConnectionView {
     server: Arc<ActiveServer>,
     negotiated_tls_h2: Option<bool>,
     tls_log: Option<Arc<access_log::Tls>>,
+    tls_snapshot: Option<Arc<ConnectionSnapshot>>,
     tls_details: Option<fastcgi::TlsDetails>,
     identity: Option<Arc<TlsIdentity>>,
 }
@@ -1183,10 +1149,12 @@ async fn serve_connection<I>(
         server,
         negotiated_tls_h2,
         tls_log,
+        tls_snapshot,
         tls_details,
         identity,
         admission,
     } = view;
+    let client_cert_cache = tls_snapshot.as_ref().map(|snapshot| client_cert_facts::Cache::new(snapshot.clone()));
     let tls = negotiated_tls_h2.is_some();
     let svc_inner = inner.clone();
     let svc_server = server.clone();
@@ -1198,6 +1166,8 @@ async fn serve_connection<I>(
         let identity = identity.clone();
         let requested_drain = service_drain.clone();
         let tls_log = tls_log.clone();
+        let tls_snapshot = tls_snapshot.clone();
+        let client_cert_cache = client_cert_cache.clone();
         let admission = admission.clone();
         async move {
             // Count admission before confirming that this exact view is still
@@ -1296,7 +1266,8 @@ async fn serve_connection<I>(
             }
             let activity = business.generation().clone();
             let close_after = verdict == TlsVerdict::ServeThenClose
-                || current.plan.read_header_timeout != accepted_server.plan.read_header_timeout;
+                || current.plan.read_header_timeout != accepted_server.plan.read_header_timeout
+                || current.plan.idle_timeout != accepted_server.plan.idle_timeout;
             let request_h2 = request.version() == http::Version::HTTP_2;
             let metadata = match trailer_policy::prepare_request(&mut request) {
                 Ok(metadata) => metadata,
@@ -1311,6 +1282,10 @@ async fn serve_connection<I>(
             };
             if let Some(tls_log) = tls_log.filter(|_| current.plan.access_logs.is_some()) {
                 request.extensions_mut().insert(tls_log);
+            }
+            if let Some(cache) = client_cert_cache { request.extensions_mut().insert(cache); }
+            if let Some(snapshot) = tls_snapshot {
+                request.extensions_mut().insert(snapshot);
             }
             if let Some(details) = tls_details {
                 request.extensions_mut().insert(details);
@@ -1367,9 +1342,15 @@ async fn serve_connection<I>(
         }
     });
     let mut builder = Builder::new(TokioExecutor::new());
+    // A negotiated H2 connection has the protocol's 10s preface window;
+    // ReadHeaderTimeout is an HTTP/1 head deadline, not an H2 idle deadline.
+    let protocol_timeout = if negotiated_tls_h2 == Some(true) {
+        Duration::from_secs(10)
+    } else { server.plan.read_header_timeout };
+    builder.protocol_read_timeout(protocol_timeout, TokioTimer::new());
     // The original HTTP/2 sender queues informational headers separately
     // from DATA flow control. Limit their aggregate per request/stream.
-    builder.http2().informational_responses(
+    builder.http2().timer(TokioTimer::new()).idle_timeout(server.plan.idle_timeout).informational_responses(
         request::MAX_INFORMATIONAL_HEADS,
         request::MAX_INFORMATIONAL_BYTES,
     );
@@ -1383,7 +1364,8 @@ async fn serve_connection<I>(
         .max_trailer_size(4096)
         .allow_obsolete_multiline_trailers(true)
         .timer(TokioTimer::new())
-        .header_read_timeout(server.plan.read_header_timeout);
+        .header_read_timeout(server.plan.read_header_timeout)
+        .idle_timeout(server.plan.idle_timeout);
     let allow_h2 = server
         .plan
         .protocols
@@ -1460,3 +1442,33 @@ impl Drop for HttpRuntime {
         self.force_shutdown();
     }
 }
+
+#[path = "http_runtime/cel_matcher.rs"]
+pub(crate) mod cel_matcher;
+#[path = "http_runtime/cel_body.rs"]
+mod cel_body;
+
+
+#[path = "http_runtime/placeholder_value.rs"]
+pub(crate) mod placeholder_value;
+
+
+#[path = "http_runtime/proxy_nss.rs"]
+mod proxy_nss;
+
+#[path = "http_runtime/proxy_dns_unix.rs"]
+mod proxy_dns_unix;
+
+#[path = "http_runtime/proxy_dns_search.rs"]
+mod proxy_dns_search;
+
+#[path = "http_runtime/proxy_dns_ip.rs"]
+mod proxy_dns_ip;
+#[cfg(target_vendor = "apple")]
+mod proxy_dns_native;
+
+#[path = "http_runtime/proxy_dns_file.rs"]
+mod proxy_dns_file;
+
+#[path="http_runtime/handler_trace.rs"]
+pub(crate) mod handler_trace;

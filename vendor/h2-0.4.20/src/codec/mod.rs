@@ -30,6 +30,10 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
     B: Buf,
 {
+    pub(crate) fn has_pending_stream_output(&self) -> bool {
+        self.inner.get_ref().has_pending_stream_output()
+    }
+
     /// Returns a new `Codec` with the default max frame size
     #[inline]
     pub fn new(io: T) -> Self {

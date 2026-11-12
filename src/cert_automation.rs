@@ -137,6 +137,31 @@ pub struct ManagedCertificate {
     pub leaf_sha256: String,
     pub obtained: bool,
 }
+/// Explicit lifecycle control results; ordinary handler failures still continue.
+#[derive(Debug)]
+pub struct ObtainEventAborted;
+impl std::fmt::Display for ObtainEventAborted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("certificate obtaining aborted by event handler")
+    }
+}
+impl std::error::Error for ObtainEventAborted {}
+#[derive(Debug)]
+pub struct ObtainEventCancelled;
+impl std::fmt::Display for ObtainEventCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("certificate obtaining event cancelled")
+    }
+}
+impl std::error::Error for ObtainEventCancelled {}
+#[derive(Debug)]
+pub struct ObtainEventRejected(pub crate::events::Reject);
+impl std::fmt::Display for ObtainEventRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "certificate obtaining event rejected: {:?}", self.0)
+    }
+}
+impl std::error::Error for ObtainEventRejected {}
 #[derive(Clone, Debug)]
 pub struct AutomationEvent {
     pub names: Vec<String>,
@@ -195,6 +220,7 @@ pub struct CertificateManager {
     inner: Arc<ManagerInner>,
 }
 struct ManagerInner {
+    lifecycle_events: Option<Arc<crate::events::EventsApp>>,
     store: FsStore,
     registry: ChallengeRegistry,
     resolver: Arc<HotCertificateResolver>,
@@ -378,6 +404,8 @@ struct NetworkPermit<'a> {
 struct Job {
     version: u8,
     names: Vec<String>,
+    #[serde(default)]
+    renewal_names: Option<Vec<String>>,
     directory: String,
     account_location: String,
     #[serde(default)]
@@ -463,10 +491,15 @@ struct MaterialInfo {
     not_before: i64,
     not_after: i64,
     leaf_id: crate::leaf_guard::LeafId,
+    spki_der: Arc<[u8]>,
+    _key_state: Arc<crate::key_compromise::KeyState>,
     leaf_sha256: String,
 }
 #[derive(Clone)]
 struct Replacement {
+    not_after: i64,
+    forced: bool,
+    renewal_names: Option<Vec<String>>,
     certificate_id: Option<String>,
     previous_leaf: String,
     directory: String,
@@ -511,8 +544,8 @@ impl CertificateManager {
             metadata: Value::Null,
         };
         let names = names.to_vec();
-        self.cpu(cancel, move || material_info(&bundle, &names))
-            .await
+        let deny=self.inner.resolver.leaf_guard().key_deny().clone();
+        self.cpu(cancel, move || material_info(&bundle,&names,&deny)).await
     }
     async fn certificate_id(
         &self,
@@ -616,6 +649,7 @@ impl CertificateManager {
         let (events, _) = broadcast::channel(256);
         Ok(Self {
             inner: Arc::new(ManagerInner {
+                lifecycle_events: None,
                 store,
                 registry,
                 resolver,
@@ -631,6 +665,44 @@ impl CertificateManager {
                 recovery_announced: AtomicBool::new(false),
             }),
         })
+    }
+    /// The generation retains this event app; later reloads cannot replace it.
+    pub fn with_events(mut self, events: Option<Arc<crate::events::EventsApp>>) -> Result<Self> {
+        Arc::get_mut(&mut self.inner)
+            .ok_or_else(|| anyhow!("certificate manager already shared"))?
+            .lifecycle_events = events;
+        Ok(self)
+    }
+    async fn emit_obtaining(&self, names: &[String], previous: Option<&Replacement>,
+        cancel: &CancellationToken) -> Result<crate::cert_events::Attempt> {
+        let subject=names.first().ok_or_else(||anyhow!("certificate lifecycle subject missing"))?;
+        let lifecycle=crate::cert_events::Attempt::new(subject,previous.map(|p|p.not_after));
+        let Some(app) = &self.inner.lifecycle_events else { return Ok(lifecycle); };
+        if !app.should_emit("cert_obtaining") {return Ok(lifecycle)}
+        let mut data = crate::events::EventData::new();
+        data.insert("identifier".to_owned(), crate::events::Value::Str(names.first()
+            .ok_or_else(|| anyhow!("certificate lifecycle subject missing"))?.clone()));
+        if let Some(previous) = previous {
+            let remaining = lifecycle.remaining.expect("renewal remaining");
+            data.insert("renewal".to_owned(), crate::events::Value::Bool(true));
+            data.insert("forced".to_owned(), crate::events::Value::Bool(previous.forced));
+            data.insert("remaining".to_owned(), crate::events::Value::Duration(remaining));
+            data.insert("issuer".to_owned(), crate::events::Value::Str(issuer_key(&previous.directory)?));
+        }
+        let emitted = app.emit(crate::events::EmitContext { cancel: cancel.child_token() },
+            "cert_obtaining", "tls", data).await;
+        match emitted.status {
+            crate::events::Status::Completed => Ok(lifecycle),
+            crate::events::Status::Aborted => Err(ObtainEventAborted.into()),
+            crate::events::Status::Cancelled => Err(ObtainEventCancelled.into()),
+            crate::events::Status::Rejected(reason) => {
+                let _ = self.inner.events.send(AutomationEvent {
+                    names: names.to_vec(), kind: "cert_obtaining_rejected",
+                    recovery_issue: Some(json!({"reason": format!("{reason:?}")})),
+                });
+                Err(ObtainEventRejected(reason).into())
+            },
+        }
     }
     pub fn recovery_report(&self) -> Option<RecoveryReport> {
         self.inner.recovered.get().cloned()
@@ -716,6 +788,7 @@ impl CertificateManager {
                     && job.phase == "new_order_intent",
                 "checkpoint is not an ambiguous newOrder"
             );
+            self.validate_job_renewal_scope(&job).await?;
             match resolution {
                 OrderResolution::ConfirmNoOrder => {
                     job.phase = "prepared".to_owned();
@@ -764,7 +837,7 @@ impl CertificateManager {
                         &job.account_location,
                     )?;
                     let resource = session.order(&order_url, &cancel).await?;
-                    validate_order(&resource.value, &names)?;
+                    validate_order(&resource.value, job.renewal_names.as_deref().unwrap_or(&names))?;
                     job.order_url = Some(order_url);
                     job.phase = "order_recovered".to_owned();
                 }
@@ -935,8 +1008,11 @@ impl CertificateManager {
             // network request is necessary. Keep registration/domain lock order.
             let (ready, previous) = self.load_state(&names, &lease, &cancel).await?;
             if ready.is_some() {
-                return Ok((ready, previous, None));
+                return Ok((ready, previous, None, None));
             }
+            // One abortable event precedes new attempt/key/account/order work,
+            // including issuer fallback; already ready material emits nothing.
+            let lifecycle=self.emit_obtaining(&names, previous.as_ref(), &cancel).await?;
             use p256::elliptic_curve::rand_core::RngCore;
             let mut random = [0u8; 32];
             p256::elliptic_curve::rand_core::OsRng.fill_bytes(&mut random);
@@ -960,15 +1036,16 @@ impl CertificateManager {
                 &lease,
             )
             .await?;
-            Ok::<_, anyhow::Error>((None, previous, Some(attempt.attempt_id)))
+            Ok::<_, anyhow::Error>((None, previous, Some(attempt.attempt_id), Some(lifecycle)))
         }
         .await;
         let release = lease.release().await;
-        let (ready, mut previous, attempt_id) = initial?;
+        let (ready, mut previous, attempt_id, lifecycle) = initial?;
         release?;
         if let Some(ready) = ready {
             return Ok(ready);
         }
+        let lifecycle=lifecycle.ok_or_else(||anyhow!("certificate lifecycle attempt missing"))?;
         let attempt_id =
             attempt_id.ok_or_else(|| anyhow!("certificate attempt was not initialized"))?;
         let _ = self.inner.events.send(AutomationEvent {
@@ -1089,6 +1166,7 @@ impl CertificateManager {
                         &account,
                         &lease,
                         (previous.as_ref(), current.as_ref(), &attempt_id),
+                        &lifecycle,
                         &leg_cancel,
                     )
                     .await
@@ -1130,7 +1208,10 @@ impl CertificateManager {
                 }
             }
         }
-        Err(last_error.unwrap_or_else(|| anyhow!("no ACME issuer available")))
+        let error=last_error.unwrap_or_else(|| anyhow!("no ACME issuer available"));
+        let issuer_keys=self.inner.issuers.iter().map(|i|issuer_key(&i.config.wire.directory)).collect::<Result<Vec<_>>>()?;
+        lifecycle.failed(self.inner.lifecycle_events.as_ref(),&issuer_keys,&error,&cancel).await;
+        Err(error)
     }
 
     async fn load_state(
@@ -1195,6 +1276,19 @@ impl CertificateManager {
         Ok(Some(marker))
     }
 
+    async fn validate_job_renewal_scope(&self, job: &Job) -> Result<()> {
+        if let Some(sans) = &job.renewal_names {
+            ensure!(job.names.len() == 1, "Name0 renewal checkpoint has multiple storage subjects");
+            let issuer = issuer_key(&job.directory)?;
+            let name = names_key(&job.names)?;
+            let old = self.inner.store.load_certificate(&issuer, &name).await?
+                .ok_or_else(|| anyhow!("Name0 renewal checkpoint lost its signed resource"))?;
+            ensure!(crate::certstore::name0_renewal_names(&old, &name)?.as_ref() == Some(sans),
+                "Name0 renewal checkpoint changed signed subject scope");
+        }
+        Ok(())
+    }
+
     async fn recover_candidate(
         &self,
         names: &[String],
@@ -1233,6 +1327,7 @@ impl CertificateManager {
                 && job.leaf_key_type == marker.leaf_key_type,
             "active ACME checkpoint identity changed"
         );
+        self.validate_job_renewal_scope(&job).await?;
         if job.phase == "prepared" {
             self.save_job(&marker.job_id, &job, lease).await?;
             return Ok(None);
@@ -1262,7 +1357,8 @@ impl CertificateManager {
                 job.csr_der.clear();
                 job.downloaded_pem = None;
                 self.save_job(&marker.job_id, &job, lease).await?;
-                if self
+                if self.inner.resolver.leaf_guard().key_deny().check_spki_der(&info.spki_der).is_ok()
+                    && self
                     .claim_winner(
                         names,
                         &job.attempt_id,
@@ -1284,10 +1380,15 @@ impl CertificateManager {
             let bundle = CertificateBundle {
                 chain_pem: chain.as_bytes().to_vec(),
                 private_key_pem: Zeroizing::new(job.private_key_pem.as_bytes().to_vec()),
-                metadata: json!({"sans":names,"issuer_data":{"url":job.certificate_url,"ca":job.directory,"account":job.account_location}}),
+                metadata: json!({"sans":job.renewal_names.as_deref().unwrap_or(names),"issuer_data":{"url":job.certificate_url,"ca":job.directory,"account":job.account_location}}),
             };
             let info = self.inspect_material(&bundle, names, cancel).await?;
-            if info.not_after <= now() {
+            let denied = match self.inner.resolver.leaf_guard().key_deny().check_spki_der(&info.spki_der) {
+                Ok(()) => false,
+                Err(error) if error.is::<crate::key_compromise::KeyCompromised>() => true,
+                Err(error) => return Err(error),
+            };
+            if denied || info.not_after <= now() {
                 job.phase = "prepared".to_owned();
                 job.order_url = None;
                 job.certificate_url = None;
@@ -1436,14 +1537,39 @@ impl CertificateManager {
             let now = now();
             // Preserve the attempt/winner selection above. A revocation vetoes
             // cached readiness; it must not select an older issuer's leaf.
-            let revoked = info.not_after > now && self.material_revocation(&info)?.is_some();
+            let denied = match self.inner.resolver.leaf_guard().key_deny().check_spki_der(&info.spki_der) {
+                Ok(()) => false,
+                Err(error) if error.is::<crate::key_compromise::KeyCompromised>() => true,
+                Err(error) => return Err(error),
+            };
+            let revocation = self.material_revocation(&info)?;
+            let revoked = denied || (info.not_after > now && revocation.is_some());
+            let renewal_names = if denied || revocation.as_ref().is_some_and(|v| v.version.reason == Some(1)) {
+                None
+            } else { crate::certstore::name0_renewal_names(&bundle, &key)? };
+            if denied && let Some(lease) = lease {
+                // Scope comes from this manager's current authorized issuer and
+                // actual selected bundle. Do not reconstruct or export a key
+                // retained from another policy/store.
+                let archived = self.inner.store.archive_compromised_key(
+                    &issuer_key(&issuer.config.wire.directory)?, &key,
+                    Sha256::digest(&info.spki_der).into(), names, lease).await;
+                let _ = self.inner.events.send(AutomationEvent {
+                    names: names.to_vec(), kind: match archived {
+                        Ok(true) => "compromised_key_archived",
+                        Ok(false) => "compromised_key_not_archived",
+                        Err(_) => "compromised_key_archive_failed",
+                    }, recovery_issue: None,
+                });
+            }
+
             if matches!(mode, LoadMode::Online | LoadMode::Refresh) && info.not_before > now {
                 // A stored future leaf can mean local clock skew. Preserve the
                 // selected winner/base and wait rather than creating another
                 // order (possibly another future leaf) at each scheduler pass.
                 return Err(FutureCertificate(info.not_before).into());
             }
-            if mode == LoadMode::Online && info.not_before <= now && info.not_after > now {
+            if !denied && mode == LoadMode::Online && info.not_before <= now && info.not_after > now {
                 self.publish(names, &bundle, cancel).await?;
             }
             let certificate_id = { self.certificate_id(&bundle.chain_pem, cancel).await? };
@@ -1481,7 +1607,7 @@ impl CertificateManager {
                     Ok(Some(updated)) => {
                         // Caddy may have persisted an equivalent SAN set in a
                         // different order. Native leases use normalized first SAN.
-                        bundle.metadata["sans"] = json!(names);
+                        if renewal_names.is_none() { bundle.metadata["sans"] = json!(names); }
                         write_ari(
                             &mut bundle.metadata,
                             &updated,
@@ -1512,6 +1638,9 @@ impl CertificateManager {
                 }
             }
             previous_id = Some(Replacement {
+                not_after: info.not_after,
+                forced: revoked,
+                renewal_names,
                 certificate_id,
                 previous_leaf: info.leaf_sha256.clone(),
                 directory: issuer.config.wire.directory.clone(),
@@ -2003,6 +2132,17 @@ impl CertificateManager {
         Ok(session)
     }
 
+    async fn check_job_key(&self, key: &[u8], cancel: &CancellationToken) -> Result<Arc<crate::key_compromise::KeyState>> {
+        let key = Zeroizing::new(key.to_vec());
+        let deny = self.inner.resolver.leaf_guard().key_deny().clone();
+        self.cpu(cancel, move || {
+            let signer = crate::certmagic::signing_key(&key, "pending-managed-key")?;
+            let public = signer.public_key().ok_or_else(|| anyhow!("pending key SPKI unavailable"))?;
+            let key=deny.register_spki(Arc::from(public.as_ref()))?;
+            deny.check_state(&key)?;Ok(key)
+        }).await
+    }
+
     async fn issue(
         &self,
         names: &[String],
@@ -2010,6 +2150,7 @@ impl CertificateManager {
         account: &AccountSession,
         lease: &StorageLease,
         cycle: (Option<&Replacement>, Option<&Reservation>, &str),
+        lifecycle: &crate::cert_events::Attempt,
         cancel: &CancellationToken,
     ) -> Result<ManagedCertificate> {
         let (replacement, reservation, attempt_id) = cycle;
@@ -2024,6 +2165,8 @@ impl CertificateManager {
             })
             .await?;
         let issuer_name = issuer_key(wire.directory_url())?;
+        let renewal_names = replacement.filter(|r| r.directory == wire.directory_url())
+            .and_then(|r| r.renewal_names.clone());
         let replaces = replacement
             .filter(|r| {
                 r.directory == wire.directory_url()
@@ -2045,6 +2188,7 @@ impl CertificateManager {
             .as_bytes(),
         );
         let id = reservation.map(|r| r.job_id.clone()).unwrap_or(computed_id);
+        let mut _job_key_reservation: Option<Arc<crate::key_compromise::KeyState>>=None;
         let mut job = if let Some(value) = self.inner.store.journal_load(&id).await? {
             let job: Job = serde_json::from_value(value)
                 .map_err(|_| anyhow!("invalid ACME order checkpoint"))?;
@@ -2059,14 +2203,15 @@ impl CertificateManager {
             );
             job
         } else {
-            let csr_names = names.to_vec();
+            let csr_names = renewal_names.clone().unwrap_or_else(|| names.to_vec());
             let kind = issuer.config.leaf_key_type;
-            let (csr, key) = self
-                .cpu(cancel, move || generate_csr(&csr_names, kind))
-                .await?;
+            let deny=self.inner.resolver.leaf_guard().key_deny().clone();
+            let (csr,key,reserved_key)=self.cpu(cancel,move ||generate_csr(&csr_names,kind,&deny)).await?;
+            _job_key_reservation=Some(reserved_key);
             let job = Job {
                 version: 1,
                 names: names.to_vec(),
+                renewal_names: renewal_names.clone(),
                 directory: wire.directory_url().to_owned(),
                 account_location: account.location().to_owned(),
                 config_email: issuer.config.email.clone(),
@@ -2088,6 +2233,26 @@ impl CertificateManager {
             self.save_job(&id, &job, lease).await?;
             job
         };
+        self.validate_job_renewal_scope(&job).await?;
+        if job.phase != "stored" {
+            match self.check_job_key(job.private_key_pem.as_bytes(), cancel).await {
+                Ok(key) => _job_key_reservation=Some(key),
+                Err(error) if error.is::<crate::key_compromise::KeyCompromised>() => {
+                    let csr_names = renewal_names.clone().unwrap_or_else(|| names.to_vec()); let kind = issuer.config.leaf_key_type;
+                    let deny=self.inner.resolver.leaf_guard().key_deny().clone();
+                    let (csr,key,reserved_key)=self.cpu(cancel,move ||generate_csr(&csr_names,kind,&deny)).await?;
+                    _job_key_reservation=Some(reserved_key);
+                    job.private_key_pem.zeroize();
+                    job.private_key_pem = std::str::from_utf8(&key)?.to_owned();
+                    job.renewal_names = renewal_names.clone();
+                    job.csr_der = csr; job.phase = "prepared".to_owned();
+                    job.order_url = None; job.certificate_url = None; job.downloaded_pem = None;
+                    job.stored_leaf_sha256 = None; job.poll_after_unix = 0; job.replaces_disabled = false;
+                    self.save_job(&id, &job, lease).await?;
+                },
+                Err(error) => return Err(error),
+            }
+        }
         self.activate_leg(names, attempt_id, &id, lease).await?;
         job.attempt_id = attempt_id.to_owned();
         job.abandoned = false;
@@ -2111,6 +2276,7 @@ impl CertificateManager {
                     && info.not_before <= now()
                     && now() < renew_at
                     && self.material_revocation(&info)?.is_none()
+                    && self.inner.resolver.leaf_guard().key_deny().check_spki_der(&info.spki_der).is_ok()
                 {
                     ensure!(
                         self.claim_winner(
@@ -2130,11 +2296,12 @@ impl CertificateManager {
             }
             // This journal is terminal, never an uncertain CA request. A missing,
             // externally replaced or now-due certificate starts a fresh cycle.
-            let csr_names = names.to_vec();
+            let csr_names = renewal_names.clone().unwrap_or_else(|| names.to_vec());
             let kind = issuer.config.leaf_key_type;
-            let (csr, key) = self
-                .cpu(cancel, move || generate_csr(&csr_names, kind))
-                .await?;
+            let deny=self.inner.resolver.leaf_guard().key_deny().clone();
+            let (csr,key,reserved_key)=self.cpu(cancel,move ||generate_csr(&csr_names,kind,&deny)).await?;
+            _job_key_reservation=Some(reserved_key);
+            job.renewal_names = renewal_names.clone();
             job.csr_der = csr;
             job.private_key_pem = std::str::from_utf8(&key)
                 .map_err(|_| anyhow!("invalid generated certificate key"))?
@@ -2148,6 +2315,7 @@ impl CertificateManager {
             job.replaces_disabled = false;
             self.save_job(&id, &job, lease).await?;
         }
+        let issuance_names = job.renewal_names.clone().unwrap_or_else(|| names.to_vec());
         if job.poll_after_unix > now() {
             let error = anyhow::Error::new(RetryAfterError(job.poll_after_unix));
             return Err(if job.order_url.is_some() {
@@ -2157,7 +2325,7 @@ impl CertificateManager {
             });
         }
         if job.order_url.is_none() && job.phase == "new_order_intent" {
-            let identifiers = names
+            let identifiers = issuance_names
                 .iter()
                 .map(|name| Identifier {
                     kind: "dns".to_owned(),
@@ -2176,7 +2344,7 @@ impl CertificateManager {
         if job.order_url.is_none() {
             job.phase = "new_order_intent".to_owned();
             self.save_job(&id, &job, lease).await?;
-            let identifiers = names
+            let identifiers = issuance_names
                 .iter()
                 .map(|name| Identifier {
                     kind: "dns".to_owned(),
@@ -2263,12 +2431,12 @@ impl CertificateManager {
                 self.save_job(&id,&job,lease).await?;
                 bail!("ACME order is definitively invalid or expired; retry required")
             }
-            validate_order(&resource.value,names)?;
+            validate_order(&resource.value,&issuance_names)?;
             if resource.value.status=="pending" {
                 ensure!(resource.value.authorizations.len()<=100,"ACME authorization count exceeds bounds");
                 for authorization_url in &resource.value.authorizations {
                     let authorization=account.authorization(authorization_url,cancel).await?.value;
-                    ensure!(!authorization.wildcard && authorization.identifier.kind=="dns" && names.contains(&authorization.identifier.value.to_ascii_lowercase()),"ACME authorization identifier changed");
+                    ensure!(!authorization.wildcard && authorization.identifier.kind=="dns" && issuance_names.contains(&authorization.identifier.value.to_ascii_lowercase()),"ACME authorization identifier changed");
                     if authorization.status=="valid" {continue}
                     ensure!(authorization.status=="pending","ACME authorization is not pending or valid");
                     let challenge=issuer.config.challenge_types.iter().find_map(|kind|authorization.challenges.iter().find(|c|c.kind==kind.as_str() && ["pending","processing"].contains(&c.status.as_str())).map(|c|(*kind,c))).ok_or_else(||anyhow!("requested ACME challenge unavailable"))?;
@@ -2278,7 +2446,7 @@ impl CertificateManager {
                     let ttl=self.inner.options.job_timeout.min(Duration::from_secs(3600));
                     let proof=match challenge.0 {
                         ChallengeType::Http01=>self.inner.registry.register_http(&id,&authorization.identifier.value,token,&authorization_value,ttl)?,
-                        ChallengeType::TlsAlpn01=>self.inner.registry.register_tls(&id,&authorization.identifier.value,&authorization_value,ttl)?,
+                        ChallengeType::TlsAlpn01=>self.inner.registry.register_tls_with_events(&id,&authorization.identifier.value,&authorization_value,ttl,self.inner.lifecycle_events.clone(),cancel.child_token())?,
                     };proofs.push(proof);
                     job.phase="authorizing".to_owned();self.save_job(&id,&job,lease).await?;
                     lease.check().await?;let response=account.respond(&challenge.1.url,cancel).await?;resource.retry_after=resource.retry_after.max(response.retry_after);
@@ -2286,10 +2454,11 @@ impl CertificateManager {
                 for _ in 0..240 {
                     if resource.value.status!="pending" {break}
                     self.wait_poll(&id,&mut job,lease,resource.retry_after,cancel).await?;
-                    resource=account.order(&url,cancel).await?;validate_order(&resource.value,names)?;lease.check().await?;
+                    resource=account.order(&url,cancel).await?;validate_order(&resource.value,&issuance_names)?;lease.check().await?;
                 }
             }
             if resource.value.status=="ready" {
+                let _finalize_key_reservation=self.check_job_key(job.private_key_pem.as_bytes(),cancel).await?;
                 job.phase="finalize_intent".to_owned();self.save_job(&id,&job,lease).await?;
                 resource=account.finalize(&resource.value.finalize,&job.csr_der,cancel).await?;
                 job.phase="finalized".to_owned();self.save_job(&id,&job,lease).await?;
@@ -2298,7 +2467,7 @@ impl CertificateManager {
                 if resource.value.status=="valid" {break}
                 ensure!(resource.value.status=="processing" || resource.value.status=="ready","ACME order failed to finalize");
                 self.wait_poll(&id,&mut job,lease,resource.retry_after,cancel).await?;
-                resource=account.order(&url,cancel).await?;validate_order(&resource.value,names)?;lease.check().await?;
+                resource=account.order(&url,cancel).await?;validate_order(&resource.value,&issuance_names)?;lease.check().await?;
             }
             ensure!(resource.value.status=="valid","ACME certificate polling deadline exceeded");
             job.certificate_url=resource.value.certificate;
@@ -2307,12 +2476,14 @@ impl CertificateManager {
                 job.downloaded_pem=Some(String::from_utf8(certificate).map_err(|_|anyhow!("ACME certificate response is not PEM"))?);
                 job.phase="downloaded".to_owned();self.save_job(&id,&job,lease).await?;
             }
-            let mut bundle=CertificateBundle {chain_pem:job.downloaded_pem.as_ref().ok_or_else(||anyhow!("ACME certificate missing"))?.as_bytes().to_vec(),private_key_pem:Zeroizing::new(job.private_key_pem.as_bytes().to_vec()),metadata:json!({"sans":names,"issuer_data":{"url":job.certificate_url,"ca":wire.directory_url(),"account":account.location()}})};
+            let mut bundle=CertificateBundle {chain_pem:job.downloaded_pem.as_ref().ok_or_else(||anyhow!("ACME certificate missing"))?.as_bytes().to_vec(),private_key_pem:Zeroizing::new(job.private_key_pem.as_bytes().to_vec()),metadata:json!({"sans":issuance_names,"issuer_data":{"url":job.certificate_url,"ca":wire.directory_url(),"account":account.location()}})};
             let info=self.inspect_material(&bundle,names,cancel).await?;
+            self.inner.resolver.leaf_guard().key_deny().check_spki_der(&info.spki_der)?;
             ensure!(info.not_before<=now() && info.not_after>now(),"issued certificate is not currently valid");
             if let Some(cert_id)=self.certificate_id(&bundle.chain_pem,cancel).await? && let Ok(Some(ari))=wire.renewal_info(&cert_id,cancel).await {write_ari(&mut bundle.metadata,&ari,&info,self.inner.options.renewal_window_ratio)?;}
             job.stored_leaf_sha256=Some(info.leaf_sha256.clone());job.phase="store_intent".to_owned();self.save_job(&id,&job,lease).await?;
             lease.check().await?;self.inner.store.save_certificate(&issuer_name,&names_key(names)?,&bundle,lease).await?;
+            lifecycle.obtained(self.inner.lifecycle_events.as_ref(),&issuer_name,names,&job.csr_der,cancel).await;
             job.phase="stored".to_owned();job.private_key_pem.zeroize();job.downloaded_pem=None;job.csr_der.clear();self.save_job(&id,&job,lease).await?;
             // Once persisted, publication errors retain this candidate. A later
             // ensure loads it instead of creating or paying for another order.
@@ -2547,6 +2718,7 @@ impl CertificateManager {
         info: MaterialInfo,
         obtained: bool,
     ) -> Result<ManagedCertificate> {
+        self.inner.resolver.leaf_guard().key_deny().check_spki_der(&info.spki_der)?;
         ensure!(
             self.material_revocation(&info)?.is_none(),
             "managed certificate is revoked"
@@ -2769,7 +2941,8 @@ fn validate_order(order: &Order, names: &[String]) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     actual.sort();
     actual.dedup();
-    ensure!(actual == names, "ACME order identifiers changed");
+    let mut expected = names.to_vec(); expected.sort(); expected.dedup();
+    ensure!(actual == expected, "ACME order identifiers changed");
     Ok(())
 }
 /// rcgen's built-in ring key importer caps RSA key sizes. Keep the caller's
@@ -2830,8 +3003,11 @@ impl rcgen::SigningKey for CsrSigner {
 pub(crate) fn generate_csr(
     names: &[String],
     kind: KeyType,
-) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
+    deny: &crate::key_compromise::KeyDeny,
+) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>, Arc<crate::key_compromise::KeyState>)> {
     let (signer, pem) = AccountSigner::generate(kind)?;
+    let reservation=deny.register_spki(Arc::from(signer.public_spki()?))?;
+    deny.check_state(&reservation)?;
     let pair = CsrSigner::new(signer)?;
     let mut params = rcgen::CertificateParams::new(names.to_vec())
         .map_err(|_| anyhow!("invalid certificate CSR names"))?;
@@ -2843,9 +3019,10 @@ pub(crate) fn generate_csr(
             .der()
             .to_vec(),
         pem,
+        reservation,
     ))
 }
-fn material_info(bundle: &CertificateBundle, names: &[String]) -> Result<MaterialInfo> {
+fn material_info(bundle: &CertificateBundle, names: &[String], deny:&crate::key_compromise::KeyDeny) -> Result<MaterialInfo> {
     use x509_parser::extensions::GeneralName;
     let blocks = crate::certmagic::pem_blocks(&bundle.chain_pem, "managed-certificate")?;
     let mut chain = Vec::new();
@@ -2889,10 +3066,14 @@ fn material_info(bundle: &CertificateBundle, names: &[String]) -> Result<Materia
         cert.validity().not_after.timestamp() > cert.validity().not_before.timestamp(),
         "managed certificate lifetime is empty"
     );
+    let spki_der:Arc<[u8]>=Arc::from(cert.public_key().raw);
+    let key_state=deny.register_spki(spki_der.clone())?;
     Ok(MaterialInfo {
         not_before: cert.validity().not_before.timestamp(),
         not_after: cert.validity().not_after.timestamp(),
         leaf_id: crate::leaf_guard::leaf_id(&blocks[0].1),
+        spki_der,
+        _key_state:key_state,
         leaf_sha256: digest(&blocks[0].1),
     })
 }

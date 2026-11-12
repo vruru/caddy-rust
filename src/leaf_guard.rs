@@ -229,6 +229,7 @@ impl LeafState {
 pub struct LeafGuard {
     states: Mutex<HashMap<LeafId, Arc<LeafState>>>,
     capacity: usize,
+    key_deny: Arc<crate::key_compromise::KeyDeny>,
 }
 impl LeafGuard {
     pub fn new(capacity: usize) -> Result<Self> {
@@ -239,8 +240,10 @@ impl LeafGuard {
         Ok(Self {
             states: Mutex::new(HashMap::new()),
             capacity,
+            key_deny: Arc::new(crate::key_compromise::KeyDeny::new()),
         })
     }
+    pub fn key_deny(&self) -> &Arc<crate::key_compromise::KeyDeny> { &self.key_deny }
     fn states(&self) -> Result<MutexGuard<'_, HashMap<LeafId, Arc<LeafState>>>> {
         self.states
             .lock()

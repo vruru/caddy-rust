@@ -461,7 +461,7 @@ fn pdqsort_func<T, F: FnMut(&T, &T) -> bool>(
 
 // --- Public Interface ---
 
-pub(super) fn sort_by<T, F: FnMut(&T, &T) -> bool>(data: &mut [T], mut less: F) {
+pub(crate) fn sort_by<T, F: FnMut(&T, &T) -> bool>(data: &mut [T], mut less: F) {
     let n = data.len();
     if n < 2 {
         return;

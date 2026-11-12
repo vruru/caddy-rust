@@ -282,6 +282,10 @@ where
         }
     }
 
+    pub fn has_pending_stream_output(&self) -> bool {
+        self.codec.has_pending_stream_output()
+    }
+
     /// Checks if there are any streams
     pub fn has_streams(&self) -> bool {
         self.inner.streams.has_streams()

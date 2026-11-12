@@ -54,6 +54,7 @@ struct Root {
     resources: Arc<CertificateResources>,
     http: Arc<HttpRuntime>,
     logging_registry: Arc<LoggingRegistry>,
+    events_registry: Arc<crate::events::HandlerRegistry>,
     serial: AsyncMutex<()>,
     active: ArcSwapOption<Active>,
     retained: Mutex<Option<Predecessor>>,
@@ -66,6 +67,7 @@ struct Root {
     retirements: TaskTracker,
 }
 struct Active {
+    events: Arc<crate::events::EventsApp>,
     generation: u64,
     digest: [u8; 32],
     services: Arc<CertificateServices>,
@@ -86,15 +88,40 @@ struct Prepared {
     needs_client: bool,
     effective_tls_app: bool,
     logging: Option<Value>,
+    events: Value,
 }
 fn failed(category: &'static str) -> AdminError {
     AdminError::new(400, category)
+}
+/// Keep the public category stable while recording the bounded internal cause.
+/// Storage errors omit payloads/paths; do not discard their diagnostic chain.
+fn storage_preparation_failed(logging:&Logging,error:&anyhow::Error)->AdminError {
+    struct Limited(String);
+    impl std::fmt::Write for Limited {
+        fn write_str(&mut self,text:&str)->std::fmt::Result {
+            let mut count=(4096-self.0.len()).min(text.len());
+            while !text.is_char_boundary(count){count-=1;}
+            self.0.push_str(&text[..count]);
+            if count<text.len(){Err(std::fmt::Error)}else{Ok(())}
+        }
+    }
+    let mut cause=Limited(String::with_capacity(4096));
+    let _=std::fmt::write(&mut cause,format_args!("{error:#}"));
+    if let Ok(mut event)=Event::new(Origin::Module{module_id:"tls".into()},"tls",Level::Error,"certificate storage preparation failed") {
+        event.fields.push(Field::new("error",FieldValue::String(cause.0)));
+        let _=logging.try_emit(event);
+    }
+    failed("certificate_storage_preparation_failed")
 }
 fn stopping() -> AdminError {
     AdminError::new(503, "backend_stopping")
 }
 
 impl NativeBackend {
+    /// The current generation's shared event application.
+    pub fn events_app(&self) -> Option<Arc<crate::events::EventsApp>> { self.inner.active.load_full().map(|active| active.events.clone()) }
+    /// Register native event-handler extensions before validating or loading their configuration.
+    pub fn events_registry(&self) -> Arc<crate::events::HandlerRegistry> { self.inner.events_registry.clone() }
     pub fn new(options: RootOptions) -> Result<Self, AdminError> {
         if !options.paths.cwd.is_absolute()
             || !options.paths.default_storage.is_absolute()
@@ -124,6 +151,7 @@ impl NativeBackend {
                 resources,
                 http,
                 logging_registry,
+                events_registry: Arc::new(crate::events::HandlerRegistry::new()),
                 serial: AsyncMutex::new(()),
                 active: ArcSwapOption::empty(),
                 retained: Mutex::new(None),
@@ -147,6 +175,9 @@ impl NativeBackend {
             return Err(stopping());
         }
         let prepared = root.offload(move || prepare(raw)).await?;
+        let raw_events = prepared.events;
+        let registry = root.events_registry.clone();
+        let events = root.offload(move || crate::events::EventsApp::prepare(&raw_events, &registry, Default::default()).map_err(|_| failed("invalid_events_application"))).await?;
         let resolver = Arc::new(HotCertificateResolver::with_leaf_guard(
             root.challenges.clone(),
             root.guard.clone(),
@@ -155,6 +186,7 @@ impl NativeBackend {
         let services = CertificateServices::new(
             prepared.certificates,
             PrepareContext {
+                events: Some(events.clone()),
                 paths: root.options.paths.clone(),
                 resources: root.resources.clone(),
                 challenges: root.challenges.clone(),
@@ -179,18 +211,12 @@ impl NativeBackend {
         let result = async {
             services.set_effective_tls_app(prepared.effective_tls_app)
                 .map_err(|_| failed("certificate_scope_preparation_failed"))?;
-            let (certificates, logging) = tokio::join!(
-                async {
-                    services.prepare(root.candidates.child_token()).await
-                        .map_err(|_| failed("certificate_storage_preparation_failed"))
-                },
-                async {
-                    logging::prepare(prepared.logging, root.logging_registry.clone(), root.candidates.child_token()).await
-                        .map_err(|_| failed("logging_candidate_preparation_failed"))
-                }
-            );
-            certificates?;
-            drop(logging?);
+            let logging=logging::prepare(prepared.logging,root.logging_registry.clone(),root.candidates.child_token()).await
+                .map_err(|_|failed("logging_candidate_preparation_failed"))?;
+            events.set_logging(logging.clone());
+            services.prepare(root.candidates.child_token()).await
+                .map_err(|error|storage_preparation_failed(&logging,&error))?;
+            drop(logging);
             let manual = services
                 .manual_certificates()
                 .map_err(|_| failed("manual_certificate_inventory_failed"))?;
@@ -299,7 +325,11 @@ impl Root {
             return Err(AdminError::new(409, "backend_generation_fenced"));
         }
         let restore_only = transaction.restore_only;
-        let prepared = self.offload(move || prepare(transaction.config)).await?;
+        let mut prepared = self.offload(move || prepare(transaction.config)).await?;
+        let raw_events = prepared.events;
+        let registry = self.events_registry.clone();
+        let events = self.offload(move || crate::events::EventsApp::prepare(&raw_events, &registry, Default::default()).map_err(|_| failed("invalid_events_application"))).await?;
+        prepared.http.events = Some(events.clone());
         let (mode, restore_tickets) = if restore_only {
             let old = self
                 .retained
@@ -329,6 +359,7 @@ impl Root {
         let services = CertificateServices::new(
             prepared.certificates,
             PrepareContext {
+                events: Some(events.clone()),
                 paths: self.options.paths.clone(),
                 resources: self.resources.clone(),
                 challenges: self.challenges.clone(),
@@ -353,18 +384,14 @@ impl Root {
         let result = async {
             services.set_effective_tls_app(prepared.effective_tls_app)
                 .map_err(|_| failed("certificate_scope_preparation_failed"))?;
-            let (certificates, logging) = tokio::join!(
-                async {
-                    services.prepare(self.candidates.child_token()).await
-                        .map_err(|_| failed("certificate_storage_preparation_failed"))
-                },
-                async {
-                    logging::prepare(prepared.logging, self.logging_registry.clone(), self.candidates.child_token()).await
-                        .map_err(|_| failed("logging_candidate_preparation_failed"))
-                }
-            );
-            certificates?;
-            let logging = logging?;
+            let logging=logging::prepare(prepared.logging,self.logging_registry.clone(),self.candidates.child_token()).await
+                .map_err(|_|failed("logging_candidate_preparation_failed"))?;
+            events.set_logging(logging.clone());
+            services.prepare(self.candidates.child_token()).await
+                .map_err(|error|storage_preparation_failed(&logging,&error))?;
+            // Manual loading is Provision-time; configured subscriptions become
+            // active only when the app starts, before business acquisition.
+            events.start().map_err(|_| failed("events_start_failed"))?;
             let manual = services
                 .manual_certificates()
                 .map_err(|_| failed("manual_certificate_inventory_failed"))?;
@@ -435,6 +462,7 @@ impl Root {
                 .stage_ticket_worker(&tickets, epoch)
                 .map_err(|_| failed("session_ticket_worker_preparation_failed"))?;
             let next = Arc::new(Active {
+                events: events.clone(),
                 generation: epoch,
                 digest: prepared.digest,
                 services: services.clone(),
@@ -552,6 +580,27 @@ impl AdminBackend for NativeBackend {
                 _=>Err(failed("unsupported_configuration_adapter")),
             }
         }).await
+        })
+    }
+    fn upstream_statuses(&self)->AdminFuture<Vec<crate::admin::UpstreamStatus>> {
+        let root=self.inner.clone();
+        Box::pin(async move {
+            if root.phase.load(Ordering::Acquire)!=RUNNING{return Err(stopping());}
+            let rows=root.http.upstream_statuses().await.map_err(|_|AdminError::new(503,"upstream_snapshot_unavailable"))?;
+            if root.phase.load(Ordering::Acquire)!=RUNNING{return Err(stopping());}
+            Ok(rows)
+        })
+    }
+    fn pki_info(&self,id:String)->AdminFuture<crate::admin::PkiInfo> {
+        let root=self.inner.clone();
+        Box::pin(async move {
+            if root.phase.load(Ordering::Acquire)!=RUNNING {return Err(stopping());}
+            let active=root.active.load_full().ok_or_else(||AdminError::new(503,"active_configuration_unavailable"))?;
+            let info=active.services.public_ca(id,root.cancel.child_token()).await
+                .map_err(|_|failed("pki_authority_unavailable"))?
+                .ok_or_else(||AdminError::new(404,"pki_authority_not_found"))?;
+            if root.phase.load(Ordering::Acquire)!=RUNNING {return Err(stopping());}
+            Ok(info)
         })
     }
     fn active_identity_client(&self) -> Option<ClientIdentity> {
@@ -796,7 +845,7 @@ fn prepare(raw: Value) -> Result<Prepared, AdminError> {
     if apps.is_some_and(|v| {
         v.as_object().is_none_or(|o| {
             o.keys()
-                .any(|key| !matches!(key.as_str(), "http" | "tls" | "pki"))
+                .any(|key| !matches!(key.as_str(), "http" | "tls" | "pki" | "events"))
         })
     }) {
         return Err(failed("unsupported_application_module"));
@@ -804,7 +853,7 @@ fn prepare(raw: Value) -> Result<Prepared, AdminError> {
     let effective_tls_app = apps.is_some_and(|apps| {
         ["tls","http"].into_iter().any(|name| apps.get(name).is_some_and(|v| !v.is_null()))
     });
-    let certificates = CertificatePlan::parse(CertificateViews {
+    let mut certificates = CertificatePlan::parse(CertificateViews {
         storage: root.get("storage"),
         tls: apps.and_then(|a| a.get("tls")),
         pki: apps.and_then(|a| a.get("pki")),
@@ -822,8 +871,10 @@ fn prepare(raw: Value) -> Result<Prepared, AdminError> {
     applications.insert("http".to_owned(), http);
     let mut document = serde_json::Map::new();
     document.insert("apps".to_owned(), Value::Object(applications));
-    let http = http_config::validate_json(&Value::Object(document))
+    let mut http = http_config::validate_json(&Value::Object(document))
         .map_err(|_| failed("invalid_http_application"))?;
+    certificates.http_application_ports(http.http_port,http.https_port);
+    http.explicit_tls_subjects=certificates.explicit_subjects();
     let digest = Sha256::digest(
         crate::admin_json::encoded_typed(&raw)
             .map_err(|_| failed("invalid_configuration_encoding"))?,
@@ -836,5 +887,6 @@ fn prepare(raw: Value) -> Result<Prepared, AdminError> {
         needs_client: admin::client_identity_required(root)?,
         effective_tls_app,
         logging: root.get("logging").filter(|value| !value.is_null()).cloned(),
+        events: apps.and_then(|a| a.get("events")).filter(|v| !v.is_null()).cloned().unwrap_or_else(|| json!({})),
     })
 }

@@ -3,6 +3,7 @@ pub(crate) struct Route {
     pub(crate) group: Option<String>,
     pub(crate) matchers: Vec<MatcherSet>,
     pub(crate) handlers: Vec<Handler>,
+    pub(crate) trace_modules: Vec<crate::http_runtime::handler_trace::Module>,
     pub(crate) terminal: bool,
 }
 
@@ -10,6 +11,7 @@ pub(crate) type MatcherSet = Vec<Matcher>;
 
 #[derive(Clone)]
 pub(crate) enum Matcher {
+    Expression(std::sync::Arc<crate::http_runtime::cel_matcher::Plan>),
     Host(Vec<String>),
     Path(Vec<String>),
     PathRegex(RequestRegex),
@@ -77,6 +79,7 @@ pub(crate) struct HeaderOps {
 
 #[derive(Clone)]
 pub(crate) enum Handler {
+    Templates(std::sync::Arc<crate::http_runtime::templates::TemplatePlan>),
     StaticError {
         status: String,
         message: String,
@@ -113,6 +116,7 @@ pub(crate) enum Handler {
         defaults: Vec<serde_json::Value>,
     },
     Authentication {
+        algorithm: crate::http_runtime::auth_hash::Algorithm,
         accounts: Vec<Account>,
         realm: String,
         cache: Option<std::sync::Arc<crate::http_runtime::auth_cache::AuthCache>>,
@@ -162,6 +166,7 @@ pub(crate) struct Account {
 
 #[derive(Clone)]
 pub(crate) struct ProxyConfig {
+    pub(crate) ext: std::sync::Arc<super::proxy_ext::ProxyExt>,
     pub(crate) upstreams: Vec<crate::http_runtime::proxy_policy::Upstream>,
     pub(crate) selection: crate::http_runtime::proxy_policy::Selection,
     pub(crate) fastcgi: Option<FastCgiConfig>,
@@ -182,6 +187,7 @@ pub(crate) struct ProxyConfig {
 
 #[derive(Clone)]
 pub(crate) struct ProxyTls {
+    pub(crate) except_ports: Vec<String>,
     pub(crate) server_name: Option<String>,
     pub(crate) insecure_skip_verify: bool,
     pub(crate) root_ca_pem_files: Vec<String>,
@@ -189,6 +195,14 @@ pub(crate) struct ProxyTls {
     pub(crate) client_certificate_file: Option<String>,
     pub(crate) client_certificate_key_file: Option<String>,
     pub(crate) handshake_timeout: Option<std::time::Duration>,
+}
+
+impl ProxyConfig {
+    pub(crate) fn tls_for_port(&self, port: &str) -> Option<&ProxyTls> {
+        self.tls
+            .as_ref()
+            .filter(|tls| !tls.except_ports.iter().any(|except| except == port))
+    }
 }
 
 #[derive(Clone)]

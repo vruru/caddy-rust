@@ -8,12 +8,12 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::task::TaskTracker;
 
 const MAX_TARGETS: usize = 1024;
-pub(super) const MEMORY_UNIT: u64 = 4096;
+pub(in crate::http_runtime) const MEMORY_UNIT: u64 = 4096;
 
 pub(in crate::http_runtime) struct Admission {
     limit_per_target: usize,
     targets: Mutex<HashMap<String, Weak<Semaphore>>>,
-    pub(super) prefix_memory: Arc<Semaphore>,
+    pub(in crate::http_runtime) prefix_memory: Arc<Semaphore>,
     pub(super) diagnostic_slots: Arc<Semaphore>,
     pub(in crate::http_runtime) diagnostics: TaskTracker,
 }

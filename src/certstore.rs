@@ -544,11 +544,10 @@ impl FsStore {
                 .map(|k| c.data.load_pinned(k, k.ends_with(".key")))
                 .collect::<Result<Vec<_>>>()?;
             ensure!(
-                pinned
-                    .iter()
-                    .zip(&before)
-                    .all(|(value, signature)| value.as_ref().map(io::PinnedRead::signature)
-                        == signature.as_ref()),
+                pinned.iter().zip(&before).all(|(value, signature)| value
+                    .as_ref()
+                    .map(io::PinnedRead::signature)
+                    == signature.as_ref()),
                 "storage generation changed during grouped read"
             );
             ensure!(
@@ -952,7 +951,8 @@ impl FsStore {
                     .map_err(|_| anyhow!("invalid certificate metadata JSON"))?;
                 validate_certificate(&crt, &key, &metadata)?;
                 ensure!(
-                    safe(&names_key(&metadata_names(&metadata)?)?) == safe(name),
+                    safe(&names_key(&metadata_names(&metadata)?)?) == safe(name)
+                        || legacy_name0_sans(&crt, &metadata, name)?.is_some(),
                     "certificate metadata storage name mismatch"
                 );
                 Ok(Some(CertificateBundle {
@@ -963,6 +963,59 @@ impl FsStore {
             }
             _ => bail!("partial certificate material; recovery required, reissuance refused"),
         }
+    }
+
+    /// Archive only the actual stored key while holding its certificate-group
+    /// transaction gate and metadata Name0 lease. Never mutates the key/crt/json
+    /// generation, and never grants ordinary writes into certificate namespaces.
+    pub async fn archive_compromised_key(
+        &self, issuer: &str, name: &str, expected_spki: [u8; 32],
+        authorized_names: &[String], lease: &StorageLease,
+    ) -> Result<bool> {
+        let base = cert_path(issuer, name)?;
+        let scoped = self.scoped(&self.tx_key(Kind::Certificate, issuer, name)?,
+            &base, lease).await?;
+        let Some(bundle) = scoped.load_certificate(issuer, name).await? else {
+            return Ok(false);
+        };
+        let normalize = |names: &[String]| -> Result<Vec<String>> {
+            let mut names = names.iter().map(|name| crate::tls_resolver::normalize_certificate_name(name))
+                .collect::<Result<Vec<_>>>()?;
+            names.sort(); names.dedup(); Ok(names)
+        };
+        let sans = normalize(&metadata_names(&bundle.metadata)?)?;
+        let authorized = normalize(authorized_names)?;
+        let legacy = legacy_name0_sans(&bundle.chain_pem, &bundle.metadata, name)?.is_some();
+        ensure!(authorized_names == authorized && (sans == authorized
+            || (legacy && authorized == [name])),
+            "compromised key archive subject scope mismatch");
+        let name0 = authorized.first().ok_or_else(|| anyhow!("archive metadata has no SAN"))?;
+        ensure!(lease.belongs(&scoped.core, &format!("issue_cert_{name0}")),
+            "compromised key archive lease scope mismatch");
+        let blocks = crate::certmagic::pem_blocks(&bundle.chain_pem, "compromised-key-archive")?;
+        let first = blocks.first().ok_or_else(|| anyhow!("archive certificate is missing"))?;
+        let (tail, leaf) = x509_parser::parse_x509_certificate(&first.1)
+            .map_err(|_| anyhow!("invalid compromised archive leaf"))?;
+        ensure!(tail.is_empty(), "trailing compromised archive leaf DER");
+        let actual_spki: [u8; 32] = Sha256::digest(leaf.public_key().raw).into();
+        if actual_spki != expected_spki { return Ok(false); }
+        let primary = format!("{base}.key.compromised");
+        let fallback = format!("{primary}.{}", hash(leaf.public_key().raw));
+        let private_key = bundle.private_key_pem;
+        scoped.fenced(lease, move |c| {
+            let destination = match c.data.load(&primary, true)? {
+                Some(existing) if existing.as_slice() == private_key.as_slice() => return Ok(()),
+                Some(_) => fallback,
+                None => primary,
+            };
+            if let Some(existing) = c.data.load(&destination, true)? {
+                ensure!(existing.as_slice() == private_key.as_slice(),
+                    "compromised private key archive collision");
+                return Ok(());
+            }
+            c.data.store(&destination, &private_key)
+        }).await?;
+        Ok(true)
     }
 
     pub async fn save_certificate(
@@ -981,17 +1034,27 @@ impl FsStore {
             "new certificate is not currently valid"
         );
         let sans = metadata_names(&bundle.metadata)?;
-        ensure!(
-            safe(&names_key(&sans)?) == safe(name),
-            "certificate metadata storage name mismatch"
-        );
-        let expected = format!("issue_cert_{}", sans[0]);
+        let canonical = safe(&names_key(&sans)?) == safe(name);
+        let legacy = if canonical { None } else {
+            Some(legacy_name0_sans(&bundle.chain_pem, &bundle.metadata, name)?
+                .ok_or_else(|| anyhow!("certificate metadata storage name mismatch"))?)
+        };
+        let expected = format!("issue_cert_{}", if legacy.is_some() { name } else { &sans[0] });
         ensure!(
             lease.belongs(&self.core, &expected),
             "certificate lease scope mismatch"
         );
         let base = cert_path(issuer, name)?;
-        self.commit(
+        // The legacy namespace is a replacement capability derived from the
+        // actual old signed resource, held under the same group gate as commit.
+        let scoped = self.scoped(&self.tx_key(Kind::Certificate, issuer, name)?, &base, lease).await?;
+        if let Some(sans) = legacy {
+            let old = scoped.load_certificate(issuer, name).await?
+                .ok_or_else(|| anyhow!("Name0 replacement requires existing signed resource"))?;
+            ensure!(legacy_name0_sans(&old.chain_pem, &old.metadata, name)? == Some(sans),
+                "Name0 replacement changed signed subject scope");
+        }
+        scoped.commit_scoped(
             Kind::Certificate,
             issuer,
             name,
@@ -1683,11 +1746,21 @@ impl FsStore {
                         validate_certificate(&new[1], &new[0], &metadata)?;
                     }
                     let sans = metadata_names(&metadata)?;
-                    ensure!(
-                        safe(&names_key(&sans)?) == safe(&tx.name)
-                            && tx.lock_name == format!("issue_cert_{}", sans[0]),
-                        "transaction certificate scope mismatch"
-                    );
+                    if safe(&names_key(&sans)?) == safe(&tx.name) {
+                        ensure!(tx.lock_name == format!("issue_cert_{}", sans[0]),
+                            "transaction certificate scope mismatch");
+                    } else {
+                        let scope = legacy_name0_sans(&new[1], &metadata, &tx.name)?
+                            .ok_or_else(|| anyhow!("transaction Name0 scope mismatch"))?;
+                        let old_key = old[0].as_ref().ok_or_else(|| anyhow!("missing Name0 anchor key"))?;
+                        let old_crt = old[1].as_ref().ok_or_else(|| anyhow!("missing Name0 anchor leaf"))?;
+                        let old_meta: Value = serde_json::from_slice(old[2].as_ref()
+                            .ok_or_else(|| anyhow!("missing Name0 anchor metadata"))?)?;
+                        validate_certificate(old_crt, old_key, &old_meta)?;
+                        ensure!(legacy_name0_sans(old_crt, &old_meta, &tx.name)? == Some(scope)
+                            && tx.lock_name == format!("issue_cert_{}", tx.name),
+                            "transaction Name0 replacement changed signed subject scope");
+                    }
                 }
             }
             Ok(())
@@ -1821,6 +1894,34 @@ fn staged_key(key: &str, id: &str, suffix: &str, direction: &str) -> Result<Stri
     Ok(format!("transactions/{name}/{id}.{suffix}.{direction}"))
 }
 
+/// CertMagic's ARI writer uses actual Name0 as the directory while persisting
+/// the full signed SAN set. This only recognizes that exact existing shape.
+fn legacy_name0_sans(crt: &[u8], metadata: &Value, name: &str) -> Result<Option<Vec<String>>> {
+    let blocks = crate::certmagic::pem_blocks(crt, "Name0-resource")?;
+    let first = blocks.first().ok_or_else(|| anyhow!("Name0 resource has no leaf"))?;
+    let (tail, leaf) = x509_parser::parse_x509_certificate(&first.1)
+        .map_err(|_| anyhow!("invalid Name0 resource leaf"))?;
+    ensure!(tail.is_empty(), "trailing Name0 leaf DER");
+    let actual_name0 = crate::tls_resolver::certificate_management_name(&leaf)?;
+    if actual_name0.as_ref() != name { return Ok(None); }
+    let normalize = |names: Vec<String>| -> Result<Vec<String>> {
+        let mut names = names.iter().map(|name| crate::tls_resolver::normalize_certificate_name(name))
+            .collect::<Result<Vec<_>>>()?;
+        names.sort(); names.dedup(); Ok(names)
+    };
+    let mut signed = normalize(crate::tls_resolver::certificate_san_names(&leaf)?)?;
+    if signed != normalize(metadata_names(metadata)?)?
+        || !signed.iter().any(|value| value == name) { return Ok(None); }
+    signed.retain(|value| value != name);
+    signed.insert(0, name.to_owned());
+    Ok(Some(signed))
+}
+
+pub(crate) fn name0_renewal_names(bundle: &CertificateBundle, name: &str) -> Result<Option<Vec<String>>> {
+    if safe(&names_key(&metadata_names(&bundle.metadata)?)?) == safe(name) { return Ok(None); }
+    legacy_name0_sans(&bundle.chain_pem, &bundle.metadata, name)
+}
+
 fn metadata_names(metadata: &Value) -> Result<Vec<String>> {
     let values = metadata
         .get("sans")
@@ -1916,14 +2017,20 @@ fn validate_certificate(crt: &[u8], key: &[u8], metadata: &Value) -> Result<()> 
         .general_names
         .iter()
         .filter_map(|g| match g {
-            x509_parser::extensions::GeneralName::DNSName(s) => {
+            x509_parser::extensions::GeneralName::DNSName(s)
+                if s.trim_end_matches('.').parse::<std::net::IpAddr>().is_err() =>
+            {
                 Some(s.trim_end_matches('.').to_ascii_lowercase())
             }
             x509_parser::extensions::GeneralName::IPAddress(b) => match b.len() {
-                4 => Some(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]).to_string()),
+                4 => Some(crate::tls_resolver::canonical_certificate_ip(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3])),
+                )),
                 16 => {
                     let a: [u8; 16] = (*b).try_into().ok()?;
-                    Some(std::net::Ipv6Addr::from(a).to_string())
+                    Some(crate::tls_resolver::canonical_certificate_ip(
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::from(a)),
+                    ))
                 }
                 _ => None,
             },
@@ -1933,7 +2040,7 @@ fn validate_certificate(crt: &[u8], key: &[u8], metadata: &Value) -> Result<()> 
     for name in metadata_names(metadata)? {
         let normalized = name
             .parse::<std::net::IpAddr>()
-            .map(|s| s.to_string())
+            .map(crate::tls_resolver::canonical_certificate_ip)
             .unwrap_or_else(|_| name.trim_end_matches('.').to_ascii_lowercase());
         ensure!(
             actual.contains(&normalized),

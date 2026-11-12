@@ -31,6 +31,8 @@ fn resolve_parent(path: &Path, create: bool) -> Result<Option<Parent>, AdminErro
     if !path.is_absolute() {
         return Err(AdminError::new(400, "admin_path_must_be_absolute"));
     }
+    let normalized=crate::storage_boundary::system_absolute(path).map_err(|_|error())?;
+    let path=normalized.as_ref();
     let parts = path
         .components()
         .filter_map(|c| match c {
@@ -47,6 +49,7 @@ fn resolve_parent(path: &Path, create: bool) -> Result<Option<Parent>, AdminErro
     )
     .map_err(|_| error())?;
     let mut sticky_parent = false;
+    let mut mount_anchor_required=false;
     for (i, component) in parts[..parts.len() - 1].iter().enumerate() {
         let Component::Normal(name) = component else {
             return Err(error());
@@ -73,14 +76,22 @@ fn resolve_parent(path: &Path, create: bool) -> Result<Option<Parent>, AdminErro
         if st.st_uid != uid && st.st_uid != 0 {
             return Err(AdminError::new(400, "foreign_admin_parent_directory"));
         }
+        if mount_anchor_required && !crate::storage_boundary::private_anchor(&st,uid) {
+            return Err(AdminError::new(400,"mount_requires_private_admin_anchor"));
+        }
         let writable = st.st_mode & 0o022 != 0;
-        if writable && !(st.st_mode & 0o1000 != 0 && !final_parent && !sticky_parent) {
+        let shared_mount=if writable && !final_parent && !sticky_parent && !mount_anchor_required {
+            let parent_st=fs::fstat(&fd).map_err(|_|error())?;
+            crate::storage_boundary::shared_mount_root(&parent_st,&st)
+        }else{false};
+        if writable && !(st.st_mode & 0o1000 != 0 && !final_parent && !sticky_parent || shared_mount) {
             return Err(AdminError::new(400, "writable_admin_parent_directory"));
         }
         if sticky_parent && writable {
             return Err(AdminError::new(400, "unsafe_directory_under_sticky_parent"));
         }
-        sticky_parent = writable;
+        sticky_parent = writable && !shared_mount;
+        mount_anchor_required=shared_mount;
         fd = next;
     }
     let st = fs::fstat(&fd).map_err(|_| error())?;

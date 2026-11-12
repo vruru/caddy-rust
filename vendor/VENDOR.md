@@ -104,3 +104,12 @@ packet data without consuming it. The caller decrypts and validates outside
 the endpoint lock, and uses QUIC address validation before doing certificate
 work. Ordinary Quinn acceptance and transport limits are unchanged. External
 upstream test modules are omitted.
+
+## Password hashing
+
+The Argon2id backend is a functional copy of RustCrypto argon2 0.5.3.
+Its original licenses, exact package checksum, omitted development targets and
+opt-in Go-compatible parameter handling are documented in
+[argon2-0.5.3/VENDOR.md](argon2-0.5.3/VENDOR.md). The host reserves scratch
+memory before block allocation and uses the existing bounded authentication
+worker and per-generation HMAC/single-flight cache.

@@ -182,11 +182,17 @@ pub fn verify_response_with_max_age(
     now: i64,
     max_age: std::time::Duration,
 ) -> Result<VerifiedStatus> {
+    verify_response_mode(raw, leaf_der, issuer_der, now, max_age, false)
+}
+
+fn verify_response_mode(
+    raw: &[u8], leaf_der: &[u8], issuer_der: &[u8], now: i64,
+    max_age: std::time::Duration, historical: bool,
+) -> Result<VerifiedStatus> {
     ensure!(
         !raw.is_empty() && raw.len() <= 1024 * 1024,
         "OCSP response length invalid"
     );
-    validate_issuer(leaf_der, issuer_der, now)?;
     let leaf = certificate(leaf_der)?;
     let issuer = certificate(issuer_der)?;
     let outer = OcspResponse::from_der(raw)?;
@@ -206,6 +212,9 @@ pub fn verify_response_with_max_age(
     let basic = BasicOcspResponse::from_der(basic_raw)?;
     ensure!(basic.to_der()? == basic_raw, "non-canonical basic OCSP DER");
     let data = &basic.tbs_response_data;
+    let produced_at = unix(data.produced_at.0.to_unix_duration().as_secs())?;
+    let check_at = if historical { produced_at } else { now };
+    validate_issuer(leaf_der, issuer_der, check_at)?;
     ensure!(
         data.version == Version::default(),
         "unsupported OCSP version"
@@ -257,7 +266,7 @@ pub fn verify_response_with_max_age(
         None => issuer.clone(),
     };
     let delegated = responder.as_raw() != issuer.as_raw();
-    check_time(&responder, now)?;
+    check_time(&responder, check_at)?;
     if delegated {
         ensure!(
             responder.issuer().as_raw() == issuer.subject().as_raw(),
@@ -317,7 +326,7 @@ pub fn verify_response_with_max_age(
         false,
     )?;
     let this_update = unix(single.this_update.0.to_unix_duration().as_secs())?;
-    let produced_at = unix(data.produced_at.0.to_unix_duration().as_secs())?;
+
     let next_update = single
         .next_update
         .map(|v| unix(v.0.to_unix_duration().as_secs()))
@@ -335,7 +344,7 @@ pub fn verify_response_with_max_age(
         produced_at >= this_update.saturating_sub(SKEW),
         "OCSP producedAt predates thisUpdate"
     );
-    if let Some(next) = next_update {
+    if !historical && let Some(next) = next_update {
         ensure!(
             next > this_update && next <= leaf.validity().not_after.timestamp(),
             "invalid OCSP nextUpdate interval"
@@ -346,7 +355,7 @@ pub fn verify_response_with_max_age(
     let valid_until = effective_next
         .min(responder.validity().not_after.timestamp())
         .min(leaf.validity().not_after.timestamp());
-    if valid_until <= now {
+    if !historical && valid_until <= now {
         return Err(ExpiredStatus.into());
     }
     let legacy_signature = is_sha1_oid(&algorithm.algorithm.to_id_string())
@@ -382,6 +391,8 @@ pub fn verify_response_with_max_age(
             )
         }
     };
+    ensure!(!historical || (state == OcspState::Revoked && revocation_reason == Some(1)),
+        "historical proof requires explicit keyCompromise revocation");
     Ok(VerifiedStatus {
         state,
         this_update,
@@ -389,7 +400,7 @@ pub fn verify_response_with_max_age(
         legacy_signature,
         produced_at,
         valid_until,
-        refresh_at: this_update + (valid_until - this_update) / 2,
+        refresh_at: this_update.saturating_add(valid_until.saturating_sub(this_update) / 2),
         revoked_at,
         revocation_reason,
     })
@@ -660,4 +671,85 @@ fn is_sha1_oid(oid: &str) -> bool {
         oid,
         "1.2.840.113549.1.1.5" | "1.3.14.3.2.29" | "1.2.840.10045.4.1"
     )
+}
+
+/// Authenticated historical reason1 fact. This cannot be used as a live staple.
+#[derive(Clone, Debug)]
+pub struct KeyCompromiseProof {
+    spki_id: [u8; 32],
+    leaf_id: [u8; 32],
+    response_id: [u8; 32],
+    spki_der: std::sync::Arc<[u8]>,
+    raw: std::sync::Arc<[u8]>,
+    leaf_der: std::sync::Arc<[u8]>,
+    issuer_der: std::sync::Arc<[u8]>,
+    live_verified: bool,
+    verified_at: Option<i64>,
+}
+impl KeyCompromiseProof {
+    pub fn spki_der(&self) -> &[u8] { &self.spki_der }
+    pub(crate) fn raw(&self) -> &[u8] { &self.raw }
+    pub(crate) fn leaf_der(&self) -> &[u8] { &self.leaf_der }
+    pub(crate) fn issuer_der(&self) -> &[u8] { &self.issuer_der }
+    pub(crate) fn spki_arc(&self) -> std::sync::Arc<[u8]> { self.spki_der.clone() }
+    pub(crate) fn live_verified(&self) -> bool { self.live_verified }
+    pub(crate) fn verified_at(&self) -> Option<i64> { self.verified_at }
+    pub(crate) fn retained_bytes(&self) -> usize { self.spki_der.len()+self.raw.len()+self.leaf_der.len()+self.issuer_der.len() }
+
+    pub fn spki_id(&self) -> [u8; 32] { self.spki_id }
+    pub fn leaf_id(&self) -> [u8; 32] { self.leaf_id }
+    pub fn response_id(&self) -> [u8; 32] { self.response_id }
+}
+pub fn verify_key_compromise_proof(
+    raw: &[u8], leaf_der: &[u8], issuer_der: &[u8], now: i64,
+) -> Result<KeyCompromiseProof> {
+    verify_response_mode(raw, leaf_der, issuer_der, now,
+        std::time::Duration::from_secs(86400), true)?;
+    let leaf = certificate(leaf_der)?;
+    Ok(KeyCompromiseProof {
+        spki_id: Sha256::digest(leaf.public_key().raw).into(),
+        leaf_id: Sha256::digest(leaf_der).into(),
+        response_id: Sha256::digest(raw).into(),
+        spki_der: std::sync::Arc::from(leaf.public_key().raw),
+        raw: std::sync::Arc::from(raw), leaf_der: std::sync::Arc::from(leaf_der),
+        issuer_der: std::sync::Arc::from(issuer_der), live_verified: false, verified_at: None,
+    })
+}
+
+/// A fresh, authenticated reason1 observation. Only the live verifier can seal
+/// this fact; historical verification never manufactures one. Durable evidence
+/// may be unavailable even while the live observation is fully valid.
+#[derive(Debug)]
+pub struct LiveKeyCompromiseFact {
+    spki_der: std::sync::Arc<[u8]>,
+    observed_at: i64,
+    history: Result<KeyCompromiseProof>,
+}
+impl LiveKeyCompromiseFact {
+    pub fn spki_der(&self) -> &[u8] { &self.spki_der }
+    pub(crate) fn into_parts(self) -> (std::sync::Arc<[u8]>, i64, Result<KeyCompromiseProof>) {
+        (self.spki_der, self.observed_at, self.history)
+    }
+}
+
+pub fn verify_response_observation(
+    raw: &[u8], leaf: &[u8], issuer: &[u8], now: i64, max_age: std::time::Duration,
+) -> Result<(VerifiedStatus, Option<LiveKeyCompromiseFact>)> {
+    let status = verify_response_with_max_age(raw, leaf, issuer, now, max_age)?;
+    let fact = if status.state == OcspState::Revoked && status.revocation_reason == Some(1) {
+        let spki_der = std::sync::Arc::from(certificate(leaf)?.public_key().raw);
+        let history = verify_key_compromise_proof(raw, leaf, issuer, now).map(|mut proof| {
+            proof.live_verified = true; proof.verified_at = Some(now); proof
+        });
+        Some(LiveKeyCompromiseFact { spki_der, observed_at: now, history })
+    } else { None };
+    Ok((status, fact))
+}
+
+/// Compatibility view for callers which only consume the historical proof.
+pub fn verify_response_capture(
+    raw: &[u8], leaf: &[u8], issuer: &[u8], now: i64, max_age: std::time::Duration,
+) -> Result<(VerifiedStatus, Option<Result<KeyCompromiseProof>>)> {
+    let (status, fact) = verify_response_observation(raw, leaf, issuer, now, max_age)?;
+    Ok((status, fact.map(|fact| fact.history)))
 }

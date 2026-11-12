@@ -239,6 +239,14 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Close an HTTP/2 connection with no protocol-open streams after this time.
+    /// PING and other control frames do not reset this application idle limit.
+    pub fn idle_timeout(&mut self, timeout: impl Into<Option<Duration>>) -> &mut Self {
+        self.h2_builder.idle_timeout = timeout.into().filter(|d| !d.is_zero());
+        self
+    }
+
+
     /// Set the maximum write buffer size for each HTTP/2 stream.
     ///
     /// Default is currently ~400KB, but may change.

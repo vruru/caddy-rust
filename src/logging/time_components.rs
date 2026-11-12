@@ -2,7 +2,7 @@
 //! Local timezone discovery is supplied by the shared provisioned helper.
 use super::{time_layout::Components, types::Timestamp};
 use anyhow::{Result, ensure};
-pub(super) fn at(time: Timestamp, offset: i32, zone: String) -> Result<Components> {
+pub(crate) fn at(time: Timestamp, offset: i32, zone: String) -> Result<Components> {
     ensure!(time.nanosecond < 1_000_000_000, "invalid log timestamp");
     let seconds = i128::from(time.seconds) + i128::from(offset);
     let day = seconds.div_euclid(86_400);
@@ -33,12 +33,12 @@ pub(super) fn at(time: Timestamp, offset: i32, zone: String) -> Result<Component
         zone,
     })
 }
-pub(super) fn unix_nano(time: Timestamp) -> i64 {
+pub(crate) fn unix_nano(time: Timestamp) -> i64 {
     time.seconds
         .wrapping_mul(1_000_000_000)
         .wrapping_add(i64::from(time.nanosecond))
 }
-pub(super) fn is_zero(time: Timestamp) -> bool {
+pub(crate) fn is_zero(time: Timestamp) -> bool {
     time.seconds == -62_135_596_800 && time.nanosecond == 0
 }
 

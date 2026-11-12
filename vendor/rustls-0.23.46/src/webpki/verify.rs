@@ -183,6 +183,40 @@ pub fn verify_tls12_signature(
     )))
 }
 
+/// Verify a TLS 1.2 CertificateVerify using only an already-parsed public key.
+/// Certificate trust/extension policy belongs to the caller's independent
+/// certificate-verification step, not to proof of private-key possession.
+pub fn verify_tls12_signature_with_raw_key(
+    message: &[u8],
+    spki: &SubjectPublicKeyInfoDer<'_>,
+    dss: &DigitallySignedStruct,
+    supported_schemes: &WebPkiSupportedAlgorithms,
+) -> Result<HandshakeSignatureValid, Error> {
+    if dss.scheme.algorithm().is_none() {
+        return Err(PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme.into());
+    }
+
+    let possible_algs = supported_schemes.convert_scheme(dss.scheme)?;
+    let raw_key = webpki::RawPublicKeyEntity::try_from(spki).map_err(pki_error)?;
+
+    let mut error = None;
+    for alg in possible_algs {
+        match raw_key.verify_signature(*alg, message, dss.signature()) {
+            Err(err @ webpki::Error::UnsupportedSignatureAlgorithmForPublicKeyContext(_)) => {
+                error = Some(err);
+                continue;
+            }
+            Err(e) => return Err(pki_error(e)),
+            Ok(()) => return Ok(HandshakeSignatureValid::assertion()),
+        }
+    }
+
+    #[allow(deprecated)] // The `unwrap_or()` should be statically unreachable
+    Err(pki_error(error.unwrap_or(
+        webpki::Error::UnsupportedSignatureAlgorithmForPublicKey,
+    )))
+}
+
 /// Verify a message signature using the `cert` public key and the first TLS 1.3 compatible
 /// supported scheme.
 ///

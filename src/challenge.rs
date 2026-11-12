@@ -48,6 +48,14 @@ struct TlsProof {
     expires: Instant,
     digest: [u8; 32],
     certificate: Arc<CertifiedKey>,
+    events:Option<Arc<crate::events::EventsApp>>,
+    cancel:tokio_util::sync::CancellationToken,
+}
+impl Drop for TlsProof {fn drop(&mut self){self.cancel.cancel();}}
+#[derive(Clone)]
+pub(crate) struct TlsRegistration {
+    pub generation:u64,pub expires:Instant,pub certificate:Arc<CertifiedKey>,
+    pub events:Option<Arc<crate::events::EventsApp>>,pub cancel:tokio_util::sync::CancellationToken,
 }
 
 /// Non-cloneable proof ownership. Refresh returns a new generation, so an old
@@ -159,6 +167,10 @@ impl ChallengeRegistry {
         authorization: &str,
         ttl: Duration,
     ) -> Result<ChallengeLease> {
+        self.register_tls_with_events(owner,domain,authorization,ttl,None,tokio_util::sync::CancellationToken::new())
+    }
+    pub fn register_tls_with_events(&self,owner:&str,domain:&str,authorization:&str,ttl:Duration,
+        events:Option<Arc<crate::events::EventsApp>>,cancel:tokio_util::sync::CancellationToken)->Result<ChallengeLease> {
         let domain = normalize_domain(domain)?;
         validate_registration(owner, authorization, ttl)?;
         let digest: [u8; 32] = Sha256::digest(authorization.as_bytes()).into();
@@ -195,6 +207,8 @@ impl ChallengeRegistry {
                 expires: now + ttl,
                 digest,
                 certificate,
+                events,
+                cancel:cancel.child_token(),
             },
         );
         Ok(ChallengeLease {
@@ -208,13 +222,22 @@ impl ChallengeRegistry {
     /// The enclosing resolver must reject mixed offers containing acme-tls/1,
     /// rather than letting its normal certificate negotiate the ACME protocol.
     pub fn lookup_tls(&self, sni: &str, offered_alpn: &[&[u8]]) -> Option<Arc<CertifiedKey>> {
+        self.tls_registration(sni,offered_alpn).map(|r|r.certificate)
+    }
+    pub(crate) fn tls_registration(&self,sni:&str,offered_alpn:&[&[u8]])->Option<TlsRegistration> {
         if offered_alpn != [ACME_ALPN] {
             return None;
         }
         let domain = normalize_domain(sni).ok()?;
         let map = self.inner.tls.read().ok()?;
         let proof = map.get(&domain)?;
-        (proof.expires > Instant::now()).then(|| proof.certificate.clone())
+        (proof.expires > Instant::now() && !proof.cancel.is_cancelled()).then(|| TlsRegistration {
+            generation:proof.generation,expires:proof.expires,certificate:proof.certificate.clone(),
+            events:proof.events.clone(),cancel:proof.cancel.clone(),
+        })
+    }
+    pub(crate) fn tls_generation_current(&self,sni:&str,generation:u64)->bool {
+        self.tls_registration(sni,&[ACME_ALPN]).is_some_and(|r|r.generation==generation)
     }
 }
 

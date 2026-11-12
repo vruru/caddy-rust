@@ -207,6 +207,7 @@ fn emit_client_hello_for_retry(
         tls12: config.supports_version(ProtocolVersion::TLSv1_2, cx.common.protocol)
             && !forbids_tls12,
         tls13: config.supports_version(ProtocolVersion::TLSv1_3, cx.common.protocol),
+        ..Default::default()
     };
 
     // should be unreachable thanks to config builder
@@ -985,6 +986,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
 
         // HRR selects the ciphersuite.
         cx.common.suite = Some(cs);
+        cx.common.native_hrr = true;
         cx.common.handshake_kind = Some(HandshakeKind::FullWithHelloRetryRequest);
 
         // If we offered ECH, we need to confirm that the server accepted it.

@@ -1,0 +1,440 @@
+//! Built-in template functions, matching Go's `text/template` builtins.
+//!
+//! In Go, template functions live in a `FuncMap` and are called via
+//! reflection. Here they are boxed closures with the signature [`ValueFunc`].
+//! Built-ins are registered automatically when creating a
+//! [`Template`](crate::Template); custom functions can be added via
+//! [`Template::func`](crate::Template::func).
+//!
+//! # Built-in function reference
+//!
+//! | Category | Functions |
+//! |----------|-----------|
+//! | Comparison | `eq`, `ne`, `lt`, `le`, `gt`, `ge` |
+//! | Logic | `and`, `or`, `not` |
+//! | Output | `print`, `printf`, `println` |
+//! | Data | `len`, `index`, `slice`, `call` |
+//! | Escaping | `html`, `js`, `urlquery` |
+//!
+//! # Escape-function security notes
+//!
+//! The escape builtins match Go's `text/template` exactly, which is **not**
+//! enough for all HTML/JS contexts:
+//!
+//! - `html` does **not** escape backticks and is only safe inside
+//!   double-quoted attribute values or text nodes. Never use it in unquoted
+//!   attributes, `<script>` blocks, or inline event handlers.
+//! - `js` escapes the JS string-literal metacharacters plus `<`, `>`, `&`,
+//!   `=`, control chars, and U+2028 / U+2029 — but produces output suitable
+//!   for embedding inside a JS string literal, not arbitrary JS contexts.
+//! - `urlquery` percent-encodes for query strings (form-encoded: space → `+`)
+//!   and is not a replacement for full URL-construction logic when building
+//!   paths.
+//!
+//! For context-aware escaping use a dedicated `html/template`-style crate.
+
+use alloc::borrow::Cow;
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use core::cmp::Ordering;
+
+use crate::error::{Result, TemplateError};
+use crate::go;
+use crate::value::{Value, ValueFunc};
+
+/// Returns a [`BTreeMap`] containing all built-in template functions.
+///
+/// Called automatically by [`Template::new`](crate::Template::new); extend the
+/// result with [`Template::func`](crate::Template::func) for custom functions.
+pub fn builtins() -> BTreeMap<String, ValueFunc> {
+    let mut m: BTreeMap<String, ValueFunc> = BTreeMap::new();
+
+    // Comparison operators
+    // Go's eq can take 2+ args: eq x y z means x==y || x==z
+
+    m.insert(
+        "eq".into(),
+        Arc::new(|args: &[Value]| {
+            check_min_args("eq", args, 2)?;
+            let first = &args[0];
+            for arg in &args[1..] {
+                if compare_eq(first, arg)? {
+                    return Ok(Value::Bool(true));
+                }
+            }
+            Ok(Value::Bool(false))
+        }),
+    );
+
+    m.insert(
+        "ne".into(),
+        Arc::new(|args: &[Value]| {
+            check_args("ne", args, 2)?;
+            Ok(Value::Bool(!compare_eq(&args[0], &args[1])?))
+        }),
+    );
+
+    m.insert(
+        "lt".into(),
+        Arc::new(|args| cmp_builtin("lt", args, |o| o == Ordering::Less)),
+    );
+    m.insert(
+        "le".into(),
+        Arc::new(|args| cmp_builtin("le", args, |o| o != Ordering::Greater)),
+    );
+    m.insert(
+        "gt".into(),
+        Arc::new(|args| cmp_builtin("gt", args, |o| o == Ordering::Greater)),
+    );
+    m.insert(
+        "ge".into(),
+        Arc::new(|args| cmp_builtin("ge", args, |o| o != Ordering::Less)),
+    );
+
+    // Logic
+    // and: returns first falsy arg, or last arg if all truthy
+    // or:  returns first truthy arg, or last arg if all falsy
+    //
+    // NOTE: and/or are special-cased in the executor for short-circuit
+    // evaluation. These implementations are kept as fallbacks but the
+    // executor calls them with pre-evaluated args only when not
+    // short-circuiting (which shouldn't happen in normal flow).
+
+    m.insert(
+        "and".into(),
+        Arc::new(|args: &[Value]| {
+            check_min_args("and", args, 1)?;
+            for arg in args {
+                if !arg.is_truthy() {
+                    return Ok(arg.clone());
+                }
+            }
+            Ok(args.last().cloned().unwrap_or(Value::Nil))
+        }),
+    );
+
+    m.insert(
+        "or".into(),
+        Arc::new(|args: &[Value]| {
+            check_min_args("or", args, 1)?;
+            for arg in args {
+                if arg.is_truthy() {
+                    return Ok(arg.clone());
+                }
+            }
+            Ok(args.last().cloned().unwrap_or(Value::Nil))
+        }),
+    );
+
+    m.insert(
+        "not".into(),
+        Arc::new(|args: &[Value]| {
+            check_args("not", args, 1)?;
+            Ok(Value::Bool(!args[0].is_truthy()))
+        }),
+    );
+
+    // Output formatting
+    m.insert(
+        "print".into(),
+        Arc::new(|args: &[Value]| join_print(args, false)),
+    );
+
+    m.insert(
+        "println".into(),
+        Arc::new(|args: &[Value]| join_print(args, true)),
+    );
+
+    m.insert(
+        "printf".into(),
+        Arc::new(|args: &[Value]| {
+            check_min_args("printf", args, 1)?;
+            let fmt_str=args[0].as_go_bytes().ok_or_else(||TemplateError::Exec("printf: first argument must be string".into()))?;
+            Ok(Value::from_go_bytes(go::sprintf_bytes(fmt_str,&args[1..])?))
+        }),
+    );
+
+    // Data access
+    m.insert(
+        "len".into(),
+        Arc::new(|args: &[Value]| {
+            check_args("len", args, 1)?;
+            match args[0].len() {
+                Some(n) => Ok(Value::Int(n as i64)),
+                None => Err(TemplateError::Exec(format!(
+                    "len: cannot take length of {}",
+                    args[0]
+                ))),
+            }
+        }),
+    );
+
+    m.insert(
+        "index".into(),
+        Arc::new(|args: &[Value]| {
+            check_min_args("index", args, 2)?;
+            let mut val = args[0].clone();
+            for idx in &args[1..] {
+                val = val.index(idx)?;
+            }
+            Ok(val)
+        }),
+    );
+
+    // slice: Go allows 1-4 args total:
+    // slice x, slice x i, slice x i j, slice x i j k
+    m.insert(
+        "slice".into(),
+        Arc::new(|args: &[Value]| {
+            check_min_args("slice", args, 1)?;
+            if args.len() > 4 {
+                return Err(TemplateError::Exec(format!(
+                    "wrong number of args for slice: want 1-4 got {}",
+                    args.len()
+                )));
+            }
+
+            let v = &args[0];
+            match args.len() {
+                1 => v.slice(None, None),
+                2 => {
+                    let start = parse_slice_index(&args[1])?;
+                    v.slice(Some(start), None)
+                }
+                3 => {
+                    let start = parse_slice_index(&args[1])?;
+                    let end = parse_slice_index(&args[2])?;
+                    v.slice(Some(start), Some(end))
+                }
+                4 => {
+                    // 3-index slice. We only support this for lists (like slices),
+                    // and we validate i <= j <= k <= len.
+                    let start = parse_slice_index(&args[1])?;
+                    let end = parse_slice_index(&args[2])?;
+                    let max = parse_slice_index(&args[3])?;
+                    if start<0||end<0||max<0{return Err(TemplateError::Exec("slice: index out of range".into()));}
+                    let slice=match v{Value::List(v)=>crate::TypedSlice::from_list(v.clone()),Value::Slice(s)=>s.clone(),_=>return Err(TemplateError::Exec("slice: cannot 3-index slice this type".into()))};
+                    Ok(Value::Slice(slice.reslice3(start as usize,end as usize,max as usize)?))
+                }
+                #[allow(
+                    clippy::unreachable,
+                    reason = "args.len() is in 1..=4: bounded by check_min_args and the `> 4` bailout above"
+                )]
+                _ => unreachable!(),
+            }
+        }),
+    );
+
+    // call: invoke a function-typed value
+    m.insert(
+        "call".into(),
+        Arc::new(|args: &[Value]| {
+            check_min_args("call", args, 1)?;
+            match &args[0] {
+                Value::Function(f) => f(&args[1..]),
+                Value::Nil => Err(TemplateError::Exec("call of nil".into())),
+                other => Err(TemplateError::Exec(format!(
+                    "call: non-function value of type {}",
+                    other.type_name()
+                ))),
+            }
+        }),
+    );
+
+    // HTML/JS/URL escaping
+    m.insert(
+        "html".into(),
+        Arc::new(|args: &[Value]| {
+            check_args("html", args, 1)?;
+            let s = stringify_for_escaper(&args[0]);
+            Ok(Value::String(Arc::from(go::html_escape(&s))))
+        }),
+    );
+
+    m.insert(
+        "js".into(),
+        Arc::new(|args: &[Value]| {
+            check_args("js", args, 1)?;
+            let s = stringify_for_escaper(&args[0]);
+            Ok(Value::String(Arc::from(go::js_escape(&s))))
+        }),
+    );
+
+    m.insert(
+        "urlquery".into(),
+        Arc::new(|args: &[Value]| {
+            check_args("urlquery", args, 1)?;
+            let s = stringify_for_escaper(&args[0]);
+            Ok(Value::String(Arc::from(go::url_encode(&s))))
+        }),
+    );
+
+    m
+}
+
+/// Body shared by the `print` and `println` builtins. When `as_println` is
+/// true, args are always space-separated and a trailing newline is appended;
+/// otherwise spaces follow Go's [`go::needs_space`] rule.
+fn join_print(args:&[Value],as_println:bool)->Result<Value>{
+    Ok(Value::from_go_bytes(go::sprint_bytes(args,as_println)?))
+}
+
+/// Stringify a value the way Go's `evalArgs` does for `html` / `js` /
+/// `urlquery`: nil renders as `<no value>` (the template engine's missing-
+/// value sentinel), not `<nil>` (which is what `fmt.Sprint(nil)` gives).
+///
+/// Returns `Cow` so the `Value::String` case — the typical input — borrows
+/// instead of cloning.
+fn stringify_for_escaper(v: &Value) -> Cow<'_, str> {
+    match v {
+        Value::Nil => Cow::Borrowed("<no value>"),
+        Value::String(s) => Cow::Borrowed(s.as_ref()),
+        #[cfg(feature = "html")]
+        Value::Safe { s, .. } => Cow::Borrowed(s.as_ref()),
+        _ => Cow::Owned(format!("{}", v)),
+    }
+}
+
+// Argument validation helpers
+fn check_args(name: &str, args: &[Value], expected: usize) -> Result<()> {
+    if args.len() != expected {
+        return Err(TemplateError::ArgCount {
+            name: name.to_string(),
+            expected,
+            got: args.len(),
+        });
+    }
+    Ok(())
+}
+
+fn check_min_args(name: &str, args: &[Value], min: usize) -> Result<()> {
+    if args.len() < min {
+        return Err(TemplateError::ArgCount {
+            name: name.to_string(),
+            expected: min,
+            got: args.len(),
+        });
+    }
+    Ok(())
+}
+
+fn compare_eq(left: &Value, right: &Value) -> Result<bool> {
+    if let(Some(a),Some(b))=(left.as_go_bytes(),right.as_go_bytes()){return Ok(a==b);}
+    let map=|v:&Value|{#[cfg(feature="std")]if matches!(v,Value::SharedMap(_)|Value::GenericMap(_)){return true;}matches!(v,Value::Map(_))||matches!(v,Value::Object(o)if o.map_view.is_some())};
+    let untyped=|v:&Value|matches!(v,Value::Nil|Value::NilError);
+    if (map(left)||untyped(left))&&(map(right)||untyped(right))&&(left.is_go_nil()||right.is_go_nil()){return Ok(left.is_go_nil()==right.is_go_nil());}
+    if map(left)&&map(right){return Err(TemplateError::Exec("non-comparable type map".into()));}
+    let slice=|v:&Value|matches!(v,Value::Slice(_)|Value::List(_));
+    if (slice(left)||untyped(left))&&(slice(right)||untyped(right)){if left.is_go_nil()||right.is_go_nil(){return Ok(left.is_go_nil()==right.is_go_nil());}return Err(TemplateError::Exec("non-comparable type slice".into()));}
+    let pointer=|v:&Value|matches!(v,Value::Object(o)if o.go_type.is_some_and(|name|name.starts_with('*')));
+    if (pointer(left)||untyped(left))&&(pointer(right)||untyped(right))&&(left.is_go_nil()||right.is_go_nil()){return Ok(left.is_go_nil()==right.is_go_nil());}
+    if let(Some(a),Some(b))=(left.as_go_integer(),right.as_go_integer()){return Ok(a==b);}
+    match (left, right) {
+        (Value::Nil, Value::Nil) => Ok(true),
+        (Value::Nil, _) | (_, Value::Nil) => Ok(false),
+        (Value::Object(a), Value::Object(b)) => {
+            if a.map_view.is_some() || b.map_view.is_some() { return Err(TemplateError::Exec("non-comparable type map".into())); }
+            let pointer = |o: &crate::Object| o.go_type.is_some_and(|n| n.starts_with('*'));
+            if pointer(a) != pointer(b) { return Err(TemplateError::Exec("incompatible host comparison kinds".into())); }
+            if a.go_type != b.go_type { return Ok(false); }
+            if pointer(a) { return Ok(a.pointer_key()==b.pointer_key()); }
+            a.equal.map(|equal| equal(a,b)).ok_or_else(||TemplateError::Exec("non-comparable host type".into()))
+        },
+        (Value::Bool(a), Value::Bool(b)) => Ok(a == b),
+        (Value::Int(a) | Value::Int64(a), Value::Int(b) | Value::Int64(b)) => Ok(a == b),
+        (Value::Uint(a), Value::Uint(b)) => Ok(a == b),
+        // Go's `eq` compares int and uint regardless of sign: a negative int is
+        // never equal to any uint; otherwise compare magnitudes as u64.
+        (Value::Int(a) | Value::Int64(a), Value::Uint(b)) => Ok(*a >= 0 && *a as u64 == *b),
+        (Value::Uint(a), Value::Int(b) | Value::Int64(b)) => Ok(*b >= 0 && *a == *b as u64),
+        (Value::Float(a), Value::Float(b)) => Ok(a == b),
+        (Value::String(a), Value::String(b)) => Ok(a == b),
+        (Value::List(_), Value::List(_))
+        | (Value::Map(_), Value::Map(_))
+        | (Value::Function(_), Value::Function(_)) => Err(TemplateError::Exec(format!(
+            "non-comparable type {}",
+            left.type_name()
+        ))),
+        #[cfg(feature = "std")]
+        (Value::SharedMap(_), Value::Map(_) | Value::SharedMap(_)) |
+        (Value::Map(_), Value::SharedMap(_)) => Err(TemplateError::Exec("non-comparable type map".into())),
+        // Trusted content (`Value::Safe`) compares by its underlying string,
+        // ignoring the content kind — matching Go's `eq`, which compares
+        // template.HTML/JS/... as their string basicKind.
+        #[cfg(feature = "html")]
+        (Value::Safe { s: a, .. }, Value::Safe { s: b, .. }) => Ok(a == b),
+        #[cfg(feature = "html")]
+        (Value::Safe { s: a, .. }, Value::String(b))
+        | (Value::String(b), Value::Safe { s: a, .. }) => Ok(a == b),
+        _ => Err(TemplateError::Exec(format!(
+            "incompatible types for comparison: {} and {}",
+            left.type_name(),
+            right.type_name()
+        ))),
+    }
+}
+
+fn cmp_builtin(name: &str, args: &[Value], pred: fn(Ordering) -> bool) -> Result<Value> {
+    check_args(name, args, 2)?;
+    Ok(Value::Bool(pred(compare_order(&args[0], &args[1])?)))
+}
+
+fn compare_order(left: &Value, right: &Value) -> Result<Ordering> {
+    if let(Some(a),Some(b))=(left.as_go_bytes(),right.as_go_bytes()){return Ok(a.cmp(b));}
+    if let(Some(a),Some(b))=(left.as_go_integer(),right.as_go_integer()){return Ok(a.cmp(&b));}
+    match (left, right) {
+        (Value::Int(a) | Value::Int64(a), Value::Int(b) | Value::Int64(b)) => Ok(a.cmp(b)),
+        (Value::Uint(a), Value::Uint(b)) => Ok(a.cmp(b)),
+        // Go's ordering builtins compare int and uint regardless of sign: a
+        // negative int orders below any uint; otherwise compare as u64. These
+        // arms must precede the `type_name` mismatch guard below, or the
+        // distinct "int"/"uint" names would short-circuit to an error.
+        (Value::Int(a) | Value::Int64(a), Value::Uint(b)) => Ok(if *a < 0 {
+            Ordering::Less
+        } else {
+            (*a as u64).cmp(b)
+        }),
+        (Value::Uint(a), Value::Int(b) | Value::Int64(b)) => Ok(if *b < 0 {
+            Ordering::Greater
+        } else {
+            a.cmp(&(*b as u64))
+        }),
+        (Value::Float(a), Value::Float(b)) => a
+            .partial_cmp(b)
+            .ok_or_else(|| TemplateError::Exec("invalid type for comparison".into())),
+        (Value::String(a), Value::String(b)) => Ok(a.cmp(b)),
+        // Trusted content orders by its underlying string (see `compare_eq`).
+        #[cfg(feature = "html")]
+        (Value::Safe { s: a, .. }, Value::Safe { s: b, .. }) => Ok(a.cmp(b)),
+        #[cfg(feature = "html")]
+        (Value::Safe { s: a, .. }, Value::String(b)) => Ok(a.cmp(b)),
+        #[cfg(feature = "html")]
+        (Value::String(a), Value::Safe { s: b, .. }) => Ok(a.cmp(b)),
+        _ if left.type_name() != right.type_name() => Err(TemplateError::Exec(format!(
+            "incompatible types for comparison: {} and {}",
+            left.type_name(),
+            right.type_name()
+        ))),
+        _ => Err(TemplateError::Exec("invalid type for comparison".into())),
+    }
+}
+
+fn parse_slice_index(arg: &Value) -> Result<i64> {
+    match arg {
+        Value::Int(n) | Value::Int64(n) | Value::NamedInt64(n,_) => Ok(*n),
+        // A uint index is valid as long as it fits in i64 (slice bounds are
+        // i64-resolved); a value above i64::MAX can never be a valid offset.
+        Value::Uint(n) if *n <= i64::MAX as u64 => Ok(*n as i64),
+        Value::Uint32(n) => Ok(i64::from(*n)),
+        Value::Uint8(n)=>Ok(i64::from(*n)),Value::Uint16(n)=>Ok(i64::from(*n)),
+        Value::Uint(n) => Err(TemplateError::Exec(format!(
+            "slice: index out of range: {n}"
+        ))),
+        _ => Err(TemplateError::Exec(format!(
+            "slice: index must be integer, got {}",
+            arg.type_name()
+        ))),
+    }
+}

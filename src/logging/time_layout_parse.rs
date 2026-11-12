@@ -26,6 +26,9 @@ struct Parsed<'a> {
 }
 
 pub(super) fn parse(layout: &Layout, input: &str, local: bool) -> Option<Timestamp> {
+    parse_time(layout,input,local).map(|parsed|parsed.timestamp)
+}
+pub(super) fn parse_time(layout: &Layout, input: &str, local: bool) -> Option<super::ParsedTime> {
     let mut cursor = Cursor(input.as_bytes());
     let mut value = Parsed::default();
     let mut tokens = layout
@@ -139,7 +142,7 @@ pub(super) fn parse(layout: &Layout, input: &str, local: bool) -> Option<Timesta
     value.finish(local)
 }
 impl Parsed<'_> {
-    fn finish(mut self, local: bool) -> Option<Timestamp> {
+    fn finish(mut self, local: bool) -> Option<super::ParsedTime> {
         if self.pm && self.hour < 12 {
             self.hour += 12;
         } else if self.am && self.hour == 12 {
@@ -178,9 +181,16 @@ impl Parsed<'_> {
         } else {
             civil
         };
-        Some(Timestamp {
-            seconds,
-            nanosecond: self.nanos,
+        let offset = i32::try_from(civil.checked_sub(seconds)?).ok()?;
+        let use_local = local && !self.utc && match (self.offset.filter(|&x|x != -1),self.zone) {
+            (None,None)=>true,
+            (Some(expected),name)=>crate::http_config::helpers::local_zone_info(seconds).is_some_and(|(actual,abbreviation)|actual==expected && name.is_none_or(|n|n==abbreviation)),
+            (None,Some(name))=>local_named_offset(civil,name).is_some(),
+        };
+        Some(super::ParsedTime {
+            timestamp:Timestamp { seconds, nanosecond:self.nanos },
+            local:use_local, offset,
+            zone:if self.utc {"UTC".into()}else{self.zone.unwrap_or("").into()},
         })
     }
 }

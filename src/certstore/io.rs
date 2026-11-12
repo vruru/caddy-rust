@@ -124,6 +124,19 @@ pub(super) fn directory(
     uid: u32,
     create: bool,
 ) -> Result<Option<OwnedFd>> {
+    Ok(directory_at(parent, name, uid, create, false)?.map(|(fd, _)| fd))
+}
+
+/// A shared mount or sticky directory is a traversal boundary, never a store.
+/// The caller must require an immediately following private, user-owned anchor.
+/// All paths below an admitted Root continue through strict `directory` above.
+fn directory_at(
+    parent: &OwnedFd,
+    name: &str,
+    uid: u32,
+    create: bool,
+    allow_mount_ancestor: bool,
+) -> Result<Option<(OwnedFd, bool)>> {
     let name = cstr(name)?;
     if create {
         match fs::mkdirat(parent, &name, Mode::from_raw_mode(0o700)) {
@@ -144,8 +157,16 @@ pub(super) fn directory(
         Err(rustix::io::Errno::NOENT) if !create => return Ok(None),
         Err(_) => bail!("storage directory unavailable or symlink"),
     };
-    validate_dir(&fd, uid, false, false)?;
-    Ok(Some(fd))
+    let mount_ancestor = if let Err(error) = validate_dir(&fd, uid, false, false) {
+        if !allow_mount_ancestor { return Err(error); }
+        let st=fs::fstat(&fd).map_err(|_|anyhow!("mount ancestor metadata unavailable"))?;
+        let parent_st=fs::fstat(parent).map_err(|_|anyhow!("mount parent metadata unavailable"))?;
+        ensure!(crate::storage_boundary::shared_mount_root(&parent_st,&st)
+            || crate::storage_boundary::sticky_parent(&st,uid),
+            "unsafe storage ancestor");
+        true
+    } else { false };
+    Ok(Some((fd, mount_ancestor)))
 }
 
 impl Root {
@@ -201,6 +222,8 @@ impl Root {
     }
     pub fn open(path: &Path, private: bool) -> Result<Self> {
         ensure!(path.is_absolute(), "storage root must be absolute");
+        let normalized=crate::storage_boundary::system_absolute(path).map_err(|_|anyhow!("storage system directory unavailable"))?;
+        let path=normalized.as_ref();
         let uid = rustix::process::geteuid().as_raw();
         let mut fd = fs::open(
             "/",
@@ -209,7 +232,9 @@ impl Root {
         )
         .map_err(|_| anyhow!("storage root unavailable"))?;
         let mut count = 0usize;
-        for component in path.components() {
+        let mut private_anchor_required=false;
+        let mut components=path.components().peekable();
+        while let Some(component)=components.next() {
             match component {
                 Component::RootDir => {}
                 Component::Normal(name) => {
@@ -218,12 +243,20 @@ impl Root {
                     let name = name
                         .to_str()
                         .ok_or_else(|| anyhow!("storage component is not UTF-8"))?;
-                    fd = directory(&fd, name, uid, true)?
-                        .ok_or_else(|| anyhow!("storage root unavailable"))?;
+                    let (next,mount_ancestor)=directory_at(&fd,name,uid,true,
+                        components.peek().is_some() && !private_anchor_required)?
+                        .ok_or_else(||anyhow!("storage root unavailable"))?;
+                    if private_anchor_required {
+                        let st=fs::fstat(&next).map_err(|_|anyhow!("private anchor metadata unavailable"))?;
+                        ensure!(crate::storage_boundary::private_anchor(&st,uid),"mount requires a private user-owned anchor");
+                    }
+                    private_anchor_required=mount_ancestor;
+                    fd=next;
                 }
                 _ => bail!("invalid storage root"),
             }
         }
+        ensure!(!private_anchor_required,"mount root requires a private storage anchor");
         ensure!(count > 0, "filesystem root cannot be a store");
         validate_dir(&fd, uid, true, private)?;
         ensure_local(&fd)?;

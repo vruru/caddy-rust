@@ -1,0 +1,475 @@
+# gotmpl
+
+[![Test](https://github.com/phsym/gotmpl-rs/actions/workflows/test.yaml/badge.svg)](https://github.com/phsym/gotmpl-rs/actions/workflows/test.yaml)
+[![GitHub License](https://img.shields.io/github/license/phsym/gotmpl-rs)](./LICENSE)
+[![Crates.io Version](https://img.shields.io/crates/v/gotmpl)](https://crates.io/crates/gotmpl)
+[![docs.rs](https://img.shields.io/docsrs/gotmpl)](https://docs.rs/gotmpl)
+[![Crates.io MSRV](https://img.shields.io/crates/msrv/gotmpl)](https://crates.io/crates/gotmpl)
+
+A Rust port of Go's [`text/template`](https://pkg.go.dev/text/template).
+
+Supports the full template syntax (pipelines, control flow, custom functions, template
+composition, whitespace trimming) with Go compatible output. `no_std` compatible (with `alloc`).
+
+The crate forbids `unsafe` code and denies the panic-family lints (`panic!`, `unwrap`,
+`expect`, `unreachable!`, `todo!`, `unimplemented!`).
+User-provided functions that panic are caught under `std`; see `no_std` notes below.
+
+## Quick start
+
+```rust
+use gotmpl::{Template, tmap};
+
+let data = tmap! { "Name" => "World" };
+let result = Template::new("hello")
+    .parse("Hello, {{.Name}}!")
+    .unwrap()
+    .execute_to_string(&data)
+    .unwrap();
+assert_eq!(result, "Hello, World!");
+```
+
+For one-shot renders with no configuration, use `gotmpl::execute` (source
+string) or `gotmpl::execute_file` (reads from disk):
+
+```rust
+use gotmpl::{execute, tmap};
+
+let result = execute("Hello, {{.Name}}!", &tmap! { "Name" => "World" }).unwrap();
+assert_eq!(result, "Hello, World!");
+```
+
+## HTML auto-escaping (`html` feature)
+
+With the `html` feature, `gotmpl::html::Template` is a drop-in analog of
+`Template` that context-aware auto-escapes its output, exactly like Go's
+[`html/template`](https://pkg.go.dev/html/template). It is a *distinct type* on
+purpose: escaping can't be forgotten, and passing a non-escaping `Template`
+where escaped output is required won't compile.
+
+```rust,ignore
+use gotmpl::html::Template;
+use gotmpl::tmap;
+
+let data = tmap! {
+    "Comment" => "<script>alert('xss')</script>",
+    "Link"    => "javascript:alert(1)",
+};
+let out = Template::new("page")
+    .parse(r#"<p>{{.Comment}}</p><a href="{{.Link}}">x</a>"#)
+    .unwrap()
+    .execute_to_string(&data)
+    .unwrap();
+assert_eq!(
+    out,
+    r#"<p>&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;</p><a href="#ZgotmplZ">x</a>"#,
+);
+```
+
+Each interpolation is escaped for its surrounding context — HTML text, tag and
+attribute names, quoted/unquoted attribute values, RCDATA (`<textarea>`,
+`<title>`), URLs, `srcset`, JavaScript (value/string/regexp/template-literal),
+and CSS. An unsafe URL scheme becomes `#ZgotmplZ`, and other rejected values
+become `ZgotmplZ`, matching Go.
+
+Trusted content that should bypass escaping is wrapped in one of the
+content types — `html::HTML`, `HTMLAttr`, `JS`, `JSStr`, `CSS`, `URL`, `Srcset`
+(analogs of Go's `template.HTML` etc.), which produce a `Value::Safe`:
+
+```rust,ignore
+use gotmpl::html::{Template, HTML};
+use gotmpl::tmap;
+
+let data = tmap! { "Body" => HTML::from("<b>trusted</b>") };
+let out = Template::new("t")
+    .parse("{{.Body}}")
+    .unwrap()
+    .execute_to_string(&data)
+    .unwrap();
+assert_eq!(out, "<b>trusted</b>"); // emitted verbatim in HTML text context
+```
+
+Escaping runs once, lazily, on the first `execute*` call (so `{{template "x"}}`
+can reference templates added beforehand); after that the template can no longer
+be parsed into. The feature is `no_std`-compatible. See `examples/html.rs`
+(`cargo run --example html --features html`).
+
+## Serde integration (`serde` feature)
+
+With the `serde` feature, any [`serde::Serialize`](https://docs.rs/serde) type
+becomes template data with no hand-written conversion. `gotmpl::to_value`
+(mirroring `serde_json::to_value`) turns it into a `Value`, and the
+`ToSerdeValue` extension trait adds an equivalent `.to_serde_value()` method:
+
+```rust,ignore
+use gotmpl::{Template, ToSerdeValue, to_value};
+use serde::Serialize;
+
+// Go templates access exported PascalCase fields (`{{.Name}}`), but serde
+// derives field names verbatim, so add `rename_all` to line the keys up.
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct User { name: String, age: u8, roles: Vec<String> }
+
+let user = User { name: "Alice".into(), age: 30, roles: vec!["admin".into()] };
+
+let tmpl = Template::new("t")
+    .parse("{{.Name}} ({{.Age}}){{range .Roles}} {{.}}{{end}}")
+    .unwrap();
+
+let data = to_value(&user).unwrap();        // or: user.to_serde_value().unwrap()
+assert_eq!(tmpl.execute_to_string(&data).unwrap(), "Alice (30) admin");
+```
+
+Both entry points return `Result<Value>` (serde serialization can fail on a
+non-string map key or an out-of-range 128-bit integer) and, like `ToValue`,
+materialize the whole value eagerly. Structs and maps become `Value::Map`, so
+field access uses **map** semantics: a missing field yields `<no value>` by
+default. The feature is `no_std`-compatible. See `examples/serde.rs`
+(`cargo run --example serde --features serde`) and the `ser` module docs for the
+rest of the mapping (map-key stringification and ordering-vs-Go).
+
+## Template syntax
+
+Actions are delimited by `{{` and `}}` (configurable via `.delims()`).
+
+### Data access
+
+```text
+{{.}}              Current context (dot)
+{{.Name}}          Field access on dot
+{{.User.Email}}    Nested field access
+{{$}}              Top-level data (root context)
+{{$x}}             Variable access
+{{$x.Name}}        Field access on variable
+```
+
+### Pipelines
+
+```text
+{{.Name | printf "%s!"}}
+{{"hello" | len | printf "%d chars"}}
+```
+
+### Control flow
+
+```text
+{{if .Condition}}...{{end}}
+{{if .Cond}}...{{else}}...{{end}}
+{{if eq .X 1}}...{{else if eq .X 2}}...{{else}}...{{end}}
+
+{{range .Items}}...{{end}}
+{{range .Items}}...{{else}}empty{{end}}
+{{range $i, $v := .Items}}{{$i}}: {{$v}}{{end}}
+{{range .Items}}{{if eq . 3}}{{break}}{{end}}{{.}}{{end}}
+{{range .Items}}{{if eq . 3}}{{continue}}{{end}}{{.}}{{end}}
+{{range 5}}{{.}} {{end}}
+
+{{with .Value}}...{{end}}
+{{with .Value}}...{{else}}fallback{{end}}
+```
+
+### Variables
+
+```text
+{{$x := .Name}}            Declare variable
+{{$x = "new value"}}       Assign to existing variable
+{{$i, $v := range .List}}  Range with index and value (declaration)
+{{$i, $v = range .List}}   Range with index and value (assignment)
+```
+
+### Template composition
+
+```text
+{{define "name"}}...{{end}}        Define a named template
+{{template "name" .}}              Invoke a named template
+{{block "name" .}}default{{end}}   Define and invoke (with default)
+```
+
+### Comments and whitespace trimming
+
+```text
+{{/* This is a comment */}}
+{{- .X}}     Trim whitespace before
+{{.X -}}     Trim whitespace after
+{{- .X -}}   Trim both sides
+```
+
+## Built-in functions
+
+| Function                           | Description                                                  |
+| ---------------------------------- | ------------------------------------------------------------ |
+| `print`                            | Concatenate args (spaces between non-string adjacent args)   |
+| `printf`                           | Formatted output ([see below](#printf-verbs-and-flags))      |
+| `println`                          | Print with spaces between args, trailing newline             |
+| `len`                              | Length of string, list, or map                               |
+| `index`                            | Index into list or map: `index .List 0`, `index .Map "key"`  |
+| `slice`                            | Slice a list or string: `slice .List 1 3`                    |
+| `call`                             | Call a function value: `call .Func arg1 arg2`                |
+| `eq`, `ne`, `lt`, `le`, `gt`, `ge` | Comparison operators. `eq` supports multi-arg: `eq .X 1 2 3` |
+| `and`, `or`                        | Short-circuit logic, return the deciding value               |
+| `not`                              | Boolean negation                                             |
+| `html`, `js`, `urlquery`           | Escape for HTML, JavaScript, URL query                       |
+
+### `printf` verbs and flags
+
+Format strings follow Go's [`fmt`](https://pkg.go.dev/fmt) syntax:
+`%[flags][width][.precision][argument index]verb`.
+
+| Verb       | Applies to        | Output                                          |
+| ---------- | ----------------- | ----------------------------------------------- |
+| `%s`       | string            | The string itself                               |
+| `%q`       | string, int(rune) | Go-quoted string, or single-quoted rune literal |
+| `%v`       | any               | Default formatted value                         |
+| `%d`       | int               | Decimal                                         |
+| `%b`       | int               | Binary                                          |
+| `%o`       | int               | Octal                                           |
+| `%x`, `%X` | int, string       | Lower/upper hex (on strings: hex of each byte)  |
+| `%c`       | int               | Unicode scalar                                  |
+| `%U`       | int               | Unicode `U+XXXX` (with `#`: appends `'c'`)      |
+| `%f`       | float             | Decimal, no exponent                            |
+| `%e`, `%E` | float             | Scientific notation (lower/upper `e`)           |
+| `%g`, `%G` | float             | `%e`/`%E` for large exponents, else `%f`        |
+| `%t`       | bool              | `true` / `false`                                |
+| `%%`       | —                 | Literal `%`                                     |
+
+The integer verbs (`%d`, `%b`, `%o`, `%x`/`%X`, `%c`, `%U`, and `%q` for runes) accept
+both signed (`int`) and unsigned (`uint`) values; `uint` values above `i64::MAX` print
+their true magnitude.
+
+Flags: `-` (left-align), `+` (always sign numerics), ` ` (leading space for non-negative
+numerics), `#` (alternate form: `0b`/`0o`/`0x`/`0X` prefix, or quoted rune for `%U`),
+`0` (zero-pad numerics).
+
+Width and `.precision` accept either a literal number or `*` / `.*` to read the value
+from the next argument (which must be an integer — floats and other types yield
+`%!(BADWIDTH)` / `%!(BADPREC)`).
+
+Argument indexing with `%[N]verb` selects the N-th (1-based) argument and resets the
+sequential cursor. Out-of-range or malformed indices produce `%!verb(BADINDEX)`.
+
+Mismatched verb/argument pairs produce Go's error markers rather than panicking:
+`%!v(BADVERB)`, `%!v(MISSING)`, `%!(EXTRA …)` for unconsumed args, and the
+`BADWIDTH` / `BADPREC` / `BADINDEX` forms above.
+
+## Custom functions
+
+Register functions before parsing:
+
+```rust
+use gotmpl::{Template, tmap};
+use gotmpl::Value;
+
+let result = Template::new("test")
+    .func("upper", |args| {
+        match args.first() {
+            Some(Value::String(s)) => Ok(Value::String(s.to_uppercase().into())),
+            _ => Ok(Value::Nil),
+        }
+    })
+    .parse("{{.Name | upper}}")
+    .unwrap()
+    .execute_to_string(&tmap! { "Name" => "hello" })
+    .unwrap();
+assert_eq!(result, "HELLO");
+```
+
+## Function values and `call`
+
+`Value::Function` allows passing callable values through templates:
+
+```rust
+extern crate alloc;
+use alloc::sync::Arc;
+use gotmpl::{Template, tmap};
+use gotmpl::{Value, ValueFunc};
+
+let adder: ValueFunc = Arc::new(|args| {
+    let sum: i64 = args.iter().filter_map(|a| a.as_int()).sum();
+    Ok(Value::Int(sum))
+});
+
+let result = Template::new("test")
+    .func("getAdder", move |_| Ok(Value::Function(adder.clone())))
+    .parse("{{call (getAdder) 3 4}}")
+    .unwrap()
+    .execute_to_string(&tmap!{})
+    .unwrap();
+assert_eq!(result, "7");
+```
+
+## Options
+
+```rust
+use gotmpl::{Template, MissingKey};
+
+let tmpl = Template::new("t")
+    .missing_key(MissingKey::Error)   // error on missing map keys
+    .delims("<<", ">>")              // custom delimiters
+    .parse("<< .Name >>")
+    .unwrap();
+```
+
+`MissingKey` implements `FromStr`, so you can parse from strings (useful for
+config files or CLI args):
+
+```rust
+use gotmpl::MissingKey;
+
+let mk: MissingKey = "error".parse().unwrap();
+```
+
+| `MissingKey` variant | `FromStr` value          | Behavior            |
+| -------------------- | ------------------------ | ------------------- |
+| `Invalid` (default)  | `"invalid"`, `"default"` | Return `<no value>` |
+| `ZeroValue`          | `"zero"`                 | Return `<no value>` |
+| `Error`              | `"error"`                | Return an error     |
+
+`ZeroValue` exists for parity with Go's `{{options "missingkey=zero"}}` directive.
+Since `Value` is untyped, it behaves the same as `Invalid`; the variant is there so
+callers can still opt in to the named option.
+
+## Number literals
+
+Go-compatible number literal syntax:
+
+```text
+{{42}}          Decimal
+{{3.14}}        Float
+{{0xFF}}        Hexadecimal
+{{0o77}}        Octal
+{{0377}}        Octal (legacy leading zero)
+{{0b1010}}      Binary
+{{1_000_000}}   Underscore separators
+{{'a'}}         Character literal (97)
+{{0x1.ep+2}}    Hex float (7.5)
+```
+
+## Data model
+
+Template data uses the `Value` enum:
+
+| Variant                               | Rust type     | Go equivalent    |
+| ------------------------------------- | ------------- | ---------------- |
+| `Nil`                                 | n/a           | `nil`            |
+| `Bool(bool)`                          | `bool`        | `bool`           |
+| `Int(i64)`                            | `i64`         | `int`            |
+| `Uint(u64)`                           | `u64`         | `uint`           |
+| `Float(f64)`                          | `f64`         | `float64`        |
+| `String(Arc<str>)`                    | `String`      | `string`         |
+| `List(Arc<[Value]>)`                  | `Vec<Value>`  | `[]any`          |
+| `Map(Arc<BTreeMap<Arc<str>, Value>>)` | `BTreeMap`    | `map[string]any` |
+| `Function(ValueFunc)`                 | `Arc<dyn Fn>` | `func(...)`      |
+
+The `tmap!` macro builds data maps:
+
+```rust
+use gotmpl::{tmap, ToValue};
+
+let data = tmap! {
+    "Name" => "Alice",
+    "Age" => 30i64,
+    "Scores" => vec![95i64, 87, 92],
+    "Address" => tmap! {
+        "City" => "Paris",
+    },
+};
+```
+
+Custom types reach the engine two ways: implement `ToValue` by hand, or enable
+the [`serde` feature](#serde-integration-serde-feature), derive
+`serde::Serialize`, and convert via `gotmpl::to_value` / `.to_serde_value()`.
+
+## `no_std` support
+
+The crate works in `no_std` environments (requires `alloc`). Disable the default `std`
+feature:
+
+```toml
+[dependencies]
+gotmpl = { version = "0.3", default-features = false }
+```
+
+Without `std`, `execute_fmt` and `execute_to_string` are available. The `io::Write`-based
+`execute`/`execute_template` methods and `parse_files` require the `std` feature.
+User-defined functions that panic will propagate instead of being caught.
+
+## Differences from Go
+
+Rust has no runtime reflection, so:
+
+- **No struct field access**: use `Value::Map` instead
+- **No method calls**: `.Foo` is always a field lookup against a `Value::Map`,
+  never a method invocation. Register the callable via `.func()`, or store
+  it as `Value::Function` and dispatch with the `call` builtin.
+- **No pointer/interface indirection**: `Value` is always concrete
+- **No complex numbers, channels, or `iter.Seq`**
+- **No typed-nil**: `Option::<T>::None` collapses to untyped `Value::Nil`.
+  Go's `(*Foo)(nil) != nil` distinction does not exist here.
+- **NaN comparisons** return an error instead of Go's silently wrong results
+
+API shape is also a bit different:
+
+- **`Template::lookup`** returns the parsed body (`Option<&ListNode>`) rather
+  than a re-executable `*Template`. To run a named definition, use
+  `execute_template_to_string("name", ...)` on the parent.
+- **`Template::templates`** returns the list of defined names, not `Template`
+  objects — definitions share the parent's func map and options, so there's
+  no per-definition handle to hand back.
+- **`parse_files`** requires the files to be valid UTF-8. Go's `os.ReadFile` +
+  `string(b)` is a zero-copy reinterpret and accepts any bytes; we use
+  `std::fs::read_to_string`, which validates.
+- **`parse_glob`** is gated behind the `glob` cargo feature (on by default,
+  pulls in the [`glob`](https://crates.io/crates/glob) crate). It accepts a
+  strict superset of Go's `filepath.Match`: `*`, `?`, `[abc]` /  `[!abc]`
+  classes, and `**` for recursive descent (Go does not support `**`).
+  Disabling the feature drops the dependency and removes the API. Match
+  ordering follows the `glob` crate (sorted within each directory, depth-first
+  across directories) and may differ from Go's `filepath.Glob` when the
+  pattern crosses multiple directories — relevant if templates redefine each
+  other (last-wins). Matching is case-sensitive and `*` matches leading-dot
+  files (the `glob::glob` default — `MatchOptions::new()`, `case_sensitive =
+  true`, `require_literal_leading_dot = false`), so `*.tmpl` matches
+  `.hidden.tmpl`. Both match Go's `filepath.Match` / `filepath.Glob`, which
+  also match dotfiles (unlike shell globbing).
+- **Empty / identical custom delimiters**: `delims("", "}}")` and
+  `delims("{{", "")` produce a parse error rather than substituting the
+  defaults (Go silently substitutes); `delims("##", "##")` is accepted (Go
+  forbids identical left/right). These are pinned by tests so changes to
+  validation are intentional.
+
+Error reporting differs in a couple of places:
+
+- **Runtime errors carry no source position.** `MissingKey`,
+  `UndefinedFunction`, and other exec-time errors print just the message;
+  Go prefixes them with `template: NAME:LINE:COL:`. Tracked as a known gap.
+- **The parser stops at the first error.** Go's parser collects multiple
+  parse errors per pass; we surface exactly one.
+
+A few data and formatting edge cases diverge too:
+
+- **`\NNN` octal escapes with value ≥ 0x80** encode as the Unicode codepoint
+  U+0080..U+00FF (a 2-byte UTF-8 sequence) where Go emits the single byte
+  0xNN. Same root cause as the `slice` divergence below: `Value::String` is
+  UTF-8, Go strings are byte-slices.
+- **`%#v`** falls back to `%v`. Go's Go-syntax output (`[]interface {}{1, 2, 3}`,
+  `map[string]interface {}{"a":1}`) needs concrete-type info we don't carry.
+- **`%#U`** quotes some non-ASCII codepoints that Go skips. Our gate is
+  `char::is_control`; Go uses the full `strconv.IsPrint` table, which also
+  rejects non-ASCII spacing characters like U+00A0.
+- **`slice` on a string** at a mid-codepoint offset returns an error. Go would
+  hand back the raw bytes (potentially invalid UTF-8); we can't store invalid
+  UTF-8 in `Value::String`, so we reject the slice instead.
+
+## Go cross-check
+
+The test suite can optionally run every template through Go's `text/template` and assert
+output parity:
+
+```sh
+cargo test --features go-crosscheck
+```
+
+A Go helper (`tests/testdata/go_crosscheck.go`) is compiled once per test run. It
+reads templates and typed data from stdin as JSON, executes them via Go's
+`text/template`, and prints the result.

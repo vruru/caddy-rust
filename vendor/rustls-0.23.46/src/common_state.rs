@@ -31,6 +31,10 @@ use crate::{quic, record_layer};
 pub struct CommonState {
     pub(crate) negotiated_version: Option<ProtocolVersion>,
     pub(crate) handshake_kind: Option<HandshakeKind>,
+    pub(crate) native_hrr: bool,
+    pub(crate) native_session_curve: Option<u16>,
+    pub(crate) native_tls_unique: Option<Vec<u8>>,
+    pub(crate) native_tls12_ems: bool,
     pub(crate) side: Side,
     pub(crate) record_layer: record_layer::RecordLayer,
     pub(crate) suite: Option<SupportedCipherSuite>,
@@ -68,6 +72,10 @@ impl CommonState {
         Self {
             negotiated_version: None,
             handshake_kind: None,
+            native_hrr: false,
+            native_session_curve: None,
+            native_tls_unique: None,
+            native_tls12_ems: false,
             side,
             record_layer: record_layer::RecordLayer::new(),
             suite: None,
@@ -177,6 +185,25 @@ impl CommonState {
     /// This returns `None` until the version is agreed.
     pub fn protocol_version(&self) -> Option<ProtocolVersion> {
         self.negotiated_version
+    }
+
+    /// Whether this connection sent or received a TLS 1.3 HelloRetryRequest.
+    pub fn native_hello_retry_request(&self) -> bool { self.native_hrr }
+    /// Actual full-handshake group, or the authenticated TLS1.2 session group.
+    pub fn native_curve_id(&self) -> Option<u16> {
+        if self.is_handshaking() { return None; }
+        self.negotiated_key_exchange_group().map(|group| u16::from(group.name()))
+            .or(self.native_session_curve)
+    }
+
+    /// The RFC 5929 first Finished, available only after a complete handshake.
+    /// TLS 1.3 and TLS 1.2 resumption without EMS have no tls-unique value.
+    pub fn native_tls_unique(&self) -> Option<&[u8]> {
+        if self.is_handshaking() || self.negotiated_version != Some(ProtocolVersion::TLSv1_2)
+            || (self.handshake_kind == Some(HandshakeKind::Resumed) && !self.native_tls12_ems) {
+            return None;
+        }
+        self.native_tls_unique.as_deref()
     }
 
     /// Which kind of handshake was performed.
@@ -929,6 +956,10 @@ pub(crate) trait State<Data>: Send + Sync {
         _label: &[u8],
         _context: Option<&[u8]>,
     ) -> Result<(), Error> {
+        Err(Error::HandshakeNotComplete)
+    }
+
+    fn native_exporter(&self) -> Result<alloc::sync::Arc<dyn crate::NativeExporter>, Error> {
         Err(Error::HandshakeNotComplete)
     }
 

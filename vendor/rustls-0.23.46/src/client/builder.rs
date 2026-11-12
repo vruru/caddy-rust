@@ -168,6 +168,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
         ClientConfig {
             provider: self.provider,
             alpn_protocols: Vec::new(),
+            native_client_signed_certificate_timestamps: Vec::new(),
             check_selected_alpn: true,
             resumption: Resumption::default(),
             max_fragment_size: None,

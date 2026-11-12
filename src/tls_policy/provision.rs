@@ -127,7 +127,7 @@ impl ConnectionPolicy {
     }
     pub fn has_custom_settings(&self) -> bool {
         !self.matcher.is_empty()
-            || self.any_tag.is_some()
+            || self.certificate_selection.is_some()
             || self.protocol_min.is_some()
             || self.protocol_max.is_some()
             || self.cipher_suites.is_some()

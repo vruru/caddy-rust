@@ -33,6 +33,8 @@ pub struct VerifiedStatus {
 
 pub(crate) use verify::verify_signature as verify_x509_signature;
 pub use verify::{
+    KeyCompromiseProof, LiveKeyCompromiseFact, verify_key_compromise_proof, verify_response_capture,
+    verify_response_observation,
     request as create_request, validate_issuer, verify_response, verify_response_with_max_age,
 };
 
@@ -231,7 +233,7 @@ struct Inner {
     cpu_slots: Arc<Semaphore>,
     resources: Arc<OcspResources>,
     inventory: OcspInventorySelector,
-    names_scope: Option<Arc<HashSet<String>>>,
+    identity_scope: Option<[u8; 32]>,
     entries: Mutex<HashMap<CertificateKey, Entry>>,
     observations: Mutex<HashMap<[u8; 32], Observed>>,
     events: broadcast::Sender<OcspEvent>,
@@ -335,7 +337,7 @@ impl OcspManager {
                 cpu_slots: cpu,
                 resources,
                 inventory,
-                names_scope: None,
+                identity_scope: None,
                 options,
                 policy,
                 entries: Mutex::new(HashMap::new()),
@@ -366,12 +368,10 @@ impl OcspManager {
     /// Set once before sharing/running the manager. The inventory selector is
     /// still applied to each complete record; this only avoids cloning public
     /// DER belonging to unrelated scopes.
-    pub(crate) fn with_names_scope(mut self, names: Vec<String>) -> Result<Self> {
-        let inner =
-            Arc::get_mut(&mut self.inner).ok_or_else(|| anyhow!("OCSP scope already shared"))?;
-        inner.names_scope = Some(Arc::new(names.into_iter().collect()));
-        // One managed group is one certificate. Its internal watcher uses
-        // the authenticated LeafGuard after lag, not an unbounded event log.
+    pub(crate) fn with_identity_scope(mut self, identity: [u8; 32]) -> Result<Self> {
+        let inner = Arc::get_mut(&mut self.inner)
+            .ok_or_else(|| anyhow!("OCSP scope already shared"))?;
+        inner.identity_scope = Some(identity);
         inner.events = broadcast::channel(8).0;
         Ok(self)
     }
@@ -425,9 +425,11 @@ impl OcspManager {
             identity: certificate.identity,
             generation: certificate.generation,
             names: certificate.names.clone(),
+            management_name: certificate.management_name.clone(),
             chain_der: Vec::new(),
             leaf_state: certificate.leaf_state.clone(),
             leaf_sha256: certificate.leaf_sha256,
+            key_state: certificate.key_state.clone(),
         };
         let result = self
             .refresh_one_inner(certificate, cancel.clone(), RefreshMode::Online)
@@ -742,7 +744,8 @@ impl OcspManager {
                 )
                 .await
                 {
-                    Ok(status) => {
+                    Ok((status, proof)) => {
+                        self.note_key_compromise(proof, &certificate, quiet);
                         if let Err(error) = record_leaf(&certificate, &status) {
                             self.preserve_negative(&certificate, &status, quiet, None)
                                 .await?;
@@ -845,7 +848,7 @@ impl OcspManager {
                     .ok_or_else(|| anyhow!("OCSP network is unavailable in cached-only mode"))?
                     .post(&responder, &request, &work)
                     .await?;
-                let status = verify_owned(
+                let (status, proof) = verify_owned(
                     raw.clone(),
                     certificate.chain_der[0].clone(),
                     issuer,
@@ -855,6 +858,7 @@ impl OcspManager {
                     acquire_cpu(self.inner.cpu_slots.clone(), &work).await?,
                 )
                 .await?;
+                self.note_key_compromise(proof, &certificate, quiet);
                 // Authentication establishes a leaf fact independently of
                 // whether this job still owns permission to write the cache.
                 if let Err(error) = record_leaf(&certificate, &status) {
@@ -996,6 +1000,23 @@ impl OcspManager {
             }
         })
     }
+    fn note_key_compromise(&self, proof: Option<LiveKeyCompromiseFact>,
+        certificate: &OcspCertificate, quiet: bool) {
+        let Some(proof) = proof else { return; };
+        let result = (|| {
+            let guard=self.inner.resolver.leaf_guard();let deny=guard.key_deny();
+            ensure!(deny.owns_state(&certificate.key_state) && certificate.key_state.spki_der()==proof.spki_der(),
+                "OCSP observation key reservation changed");
+            deny.record_observed(proof)
+        })();
+        if let Err(error) = result {
+            self.cache_error(certificate, &error, quiet);
+            self.emit(certificate, if error.is::<crate::key_compromise::KeyCompromiseNotDurable>() {
+                "key_compromise_not_durable"
+            } else { "key_compromise_not_recorded" }, None, quiet);
+        }
+    }
+
     fn observed(&self, identity: &[u8; 32]) -> Result<Option<Observed>> {
         Ok(self
             .inner
@@ -1272,8 +1293,11 @@ impl OcspManager {
             if refresh_inventory||tokio::time::Instant::now()>=next_scan {
                 refresh_inventory=false;next_scan=tokio::time::Instant::now()+self.inner.options.check_interval;
                 let resolver=self.inner.resolver.clone();
-                let names=self.inner.names_scope.clone();
-                let certificates=crate::cert_cpu::run(self.inner.cpu_slots.clone(),cancel.clone(),move||match names {Some(names)=>resolver.ocsp_certificates_for_names(&names),None=>resolver.ocsp_certificates()}).await?;
+                let identity=self.inner.identity_scope;
+                let certificates=crate::cert_cpu::run(self.inner.cpu_slots.clone(),cancel.clone(),move||match identity {
+                    Some(identity)=>Ok(resolver.ocsp_current_certificate(&identity)?.into_iter().collect()),
+                    None=>resolver.ocsp_certificates(),
+                }).await?;
                 let certificates=certificates.into_iter().filter(|certificate|(self.inner.inventory)(certificate)).collect::<Vec<_>>();
                 ensure!(certificates.len()<=crate::tls_resolver::MAX_CERTIFICATES,"OCSP inventory exceeds resolver certificate limit");
                 let current:HashSet<_>=certificates.iter().map(|c|(c.identity,c.generation)).collect();
@@ -1394,13 +1418,13 @@ async fn verify_owned(
     admission: Option<tokio::sync::OwnedSemaphorePermit>,
     budget: Option<Arc<OcspNetworkBudget>>,
     cpu: tokio::sync::OwnedSemaphorePermit,
-) -> Result<VerifiedStatus> {
+) -> Result<(VerifiedStatus, Option<LiveKeyCompromiseFact>)> {
     tokio::task::spawn_blocking(move || {
         let _cpu = cpu;
         let now = now()?;
         let _admission = admission;
         let _budget = budget;
-        verify_response_with_max_age(&raw, &leaf, &issuer, now, max_age)
+        verify::verify_response_observation(&raw, &leaf, &issuer, now, max_age)
     })
     .await?
 }

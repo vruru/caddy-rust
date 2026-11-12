@@ -36,6 +36,12 @@ mod remote_pin;
 #[path = "admin/server.rs"]
 mod server;
 pub use controller::AdminController;
+#[path="admin/pki.rs"]
+mod pki;
+pub use pki::PkiInfo;
+#[path="admin/upstreams.rs"]
+mod upstreams;
+pub use upstreams::UpstreamStatus;
 #[path = "admin/source.rs"]
 mod source;
 use serde_json::Value;
@@ -136,6 +142,14 @@ pub trait AdminBackend: Send + Sync + 'static {
     /// Read the committed clientAuth identity without obtaining a transaction lock.
     fn active_identity_client(&self) -> Option<Arc<dyn rustls::client::ResolvesClientCert>> {
         None
+    }
+    /// Public CA metadata; the native backend may provision the default local
+    /// CA, but this operation never installs trust or returns a private key.
+    fn pki_info(&self, _id: String) -> AdminFuture<PkiInfo> {
+        Box::pin(async { Err(AdminError::new(404,"pki_authority_not_found")) })
+    }
+    fn upstream_statuses(&self) -> AdminFuture<Vec<UpstreamStatus>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
     /// Force must synchronously fence publication/admission when called; its
     /// future owns the bounded join. This also holds during runtime teardown;

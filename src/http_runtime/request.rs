@@ -20,6 +20,10 @@ struct LazyMap {
     defaults: Vec<serde_json::Value>,
 }
 pub(super) struct Context {
+    pub(super) request_started: std::time::Instant,
+    pub(super) typed_vars: HashMap<String, Arc<serde_json::Value>>,
+    pub(super) cel_body: Option<Bytes>,
+    pub(super) cel_body_failure: Option<StatusCode>,
     pub request: Option<Request<Body>>,
     pub fastcgi_body_claimed: bool,
     pub(super) body_limit: Option<Arc<super::request_body::LimitState>>,
@@ -37,6 +41,7 @@ pub(super) struct Context {
     pub drain: CancellationToken,
     pub business: Arc<BusinessGuard>,
     pub original_uri: Uri,
+    request_content_length:i64,
     original_method: Method,
     error_status: Option<StatusCode>,
     access_start: Option<std::time::Instant>,
@@ -52,6 +57,7 @@ pub(super) struct Context {
     response_route_depth: u8,
     proxy_response: Option<Box<super::proxy::PreparedResponse>>,
     maps: Vec<LazyMap>,
+    pub(super) probe: bool,
 }
 #[path = "response_routes.rs"]
 mod response_routes;
@@ -62,6 +68,84 @@ enum DeferredResponse {
     LogBody(usize),
 }
 impl Context {
+    // 保留 id：永不分配给配置 generation；类型按 BusinessGeneration::new 调整
+    const PROBE_GENERATION_ID: u64 = u64::MAX;
+
+    /// Go: 健康请求只携带 globals replacer、无 RemoteAddr/LocalAddr、无 access log。
+    pub(super) fn for_probe(
+        request: Request<Body>,
+        resources: Arc<super::resource_budget::Resources>,
+    ) -> Result<Self> {
+        // 合成 generation：不计入真实业务请求；guard 随 ctx/诊断 owner 释放
+        let generation = BusinessGeneration::new(
+            Self::PROBE_GENERATION_ID,
+            crate::http_config::HttpShutdownPolicy::default(),
+        );
+        let business = generation.begin()?;
+        let (mut parts, body) = request.into_parts();
+        // 绝对 URL → authority 进 ctx.authority；URI 规范成 origin-form，
+        // 使 REQUEST_URI == Go origReq.URL.RequestURI()
+        let authority = parts
+            .uri
+            .authority()
+            .map(|a| a.as_str().to_owned())
+            .unwrap_or_default();
+        let origin: Uri = parts
+            .uri
+            .path_and_query()
+            .map_or("/", |pq| pq.as_str())
+            .parse()?;
+        parts.uri = origin;
+        let request = Request::from_parts(parts, body);
+        let original_framing = super::request_body::original_framing(&request);
+        let request_content_length=request.headers().get(http::header::CONTENT_LENGTH).and_then(|v|v.to_str().ok()).and_then(|v|v.parse().ok()).unwrap_or(if original_framing.chunked || !request.body().is_end_stream(){-1}else{0});
+        let zero = SocketAddr::from(([0, 0, 0, 0], 0));
+        Ok(Context {
+            request_started: std::time::Instant::now(),
+            typed_vars: HashMap::new(),
+            cel_body: None,
+            cel_body_failure: None,
+            original_uri: request.uri().clone(),
+            original_method: request.method().clone(),
+            request: Some(request),
+            fastcgi_body_claimed: false,
+            body_limit: None,
+            await_h2_response_head: false,
+            original_framing,
+            request_content_length,
+            resources,
+            peer: zero, // 占位；REMOTE_* 由 D2 置空，SERVER_ADDR 由 D3 移除
+            local: zero,
+            tls: false, // FastCGI 健康 scheme 恒为 http：无 HTTPS/SSL_*
+            access_names: None,
+            skip_access: true,
+            authority,
+            client_ip: zero.ip(),
+            trusted: false,
+            drain: business.generation().drain.clone(),
+            business,
+            error_status: None,
+            access_start: None,
+            log_fields: None,
+            values: HashMap::new(),
+            regex_capture_budget: super::request_regex::CAPTURE_BYTES,
+            immediate: HeaderMap::new(),
+            informational: None,
+            close_after_response: false,
+            deferred: Vec::new(),
+            groups: HashSet::new(),
+            invoke_depth: 0,
+            response_route_depth: 0,
+            proxy_response: None,
+            maps: Vec::new(),
+            probe: true,
+        })
+    }
+    pub(super) fn template_content_length(&self)->i64 {
+        self.req().extensions().get::<super::request_body::Replacement>().map_or(self.request_content_length,|replacement|replacement.length as i64)
+    }
+    pub(super) fn template_map_destinations(&self)->impl Iterator<Item=&str> {self.maps.iter().flat_map(|map|map.destinations.iter().map(String::as_str))}
+
     pub fn req(&self) -> &Request<Body> {
         self.request
             .as_ref()
@@ -84,6 +168,9 @@ impl Context {
     fn lookup_depth(&self, name: &str, depth: usize) -> Option<String> {
         if let Some(value) = crate::http_config::helpers::global_lookup(name) {
             return Some(value);
+        }
+        if self.probe {
+            return None;
         }
         if depth > 64 {
             return None;
@@ -159,7 +246,9 @@ impl Context {
             _ if name.starts_with("http.request.header.") => {
                 let field = &name[20..];
                 if field.eq_ignore_ascii_case("Host") {
-                    self.authority.clone()
+                    // net/http keeps the wire Host in Request.Host and removes
+                    // it from Header before the replacer observes the request.
+                    String::new()
                 } else {
                     req?.headers()
                         .get(field)
@@ -337,6 +426,7 @@ where
         })
         .map(Box::new);
     let original_framing = super::request_body::original_framing(&request);
+    let request_content_length=request.headers().get(http::header::CONTENT_LENGTH).and_then(|value|value.to_str().ok()).and_then(|value|value.parse::<i64>().ok()).unwrap_or_else(||if original_framing.chunked||!request.body().is_end_stream(){-1}else{0});
     server.plan.header_aliases.sanitize(request.headers_mut());
     let original_uri = request.uri().clone();
     let original_method = request.method().clone();
@@ -360,6 +450,10 @@ where
         body.boxed_unsync()
     };
     let mut ctx = Context {
+        request_started: std::time::Instant::now(),
+        typed_vars: HashMap::new(),
+        cel_body: None,
+        cel_body_failure: None,
         request: Some(Request::from_parts(parts, body)),
         fastcgi_body_claimed: false,
         body_limit: None,
@@ -377,6 +471,7 @@ where
         drain: business.generation().drain.clone(),
         business,
         original_uri,
+        request_content_length,
         original_method,
         error_status: None,
         access_start: access.as_ref().map(|access| access.started_at()),
@@ -399,6 +494,7 @@ where
         response_route_depth: 0,
         proxy_response: None,
         maps: Vec::new(),
+        probe: false,
     };
     let result = if tls
         && server.plan.strict_sni_host
@@ -466,11 +562,10 @@ where
     }
     log_append::unwind(&mut ctx, 0, Some(&headers)).await;
     *response.headers_mut() = headers;
-    if ctx
-        .request
-        .as_ref()
-        .is_some_and(|r| r.method() == Method::HEAD)
-    {
+    let final_method=ctx.request.as_ref().map(|request|request.method()).unwrap_or(&ctx.original_method);
+    let is_head=final_method==Method::HEAD;
+    let is_connect=final_method==Method::CONNECT;
+    if is_head    {
         if !response
             .headers()
             .contains_key(http::header::CONTENT_LENGTH)
@@ -504,6 +599,8 @@ where
         }
         *response.body_mut() = full(Bytes::new());
     }
+    let exact=response.body().size_hint().exact();let status=response.status();
+    super::response_length::apply(response.headers_mut(),status,is_head,is_connect,exact);
     response = super::request_body::mark_response(response, ctx.await_h2_response_head);
     if let Some(access) = access.filter(|_| !ctx.skip_access) {
         return (*access).attach(
@@ -709,7 +806,7 @@ enum Next<'a> {
     End,
     Stop,
     Routes(&'a [Route], &'a Next<'a>),
-    Handlers(&'a [Handler], &'a Next<'a>),
+    Handlers(&'a [Handler], &'a [super::handler_trace::Module], &'a Next<'a>),
 }
 
 fn routes<'a>(
@@ -732,11 +829,12 @@ fn continue_chain<'a>(
             let (flow, after) = match step {
                 Next::End => return Ok(Flow::Continue),
                 Next::Stop => return Ok(Flow::Stop),
-                Next::Routes(list, after) => {
-                    (chained_routes(list, ctx, inner, server, after).await?, after)
-                }
-                Next::Handlers(list, after) => {
-                    (handlers(list, ctx, inner, server, after).await?, after)
+                Next::Routes(list, after) => (
+                    chained_routes(list, ctx, inner, server, after).await?,
+                    after,
+                ),
+                Next::Handlers(list, traces, after) => {
+                    (handlers(list, traces, ctx, inner, server, after).await?, after)
                 }
             };
             if !matches!(flow, Flow::Continue) {
@@ -770,7 +868,7 @@ fn chained_routes<'a>(
             } else {
                 Next::Routes(&list[index + 1..], next)
             };
-            match handlers(&route.handlers, ctx, inner, server, &after).await? {
+            match handlers(&route.handlers, &route.trace_modules, ctx, inner, server, &after).await? {
                 Flow::Continue if route.terminal => return Ok(Flow::Stop),
                 Flow::Continue => {}
                 flow => return Ok(flow),
@@ -781,6 +879,7 @@ fn chained_routes<'a>(
 }
 fn handlers<'a>(
     list: &'a [Handler],
+    traces: &'a [super::handler_trace::Module],
     ctx: &'a mut Context,
     inner: &'a Arc<Inner>,
     server: &'a Arc<ActiveServer>,
@@ -788,6 +887,9 @@ fn handlers<'a>(
 ) -> ResponseFuture<'a> {
     Box::pin(async move {
         for (index, handler) in list.iter().enumerate() {
+            if server.plan.access_logs.as_ref().is_some_and(|logs|logs.trace)
+                && let Some(logging)=server.logging.as_deref()
+                && let Some(module)=traces.get(index) {module.emit(logging);}
             match handler {
                 Handler::StaticError { status, message } => {
                     let code = if status.is_empty() {
@@ -824,8 +926,10 @@ fn handlers<'a>(
                         return Err(failure(StatusCode::INTERNAL_SERVER_ERROR));
                     }
                     ctx.invoke_depth += 1;
-                    let after = Next::Handlers(&list[index + 1..], next);
-                    let result = chained_routes(std::slice::from_ref(route), ctx, inner, server, &after).await;
+                    let after = Next::Handlers(&list[index + 1..], traces.get(index+1..).unwrap_or_default(), next);
+                    let result =
+                        chained_routes(std::slice::from_ref(route), ctx, inner, server, &after)
+                            .await;
                     ctx.invoke_depth -= 1;
                     match result? {
                         Flow::Continue => {}
@@ -878,6 +982,37 @@ fn handlers<'a>(
                 Handler::RequestBody(plan) => {
                     Box::pin(super::request_body::apply(ctx, plan)).await?;
                 }
+                Handler::Templates(plan) => {
+                    let deferred_mark=ctx.deferred.len();let log_mark=log_append::mark(ctx);
+                    let after=Next::Handlers(&list[index+1..],traces.get(index+1..).unwrap_or_default(),next);
+                    let flow=continue_chain(after,ctx,inner,server).await?;
+                    let(mut response,explicit)=match flow{
+                        Flow::Response(response)=>(response,true),
+                        Flow::ImplicitResponse(response)=>(response,false),
+                        Flow::Continue|Flow::Stop=>(simple(StatusCode::OK,Bytes::new()),false),
+                    };
+                    let mut headers=take_writer_headers(&mut response,ctx);
+                    if explicit{
+                        if let Err(error)=finalize_transforms(&mut headers,&mut response,true,deferred_mark,ctx).await{
+                            ctx.immediate=headers;return Err(error);
+                        }
+                        log_append::unwind(ctx,log_mark,Some(&headers)).await;
+                        let body=std::mem::replace(response.body_mut(),full(Bytes::new()));
+                        match super::templates::finish(plan,&mut headers,body,ctx,inner,server).await{
+                            Ok(body)=>*response.body_mut()=body,
+                            Err(error)=>{ctx.immediate=headers;return Err(failure(error.0));}
+                        }
+                    }else{
+                        // An untouched Go recorder starts buffered. Its empty
+                        // WriteResponse bypasses inner deferred writers.
+                        ctx.deferred.truncate(deferred_mark);
+                        log_append::unwind(ctx,log_mark,Some(&headers)).await;
+                        *response.status_mut()=StatusCode::OK;
+                        *response.body_mut()=super::templates::finish_empty(&mut headers);
+                    }
+                    *response.headers_mut()=headers;
+                    return Ok(Flow::Response(response));
+                }
                 Handler::Encode(plan) => {
                     if let Some(codec) = plan.select(ctx.req_mut().headers_mut()) {
                         ctx.deferred.push(DeferredResponse::Encode(
@@ -926,7 +1061,7 @@ fn handlers<'a>(
                 } => {
                     let pending_headers = ctx.deferred.len();
                     let pending_logs = log_append::mark(ctx);
-                    let after = Next::Handlers(&list[index + 1..], next);
+                    let after = Next::Handlers(&list[index + 1..], traces.get(index+1..).unwrap_or_default(), next);
                     let result = chained_routes(nested, ctx, inner, server, &after).await;
                     match result {
                         Ok(Flow::Continue) => {}
@@ -1054,6 +1189,7 @@ fn handlers<'a>(
                     });
                 }
                 Handler::Authentication {
+                    algorithm,
                     accounts,
                     realm,
                     cache,
@@ -1091,18 +1227,18 @@ fn handlers<'a>(
                         let exists = account.is_some();
                         let hash = account
                             .map(|a| a.password.as_str())
-                            .unwrap_or(super::auth_cache::FAKE_BCRYPT_HASH)
+                            .unwrap_or(algorithm.fake())
                             .to_owned();
                         let result = if let Some(cache) = cache {
-                            cache.verify(ctx.resources.clone(), hash, password).await
+                            cache.verify_with_algorithm(ctx.resources.clone(), *algorithm, hash, password).await
                         } else {
                             let count = ctx.resources.auth_comparisons.clone();
+                            let algorithm=*algorithm;
                             ctx.resources
                                 .auth
                                 .run(move || {
                                     count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    bcrypt::verify(password.as_slice(), &hash)
-                                        .map_err(|_| super::auth_cache::AuthError::HashInvalid)
+                                    algorithm.compare(&hash,password.as_slice())
                                 })
                                 .await
                                 .map_err(|e| match e {
@@ -1174,7 +1310,7 @@ fn handlers<'a>(
                     if !rules.is_empty() {
                         return response_routes::intercept(
                             rules,
-                            Next::Handlers(&list[index + 1..], next),
+                            Next::Handlers(&list[index + 1..], traces.get(index+1..).unwrap_or_default(), next),
                             ctx,
                             inner,
                             server,
@@ -1216,7 +1352,7 @@ fn handlers<'a>(
                     return response_routes::reverse_proxy(
                         response,
                         &config.response_routes,
-                        Next::Handlers(&list[index + 1..], next),
+                        Next::Handlers(&list[index + 1..], traces.get(index+1..).unwrap_or_default(), next),
                         ctx,
                         inner,
                         server,
@@ -1228,7 +1364,7 @@ fn handlers<'a>(
         Ok(Flow::Continue)
     })
 }
-fn match_sets<'a>(
+pub(super) fn match_sets<'a>(
     sets: &'a [MatcherSet],
     ctx: &'a mut Context,
 ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
@@ -1251,7 +1387,12 @@ fn match_sets<'a>(
         Ok(false)
     })
 }
-fn var_match_value(ctx: &Context, key: &str) -> String {
+async fn var_match_value(ctx: &mut Context, key: &str) -> Result<String> {
+    if matches!(key, "{http.request.body}" | "{http.request.body_base64}") {
+        let bytes = super::cel_body::capture(ctx).await?;
+        return Ok(if key.ends_with("_base64}") { base64::engine::general_purpose::STANDARD.encode(&bytes) } else { String::from_utf8_lossy(&bytes).into_owned() });
+    }
+    Ok(
     if let Some(key) = key
         .strip_prefix('{')
         .and_then(|key| key.strip_suffix('}'))
@@ -1261,15 +1402,16 @@ fn var_match_value(ctx: &Context, key: &str) -> String {
     } else {
         ctx.values.get(&format!("http.vars.{key}")).cloned()
     }
-    .unwrap_or_default()
+    .unwrap_or_default())
 }
 
-fn matches<'a>(
+pub(super) fn matches<'a>(
     matcher: &'a Matcher,
     ctx: &'a mut Context,
 ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
     Box::pin(async move {
         Ok(match matcher {
+            Matcher::Expression(plan) => plan.matches(ctx).await?,
             Matcher::Host(hosts) => hosts.iter().any(|host| {
                 ctx.expand(host)
                     .is_ok_and(|host| host_match(&host, &hostname(&ctx.authority)))
@@ -1335,7 +1477,7 @@ fn matches<'a>(
             Matcher::VarsRegex(rules) => {
                 let mut matched = false;
                 for (key, plan) in rules {
-                    let value = var_match_value(ctx, key);
+                    let value = var_match_value(ctx, key).await?;
                     if super::request_regex::matches(plan, vec![value], ctx).await? {
                         matched = true;
                         break;
@@ -1383,7 +1525,7 @@ fn matches<'a>(
             Matcher::Vars(rules) => {
                 let mut matched = rules.is_empty();
                 'variables: for (key, values) in rules {
-                    let actual = var_match_value(ctx, key);
+                    let actual = var_match_value(ctx, key).await?;
                     for value in values {
                         if actual == ctx.expand(value)? {
                             matched = true;

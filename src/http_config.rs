@@ -2,6 +2,8 @@
 //! before activation. The raw configuration may contain secrets; do not Debug it.
 #[path = "http_config/helpers.rs"]
 pub(crate) mod helpers;
+#[path = "http_config/proxy_ext.rs"]
+pub(crate) mod proxy_ext;
 #[path = "http_config/types.rs"]
 pub(crate) mod types;
 use anyhow::{Result, ensure};
@@ -12,6 +14,10 @@ use types::*;
 
 #[derive(Clone)]
 pub struct PreparedConfig {
+    pub(crate) events: Option<Arc<crate::events::EventsApp>>,
+    pub(crate) http_port: u16,
+    pub(crate) https_port: u16,
+    pub(crate) explicit_tls_subjects: std::collections::BTreeSet<String>,
     pub(crate) servers: Vec<Arc<ServerConfig>>,
     pub(crate) certificates: Vec<FileCertificate>,
     shutdown_policy: HttpShutdownPolicy,
@@ -50,6 +56,7 @@ pub(crate) struct ServerConfig {
     pub(crate) client_ip_headers: Vec<String>,
     pub(crate) read_header_timeout: Duration,
     pub(crate) read_idle_timeout: Duration,
+    pub(crate) idle_timeout: Option<Duration>,
     pub(crate) protocols: Vec<String>,
     pub(crate) redirect_http: bool,
     pub(crate) manage_certificates: bool,
@@ -64,6 +71,7 @@ pub(crate) struct AccessLogConfig {
     pub(crate) skip_hosts: Vec<String>,
     pub(crate) skip_unmapped: bool,
     pub(crate) credentials: bool,
+    pub(crate) trace: bool,
 }
 
 fn access_logs(value: &Value, path: &str) -> Result<AccessLogConfig> {
@@ -80,10 +88,7 @@ fn access_logs(value: &Value, path: &str) -> Result<AccessLogConfig> {
         ],
         path,
     )?;
-    ensure!(
-        !boolean(map.get("trace"), false, path)?,
-        "HTTP handler trace logging is not implemented"
-    );
+    let trace = boolean(map.get("trace"), false, path)?;
     let mut names = std::collections::BTreeMap::new();
     if let Some(value) = map.get("logger_names").filter(|value| !value.is_null()) {
         let map = object(value, path)?;
@@ -117,6 +122,7 @@ fn access_logs(value: &Value, path: &str) -> Result<AccessLogConfig> {
         "oversized default access logger name"
     );
     Ok(AccessLogConfig {
+        trace,
         default_name,
         names,
         skip_hosts: map
@@ -237,9 +243,13 @@ pub fn validate_json(value: &Value) -> Result<PreparedConfig> {
         grace_period: (grace > 0).then(|| Duration::from_nanos(grace as u64)),
         shutdown_delay: Duration::from_nanos(delay.max(0) as u64),
     };
-    if http.contains_key("http_port") || http.contains_key("https_port") {
-        return Err(unsupported("/apps/http/port_overrides"));
+    fn port(http:&serde_json::Map<String,Value>,field:&str,default:u16)->Result<u16>{
+        let value=http.get(field).filter(|value|!value.is_null()).map(|value|value.as_number().and_then(serde_json::Number::as_go_i64).ok_or_else(||anyhow::anyhow!("integer HTTP application port required"))).transpose()?.unwrap_or(0);
+        ensure!((0..=65535).contains(&value),"HTTP application port out of range");
+        Ok(if value==0{default}else{value as u16})
     }
+    let http_port=port(http,"http_port",80)?;
+    let https_port=port(http,"https_port",443)?;
     let raw = object(
         http.get("servers")
             .ok_or_else(|| anyhow::anyhow!("servers required"))?,
@@ -251,7 +261,7 @@ pub fn validate_json(value: &Value) -> Result<PreparedConfig> {
     let mut regex_remaining = 64 << 20;
     let mut listen = std::collections::HashSet::new();
     for value in raw.values() {
-        let config = parse_server(value, &mut regex_remaining)?;
+        let config = parse_server(value, &mut regex_remaining,http_port,https_port)?;
         compiled_tls_memory = compiled_tls_memory.saturating_add(
             config
                 .tls_policies
@@ -269,6 +279,9 @@ pub fn validate_json(value: &Value) -> Result<PreparedConfig> {
         servers.push(Arc::new(config));
     }
     Ok(PreparedConfig {
+        events: None,
+        http_port,https_port,
+        explicit_tls_subjects: Default::default(),
         servers,
         certificates,
         shutdown_policy,
@@ -282,10 +295,6 @@ pub fn managed_names(config: &PreparedConfig) -> Vec<Vec<String>> {
     for server in &config.servers {
         if server.tls
             && server.manage_certificates
-            && server
-                .tls_policies
-                .iter()
-                .any(|policy| policy.any_tag.as_ref().is_none_or(Vec::is_empty))
         {
             for name in server_names(server) {
                 if !server
@@ -333,7 +342,7 @@ fn required<'a>(m: &'a serde_json::Map<String, Value>, key: &str) -> Result<&'a 
     m.get(key)
         .ok_or_else(|| anyhow::anyhow!("required configuration field missing"))
 }
-fn parse_server(value: &Value, regex_remaining: &mut usize) -> Result<ServerConfig> {
+fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_port:u16) -> Result<ServerConfig> {
     let path = "/apps/http/servers/*";
     let m = object(value, path)?;
     deny_unknown(
@@ -360,9 +369,6 @@ fn parse_server(value: &Value, regex_remaining: &mut usize) -> Result<ServerConf
         ],
         path,
     )?;
-    if m.contains_key("idle_timeout") {
-        return Err(unsupported("/apps/http/servers/*/idle_timeout"));
-    }
     let access_logs = m
         .get("logs")
         .filter(|value| !value.is_null())
@@ -482,14 +488,14 @@ fn parse_server(value: &Value, regex_remaining: &mut usize) -> Result<ServerConf
     }
     let routes = parse_routes(m.get("routes"), 0, false, regex_remaining)?;
     let inferred = !disabled
-        && listen.iter().any(|a| a.port() != 80)
+        && listen.iter().any(|a| a.port() != http_port)
         && route_names(&routes)
             .iter()
             .any(|n| !skip_redirect.iter().any(|s| s.eq_ignore_ascii_case(n)));
     let tls = policies
         .and_then(Value::as_array)
         .is_some_and(|policies| !policies.is_empty())
-        || (!disabled && listen.iter().any(|a| a.port() == 443))
+        || (!disabled && listen.iter().any(|a| a.port() == https_port))
         || inferred;
     let protocols = m
         .get("protocols")
@@ -601,6 +607,11 @@ fn parse_server(value: &Value, regex_remaining: &mut usize) -> Result<ServerConf
             .transpose()?
             .filter(|d| !d.is_zero())
             .unwrap_or(Duration::from_secs(60)),
+        idle_timeout: match m.get("idle_timeout").map(|v| signed_duration(v, path)).transpose()? {
+            None | Some(0) => Some(Duration::from_secs(300)),
+            Some(nanos) if nanos > 0 => Some(Duration::from_nanos(nanos as u64)),
+            Some(_) => None,
+        },
         read_idle_timeout: match m
             .get("read_idle_timeout")
             .map(|v| signed_duration(v, path))
@@ -656,19 +667,26 @@ fn parse_route(
     let path = "/apps/http/servers/*/routes/*";
     let m = object(value, path)?;
     deny_unknown(m, &["group", "match", "handle", "terminal"], path)?;
-    let handlers = m
+    let handlers: Vec<_> = m
         .get("handle")
         .map(|values| {
             values
                 .as_array()
                 .ok_or_else(|| anyhow::anyhow!("handler array required"))?
                 .iter()
-                .map(|value| parse_handler(value, depth + 1, normalized, regex_remaining))
+                .map(|value| {
+                    let raw=crate::module_json::inline(value,"handler",normalized)?;
+                    let handler=parse_handler(raw.as_ref(),depth+1,true,regex_remaining)?;
+                    let trace=crate::http_runtime::handler_trace::Module::prepare(raw.as_ref(),&handler,true)?;
+                    Ok((handler,trace))
+                })
                 .collect::<Result<_>>()
         })
         .transpose()?
         .unwrap_or_default();
+    let (handlers, trace_modules)=handlers.into_iter().unzip();
     Ok(Route {
+        trace_modules,
         group: m.get("group").map(|v| string(v, path)).transpose()?,
         matchers: parse_matcher_sets(m.get("match"), depth + 1, regex_remaining)?,
         handlers,
@@ -693,7 +711,7 @@ fn parse_request_regexp(value: &Value, remaining: &mut usize) -> Result<RequestR
     })
 }
 
-fn parse_matcher_sets(
+pub(crate) fn parse_matcher_sets(
     value: Option<&Value>,
     depth: usize,
     regex_remaining: &mut usize,
@@ -711,6 +729,7 @@ fn parse_matcher_sets(
         let mut set = Vec::new();
         for (k, v) in m {
             set.push(match k.as_str() {
+                "expression" => Matcher::Expression(Arc::new(crate::http_runtime::cel_matcher::Plan::prepare(v, regex_remaining)?)),
                 "host" => {
                     let mut seen = std::collections::HashSet::new();
                     let mut hosts = Vec::new();
@@ -755,11 +774,6 @@ fn parse_matcher_sets(
                     object(v, "vars_regexp")?
                         .iter()
                         .map(|(name, value)| {
-                            if name == "{http.request.body}" {
-                                return Err(unsupported(
-                                    "/match/vars_regexp/request_body_placeholder",
-                                ));
-                            }
                             Ok((name.clone(), parse_request_regexp(value, regex_remaining)?))
                         })
                         .collect::<Result<_>>()?,
@@ -789,9 +803,6 @@ fn parse_matcher_sets(
                     );
                     let mut rules = Vec::new();
                     for (key, value) in values.into_iter().flatten() {
-                        if k == "vars" && key == "{http.request.body}" {
-                            return Err(unsupported("/match/vars/request_body_placeholder"));
-                        }
                         let values = if value.is_null() {
                             Vec::new()
                         } else {
@@ -1026,6 +1037,16 @@ fn parse_handler(
             }
             Handler::RequestBody(config)
         }
+        "templates" => {
+            deny_unknown(m,&["handler","file_root","mime_types","delimiters","match"],path)?;
+            if let Some(extensions)=m.get("match"){ensure!(extensions.is_null() || object(extensions,path)?.is_empty(),"unsupported template extension module");}
+            let root=m.get("file_root").filter(|v|!v.is_null()).map(|v|string(v,path)).transpose()?.filter(|root|!root.is_empty()).unwrap_or_else(||"{http.vars.root}".into());
+            let mime_types=m.get("mime_types").filter(|v|!v.is_null()).map(|v|strings(v,path)).transpose()?.unwrap_or_else(||vec!["text/html".into(),"text/plain".into(),"text/markdown".into()]);
+            let delimiters=m.get("delimiters").filter(|v|!v.is_null()).map(|v|strings(v,path)).transpose()?.filter(|v|!v.is_empty()).unwrap_or_else(||vec!["{{".into(),"}}".into()]);
+            ensure!(delimiters.len()==2,"templates delimiters requires exactly two strings");
+            crate::http_runtime::templates::prepare_metadata()?;
+            Handler::Templates(std::sync::Arc::new(crate::http_runtime::templates::TemplatePlan{root,mime_types,delimiters:[if delimiters[0].is_empty(){"{{".into()}else{delimiters[0].clone()},if delimiters[1].is_empty(){"}}".into()}else{delimiters[1].clone()}]}))
+        }
         "encode" => Handler::Encode(std::sync::Arc::new(parse_encode(m, path)?)),
         "headers" => {
             deny_unknown(m, &["handler", "request", "response"], path)?;
@@ -1205,14 +1226,14 @@ fn parse_handler(
             deny_unknown(providers, &["http_basic"], path)?;
             let basic = object(required(providers, "http_basic")?, path)?;
             deny_unknown(basic, &["accounts", "hash", "hash_cache", "realm"], path)?;
-            if let Some(hash) = basic.get("hash") {
-                let h = object(hash, path)?;
-                deny_unknown(h, &["algorithm"], path)?;
-                ensure!(
-                    h.get("algorithm").and_then(Value::as_str) == Some("bcrypt"),
-                    "unsupported authentication hash"
-                );
-            }
+            let algorithm = if let Some(hash) = basic.get("hash").filter(|v| !v.is_null()) {
+                let h=object(hash,path)?;deny_unknown(h,&["algorithm"],path)?;
+                match h.get("algorithm").and_then(Value::as_str){
+                    Some("bcrypt")=>crate::http_runtime::auth_hash::Algorithm::Bcrypt,
+                    Some("argon2id")=>crate::http_runtime::auth_hash::Algorithm::Argon2id,
+                    _=>return Err(anyhow::anyhow!("unsupported authentication hash")),
+                }
+            }else{crate::http_runtime::auth_hash::Algorithm::Bcrypt};
             let cache = match basic.get("hash_cache") {
                 None | Some(Value::Null) => None,
                 Some(value) => {
@@ -1227,25 +1248,28 @@ fn parse_handler(
                 }
             };
             let mut accounts = Vec::new();
-            for value in required(basic, "accounts")?
-                .as_array()
-                .ok_or_else(|| anyhow::anyhow!("auth accounts array required"))?
-            {
-                let a = object(value, path)?;
-                deny_unknown(a, &["username", "password"], path)?;
-                let password = string(required(a, "password")?, path)?;
-                bcrypt::HashParts::from_str(&password)
-                    .map_err(|_| anyhow::anyhow!("invalid bcrypt configuration hash"))?;
-                accounts.push(Account {
-                    username: string(required(a, "username")?, path)?,
-                    password,
-                });
+            let mut usernames=std::collections::BTreeSet::new();
+            for value in required(basic,"accounts")?.as_array().ok_or_else(||anyhow::anyhow!("auth accounts array required"))? {
+                let a=object(value,path)?;deny_unknown(a,&["username","password"],path)?;
+                let username=helpers::replace(&string(required(a,"username")?,path)?,false,helpers::global_lookup)?;
+                let mut password=helpers::replace(&string(required(a,"password")?,path)?,false,helpers::global_lookup)?;
+                ensure!(!username.is_empty()&&!password.is_empty(),"authentication username/password required");
+                ensure!(usernames.insert(username.clone()),"duplicate authentication username");
+                if !password.starts_with('$'){
+                    use base64::Engine;
+                    let engine=base64::engine::GeneralPurpose::new(&base64::alphabet::STANDARD,base64::engine::general_purpose::GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true));
+                    let clean=password.bytes().filter(|b| !matches!(b,b'\r'|b'\n')).collect::<Vec<_>>();
+                    password=String::from_utf8(engine.decode(clean).map_err(|_|anyhow::anyhow!("invalid encoded authentication hash"))?).map_err(|_|anyhow::anyhow!("invalid authentication hash text"))?;
+                }
+                algorithm.validate(&password).map_err(|_|anyhow::anyhow!("invalid or resource-exceeding authentication hash"))?;
+                accounts.push(Account{username,password});
             }
             ensure!(
                 accounts.len() <= 4096,
                 "authentication account limit exceeded"
             );
             Handler::Authentication {
+                algorithm,
                 accounts,
                 cache,
                 realm: basic
@@ -1344,7 +1368,11 @@ fn parse_handler(
         }
         "intercept" => {
             deny_unknown(m, &["handler", "handle_response"], path)?;
-            Handler::Intercept(parse_response_routes(m.get("handle_response"), depth, regex_remaining)?)
+            Handler::Intercept(parse_response_routes(
+                m.get("handle_response"),
+                depth,
+                regex_remaining,
+            )?)
         }
         "copy_response" => {
             deny_unknown(m, &["handler", "status_code"], path)?;
@@ -1359,10 +1387,15 @@ fn parse_handler(
             deny_unknown(m, &["handler", "include", "exclude"], path)?;
             let include = parse_response_header_filter(m.get("include"), path)?;
             let exclude = parse_response_header_filter(m.get("exclude"), path)?;
-            ensure!(include.is_empty() || exclude.is_empty(), "cannot define both include and exclude");
+            ensure!(
+                include.is_empty() || exclude.is_empty(),
+                "cannot define both include and exclude"
+            );
             Handler::CopyResponseHeaders(ResponseHeaderFilter { include, exclude })
         }
-        "reverse_proxy" => Handler::ReverseProxy(Box::new(parse_proxy(m, path, depth, regex_remaining)?)),
+        "reverse_proxy" => {
+            Handler::ReverseProxy(Box::new(parse_proxy(m, path, depth, regex_remaining)?))
+        }
         _ => return Err(unsupported(path)),
     })
 }
@@ -1400,7 +1433,10 @@ fn parse_response_routes(
     let entries = value
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("{path}: expected response route list"))?;
-    ensure!(entries.len() <= 65536, "response route count limit exceeded");
+    ensure!(
+        entries.len() <= 65536,
+        "response route count limit exceeded"
+    );
     entries
         .iter()
         .map(|entry| {
@@ -1577,20 +1613,33 @@ fn parse_proxy(
             "request_buffers",
             "load_balancing",
             "handle_response",
+            "health_checks",
+            "dynamic_upstreams",
         ],
         path,
     )?;
+    let ext = Arc::new(proxy_ext::parse(m, path, regex_remaining)?);
     let mut upstreams = Vec::new();
-    for v in required(m, "upstreams")?
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("upstream array required"))?
-    {
+    let empty = Vec::new();
+    let configured_upstreams = match m.get("upstreams").filter(|v| !v.is_null()) {
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("upstream array required"))?,
+        None => &empty,
+    };
+    for v in configured_upstreams {
         let u = object(v, path)?;
         deny_unknown(u, &["dial", "max_requests"], path)?;
         let dial = string(required(u, "dial")?, path)?;
         ensure!(
             !dial.contains(['\r', '\n', '\0'])
-                && (is_fastcgi || !dial.contains('/') && !dial.starts_with("unix")),
+                && (is_fastcgi
+                    || dial
+                        .split_once('/')
+                        .is_none_or(|(network, address)| matches!(
+                            network,
+                            "tcp" | "tcp4" | "tcp6" | "unix"
+                        ) && !address.is_empty())),
             "unsupported upstream dial address"
         );
         if is_fastcgi && let Some((network, address)) = dial.split_once('/') {
@@ -1600,25 +1649,36 @@ fn parse_proxy(
             );
         }
         let max_requests = typed_proxy_int(u.get("max_requests"))?;
-        ensure!(
-            !is_fastcgi || max_requests == 0,
-            "FastCGI upstream capacity not available"
-        );
         upstreams.push(crate::http_runtime::proxy_policy::Upstream { dial, max_requests });
     }
     ensure!(
-        !upstreams.is_empty() && upstreams.len() <= 4096,
+        (!upstreams.is_empty() || ext.dynamic.is_some()) && upstreams.len() <= 4096,
         "upstream count invalid"
     );
     let load_balancing = m.get("load_balancing").filter(|v| !v.is_null());
-    ensure!(
-        !is_fastcgi || load_balancing.is_none(),
-        "FastCGI selection policies not available"
-    );
     let selection = if let Some(value) = load_balancing {
         let lb = object(value, path)?;
-        deny_unknown(lb, &["selection_policy"], path)?;
-        parse_selector(lb.get("selection_policy"), path, upstreams.len(), 0)?
+        deny_unknown(
+            lb,
+            &[
+                "selection_policy",
+                "retries",
+                "try_duration",
+                "try_interval",
+                "retry_match",
+            ],
+            path,
+        )?;
+        parse_selector(
+            lb.get("selection_policy"),
+            path,
+            if ext.dynamic.is_some() {
+                0
+            } else {
+                upstreams.len()
+            },
+            0,
+        )?
     } else {
         crate::http_runtime::proxy_policy::Selection::Random
     };
@@ -1699,10 +1759,6 @@ fn parse_proxy(
             capture_stderr: boolean(t.get("capture_stderr"), false, path)?,
         })
     } else {
-        ensure!(
-            !m.contains_key("request_buffers"),
-            "unsupported HTTP request_buffers"
-        );
         None
     };
     let mut tls = None;
@@ -1744,6 +1800,7 @@ fn parse_proxy(
                         "insecure_skip_verify",
                         "root_ca_pem_files",
                         "root_ca_pool",
+                        "except_ports",
                         "client_certificate_file",
                         "client_certificate_key_file",
                         "handshake_timeout",
@@ -1751,6 +1808,11 @@ fn parse_proxy(
                     path,
                 )?;
                 tls = Some(ProxyTls {
+                    except_ports: t
+                        .get("except_ports")
+                        .map(|v| strings(v, path))
+                        .transpose()?
+                        .unwrap_or_default(),
                     server_name: t.get("server_name").map(|v| string(v, path)).transpose()?,
                     insecure_skip_verify: boolean(t.get("insecure_skip_verify"), false, path)?,
                     root_ca_pool: t
@@ -1819,13 +1881,6 @@ fn parse_proxy(
             .transpose()?
             .filter(|d| !d.is_zero());
     }
-    if m.get("flush_interval")
-        .map(|v| signed_duration(v, path))
-        .transpose()?
-        .is_some_and(|v| v > 0)
-    {
-        return Err(unsupported("/reverse_proxy/flush_interval/positive"));
-    }
     let mut request_headers = HeaderOps::default();
     let mut response_headers = HeaderOps::default();
     if let Some(v) = m.get("headers") {
@@ -1842,6 +1897,7 @@ fn parse_proxy(
         }
     }
     Ok(ProxyConfig {
+        ext,
         upstreams,
         selection,
         fastcgi,
@@ -1870,9 +1926,9 @@ fn parse_proxy(
 use std::str::FromStr;
 
 fn pending_placeholders(value: &Value) -> Result<()> {
-    pending_placeholders_depth(value, 0)
+    pending_placeholders_depth(value, 0, false)
 }
-fn pending_placeholders_depth(value: &Value, depth: usize) -> Result<()> {
+fn pending_placeholders_depth(value: &Value, depth: usize, typed_expression: bool) -> Result<()> {
     ensure!(depth <= 128, "configuration nesting exceeds limit");
     match value {
         Value::String(s) => {
@@ -1888,7 +1944,7 @@ fn pending_placeholders_depth(value: &Value, depth: usize) -> Result<()> {
                 {
                     let key = &s[i + 1..end];
                     if key.starts_with("file.")
-                        || key.starts_with("http.request.tls.")
+                        || (!typed_expression && key.starts_with("http.request.tls."))
                         || (key.starts_with("http.reverse_proxy.")
                             && !matches!(
                                 key,
@@ -1901,6 +1957,9 @@ fn pending_placeholders_depth(value: &Value, depth: usize) -> Result<()> {
                                     | "http.reverse_proxy.upstream.fails"
                                     | "http.reverse_proxy.status_code"
                                     | "http.reverse_proxy.status_text"
+                                    | "http.reverse_proxy.retries"
+                                    | "http.reverse_proxy.is_transport_error"
+                                    | "http.reverse_proxy.active.target_upstream"
                             )
                             && !key.starts_with("http.reverse_proxy.header."))
                     {
@@ -1911,7 +1970,7 @@ fn pending_placeholders_depth(value: &Value, depth: usize) -> Result<()> {
         }
         Value::Array(values) => {
             for value in values {
-                pending_placeholders_depth(value, depth + 1)?;
+                pending_placeholders_depth(value, depth + 1, typed_expression)?;
             }
         }
         Value::Object(values) => {
@@ -1938,7 +1997,7 @@ fn pending_placeholders_depth(value: &Value, depth: usize) -> Result<()> {
                 {
                     continue;
                 }
-                pending_placeholders_depth(value, depth + 1)?;
+                pending_placeholders_depth(value, depth + 1, typed_expression || key == "expression")?;
             }
         }
         _ => {}
@@ -2152,10 +2211,11 @@ fn parse_selector(
                 .as_array()
                 .ok_or_else(|| anyhow::anyhow!("invalid proxy weights"))?;
             ensure!(
-                array.len() == 1 || array.len() == upstreams,
+                array.len() <= 4096
+                    && (upstreams == 0 || array.len() == 1 || array.len() == upstreams),
                 "proxy weights must match upstream count"
             );
-            let mut weights = Vec::with_capacity(upstreams);
+            let mut weights = Vec::with_capacity(upstreams.max(array.len()));
             let mut sum: i64 = 0;
             for item in array {
                 let n = typed_proxy_int(Some(item))?;
@@ -2169,7 +2229,9 @@ fn parse_selector(
             // The pinned module supports a single weight with a larger
             // pool: it chooses the first upstream. Preserve that shape,
             // while still honoring its capacity and never panicking.
-            weights.resize(upstreams, 0);
+            if upstreams > 0 {
+                weights.resize(upstreams, 0);
+            }
             Selection::Weighted(weights)
         }
         "random_choose" => {

@@ -12,6 +12,7 @@ use crate::sign::SigningKey;
 use crate::sync::Arc;
 pub use crate::webpki::{
     WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature,
+    verify_tls12_signature_with_raw_key,
     verify_tls13_signature_with_raw_key,
 };
 #[cfg(doc)]

@@ -42,6 +42,8 @@ pub struct CertificateResources {
     pub(super) io: Arc<Semaphore>,
     pub(super) cpu: Arc<Semaphore>,
     pub(super) revoked: Notify,
+    /// Bytes reserved before receiving/parsing manager material, shared across reloads.
+    pub(super) external_bytes: Arc<Semaphore>,
 }
 impl CertificateResources {
     pub fn new() -> Result<Self> {
@@ -68,6 +70,7 @@ impl CertificateResources {
             )?),
             io: Arc::new(Semaphore::new(8)),
             revoked: Notify::new(),
+            external_bytes: Arc::new(Semaphore::new(256 * 1024 * 1024)),
         })
     }
     pub(super) async fn store(

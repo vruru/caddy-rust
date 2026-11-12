@@ -216,7 +216,7 @@ mod log_assembly;
 mod global_servers;
 
 #[path = "caddyfile_adapter/pdqsort.rs"]
-mod pdqsort;
+pub(crate) mod pdqsort;
 
 #[path = "caddyfile_adapter/handler_acmeserver.rs"]
 mod handler_acmeserver;

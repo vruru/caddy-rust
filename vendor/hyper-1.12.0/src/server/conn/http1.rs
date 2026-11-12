@@ -6,7 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::rt::{Read, Write};
 use crate::upgrade::Upgraded;
@@ -82,6 +82,8 @@ pub struct Builder {
     h1_max_headers: Option<usize>,
     h1_max_header_size: Option<usize>,
     h1_header_read_timeout: Dur,
+    h1_idle_timeout: Dur,
+    h1_initial_header_deadline: Option<Instant>,
     h1_writev: Option<bool>,
     max_buf_size: Option<usize>,
     pipeline_flush: bool,
@@ -258,6 +260,8 @@ impl Builder {
             h1_max_headers: None,
             h1_max_header_size: None,
             h1_header_read_timeout: Dur::Default(Some(Duration::from_secs(30))),
+            h1_idle_timeout: Dur::Default(None),
+            h1_initial_header_deadline: None,
             h1_writev: None,
             max_buf_size: None,
             pipeline_flush: false,
@@ -409,6 +413,23 @@ impl Builder {
         self
     }
 
+    /// Carry the absolute initial header deadline through protocol detection.
+    /// This applies once; later request heads use `header_read_timeout`.
+    #[doc(hidden)]
+    pub fn initial_header_read_deadline(&mut self, deadline: Instant) -> &mut Self {
+        self.h1_initial_header_deadline = Some(deadline);
+        self
+    }
+
+    /// Maximum keep-alive wait for the next request's first four bytes.
+    /// Once a request starts, the independent header/body deadlines apply.
+    /// `None` disables this idle limit, and requires no timer.
+    pub fn idle_timeout(&mut self, timeout: impl Into<Option<Duration>>) -> &mut Self {
+        self.h1_idle_timeout = Dur::Configured(timeout.into().filter(|d| !d.is_zero()));
+        self
+    }
+
+
     /// Set whether HTTP/1 connections should try to use vectored writes,
     /// or always flatten into a single buffer.
     ///
@@ -552,6 +573,13 @@ impl Builder {
             .check(self.h1_header_read_timeout, "header_read_timeout")
         {
             conn.set_http1_header_read_timeout(dur);
+        }
+        if let Some(deadline) = self.h1_initial_header_deadline {
+            conn.set_http1_initial_header_deadline(deadline);
+        }
+        if let Dur::Configured(_) = self.h1_idle_timeout {
+            let idle = self.timer.check(self.h1_idle_timeout, "idle_timeout");
+            conn.set_http1_idle_timeout(idle);
         }
         if let Some(writev) = self.h1_writev {
             if writev {

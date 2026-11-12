@@ -607,6 +607,7 @@ fn emit_finished(
 ) {
     let vh = transcript.current_hash();
     let verify_data = secrets.client_verify_data(&vh);
+    if common.native_tls_unique.is_none() { common.native_tls_unique = Some(verify_data.clone()); }
     let verify_data_payload = Payload::new(verify_data);
 
     let f = Message {
@@ -1273,6 +1274,9 @@ impl State<ClientConnectionData> for ExpectFinished {
                         .send_fatal_alert(AlertDescription::DecryptError, Error::DecryptError));
                 }
             };
+        if cx.common.native_tls_unique.is_none() {
+            cx.common.native_tls_unique = Some(expect_verify_data.clone());
+        }
 
         // Hash this message too.
         st.transcript.add_message(&m);
@@ -1289,7 +1293,9 @@ impl State<ClientConnectionData> for ExpectFinished {
 
         cx.common
             .start_traffic(&mut cx.sendable_plaintext);
+        cx.common.native_tls12_ems = st.using_ems;
         Ok(Box::new(ExpectTraffic {
+            using_ems: st.using_ems,
             secrets: st.secrets,
             _cert_verified: st.cert_verified,
             _sig_verified: st.sig_verified,
@@ -1316,6 +1322,7 @@ impl State<ClientConnectionData> for ExpectFinished {
 
 // -- Traffic transit state --
 struct ExpectTraffic {
+    using_ems: bool,
     secrets: ConnectionSecrets,
     _cert_verified: verify::ServerCertVerified,
     _sig_verified: verify::HandshakeSignatureValid,
@@ -1343,6 +1350,10 @@ impl State<ClientConnectionData> for ExpectTraffic {
             }
         }
         Ok(self)
+    }
+
+    fn native_exporter(&self) -> Result<alloc::sync::Arc<dyn crate::NativeExporter>, Error> {
+        Ok(self.secrets.native_exporter(self.using_ems))
     }
 
     fn export_keying_material(

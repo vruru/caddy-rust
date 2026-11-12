@@ -29,7 +29,7 @@ fn decoded(raw: &[u8]) -> Option<Cow<'_, [u8]>> {
 
 type QueryPair<'a> = (Cow<'a, [u8]>, Cow<'a, [u8]>);
 
-fn query_pair(segment: &[u8]) -> Option<QueryPair<'_>> {
+pub(super) fn query_pair(segment: &[u8]) -> Option<QueryPair<'_>> {
     if segment.contains(&b';') {
         return None;
     }

@@ -347,6 +347,9 @@ pub struct ServerSessionValue {
     pub(crate) master_secret: Zeroizing<PayloadU8>,
     pub(crate) extended_ms: bool,
     pub(crate) client_cert_chain: Option<CertificateChain<'static>>,
+    pub(crate) native_client_chains: crate::ClientChainObservation,
+    pub(crate) native_curve_id: Option<u16>,
+    pub(crate) native_peer_extras: crate::native_peer_extras::NativePeerExtras,
     pub(crate) alpn: Option<PayloadU8>,
     pub(crate) application_data: PayloadU16,
     pub creation_time_sec: u64,
@@ -363,6 +366,9 @@ impl fmt::Debug for ServerSessionValue {
             master_secret: _,
             extended_ms,
             client_cert_chain,
+            native_client_chains: _,
+            native_curve_id: _,
+            native_peer_extras: _,
             alpn,
             application_data,
             creation_time_sec,
@@ -413,6 +419,11 @@ impl Codec<'_> for ServerSessionValue {
         self.creation_time_sec.encode(bytes);
         self.age_obfuscation_offset
             .encode(bytes);
+        0xc2u8.encode(bytes);
+        self.native_curve_id.unwrap_or(0).encode(bytes);
+        PayloadU16::<MaybeEmpty>::new(self.native_client_chains.to_session_bytes()).encode(bytes);
+        // An unrepresentable observation makes this session non-resumable, never silently empty.
+        PayloadU16::<MaybeEmpty>::new(self.native_peer_extras.encode_session().unwrap_or_default()).encode(bytes);
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
@@ -448,6 +459,27 @@ impl Codec<'_> for ServerSessionValue {
         let application_data = PayloadU16::read(r)?;
         let creation_time_sec = u64::read(r)?;
         let age_obfuscation_offset = u32::read(r)?;
+        let mut native_curve_id = None;
+        let mut native_peer_extras = crate::native_peer_extras::NativePeerExtras::default();
+        let native_client_chains = if r.any_left() {
+            let tag = u8::read(r)?;
+            if tag != 0xc1 && tag != 0xc2 { return Err(InvalidMessage::UnexpectedMessage("client chain session extension")); }
+            let curve = u16::read(r)?;
+            native_curve_id = (curve != 0).then_some(curve);
+            let body = PayloadU16::<MaybeEmpty>::read(r)?;
+            if tag == 0xc2 {
+                let extras_body = PayloadU16::<MaybeEmpty>::read(r)?;
+                native_peer_extras = crate::native_peer_extras::NativePeerExtras::decode_session(&extras_body.0)
+                    .ok_or(InvalidMessage::UnexpectedMessage("client extras session observation"))?;
+                if ccert.as_ref().map_or(true, |chain| chain.is_empty())
+                    && (!native_peer_extras.ocsp.is_empty() || !native_peer_extras.scts.is_empty()) {
+                    return Err(InvalidMessage::UnexpectedMessage("client extras without peer certificate"));
+                }
+            }
+            crate::ClientChainObservation::from_session_bytes(&body.0,
+                ccert.as_ref().map_or(0, |chain| chain.len()))
+                .ok_or(InvalidMessage::UnexpectedMessage("client chain session observation"))?
+        } else { crate::ClientChainObservation::Unavailable(crate::ChainUnavailable::LegacySession) };
 
         Ok(Self {
             sni,
@@ -456,6 +488,9 @@ impl Codec<'_> for ServerSessionValue {
             master_secret: ms,
             extended_ms: ems == 1u8,
             client_cert_chain: ccert,
+            native_client_chains,
+            native_curve_id,
+            native_peer_extras,
             alpn,
             application_data,
             creation_time_sec,
@@ -484,6 +519,9 @@ impl ServerSessionValue {
             master_secret: Zeroizing::new(PayloadU8::new(ms.to_vec())),
             extended_ms: false,
             client_cert_chain,
+            native_client_chains: crate::ClientChainObservation::NotVerified,
+            native_curve_id: None,
+            native_peer_extras: crate::native_peer_extras::NativePeerExtras::default(),
             alpn: alpn.map(|p| PayloadU8::new(p.as_ref().to_vec())),
             application_data: PayloadU16::new(application_data),
             creation_time_sec: creation_time.as_secs(),

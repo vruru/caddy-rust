@@ -21,7 +21,7 @@ use crate::headers;
 use crate::proto::h2::ping::Recorder;
 use crate::proto::Dispatched;
 use crate::rt::bounds::{Http2ServerConnExec, Http2UpgradedExec};
-use crate::rt::{Read, Write};
+use crate::rt::{Read, Write, Sleep};
 use crate::service::HttpService;
 
 use crate::upgrade::{OnUpgrade, Pending, Upgraded};
@@ -52,6 +52,7 @@ pub(crate) struct Config {
     pub(crate) max_local_error_reset_streams: Option<usize>,
     pub(crate) keep_alive_interval: Option<Duration>,
     pub(crate) keep_alive_timeout: Duration,
+    pub(crate) idle_timeout: Option<Duration>,
     pub(crate) max_send_buffer_size: usize,
     pub(crate) header_table_size: Option<u32>,
     pub(crate) max_header_list_size: u32,
@@ -73,6 +74,7 @@ impl Default for Config {
             header_table_size: None,
             keep_alive_interval: None,
             keep_alive_timeout: Duration::from_secs(20),
+            idle_timeout: None,
             max_send_buffer_size: DEFAULT_MAX_SEND_BUF_SIZE,
             max_header_list_size: DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE,
             date_header: true,
@@ -93,7 +95,8 @@ pin_project! {
         state: State<T, B>,
         date_header: bool,
         informational: Option<crate::ext::InformationalLimits>,
-        close_pending: bool
+        close_pending: bool,
+        idle_timeout: Option<Duration>,
     }
 }
 
@@ -117,6 +120,10 @@ where
     ping: Option<(ping::Recorder, ping::Ponger)>,
     conn: Connection<Compat<T>, SendBuf<B::Data>>,
     closing: Option<crate::Error>,
+    timer: Time,
+    idle_timeout: Option<Duration>,
+    idle: Option<Pin<Box<dyn Sleep>>>,
+    idle_closing: Option<Pin<Box<dyn Sleep>>>,
     date_header: bool,
     informational: Option<crate::ext::InformationalLimits>,
 }
@@ -184,6 +191,7 @@ where
             date_header: config.date_header,
             informational: config.informational,
             close_pending: false,
+            idle_timeout: config.idle_timeout,
         }
     }
 
@@ -228,6 +236,10 @@ where
                         ping,
                         conn,
                         closing: None,
+                        timer: me.timer.clone(),
+                        idle_timeout: me.idle_timeout,
+                        idle: None,
+                        idle_closing: None,
                         date_header: me.date_header,
                         informational: me.informational,
                     })
@@ -262,11 +274,37 @@ where
         S::Error: Into<Box<dyn StdError + Send + Sync>>,
         E: Http2ServerConnExec<S::Future, B>,
     {
+        if let Some(closing) = &mut self.idle_closing {
+            if self.conn.poll_closed(cx).map_err(crate::Error::new_h2)?.is_ready()
+                || closing.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Ok(()));
+            }
+            return Poll::Pending;
+        }
         if self.closing.is_none() {
             loop {
                 self.poll_ping(cx);
 
-                match ready!(self.conn.poll_accept(cx)) {
+                let next = match self.conn.poll_accept(cx) {
+                    Poll::Ready(next) => { self.idle = None; next },
+                    Poll::Pending => {
+                        if self.conn.has_active_streams() { self.idle = None; }
+                        else if let Some(duration) = self.idle_timeout {
+                            let sleep = self.idle.get_or_insert_with(|| self.timer.sleep(duration));
+                            if sleep.as_mut().poll(cx).is_ready() {
+                                self.conn.graceful_shutdown();
+                                // Give GOAWAY its usual bounded drain. An idle
+                                // peer which ignores the shutdown PING cannot
+                                // retain the connection indefinitely.
+                                self.idle_closing = Some(self.timer.sleep(Duration::from_secs(1)));
+                                self.idle = None;
+                                cx.waker().wake_by_ref();
+                            }
+                        }
+                        return Poll::Pending;
+                    },
+                };
+                match next {
                     Some(Ok((req, mut respond))) => {
                         trace!("incoming request");
                         let content_length = headers::content_length_parse_all(req.headers());

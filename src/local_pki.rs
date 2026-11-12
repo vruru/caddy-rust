@@ -334,6 +334,15 @@ impl LocalPki {
             .transpose()
             .map(Option::flatten)
     }
+    /// Names from the same provisioned authority, evaluated with its own clock.
+    /// This copies no private state and performs no filesystem or network I/O.
+    pub(crate) fn public_names(&self,id:&str)->Result<(String,String,String)> {
+        let authority=self.authority(id)?;
+        let now=(self.shared.clock)()?;
+        Ok((authority.config.name.clone(),
+            authority.common_name(&authority.config.root_common_name,now)?,
+            authority.common_name(&authority.config.intermediate_common_name,now)?))
+    }
     async fn accepted<T: Send + 'static>(
         &self,
         waiting: CancellationToken,

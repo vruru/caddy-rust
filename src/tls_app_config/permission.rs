@@ -243,3 +243,23 @@ fn permission_client(cache: &Mutex<Option<CachedClient>>, url: &Url) -> Result<r
     });
     Ok(client)
 }
+
+/// Reuse the permission transport's Go-compatible authority/path parser without
+/// adding its domain argument or normalizing encoded dot/slash path segments.
+pub(super) fn external_request(input: &str, replacements: &[(&str,&str)])
+    -> Result<(reqwest::Request,http::uri::PathAndQuery)> {
+    let target = target::Target::parse(input, "")?;
+    let original_query = input.split('#').next().unwrap_or(input)
+        .split_once('?').map_or("", |(_,query)| query);
+    let query = query::query_with_values(original_query, replacements);
+    let raw = format!("{}?{}",target.target.path(),query);
+    let mut request = reqwest::Request::new(http::Method::GET, target.origin);
+    request.headers_mut().insert(http::header::HOST,target.host);
+    if let Some(auth)=target.auth { request.headers_mut().insert(http::header::AUTHORIZATION,auth); }
+    let raw=http::uri::PathAndQuery::from_bounded_origin_form(bytes::Bytes::from(raw))?;
+    Ok((request,raw))
+}
+
+/// Keep the external HTTP manager on the same Go-compatible environment proxy
+/// rules as ask, including NO_PROXY and the CGI HTTP_PROXY protection.
+pub(super) fn external_proxy(url: &Url) -> Result<Option<Url>> { proxy::selected(url) }

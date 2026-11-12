@@ -211,6 +211,8 @@ impl UnknownExtension {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SupportedEcPointFormats {
+    pub(crate) native_offered: [u8; 255],
+    pub(crate) native_len: u8,
     pub(crate) uncompressed: bool,
 }
 
@@ -225,20 +227,21 @@ impl Codec<'_> for SupportedEcPointFormats {
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
         let mut uncompressed = false;
-
+        let mut native_offered = [0u8; 255];
+        let mut native_len = 0usize;
         for pf in TlsListIter::<ECPointFormat>::new(r)? {
-            if let ECPointFormat::Uncompressed = pf? {
-                uncompressed = true;
-            }
+            let pf = pf?;
+            if native_len == native_offered.len() { return Err(InvalidMessage::MessageTooLarge); }
+            native_offered[native_len] = u8::from(pf); native_len += 1;
+            if let ECPointFormat::Uncompressed = pf { uncompressed = true; }
         }
-
-        Ok(Self { uncompressed })
+        Ok(Self { uncompressed, native_offered, native_len: native_len as u8 })
     }
 }
 
 impl Default for SupportedEcPointFormats {
     fn default() -> Self {
-        Self { uncompressed: true }
+        Self { uncompressed: true, native_offered: [0;255], native_len: 0 }
     }
 }
 
@@ -702,10 +705,19 @@ impl TlsListElement for KeyShareEntry {
 /// ignore the preference of the client.
 ///
 /// RFC8446: `ProtocolVersion versions<2..254>;`
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct SupportedProtocolVersions {
+    pub(crate) native_offered: [ProtocolVersion; 127],
+    pub(crate) native_len: u8,
     pub(crate) tls13: bool,
     pub(crate) tls12: bool,
+}
+
+impl Default for SupportedProtocolVersions {
+    fn default() -> Self {
+        Self { tls13: false, tls12: false,
+            native_offered: [ProtocolVersion::Unknown(0);127], native_len: 0 }
+    }
 }
 
 impl SupportedProtocolVersions {
@@ -739,16 +751,19 @@ impl Codec<'_> for SupportedProtocolVersions {
     fn read(reader: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
         let mut tls12 = false;
         let mut tls13 = false;
-
+        let mut native_offered = [ProtocolVersion::Unknown(0);127];
+        let mut native_len = 0usize;
         for pv in TlsListIter::<ProtocolVersion>::new(reader)? {
-            match pv? {
+            let pv = pv?;
+            if native_len == native_offered.len() { return Err(InvalidMessage::MessageTooLarge); }
+            native_offered[native_len] = pv; native_len += 1;
+            match pv {
                 ProtocolVersion::TLSv1_3 => tls13 = true,
                 ProtocolVersion::TLSv1_2 => tls12 = true,
-                _ => continue,
+                _ => {},
             };
         }
-
-        Ok(Self { tls13, tls12 })
+        Ok(Self { tls13, tls12, native_offered, native_len: native_len as u8 })
     }
 }
 
@@ -1733,10 +1748,25 @@ impl TlsListElement for CertificateDer<'_> {
 /// that is directly controllable by the peer.
 pub(crate) const CERTIFICATE_MAX_SIZE_LIMIT: usize = 0x1_0000;
 
+#[derive(Clone, Debug)]
+pub(crate) struct NativeSctList(Vec<Vec<u8>>);
+impl Codec<'_> for NativeSctList {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        // Construction and decoding validate the nonempty TLS list.
+        if let Some(wire) = crate::native_peer_extras::encode_scts(&self.0) { bytes.extend(wire); }
+    }
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        crate::native_peer_extras::decode_scts(r.rest()).map(Self)
+            .ok_or(InvalidMessage::InvalidCertificateStatusType)
+    }
+}
+
 extension_struct! {
     pub(crate) struct CertificateExtensions<'a> {
         ExtensionType::StatusRequest =>
             pub(crate) status: Option<CertificateStatus<'a>>,
+        ExtensionType::SCT =>
+            pub(crate) native_scts: Option<NativeSctList>,
     }
 }
 
@@ -1744,6 +1774,7 @@ impl CertificateExtensions<'_> {
     fn into_owned(self) -> CertificateExtensions<'static> {
         CertificateExtensions {
             status: self.status.map(|s| s.into_owned()),
+            native_scts: self.native_scts,
         }
     }
 }
@@ -1890,6 +1921,33 @@ impl<'a> CertificatePayloadTls13<'a> {
                     .into_vec()
             })
             .unwrap_or_default()
+    }
+
+    pub(crate) fn native_end_entity_scts(&self) -> Vec<Vec<u8>> {
+        self.entries.first().and_then(|entry| entry.extensions.native_scts.as_ref())
+            .map(|scts| scts.0.clone()).unwrap_or_default()
+    }
+    pub(crate) fn native_add_scts(&mut self, scts: &[Vec<u8>]) -> Result<(), crate::Error> {
+        let wire = if scts.is_empty() { None } else {
+            Some(crate::native_peer_extras::encode_scts(scts)
+                .filter(|wire|wire.len() <= u16::MAX as usize)
+                .ok_or_else(||crate::Error::General("invalid client SCT list".into()))?)
+        };
+        let Some(entry) = self.entries.first_mut() else {
+            return if wire.is_none() { Ok(()) } else { Err(crate::Error::General("client SCTs require a certificate".into())) };
+        };
+        // Both the per-extension payload and enclosing extension list have u16
+        // lengths. Validate configured peer bytes before either can truncate.
+        let status_len = entry.extensions.status.as_ref().map_or(0, |status|status.ocsp_response.0.bytes().len());
+        let extensions_len = if entry.extensions.status.is_some() {
+            status_len.checked_add(8).filter(|_|status_len <= (u16::MAX as usize)-4)
+        } else { Some(0) };
+        let extensions_len = extensions_len.and_then(|len|len.checked_add(wire.as_ref().map_or(0, |w|w.len()+4)));
+        if !extensions_len.is_some_and(|len|len <= u16::MAX as usize) {
+            return Err(crate::Error::General("client certificate extensions exceed TLS length limit".into()));
+        }
+        if wire.is_some() { entry.extensions.native_scts = Some(NativeSctList(scts.to_vec())); }
+        Ok(())
     }
 
     pub(crate) fn into_certificate_chain(self) -> CertificateChain<'a> {
@@ -2294,6 +2352,10 @@ impl Codec<'_> for CertificateRequestPayload {
 
 extension_struct! {
     pub(crate) struct CertificateRequestExtensions {
+        ExtensionType::StatusRequest =>
+            pub(crate) native_status_request: Option<()>,
+        ExtensionType::SCT =>
+            pub(crate) native_scts_request: Option<()>,
         ExtensionType::SignatureAlgorithms =>
             pub(crate) signature_algorithms: Option<Vec<SignatureScheme>>,
 

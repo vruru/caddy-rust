@@ -1,0 +1,714 @@
+// Copyright 2015-2019 Benjamin Fry <benjaminfry@me.com>
+//
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
+
+//! Structs for creating and using a Resolver
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU8;
+use std::task::{Context, Poll};
+
+use futures_util::{
+    FutureExt, Stream,
+    future::{self, BoxFuture},
+    lock::Mutex as AsyncMutex,
+};
+use tracing::debug;
+
+#[cfg(feature = "__tls")]
+use crate::connection_provider::TlsConfig;
+#[cfg(feature = "tokio")]
+use crate::net::runtime::TokioRuntimeProvider;
+use crate::{
+    cache::{MAX_TTL, ResponseCache, TtlConfig},
+    caching_client::CachingClient,
+    config::{OpportunisticEncryption, ResolveHosts, ResolverConfig, ResolverOpts},
+    connection_provider::ConnectionProvider,
+    hosts::Hosts,
+    lookup::Lookup,
+    lookup_ip::{LookupIp, LookupIpFuture},
+    name_server_pool::{NameServerPool, NameServerTransportState, PoolContext},
+    net::{
+        NetError,
+        xfer::{DnsHandle, RetryDnsHandle},
+    },
+    proto::{
+        op::{DnsRequest, DnsRequestOptions, DnsResponse, Query},
+        rr::domain::usage::ONION,
+        rr::{IntoName, Name, RData, Record, RecordType},
+    },
+};
+#[cfg(feature = "__dnssec")]
+use crate::{net::dnssec::DnssecDnsHandle, proto::dnssec::TrustAnchors};
+
+macro_rules! lookup_fn {
+    ($p:ident, $r:path) => {
+        /// Performs a lookup for the associated type.
+        ///
+        /// *hint* queries that end with a '.' are fully qualified names and are cheaper lookups
+        ///
+        /// # Arguments
+        ///
+        /// * `query` - a string which parses to a domain name, failure to parse will return an error
+        pub async fn $p(&self, query: impl IntoName) -> Result<Lookup, NetError> {
+            self.inner_lookup(query.into_name()?, $r, self.request_options())
+                .await
+        }
+    };
+}
+
+/// A Resolver used with Tokio
+#[cfg(feature = "tokio")]
+pub type TokioResolver = Resolver<TokioRuntimeProvider>;
+
+#[cfg(feature = "tokio")]
+impl TokioResolver {
+    /// Constructs a new Tokio based Resolver with the system configuration.
+    ///
+    /// This will use `/etc/resolv.conf` on Unix OSes and the registry on Windows.
+    #[cfg(any(unix, target_os = "windows"))]
+    #[cfg(feature = "system-config")]
+    pub fn builder_tokio() -> Result<ResolverBuilder<TokioRuntimeProvider>, NetError> {
+        Self::builder(TokioRuntimeProvider::default())
+    }
+}
+
+/// An asynchronous resolver for DNS generic over async Runtimes.
+///
+/// The lookup methods on `Resolver` spawn background tasks to perform
+/// queries. The futures returned by a `Resolver` and the corresponding
+/// background tasks need not be spawned on the same executor, or be in the
+/// same thread.
+///
+/// *NOTE* If lookup futures returned by a `Resolver` and the background
+/// tasks are spawned on two separate `CurrentThread` executors, one thread
+/// cannot run both executors simultaneously, so the `run` or `block_on`
+/// functions will cause the thread to deadlock. If both the background work
+/// and the lookup futures are intended to be run on the same thread, they
+/// should be spawned on the same executor.
+#[derive(Clone)]
+pub struct Resolver<P: ConnectionProvider> {
+    domain: Option<Name>,
+    search: Vec<Name>,
+    context: Arc<PoolContext>,
+    client_cache: CachingClient<LookupEither<P>>,
+    hosts: Arc<Hosts>,
+}
+
+impl<R: ConnectionProvider> Resolver<R> {
+    /// Constructs a new [`Resolver`] via [`ResolverBuilder`] with the operating system's
+    /// configuration.
+    ///
+    /// To use this with Tokio, see [TokioResolver::builder_tokio] instead.
+    ///
+    /// This will use `/etc/resolv.conf` on Unix OSes and the registry on Windows.
+    #[cfg(any(unix, target_os = "windows"))]
+    #[cfg(feature = "system-config")]
+    pub fn builder(provider: R) -> Result<ResolverBuilder<R>, NetError> {
+        let (config, options) = super::system_conf::read_system_conf()?;
+        let mut builder = Self::builder_with_config(config, provider);
+        *builder.options_mut() = options;
+        Ok(builder)
+    }
+
+    /// Construct a new [`Resolver`] via [`ResolverBuilder`] with the provided configuration.
+    pub fn builder_with_config(config: ResolverConfig, provider: R) -> ResolverBuilder<R> {
+        ResolverBuilder {
+            config,
+            options: ResolverOpts::default(),
+            provider,
+            #[cfg(feature = "__tls")]
+            tls: None,
+            opportunistic_encryption: OpportunisticEncryption::default(),
+            encrypted_transport_state: NameServerTransportState::default(),
+            #[cfg(feature = "__dnssec")]
+            trust_anchor: None,
+            #[cfg(feature = "__dnssec")]
+            nsec3_soft_iteration_limit: None,
+            #[cfg(feature = "__dnssec")]
+            nsec3_hard_iteration_limit: None,
+        }
+    }
+
+    /// Customizes the static hosts used in this resolver.
+    pub fn set_hosts(&mut self, hosts: Arc<Hosts>) {
+        self.hosts = hosts;
+    }
+
+    /// Generic lookup for any RecordType
+    ///
+    /// *WARNING* this interface may change in the future, see if one of the specializations would be better.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - name of the record to lookup, if name is not a valid domain name, an error will be returned
+    /// * `record_type` - type of record to lookup, all RecordData responses will be filtered to this type
+    ///
+    /// # Returns
+    ///
+    //  A future for the returned Lookup RData
+    pub async fn lookup(
+        &self,
+        name: impl IntoName,
+        record_type: RecordType,
+    ) -> Result<Lookup, NetError> {
+        self.inner_lookup(name.into_name()?, record_type, self.request_options())
+            .await
+    }
+
+    pub(crate) async fn inner_lookup<L>(
+        &self,
+        name: Name,
+        record_type: RecordType,
+        options: DnsRequestOptions,
+    ) -> Result<L, NetError>
+    where
+        L: From<Lookup> + Send + Sync + 'static,
+    {
+        let names = self.build_names(name);
+        LookupFuture::lookup_with_hosts(
+            names,
+            record_type,
+            options,
+            self.client_cache.clone(),
+            self.hosts.clone(),
+        )
+        .await
+        .map(L::from)
+    }
+
+    /// Performs a dual-stack DNS lookup for the IP for the given hostname.
+    ///
+    /// See the configuration and options parameters for controlling the way in which A(Ipv4) and AAAA(Ipv6) lookups will be performed. For the least expensive query a fully-qualified-domain-name, FQDN, which ends in a final `.`, e.g. `www.example.com.`, will only issue one query. Anything else will always incur the cost of querying the `ResolverConfig::domain` and `ResolverConfig::search`.
+    ///
+    /// # Arguments
+    /// * `host` - string hostname, if this is an invalid hostname, an error will be returned.
+    pub async fn lookup_ip(&self, host: impl IntoName) -> Result<LookupIp, NetError> {
+        let mut finally_ip_addr = None;
+        let maybe_ip = host.to_ip().map(RData::from);
+        let maybe_name = host.into_name().map_err(NetError::from);
+
+        // if host is a ip address, return directly.
+        if let Some(ip_addr) = maybe_ip {
+            let name = maybe_name.clone().unwrap_or_default();
+            let record = Record::from_rdata(name.clone(), MAX_TTL, ip_addr.clone());
+
+            // if ndots are greater than 4, then we can't assume the name is an IpAddr
+            //   this accepts IPv6 as well, b/c IPv6 can take the form: 2001:db8::198.51.100.35
+            //   but `:` is not a valid DNS character, so technically this will fail parsing.
+            //   TODO: should we always do search before returning this?
+            if self.context.options.ndots > 4 {
+                finally_ip_addr = Some(record);
+            } else {
+                let query = Query::query(name, ip_addr.record_type());
+                let lookup = Lookup::new_with_max_ttl(query, [record]);
+                return Ok(lookup.into());
+            }
+        }
+
+        let name = match (maybe_name, finally_ip_addr.as_ref()) {
+            (Ok(name), _) => name,
+            (Err(_), Some(ip_addr)) => {
+                // it was a valid IP, return that...
+                let query = Query::query(ip_addr.name.clone(), ip_addr.record_type());
+                let lookup = Lookup::new_with_max_ttl(query, [ip_addr.clone()]);
+                return Ok(lookup.into());
+            }
+            (Err(err), None) => return Err(err),
+        };
+
+        let names = self.build_names(name);
+        let hosts = self.hosts.clone();
+
+        LookupIpFuture::lookup(
+            names,
+            self.context.options.ip_strategy,
+            self.client_cache.clone(),
+            self.request_options(),
+            hosts,
+            finally_ip_addr.map(|r| r.data),
+        )
+        .await
+    }
+
+    /// Clear the cache for a specific lookup
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - name of the record to clear
+    /// * `record_type` - type of record to clear
+    ///
+    pub fn clear_lookup_cache(&self, name: impl IntoName, record_type: RecordType) {
+        let Ok(name) = name.into_name() else {
+            return;
+        };
+
+        for name in self.build_names(name) {
+            let query = Query::query(name, record_type);
+            self.client_cache.clear_cache_query(&query);
+        }
+    }
+
+    fn build_names(&self, name: Name) -> Vec<Name> {
+        // if it's fully qualified, we can short circuit the lookup logic
+        if name.is_fqdn()
+            || ONION.zone_of(&name)
+                && name
+                    .trim_to(2)
+                    .iter()
+                    .next()
+                    .map(|name| name.len() == 56) // size of onion v3 address
+                    .unwrap_or(false)
+        {
+            // if already fully qualified, or if onion address, don't assume it might be a
+            // sub-domain
+            vec![name]
+        } else {
+            // Otherwise we have to build the search list
+            // Note: the vec is built in reverse order of precedence, for stack semantics
+            let mut names =
+                Vec::<Name>::with_capacity(1 /*FQDN*/ + 1 /*DOMAIN*/ + self.search.len());
+
+            // if not meeting ndots, we always do the raw name in the final lookup, or it's a localhost...
+            let raw_name_first: bool =
+                name.num_labels() as usize > self.context.options.ndots || name.is_localhost();
+
+            // if not meeting ndots, we always do the raw name in the final lookup
+            if !raw_name_first {
+                let mut fqdn = name.clone();
+                fqdn.set_fqdn(true);
+                names.push(fqdn);
+            }
+
+            for search in self.search.iter().rev() {
+                let name_search = name.clone().append_domain(search);
+
+                match name_search {
+                    Ok(name_search) => {
+                        if !names.contains(&name_search) {
+                            names.push(name_search);
+                        }
+                    }
+                    Err(e) => debug!(
+                        "Not adding {} to {} for search due to error: {}",
+                        search, name, e
+                    ),
+                }
+            }
+
+            if let Some(domain) = &self.domain {
+                let name_search = name.clone().append_domain(domain);
+
+                match name_search {
+                    Ok(name_search) => {
+                        if !names.contains(&name_search) {
+                            names.push(name_search);
+                        }
+                    }
+                    Err(e) => debug!(
+                        "Not adding {} to {} for search due to error: {}",
+                        domain, name, e
+                    ),
+                }
+            }
+
+            // this is the direct name lookup
+            if raw_name_first {
+                // adding the name as though it's an FQDN for lookup
+                let mut fqdn = name.clone();
+                fqdn.set_fqdn(true);
+                names.push(fqdn);
+            }
+
+            names
+        }
+    }
+
+    lookup_fn!(reverse_lookup, RecordType::PTR);
+    lookup_fn!(ipv4_lookup, RecordType::A);
+    lookup_fn!(ipv6_lookup, RecordType::AAAA);
+    lookup_fn!(mx_lookup, RecordType::MX);
+    lookup_fn!(ns_lookup, RecordType::NS);
+    lookup_fn!(smimea_lookup, RecordType::SMIMEA);
+    lookup_fn!(soa_lookup, RecordType::SOA);
+    lookup_fn!(srv_lookup, RecordType::SRV);
+    lookup_fn!(tlsa_lookup, RecordType::TLSA);
+    lookup_fn!(txt_lookup, RecordType::TXT);
+    lookup_fn!(cert_lookup, RecordType::CERT);
+
+    /// Flushes/Removes all entries from the cache
+    pub fn clear_cache(&self) {
+        self.client_cache.clear_cache();
+    }
+
+    /// Per request options based on the ResolverOpts
+    pub(crate) fn request_options(&self) -> DnsRequestOptions {
+        let mut request_opts = DnsRequestOptions::default();
+        request_opts.recursion_desired = self.context.options.recursion_desired;
+        request_opts.use_edns = self.context.options.edns0;
+        request_opts.edns_payload_len = self.context.options.edns_payload_len;
+        request_opts.case_randomization = self.context.options.case_randomization;
+
+        // Set DNSSEC OK bit when DNSSEC validation is enabled
+        #[cfg(feature = "__dnssec")]
+        {
+            request_opts.edns_set_dnssec_ok = self.context.options.validate;
+        }
+
+        request_opts
+    }
+
+    /// Read the options for this resolver.
+    pub fn options(&self) -> &ResolverOpts {
+        &self.context.options
+    }
+}
+
+impl<P: ConnectionProvider> fmt::Debug for Resolver<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Resolver").finish()
+    }
+}
+
+/// Different lookup options for the lookup attempts and validation
+#[derive(Clone)]
+enum LookupEither<P: ConnectionProvider> {
+    Retry(RetryDnsHandle<NameServerPool<P>>),
+    #[cfg(feature = "__dnssec")]
+    Secure(DnssecDnsHandle<RetryDnsHandle<NameServerPool<P>>>),
+}
+
+impl<P: ConnectionProvider> DnsHandle for LookupEither<P> {
+    type Response = Pin<Box<dyn Stream<Item = Result<DnsResponse, NetError>> + Send>>;
+    type Runtime = P::RuntimeProvider;
+
+    fn is_verifying_dnssec(&self) -> bool {
+        match self {
+            Self::Retry(c) => c.is_verifying_dnssec(),
+            #[cfg(feature = "__dnssec")]
+            Self::Secure(c) => c.is_verifying_dnssec(),
+        }
+    }
+
+    fn send(&self, request: DnsRequest) -> Self::Response {
+        match self {
+            Self::Retry(c) => c.send(request),
+            #[cfg(feature = "__dnssec")]
+            Self::Secure(c) => c.send(request),
+        }
+    }
+}
+
+/// A builder to construct a [`Resolver`].
+///
+/// Created by [`Resolver::builder`].
+pub struct ResolverBuilder<P> {
+    config: ResolverConfig,
+    options: ResolverOpts,
+    provider: P,
+
+    #[cfg(feature = "__tls")]
+    tls: Option<rustls::ClientConfig>,
+    opportunistic_encryption: OpportunisticEncryption,
+    encrypted_transport_state: NameServerTransportState,
+    #[cfg(feature = "__dnssec")]
+    trust_anchor: Option<Arc<TrustAnchors>>,
+    #[cfg(feature = "__dnssec")]
+    nsec3_soft_iteration_limit: Option<u16>,
+    #[cfg(feature = "__dnssec")]
+    nsec3_hard_iteration_limit: Option<u16>,
+}
+
+impl<P: ConnectionProvider> ResolverBuilder<P> {
+    /// Sets the [`ResolverOpts`] to be used by the resolver.
+    ///
+    /// NB: A [`ResolverBuilder<P>`] will use the system configuration e.g., `resolv.conf`, by
+    /// default. Usage of this method will overwrite any options set by the system configuration.
+    ///
+    /// See [`system_conf`][crate::system_conf] for functions that can parse a [`ResolverOpts`]
+    /// from the system configuration, or use [`options_mut()`][ResolverBuilder::with_options] to
+    /// acquire a muitable reference to the existing [`ResolverOpts`].
+    pub fn with_options(mut self, options: ResolverOpts) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Returns a mutable reference to the [`ResolverOpts`].
+    pub fn options_mut(&mut self) -> &mut ResolverOpts {
+        &mut self.options
+    }
+
+    /// Set the DNSSEC trust anchors to be used by the resolver.
+    #[cfg(feature = "__dnssec")]
+    pub fn with_trust_anchor(mut self, trust_anchor: Arc<TrustAnchors>) -> Self {
+        self.trust_anchor = Some(trust_anchor);
+        self
+    }
+
+    /// Set the TLS configuration to be used by the resolver.
+    #[cfg(feature = "__tls")]
+    pub fn with_tls_config(mut self, config: rustls::ClientConfig) -> Self {
+        self.tls = Some(config);
+        self
+    }
+
+    /// Set the opportunistic encryption configuration to be used by the resolver.
+    pub fn with_opportunistic_encryption(
+        mut self,
+        opportunistic_encryption: OpportunisticEncryption,
+    ) -> Self {
+        self.opportunistic_encryption = opportunistic_encryption;
+        self
+    }
+
+    /// Set pre-existing encrypted transport state for use with opportunistic encryption.
+    pub fn with_encrypted_transport_state(
+        mut self,
+        encrypted_transport_state: NameServerTransportState,
+    ) -> Self {
+        self.encrypted_transport_state = encrypted_transport_state;
+        self
+    }
+
+    /// Set maximum limits on NSEC3 additional iterations.
+    ///
+    /// See [RFC 9276](https://www.rfc-editor.org/rfc/rfc9276.html). Signed
+    /// zones that exceed the soft limit will be treated as insecure, and signed
+    /// zones that exceed the hard limit will be treated as bogus.
+    #[cfg(feature = "__dnssec")]
+    pub fn nsec3_iteration_limits(
+        mut self,
+        soft_limit: Option<u16>,
+        hard_limit: Option<u16>,
+    ) -> Self {
+        self.nsec3_soft_iteration_limit = soft_limit;
+        self.nsec3_hard_iteration_limit = hard_limit;
+        self
+    }
+
+    /// Construct the resolver.
+    pub fn build(self) -> Result<Resolver<P>, NetError> {
+        #[cfg_attr(not(feature = "__dnssec"), allow(unused_mut))]
+        let Self {
+            config:
+                ResolverConfig {
+                    domain,
+                    search,
+                    name_servers,
+                },
+            mut options,
+            provider,
+            #[cfg(feature = "__tls")]
+            tls,
+            #[cfg(feature = "__dnssec")]
+            trust_anchor,
+            #[cfg(feature = "__dnssec")]
+            nsec3_soft_iteration_limit,
+            #[cfg(feature = "__dnssec")]
+            nsec3_hard_iteration_limit,
+            opportunistic_encryption,
+            encrypted_transport_state,
+        } = self;
+
+        #[cfg(feature = "__dnssec")]
+        if trust_anchor.is_some() || options.trust_anchor.is_some() {
+            options.validate = true;
+        }
+
+        let context = Arc::new(PoolContext {
+            answer_address_filter: options.answer_address_filter(),
+            options,
+            #[cfg(feature = "__tls")]
+            tls: match tls {
+                Some(config) => config,
+                None => TlsConfig::new()?.config,
+            },
+            opportunistic_probe_budget: AtomicU8::new(
+                opportunistic_encryption
+                    .max_concurrent_probes()
+                    .unwrap_or_default(),
+            ),
+            opportunistic_encryption,
+            transport_state: AsyncMutex::new(encrypted_transport_state),
+        });
+
+        let pool = NameServerPool::from_config(name_servers, context.clone(), provider);
+
+        let client = RetryDnsHandle::new(pool, context.options.attempts);
+
+        #[cfg(feature = "__dnssec")]
+        let either = if context.options.validate {
+            let trust_anchor = trust_anchor.unwrap_or_else(|| Arc::new(TrustAnchors::default()));
+
+            LookupEither::Secure(
+                DnssecDnsHandle::with_trust_anchor(client, trust_anchor)
+                    .nsec3_iteration_limits(nsec3_soft_iteration_limit, nsec3_hard_iteration_limit),
+            )
+        } else {
+            LookupEither::Retry(client)
+        };
+        #[cfg(not(feature = "__dnssec"))]
+        let either = LookupEither::Retry(client);
+
+        let cache = ResponseCache::new(
+            context.options.cache_size,
+            TtlConfig::from_opts(&context.options),
+        );
+        let client_cache =
+            CachingClient::with_cache(cache, either, context.options.preserve_intermediates)
+                .with_special_use_queries(context.options.allow_special_use_queries);
+
+        let hosts = Arc::new(match context.options.use_hosts_file {
+            ResolveHosts::Always | ResolveHosts::Auto => Hosts::from_system().unwrap_or_default(),
+            ResolveHosts::Never => Hosts::default(),
+        });
+
+        Ok(Resolver {
+            domain,
+            search,
+            context,
+            client_cache,
+            hosts,
+        })
+    }
+}
+
+/// The Future returned from [`Resolver`] when performing a lookup.
+#[doc(hidden)]
+pub struct LookupFuture<C>
+where
+    C: DnsHandle + 'static,
+{
+    client_cache: CachingClient<C>,
+    names: Vec<Name>,
+    record_type: RecordType,
+    options: DnsRequestOptions,
+    query: BoxFuture<'static, Result<Lookup, NetError>>,
+}
+
+impl<C> LookupFuture<C>
+where
+    C: DnsHandle + 'static,
+{
+    /// Perform a lookup from a name and type to a set of RDatas
+    ///
+    /// # Arguments
+    ///
+    /// * `names` - a set of DNS names to attempt to resolve, they will be attempted in queue order, i.e. the first is `names.pop()`. Upon each failure, the next will be attempted.
+    /// * `record_type` - type of record being sought
+    /// * `client_cache` - cache with a connection to use for performing all lookups
+    #[doc(hidden)]
+    pub fn lookup(
+        names: Vec<Name>,
+        record_type: RecordType,
+        options: DnsRequestOptions,
+        client_cache: CachingClient<C>,
+    ) -> Self {
+        Self::lookup_with_hosts(
+            names,
+            record_type,
+            options,
+            client_cache,
+            Arc::new(Hosts::default()),
+        )
+    }
+
+    /// Perform a lookup from a name and type to a set of RDatas, taking the local
+    /// hosts file into account.
+    ///
+    /// # Arguments
+    ///
+    /// * `names` - a set of DNS names to attempt to resolve, they will be attempted in queue order, i.e. the first is `names.pop()`. Upon each failure, the next will be attempted.
+    /// * `record_type` - type of record being sought
+    /// * `client_cache` - cache with a connection to use for performing all lookups
+    /// * `hosts` - the local host file, the records inside it will be prioritized over the upstream DNS server
+    #[doc(hidden)]
+    pub fn lookup_with_hosts(
+        mut names: Vec<Name>,
+        record_type: RecordType,
+        options: DnsRequestOptions,
+        client_cache: CachingClient<C>,
+        hosts: Arc<Hosts>,
+    ) -> Self {
+        let name = names
+            .pop()
+            .ok_or(NetError::Message("can not lookup for no names"));
+
+        let query = match name {
+            Ok(name) => {
+                let query = Query::query(name, record_type);
+
+                if let Some(lookup) = hosts.lookup_static_host(&query) {
+                    future::ok(lookup).boxed()
+                } else {
+                    client_cache.lookup(query, options).boxed()
+                }
+            }
+            Err(err) => future::err(err).boxed(),
+        };
+
+        Self {
+            client_cache,
+            names,
+            record_type,
+            options,
+            query,
+        }
+    }
+}
+
+impl<C> Future for LookupFuture<C>
+where
+    C: DnsHandle + 'static,
+{
+    type Output = Result<Lookup, NetError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        loop {
+            // Try polling the underlying DNS query.
+            let query = self.query.as_mut().poll_unpin(cx);
+
+            // Determine whether or not we will attempt to retry the query.
+            let should_retry = match &query {
+                // If the query is NotReady, yield immediately.
+                Poll::Pending => return Poll::Pending,
+                // If the query returned a successful lookup, we will attempt
+                // to retry if the lookup is empty. Otherwise, we will return
+                // that lookup.
+                Poll::Ready(Ok(lookup)) => lookup.answers().is_empty(),
+                // If the query failed, we will attempt to retry.
+                Poll::Ready(Err(_)) => true,
+            };
+
+            if should_retry {
+                if let Some(name) = self.names.pop() {
+                    let record_type = self.record_type;
+                    let options = self.options;
+
+                    // If there's another name left to try, build a new query
+                    // for that next name and continue looping.
+                    self.query = self
+                        .client_cache
+                        .lookup(Query::query(name, record_type), options)
+                        .boxed();
+                    // Continue looping with the new query. It will be polled
+                    // on the next iteration of the loop.
+                    continue;
+                }
+            }
+            // If we didn't have to retry the query, or we weren't able to
+            // retry because we've exhausted the names to search, return the
+            // current query.
+            return query;
+            // If we skipped retrying the  query, this will return the
+            // successful lookup, otherwise, if the retry failed, this will
+            // return the last  query result --- either an empty lookup or the
+            // last error we saw.
+        }
+    }
+}

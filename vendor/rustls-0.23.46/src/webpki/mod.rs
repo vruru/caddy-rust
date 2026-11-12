@@ -16,7 +16,7 @@ mod server_verifier;
 mod verify;
 
 pub use anchors::RootCertStore;
-pub use client_verifier::{ClientCertVerifierBuilder, WebPkiClientVerifier};
+pub use client_verifier::{ClientCertVerifierBuilder, WebPkiClientVerifier, RawClientPath, ClientPathEnumeration, enumerate_client_cert_paths};
 pub use server_verifier::{ServerCertVerifierBuilder, WebPkiServerVerifier};
 // Conditionally exported from crate.
 #[allow(unreachable_pub)]
@@ -25,6 +25,7 @@ pub use verify::{
 };
 pub use verify::{
     WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature,
+    verify_tls12_signature_with_raw_key,
     verify_tls13_signature_with_raw_key,
 };
 

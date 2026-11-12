@@ -3,6 +3,9 @@ use std::collections::BTreeMap;
 /// net/url.ParseQuery partial-success semantics, followed by Values.Set/Encode.
 /// Bytes are preserved: Go strings do not require UTF-8 query components.
 pub(super) fn query_with_domain(query: &str, domain: &str) -> String {
+    query_with_values(query, &[("domain", domain)])
+}
+pub(super) fn query_with_values(query: &str, replacements: &[(&str, &str)]) -> String {
     let mut values: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
     let count = query.bytes().filter(|byte| *byte == b'&').count() + 1;
     let custom = std::env::var("GODEBUG").ok().and_then(|setting| {
@@ -28,7 +31,9 @@ pub(super) fn query_with_domain(query: &str, domain: &str) -> String {
         };
         values.entry(key).or_default().push(value);
     }
-    values.insert(b"domain".to_vec(), vec![domain.as_bytes().to_vec()]);
+    for (key,value) in replacements {
+        values.insert(key.as_bytes().to_vec(), vec![value.as_bytes().to_vec()]);
+    }
     let mut result = String::new();
     for (key, values) in values {
         for value in values {

@@ -13,6 +13,7 @@ pub struct Hello {
     pub server_name: Option<String>,
     pub protocols: Vec<Vec<u8>>,
     pub signatures: Vec<rustls::SignatureScheme>,
+    pub event:super::super::tls_events::HelloFields,
 }
 
 pub struct Crypto {
@@ -109,6 +110,7 @@ impl rustls::server::ResolvesServerCert for Observe {
             && !hello.signature_schemes().is_empty()
         {
             *self.0.lock().ok()? = Some(Hello {
+                event:super::super::tls_events::HelloFields::capture(&hello),
                 server_name: hello.offered_server_name().map(str::to_owned),
                 protocols: hello
                     .alpn()

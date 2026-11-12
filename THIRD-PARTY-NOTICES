@@ -254,10 +254,217 @@ The vendored Quinn extension provides opt-in, read-only cancellation observation
 for established server request streams. The application enables that extension;
 its original SendStream ownership and transport event handling remain intact.
 
+Native response templates
+-------------------------
+vendor/gotmpl-0.6.1 is derived from gotmpl 0.6.1 under MIT; its LICENSE is retained.
+The controlled patch adds bounded execution and explicit Go host-value adapters.
+The Sprig helper ports in src/http_runtime/templates/sprig follow Sprig v3.3.0,
+Masterminds/semver v3.5.0 and Masterminds/goutils v1.1.1 under MIT.
+Go case tables and integer/float formatting ports follow Go standard-library
+sources under the BSD-3-Clause license printed above.
 
-urlpattern 0.6.0
-----------------
-Copyright 2018-2021 the Deno authors and contributors. MIT license.
-Source: https://github.com/denoland/rust-urlpattern
-Runtime source and license are retained in vendor/urlpattern-0.6.0.
-The local ignore-case matcher correction is described in its VENDOR.md.
+Sprig v3.3.0 license:
+Copyright (C) 2013-2020 Masterminds
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+Masterminds/semver v3.5.0 license:
+Copyright (C) 2014-2019, Matt Butcher and Matt Farina
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+Goldmark v1.8.6 / goldmark-highlighting 37449abec8cc behavioral ports and HTML entity data:
+MIT License
+
+Copyright (c) 2019 Yusuke Inuzuka
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+dustin/go-humanize v1.1.0 behavioral ports:
+Copyright (c) 2005-2008  Dustin Sallings <dustin@spy.net>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+<http://www.opensource.org/licenses/mit-license.php>
+
+
+YAML front matter
+-----------------
+The first-document decoder and scalar-resolution behavior in
+src/http_runtime/templates/rich/yaml follow gopkg.in/yaml.v3 v3.0.1
+(Copyright 2011-2019 Canonical Ltd), under Apache-2.0. The upstream combined
+license is retained at LICENSES/yaml-v3.0.1-LICENSE. This is a native Rust
+behavioral port; upstream Go source is not required at runtime.
+
+The small event adapter under rich/yaml/libyaml derives from serde_yaml_ng
+0.10.0 (MIT). Its original license is retained beside the adapter as
+rich/yaml/libyaml/LICENSE-MIT. The adapter uses unsafe-libyaml 0.2.11 (MIT)
+as a vendored Rust dependency at vendor/unsafe-libyaml-0.2.11, including its
+LICENSE-MIT. The local allocation-scope extension prepays scanner allocations
+and growth against the template budget and reclaims raw buffers after unwind;
+no system or Go YAML runtime is invoked.
+
+Chroma 2.27.0 native lexer/HTML formatter port and compiled lexer program data
+Copyright (C) 2017 Alec Thomas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+regexp2 v2.2.1 native bytecode/capture implementation
+The MIT License (MIT)
+
+Copyright (c) Doug Clark
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+Unicode 17.0.0 tables and Go 1.27.3 behavioral helpers use the Unicode V3 and Go BSD terms in the project THIRD-PARTY-NOTICES. The Chroma SVG formatter/fonts are not included.
+
+Goldmark 1.8.6 byte parser/renderer behavioral port
+------------------------------------------------
+The modules under src/http_runtime/templates/rich/goldmark derive from
+github.com/yuin/goldmark v1.8.6, Copyright (c) 2019 Yusuke Inuzuka, under
+the MIT license retained at LICENSES/goldmark-1.8.6-LICENSE. This is Rust
+source; no Go runtime is required by these modules.
+
+Go crypto/x509/pkix and encoding/asn1
+------------------------------------
+The native PKIX name and certificate fact projection follows the Go standard
+library behavior. Copyright The Go Authors. BSD-3-Clause license; the Go license
+text already reproduced above applies.
+
+cel-go v0.32.0
+--------------
+Native byte-string, quote, split, replace and formatting behavior ports use
+cel-expr/cel-go v0.32.0 ext/strings.go, ext/formatting_v2.go and common/types.
+Copyright 2020 Google LLC and the cel-go authors. Apache License, Version 2.0.
+Source: https://github.com/cel-expr/cel-go/tree/v0.32.0
+Modifications implement Rust byte-preserving values and bounded resource costs.
+
+Go net resolver behavior
+------------------------
+Copyright 2015 The Go Authors. All rights reserved. (net/conf.go, nss.go,
+dnsclient_unix.go and dnsconfig_unix.go)
+Copyright 2009 The Go Authors. All rights reserved. (net/hosts.go)
+Rust behavior ports follow Go1.27.3. The Go BSD-3-Clause license reproduced
+in existing notices applies. Modified for bounded configuration I/O, native
+nonblocking Unix DNS, IPv6 scope and per-runtime settings snapshots.
+
+Hickory Resolver 0.26.3
+----------------------
+Copyright 2015-2023 Benjamin Fry and contributors. Apache-2.0 OR MIT.
+The source package retains LICENSE-APACHE and LICENSE-MIT. Native modifications
+add an explicit, default-disabled special-use upstream query option; the normal
+library default behavior is retained.
+Source: https://github.com/hickory-dns/hickory-dns
+
+Template TLS and X.509 host values
+---------------------------------
+The native template hostname checks follow Go 1.27.3 crypto/x509/verify.go
+(Copyright 2009 The Go Authors). Numeric and URL host adapters follow the Go
+standard library math/big, encoding/asn1 and net/url behavior. The Go
+BSD-3-Clause license reproduced above applies to these modified Rust ports.
+
+RustCrypto Argon2 0.5.3
+----------------------
+Copyright RustCrypto Developers, Apache-2.0 OR MIT.
+Source: https://github.com/RustCrypto/password-hashes/tree/argon2-v0.5.3/argon2
+Original licenses are retained in vendor/argon2-0.5.3. Functional modifications
+add opt-in Go-compatible stored-hash parameter acceptance; the HTTP host adds
+independent scratch/work admission and zeroization.

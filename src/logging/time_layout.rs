@@ -5,7 +5,7 @@ use anyhow::{Result, ensure};
 use std::ops::Range;
 #[path = "time_layout_parse.rs"]
 mod parse;
-pub(super) struct Components {
+pub(crate) struct Components {
     pub year: i128,
     pub month: u8,
     pub day: u8,
@@ -27,7 +27,7 @@ enum Token {
         trim: bool,
     },
 }
-pub(super) struct Layout {
+pub(crate) struct Layout {
     input: String,
     tokens: Vec<Token>,
 }
@@ -54,15 +54,23 @@ const DAYS: [&str; 7] = [
     "Friday",
     "Saturday",
 ];
+pub(crate) struct ParsedTime {
+    pub timestamp: super::types::Timestamp,
+    pub local: bool,
+    pub offset: i32,
+    pub zone: String,
+}
 impl Layout {
-    pub(super) fn parse_timestamp(
+    pub(crate) fn parse_time(&self,input:&str,local:bool)->Option<ParsedTime> {parse::parse_time(self,input,local)}
+
+    pub(crate) fn parse_timestamp(
         &self,
         input: &str,
         local: bool,
     ) -> Option<super::types::Timestamp> {
         parse::parse(self, input, local)
     }
-    pub(super) fn compile(input: &str) -> Result<Self> {
+    pub(crate) fn compile(input: &str) -> Result<Self> {
         ensure!(
             input.len() <= 1 << 20,
             "log time layout byte limit exceeded"
@@ -91,7 +99,7 @@ impl Layout {
             tokens,
         })
     }
-    pub(super) fn format(&self, c: &Components, max_bytes: usize) -> Result<String> {
+    pub(crate) fn format(&self, c: &Components, max_bytes: usize) -> Result<String> {
         ensure!(
             (1..=12).contains(&c.month) && c.weekday < 7 && c.nanosecond < 1_000_000_000,
             "invalid log time components"

@@ -49,6 +49,24 @@ mod connection {
     }
 
     impl Connection {
+        /// Own only immutable exporter keying material after completed Finished.
+        pub fn native_exporter(&self) -> Result<alloc::sync::Arc<dyn crate::NativeExporter>, Error> {
+            match self { Self::Client(connection)=>connection.native_exporter(),
+                Self::Server(connection)=>connection.native_exporter() }
+        }
+        /// Peer-provided client status, visible only after completed server Finished.
+        pub fn native_peer_ocsp_response(&self) -> Option<&[u8]> {
+            match self { Self::Server(connection) => connection.native_peer_ocsp_response(), Self::Client(_) => None }
+        }
+        /// Peer-provided client SCTs, visible only after completed server Finished.
+        pub fn native_peer_scts(&self) -> Option<&[Vec<u8>]> {
+            match self { Self::Server(connection) => connection.native_peer_scts(), Self::Client(_) => None }
+        }
+        /// Verified client paths from a completed server-side QUIC handshake.
+        pub fn native_client_chains(&self) -> Option<&crate::ClientChainObservation> {
+            match self { Self::Server(connection) => connection.native_client_chains(),
+                Self::Client(_) => None }
+        }
         /// Return the TLS-encoded transport parameters for the session's peer.
         ///
         /// See [`ConnectionCommon::quic_transport_parameters()`] for more details.
@@ -259,6 +277,19 @@ mod connection {
     }
 
     impl ServerConnection {
+        /// Actual verified client paths; never visible before Finished.
+        /// Peer-provided client OCSP response, visible only after completed Finished.
+        pub fn native_peer_ocsp_response(&self) -> Option<&[u8]> {
+            if self.is_handshaking() { None } else { Some(&self.inner.core.data.native_peer_extras.ocsp) }
+        }
+        /// Peer-provided client SCTs, visible only after completed Finished.
+        pub fn native_peer_scts(&self) -> Option<&[Vec<u8>]> {
+            if self.is_handshaking() { None } else { Some(&self.inner.core.data.native_peer_extras.scts) }
+        }
+
+        pub fn native_client_chains(&self) -> Option<&crate::ClientChainObservation> {
+            if self.is_handshaking() { None } else { Some(&self.inner.core.data.native_client_chains) }
+        }
         /// Make a new QUIC ServerConnection.
         ///
         /// This differs from `ServerConnection::new()` in that it takes an extra `params` argument,
@@ -363,6 +394,11 @@ mod connection {
     }
 
     impl<Data: SideData> ConnectionCommon<Data> {
+        /// A read-only exporter capability retaining no QUIC stream or packet keys.
+        pub fn native_exporter(&self) -> Result<alloc::sync::Arc<dyn crate::NativeExporter>, Error> {
+            if self.is_handshaking() { return Err(Error::HandshakeNotComplete); }
+            self.core.native_exporter()
+        }
         /// Return the TLS-encoded transport parameters for the session's peer.
         ///
         /// While the transport parameters are technically available prior to the

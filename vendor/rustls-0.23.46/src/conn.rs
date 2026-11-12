@@ -91,7 +91,15 @@ mod connection {
             }
         }
 
-        /// Derives key material from the agreed connection secrets.
+        /// Capture an independent completed-handshake exporter.
+        pub fn native_exporter(&self) -> Result<alloc::sync::Arc<dyn crate::NativeExporter>, Error> {
+            match self {
+                Self::Client(conn) => conn.native_exporter(),
+                Self::Server(conn) => conn.native_exporter(),
+            }
+        }
+
+            /// Derives key material from the agreed connection secrets.
         ///
         /// See [`ConnectionCommon::export_keying_material()`] for more information.
         pub fn export_keying_material<T: AsMut<[u8]>>(
@@ -461,6 +469,13 @@ impl<Data> ConnectionCommon<Data> {
     pub fn process_new_packets(&mut self) -> Result<IoState, Error> {
         self.core
             .process_new_packets(&mut self.deframer_buffer, &mut self.sendable_plaintext)
+    }
+
+    /// Capture an independent exporter after the complete authenticated handshake.
+    /// The capability retains only exporter keying material until its final drop.
+    pub fn native_exporter(&self) -> Result<alloc::sync::Arc<dyn crate::NativeExporter>, Error> {
+        if self.is_handshaking() { return Err(Error::HandshakeNotComplete); }
+        self.core.native_exporter()
     }
 
     /// Derives key material from the agreed connection secrets.
@@ -1260,6 +1275,10 @@ impl<Data> ConnectionCore<Data> {
         let external = KernelConnection::new(state, self.common_state)?;
 
         Ok((secrets, external))
+    }
+
+    pub(crate) fn native_exporter(&self) -> Result<alloc::sync::Arc<dyn crate::NativeExporter>, Error> {
+        match self.state.as_ref() { Ok(state) => state.native_exporter(), Err(error) => Err(error.clone()) }
     }
 
     pub(crate) fn export_keying_material<T: AsMut<[u8]>>(

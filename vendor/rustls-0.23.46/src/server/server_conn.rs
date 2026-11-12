@@ -137,6 +137,10 @@ pub trait ResolvesServerCert: Debug + Send + Sync {
 /// A struct representing the received Client Hello
 #[derive(Debug)]
 pub struct ClientHello<'a> {
+    pub(super) legacy_version: ProtocolVersion,
+    pub(super) offered_versions: Option<&'a [ProtocolVersion]>,
+    pub(super) offered_signature_schemes: Option<&'a [SignatureScheme]>,
+    pub(super) offered_ec_point_formats: Option<&'a [u8]>,
     pub(super) negotiated_version: Option<ProtocolVersion>,
     pub(super) server_name: &'a Option<DnsName<'a>>,
     pub(super) offered_server_name: Option<&'a str>,
@@ -153,6 +157,20 @@ pub struct ClientHello<'a> {
 }
 
 impl<'a> ClientHello<'a> {
+    /// The exact legacy_version field from this ClientHello.
+    pub fn legacy_version(&self) -> ProtocolVersion { self.legacy_version }
+    /// All versions in the extension's original wire order, including unknowns.
+    /// None means the extension was absent; this does not synthesize versions.
+    pub fn offered_versions(&self) -> Option<&[ProtocolVersion]> { self.offered_versions }
+    /// Exact SignatureAlgorithms extension before compatibility filtering.
+    /// None means the extension was absent, without synthesized defaults.
+    pub fn offered_signature_schemes(&self) -> Option<&[SignatureScheme]> {
+        self.offered_signature_schemes
+    }
+
+    /// Original EC point-format octets, including unknown values and order.
+    pub fn offered_ec_point_formats(&self) -> Option<&[u8]> { self.offered_ec_point_formats }
+
     /// Version selected by the server configuration for this handshake.
     ///
     /// Returns `None` from `Accepted::client_hello()` before a configuration
@@ -698,6 +716,21 @@ mod connection {
             self.inner.core.get_sni_str()
         }
 
+        /// Peer-provided client OCSP response, visible only after completed Finished.
+        pub fn native_peer_ocsp_response(&self) -> Option<&[u8]> {
+            if self.is_handshaking() { None } else { Some(&self.inner.core.data.native_peer_extras.ocsp) }
+        }
+        /// Peer-provided client SCTs, visible only after completed Finished.
+        pub fn native_peer_scts(&self) -> Option<&[alloc::vec::Vec<u8>]> {
+            if self.is_handshaking() { None } else { Some(&self.inner.core.data.native_peer_extras.scts) }
+        }
+
+        /// Actual verified client paths, visible only after completed Finished.
+        pub fn native_client_chains(&self) -> Option<&crate::ClientChainObservation> {
+            if self.is_handshaking() { None } else { Some(&self.inner.core.data.native_client_chains) }
+        }
+
+
         /// Application-controlled portion of the resumption ticket supplied by the client, if any.
         ///
         /// Recovered from the prior session's `set_resumption_data`. Integrity is guaranteed by rustls.
@@ -1049,6 +1082,12 @@ impl Accepted {
     pub fn client_hello(&self) -> ClientHello<'_> {
         let payload = Self::client_hello_payload(&self.message);
         let ch = ClientHello {
+            legacy_version: payload.client_version,
+            offered_signature_schemes: payload.signature_schemes.as_deref(),
+            offered_versions: payload.supported_versions.as_ref().map(|versions|
+                &versions.native_offered[..usize::from(versions.native_len)]),
+            offered_ec_point_formats: payload.ec_point_formats.as_ref().map(|formats|
+                &formats.native_offered[..usize::from(formats.native_len)]),
             negotiated_version: None,
             server_name: &self.connection.core.data.sni,
             offered_server_name: payload
@@ -1275,6 +1314,8 @@ impl ConnectionCore<ServerConnectionData> {
 /// State associated with a server connection.
 #[derive(Default, Debug)]
 pub struct ServerConnectionData {
+    pub(crate) native_client_chains: crate::ClientChainObservation,
+    pub(crate) native_peer_extras: crate::native_peer_extras::NativePeerExtras,
     pub(super) sni: Option<DnsName<'static>>,
     pub(super) received_resumption_data: Option<Vec<u8>>,
     pub(super) resumption_data: Vec<u8>,

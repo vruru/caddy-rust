@@ -1309,3 +1309,29 @@ mod benchmarks {
         });
     }
 }
+
+struct NativeTls13Exporter {
+    ks: KeyScheduleSuite,
+    secret: OkmBlock,
+}
+impl crate::native_exporter::sealed::Sealed for NativeTls13Exporter {}
+impl crate::NativeExporter for NativeTls13Exporter {
+    fn export_keying_material(&self, output: &mut [u8], label: &[u8],
+        context: Option<&[u8]>) -> Result<(), Error> {
+        if label.len() > 249 || output.len() > 255 * self.ks.suite.common.hash_provider.output_len() {
+            return Err(Error::General("TLS exporter input outside HKDF bounds".into()));
+        }
+        if output.is_empty() { return Ok(()); }
+        let mut temporary = zeroize::Zeroizing::new(alloc::vec![0u8; output.len()]);
+        self.ks.export_keying_material(&self.secret, &mut temporary, label, context)?;
+        output.copy_from_slice(&temporary);
+        Ok(())
+    }
+}
+impl KeyScheduleTraffic {
+    pub(crate) fn native_exporter(&self) -> alloc::sync::Arc<dyn crate::NativeExporter> {
+        alloc::sync::Arc::new(NativeTls13Exporter {
+            ks: self.ks.suite.into(), secret: self.current_exporter_secret.clone(),
+        })
+    }
+}

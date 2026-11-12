@@ -26,6 +26,7 @@ pub struct FramedWrite<T, B> {
     /// Upstream `AsyncWrite`
     inner: T,
     final_flush_done: bool,
+    stream_output_pending: bool,
 
     encoder: Encoder<B>,
     send_completions: Vec<crate::ext::SendCompletionOwner>,
@@ -94,6 +95,7 @@ where
         FramedWrite {
             inner,
             final_flush_done: false,
+            stream_output_pending: false,
             send_completions: Vec::new(),
             encoder: Encoder {
                 hpack: hpack::Encoder::default(),
@@ -136,7 +138,14 @@ where
     /// `poll_ready` must be called first to ensure that a frame may be
     /// accepted.
     pub fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
-        self.encoder.buffer(item)
+        let stream_output = matches!(&item, Frame::Data(_) | Frame::Headers(_) | Frame::PushPromise(_));
+        self.encoder.buffer(item)?;
+        self.stream_output_pending |= stream_output;
+        Ok(())
+    }
+
+    pub(crate) fn has_pending_stream_output(&self) -> bool {
+        self.stream_output_pending
     }
 
     pub(crate) fn buffer_with_send_completion(
@@ -154,6 +163,7 @@ where
     /// Flush buffered data to the wire
     pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         let result = self.flush_frames(cx);
+        if matches!(&result, Poll::Ready(Ok(()))) { self.stream_output_pending = false; }
         match &result {
             Poll::Ready(Ok(())) if !self.send_completions.is_empty() => {
                 let now = std::time::Instant::now();

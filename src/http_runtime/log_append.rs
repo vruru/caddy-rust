@@ -33,6 +33,7 @@ pub(super) struct LogFields {
 }
 
 pub(super) fn remember_var(ctx: &mut Context, key: &str, value: &Arc<Value>) {
+    if value.is_string() { ctx.typed_vars.remove(key); } else { ctx.typed_vars.insert(key.to_owned(), value.clone()); }
     if ctx.access_start.is_none() {
         return;
     }

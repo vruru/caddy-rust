@@ -337,7 +337,9 @@ pub(crate) fn signing_key(
         }
         _ => return Err(issue(id, "unsupported private key label")),
     };
-    let signer = crate::crypto::provider().key_provider.load_private_key(key.clone_key())
+    let signer = crate::crypto::provider()
+        .key_provider
+        .load_private_key(key.clone_key())
         .map_err(|_| issue(id, "unsupported or invalid private key"))?;
     let alg = algorithm(signer.algorithm(), id)?;
     ensure!(

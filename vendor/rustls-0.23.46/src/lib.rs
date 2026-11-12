@@ -430,6 +430,11 @@ mod sync {
 #[macro_use]
 mod msgs;
 mod common_state;
+mod native_exporter;
+mod native_client_chains;
+mod native_peer_extras;
+pub use native_client_chains::{ChainUnavailable, ClientChainObservation, VerifiedChainSet, VerifiedChainRef};
+pub use native_exporter::NativeExporter;
 pub mod compress;
 mod conn;
 /// Crypto provider interface.
@@ -652,6 +657,7 @@ pub mod server {
     pub use crate::verify::NoClientAuth;
     pub use crate::webpki::{
         ClientCertVerifierBuilder, ParsedCertificate, VerifierBuilderError, WebPkiClientVerifier,
+        RawClientPath, ClientPathEnumeration, enumerate_client_cert_paths,
     };
 
     /// Dangerous configuration that should be audited and used with extreme care.

@@ -132,6 +132,8 @@ pub(crate) fn replace_accounted(
     Ok(out)
 }
 
+pub(crate) fn process_elapsed() -> std::time::Duration { PROCESS_CLOCK.get_or_init(std::time::Instant::now).elapsed() }
+
 static PROCESS_CLOCK: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 /// Call during blocking configuration preparation to warm local timezone data.
 /// Monotonic formatting uses this process-local Rust Instant, never wall-clock deltas.

@@ -1,0 +1,481 @@
+//! # CEL-Rust
+//!
+//! A parser and interpreter for the Common Expression Language (CEL) in Rust.
+//!
+//! [`common`] explains CEL's type system: how values, types, operators and functions fit together,
+//! and how to add types of your own.
+//!
+//! ## Optional Features
+//!
+//! - `chrono`: Enables support for `duration` and `timestamp` types using the `chrono` crate (and `chrono-tz` for
+//!   IANA time zone arguments).
+//! - `regex`: Enables support for regular expressions.
+//! - `json`: Enables conversion between CEL values and JSON.
+//! - `ext_encoders` (default): Enables the [`extensions::encoders`] extension library, `base64.encode`
+//!   and `base64.decode`, using the `base64` crate.
+//!
+extern crate core;
+
+use std::convert::TryFrom;
+use std::fmt;
+use std::sync::Arc;
+use thiserror::Error;
+
+mod macros;
+#[doc(hidden)]
+pub use macros::to_camel_case;
+
+pub mod common;
+mod container;
+pub mod context;
+mod env;
+pub mod extensions;
+pub mod parser;
+
+pub use common::ast::IdedExpr;
+use common::ast::SelectExpr;
+pub use context::Context;
+pub use functions::FunctionContext;
+pub use objects::{ResolveResult, Value};
+use parser::{Expression, ExpressionReferences, Parser};
+pub use parser::{ParseError, ParseErrors};
+pub mod functions;
+mod magic;
+pub mod objects;
+mod resolvers;
+
+#[cfg(feature = "chrono")]
+mod duration;
+#[cfg(feature = "chrono")]
+pub use ser::{Duration, Timestamp};
+
+pub use env::Env;
+mod registry;
+pub use env::StructDef;
+pub use registry::StructType;
+pub use registry::{TypeDecl, TypeRegistry};
+
+mod ser;
+pub use ser::to_value;
+pub use ser::SerializationError;
+
+#[cfg(feature = "json")]
+mod json;
+#[cfg(feature = "json")]
+pub use json::ConvertToJsonError;
+
+use magic::FromContext;
+
+pub mod extractors {
+    pub use crate::magic::{Arguments, Identifier, This};
+
+    pub use crate::magic::{IntoFunction, IntoResolveResult};
+}
+
+/// Details about an operator or function call for which no overload matched.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OverloadError {
+    function: Arc<String>,
+    argument_types: Arc<[String]>,
+    member_function: bool,
+}
+
+impl OverloadError {
+    fn new(function: &str, argument_types: Vec<String>, member_function: bool) -> Self {
+        Self {
+            function: Arc::new(function.to_owned()),
+            argument_types: argument_types.into(),
+            member_function,
+        }
+    }
+
+    /// Returns the operator or function name.
+    pub fn function(&self) -> &str {
+        self.function.as_str()
+    }
+
+    /// Returns the runtime types of the arguments supplied to the call.
+    ///
+    /// For a member function, the first type is the receiver type.
+    pub fn argument_types(&self) -> &[String] {
+        &self.argument_types
+    }
+
+    /// Returns whether the overload was invoked using member-call syntax.
+    pub fn is_member_function(&self) -> bool {
+        self.member_function
+    }
+}
+
+impl fmt::Display for OverloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let signature = if self.member_function && !self.argument_types.is_empty() {
+            format!(
+                "{}.({})",
+                self.argument_types[0],
+                self.argument_types[1..].join(", ")
+            )
+        } else {
+            format!("({})", self.argument_types.join(", "))
+        };
+        write!(
+            f,
+            "found no matching overload for '{}' applied to '{signature}'",
+            self.function
+        )
+    }
+}
+
+impl std::error::Error for OverloadError {}
+
+#[derive(Error, Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum ExecutionError {
+    #[error("Invalid argument count: expected {expected}, got {actual}")]
+    InvalidArgumentCount { expected: usize, actual: usize },
+    #[error("Invalid argument type: {:?}", .target)]
+    UnsupportedTargetType { target: Value },
+    #[error("Method '{method}' not supported on type '{target:?}'")]
+    NotSupportedAsMethod { method: String, target: Value },
+    /// Indicates that the script attempted to use a value as a key in a map,
+    /// but the type of the value was not supported as a key.
+    #[error("Unable to use value '{0:?}' as a key")]
+    UnsupportedKeyType(Value),
+    #[error("Unexpected type: got '{got}', want '{want}'")]
+    UnexpectedType { got: String, want: String },
+    /// Indicates that the script attempted to reference a key on a type that
+    /// was missing the requested key.
+    #[error("No such key: {0}")]
+    NoSuchKey(Arc<String>),
+    /// Indicates that the script used an existing operator or function with
+    /// values of one or more types for which no overload was declared.
+    #[error("{0}")]
+    NoSuchOverload(OverloadError),
+    /// Indicates that the script attempted to reference an undeclared variable
+    /// method, or function.
+    #[error("Undeclared reference to '{0}'")]
+    UndeclaredReference(Arc<String>),
+    /// Indicates that a function expected to be called as a method, or to be
+    /// called with at least one parameter.
+    #[error("Missing argument or target")]
+    MissingArgumentOrTarget,
+    /// Indicates that a comparison could not be performed.
+    #[error("{0:?} can not be compared to {1:?}")]
+    ValuesNotComparable(Value, Value),
+    #[deprecated]
+    #[error("Unsupported unary operator '{0}': {1:?}")]
+    UnsupportedUnaryOperator(&'static str, Value),
+    /// Indicates that an unsupported binary operator was applied on two values
+    /// where it's unsupported, for example list + map.
+    #[error("Unsupported binary operator '{0}': {1:?}, {2:?}")]
+    UnsupportedBinaryOperator(&'static str, Value, Value),
+    #[deprecated]
+    #[error("Cannot use value as map index: {0:?}")]
+    UnsupportedMapIndex(Value),
+    #[deprecated]
+    #[error("Cannot use value as list index: {0:?}")]
+    UnsupportedListIndex(Value),
+    /// Indicates that an unsupported type was used to index a list
+    #[error("Cannot use value {0:?} to index {1:?}")]
+    UnsupportedIndex(Value, Value),
+    #[deprecated]
+    #[error("Unsupported function call identifier type: {0:?}")]
+    UnsupportedFunctionCallIdentifierType(Expression),
+    #[deprecated]
+    #[error("Unsupported fields construction: {0:?}")]
+    UnsupportedFieldsConstruction(SelectExpr),
+    /// Indicates that a function had an error during execution.
+    #[error("Error executing function '{function}': {message}")]
+    FunctionError { function: String, message: String },
+    #[error("Division by zero of {0:?}")]
+    DivisionByZero(Value),
+    #[error("Remainder by zero of {0:?}")]
+    RemainderByZero(Value),
+    #[error("Overflow from binary operator '{0}': {1:?}, {2:?}")]
+    Overflow(&'static str, Value, Value),
+    #[error("Index out of bounds: {0:?}")]
+    IndexOutOfBounds(Value),
+    /// Indicates that a map literal declared the same key more than once.
+    #[error("Failed with repeated key: {0:?}")]
+    DuplicateKey(Value),
+    #[error("InternalError: {0:?}")]
+    InternalError(String),
+}
+
+impl ExecutionError {
+    /// Creates an error for a global function or operator with no matching overload.
+    pub fn no_such_overload(function: &str, argument_types: Vec<String>) -> Self {
+        ExecutionError::NoSuchOverload(OverloadError::new(function, argument_types, false))
+    }
+
+    /// Creates an error for a member function with no matching overload.
+    ///
+    /// The receiver type must be the first entry in `argument_types`.
+    pub fn no_such_member_overload(function: &str, argument_types: Vec<String>) -> Self {
+        ExecutionError::NoSuchOverload(OverloadError::new(function, argument_types, true))
+    }
+
+    pub(crate) fn overload_for_values<'a>(
+        function: &str,
+        arguments: impl IntoIterator<Item = &'a dyn common::value::Val>,
+        member_function: bool,
+    ) -> Self {
+        let argument_types = arguments
+            .into_iter()
+            .map(|argument| argument.get_type().name().to_owned())
+            .collect();
+        let overload = OverloadError::new(function, argument_types, member_function);
+        ExecutionError::NoSuchOverload(overload)
+    }
+
+    pub(crate) fn with_overload_context(self, context: ExecutionError) -> Self {
+        self.with_lazy_overload_context(|| context)
+    }
+
+    /// Like [`with_overload_context`](Self::with_overload_context), but the context
+    /// is only built if it is going to replace `self`.
+    pub(crate) fn with_lazy_overload_context(
+        self,
+        context: impl FnOnce() -> ExecutionError,
+    ) -> Self {
+        match self {
+            ExecutionError::NoSuchOverload(_)
+            | ExecutionError::ValuesNotComparable(_, _)
+            | ExecutionError::UnsupportedKeyType(_)
+            | ExecutionError::UnexpectedType { .. } => context(),
+            error => error,
+        }
+    }
+
+    pub(crate) fn values_not_comparable(
+        lhs: &dyn common::value::Val,
+        rhs: &dyn common::value::Val,
+    ) -> Self {
+        ExecutionError::ValuesNotComparable(
+            Value::try_from(lhs).unwrap_or(Value::Null),
+            Value::try_from(rhs).unwrap_or(Value::Null),
+        )
+    }
+
+    pub(crate) fn unsupported_binary_operator(
+        operator: &'static str,
+        lhs: &dyn common::value::Val,
+        rhs: &dyn common::value::Val,
+    ) -> Self {
+        ExecutionError::UnsupportedBinaryOperator(
+            operator,
+            Value::try_from(lhs).unwrap_or(Value::Null),
+            Value::try_from(rhs).unwrap_or(Value::Null),
+        )
+    }
+
+    pub fn no_such_key(name: &str) -> Self {
+        ExecutionError::NoSuchKey(Arc::new(name.to_string()))
+    }
+
+    pub fn undeclared_reference(name: &str) -> Self {
+        ExecutionError::UndeclaredReference(Arc::new(name.to_string()))
+    }
+
+    pub fn invalid_argument_count(expected: usize, actual: usize) -> Self {
+        ExecutionError::InvalidArgumentCount { expected, actual }
+    }
+
+    pub fn function_error<E: ToString>(function: &str, error: E) -> Self {
+        ExecutionError::FunctionError {
+            function: function.to_string(),
+            message: error.to_string(),
+        }
+    }
+
+    pub fn unsupported_target_type(target: Value) -> Self {
+        ExecutionError::UnsupportedTargetType { target }
+    }
+
+    pub fn not_supported_as_method(method: &str, target: Value) -> Self {
+        ExecutionError::NotSupportedAsMethod {
+            method: method.to_string(),
+            target,
+        }
+    }
+
+    pub fn unsupported_key_type(value: Value) -> Self {
+        ExecutionError::UnsupportedKeyType(value)
+    }
+
+    pub fn missing_argument_or_target() -> Self {
+        ExecutionError::MissingArgumentOrTarget
+    }
+}
+
+/// An error declaring something in an [`Env`] or a [`Context`].
+///
+/// Declarations are made once the program is parsed and before it is evaluated,
+/// which is what sets this apart from an [`ExecutionError`], raised while a
+/// program runs.
+#[derive(Error, Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum DeclarationError {
+    /// A function could not be added to a [`Context`] because its name is already
+    /// declared as an overload in the [`Env`].
+    ///
+    /// When a call is resolved, overloads take precedence over the functions
+    /// added to a [`Context`]: a function sharing a name with an overload would
+    /// be shadowed for every call that overload accepts.
+    #[error("Cannot add function '{function}': an overload with that name is already declared")]
+    OverloadConflict { function: String },
+    /// An overload could not be declared for a function because one with the same
+    /// id, or with the same signature, is already declared.
+    ///
+    /// An id is unique across all the overloads of a function, member functions
+    /// included. A signature is the argument types, together with whether the
+    /// overload is a member function.
+    #[error("Cannot declare overload '{id}' of '{function}': one with the same id or signature is already declared")]
+    DuplicateOverload { function: String, id: String },
+    /// A type could not be registered because another type is already
+    /// registered under the same name.
+    ///
+    /// Registering a type equal to the registered one is not a conflict.
+    #[error("Cannot register type '{name}': another type with that name is already registered")]
+    TypeConflict { name: String },
+    /// A type could not be registered because its name is not an identifier,
+    /// or several separated by dots, so no expression could refer to it.
+    #[error("Cannot register type '{name}': not a valid type name")]
+    InvalidTypeName { name: String },
+    /// A container could not be created because its name is not empty and
+    /// not an identifier, or several separated by dots.
+    #[error("Invalid container name '{name}': not an identifier, or several separated by dots")]
+    InvalidContainerName { name: String },
+    /// A macro could not be added because one for the same function, called
+    /// the same way (globally or on a target) with as many arguments, is
+    /// already added.
+    #[error("Cannot add macro '{function}': one for the same call style and argument count is already added")]
+    DuplicateMacro { function: String },
+}
+
+impl DeclarationError {
+    pub fn overload_conflict(function: &str) -> Self {
+        DeclarationError::OverloadConflict {
+            function: function.to_string(),
+        }
+    }
+
+    pub fn duplicate_overload(function: &str, id: &str) -> Self {
+        DeclarationError::DuplicateOverload {
+            function: function.to_string(),
+            id: id.to_string(),
+        }
+    }
+
+    pub fn type_conflict(name: &str) -> Self {
+        DeclarationError::TypeConflict {
+            name: name.to_string(),
+        }
+    }
+
+    pub fn invalid_type_name(name: &str) -> Self {
+        DeclarationError::InvalidTypeName {
+            name: name.to_string(),
+        }
+    }
+
+    pub fn invalid_container_name(name: &str) -> Self {
+        DeclarationError::InvalidContainerName {
+            name: name.to_string(),
+        }
+    }
+
+    pub fn duplicate_macro(function: &str) -> Self {
+        DeclarationError::DuplicateMacro {
+            function: function.to_string(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Program {
+    expression: Expression,
+    source_info: common::ast::SourceInfo,
+}
+
+impl Program {
+    /// Compiles `source` for the standard environment, expanding its macros
+    /// (`has`, `all`, `exists`, `exists_one`, `map` and `filter`): the same as
+    /// [`Env::compile`] on [`Env::stdlib`], without building an `Env`.
+    ///
+    /// Don't use it for a program executed with an [`Env`] that extends the
+    /// standard one, whether with [`Env::add_extension`] or otherwise, e.g.
+    /// with [`Env::add_macro`]: the program would miss what that `Env` adds to
+    /// compiling, such as its macros. Compile with that `Env` instead:
+    ///
+    /// ```
+    /// use cel::{extensions, Context, Env, Value};
+    /// use std::sync::Arc;
+    ///
+    /// let mut env = Env::stdlib();
+    /// env.add_extension(extensions::strings).unwrap();
+    /// let env = Arc::new(env);
+    /// let program = env.compile("'TacoCat'.lowerAscii()").unwrap();
+    /// let context = Context::with_env(env);
+    /// assert_eq!(program.execute(&context), Ok(Value::from("tacocat")));
+    /// ```
+    pub fn compile(source: &str) -> Result<Program, ParseErrors> {
+        Program::parse_with(Parser::default(), source)
+    }
+
+    /// Parses `source` into a program with `parser`, and the macros it expands.
+    pub(crate) fn parse_with(parser: Parser, source: &str) -> Result<Program, ParseErrors> {
+        parser
+            .parse_with_source_info(source)
+            .map(|(expression, source_info)| Program {
+                expression,
+                source_info,
+            })
+    }
+
+    /// Where every node of this program was written, in the source it was
+    /// compiled from.
+    ///
+    /// # Example
+    /// ```rust
+    /// # use cel::Env;
+    /// let program = Env::stdlib().compile("a.b").unwrap();
+    /// let root = program.expression();
+    /// assert_eq!(program.source_info().offset_for(root.id), Some((1, 1)));
+    /// ```
+    pub fn source_info(&self) -> &common::ast::SourceInfo {
+        &self.source_info
+    }
+
+    pub fn execute(&self, context: &Context) -> ResolveResult {
+        Value::resolve(&self.expression, context)
+    }
+
+    /// Returns the variables and functions referenced by the CEL program
+    ///
+    /// # Example
+    /// ```rust
+    /// # use cel::Env;
+    /// let program = Env::stdlib().compile("size(foo) > 0").unwrap();
+    /// let references = program.references();
+    ///
+    /// assert!(references.has_function("size"));
+    /// assert!(references.has_variable("foo"));
+    /// ```
+    pub fn references(&self) -> ExpressionReferences<'_> {
+        self.expression.references()
+    }
+
+    /// Returns the contained expression
+    pub fn expression(&self) -> &Expression {
+        &self.expression
+    }
+}
+
+impl TryFrom<&str> for Program {
+    type Error = ParseErrors;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Program::compile(value)
+    }
+}

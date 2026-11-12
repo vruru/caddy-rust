@@ -929,6 +929,8 @@ impl State<ClientConnectionData> for ExpectCertificateRequest {
             })
             .cloned();
 
+        cx.data.native_requested_ocsp = certreq.extensions.native_status_request.is_some();
+        cx.data.native_requested_scts = certreq.extensions.native_scts_request.is_some();
         let client_auth = ClientAuthDetails::resolve(
             self.config
                 .client_auth_cert_resolver
@@ -1251,41 +1253,32 @@ impl State<ClientConnectionData> for ExpectCertificateVerify<'_> {
 }
 
 fn emit_compressed_certificate_tls13(
-    flight: &mut HandshakeFlightTls13<'_>,
-    certkey: &CertifiedKey,
-    auth_context: Option<Vec<u8>>,
-    compressor: &dyn compress::CertCompressor,
-    config: &ClientConfig,
-) {
-    let mut cert_payload = CertificatePayloadTls13::new(certkey.cert.iter(), None);
+    flight: &mut HandshakeFlightTls13<'_>, certkey: &CertifiedKey,
+    auth_context: Option<Vec<u8>>, compressor: &dyn compress::CertCompressor,
+    config: &ClientConfig, send_ocsp: bool, scts: &[Vec<u8>],
+) -> Result<(), Error> {
+    let ocsp = if send_ocsp { certkey.ocsp.as_deref().filter(|v| !v.is_empty()) } else { None };
+    let mut cert_payload = CertificatePayloadTls13::new(certkey.cert.iter(), ocsp);
+    cert_payload.native_add_scts(scts)?;
     cert_payload.context = PayloadU8::new(auth_context.clone().unwrap_or_default());
-
-    let Ok(compressed) = config
-        .cert_compression_cache
-        .compression_for(compressor, &cert_payload)
-    else {
-        return emit_certificate_tls13(flight, Some(certkey), auth_context);
+    let Ok(compressed) = config.cert_compression_cache.compression_for(compressor, &cert_payload) else {
+        return emit_certificate_tls13(flight, Some(certkey), auth_context, send_ocsp, scts);
     };
-
-    flight.add(HandshakeMessagePayload(
-        HandshakePayload::CompressedCertificate(compressed.compressed_cert_payload()),
-    ));
+    flight.add(HandshakeMessagePayload(HandshakePayload::CompressedCertificate(compressed.compressed_cert_payload())));
+    Ok(())
 }
 
 fn emit_certificate_tls13(
-    flight: &mut HandshakeFlightTls13<'_>,
-    certkey: Option<&CertifiedKey>,
-    auth_context: Option<Vec<u8>>,
-) {
-    let certs = certkey
-        .map(|ck| ck.cert.as_ref())
-        .unwrap_or(&[][..]);
-    let mut cert_payload = CertificatePayloadTls13::new(certs.iter(), None);
+    flight: &mut HandshakeFlightTls13<'_>, certkey: Option<&CertifiedKey>,
+    auth_context: Option<Vec<u8>>, send_ocsp: bool, scts: &[Vec<u8>],
+) -> Result<(), Error> {
+    let certs = certkey.map(|ck| ck.cert.as_ref()).unwrap_or(&[][..]);
+    let ocsp = if send_ocsp { certkey.and_then(|ck|ck.ocsp.as_deref()).filter(|v| !v.is_empty()) } else { None };
+    let mut cert_payload = CertificatePayloadTls13::new(certs.iter(), ocsp);
+    cert_payload.native_add_scts(scts)?;
     cert_payload.context = PayloadU8::new(auth_context.unwrap_or_default());
-
-    flight.add(HandshakeMessagePayload(HandshakePayload::CertificateTls13(
-        cert_payload,
-    )));
+    flight.add(HandshakeMessagePayload(HandshakePayload::CertificateTls13(cert_payload)));
+    Ok(())
 }
 
 fn emit_certverify_tls13(
@@ -1392,7 +1385,7 @@ impl State<ClientConnectionData> for ExpectFinished {
                 ClientAuthDetails::Empty {
                     auth_context_tls13: auth_context,
                 } => {
-                    emit_certificate_tls13(&mut flight, None, auth_context);
+                    emit_certificate_tls13(&mut flight, None, auth_context, false, &[])?;
                 }
                 ClientAuthDetails::Verify {
                     auth_context_tls13: auth_context,
@@ -1400,7 +1393,7 @@ impl State<ClientConnectionData> for ExpectFinished {
                 } if cx.data.ech_status == EchStatus::Rejected => {
                     // If ECH was offered, and rejected, we MUST respond with
                     // an empty certificate message.
-                    emit_certificate_tls13(&mut flight, None, auth_context);
+                    emit_certificate_tls13(&mut flight, None, auth_context, false, &[])?;
                 }
                 ClientAuthDetails::Verify {
                     certkey,
@@ -1415,9 +1408,12 @@ impl State<ClientConnectionData> for ExpectFinished {
                             auth_context,
                             compressor,
                             &st.config,
-                        );
+                            cx.data.native_requested_ocsp,
+                            if cx.data.native_requested_scts { &st.config.native_client_signed_certificate_timestamps } else { &[] },
+                        )?;
                     } else {
-                        emit_certificate_tls13(&mut flight, Some(&certkey), auth_context);
+                        emit_certificate_tls13(&mut flight, Some(&certkey), auth_context, cx.data.native_requested_ocsp,
+                            if cx.data.native_requested_scts { &st.config.native_client_signed_certificate_timestamps } else { &[] })?;
                     }
                     emit_certverify_tls13(&mut flight, signer.as_ref())?;
                 }
@@ -1633,6 +1629,10 @@ impl State<ClientConnectionData> for ExpectTraffic {
             .request_key_update_and_update_encrypter(common)
     }
 
+    fn native_exporter(&self) -> Result<alloc::sync::Arc<dyn crate::NativeExporter>, Error> {
+        Ok(self.key_schedule.native_exporter())
+    }
+
     fn export_keying_material(
         &self,
         output: &mut [u8],
@@ -1694,6 +1694,10 @@ impl State<ClientConnectionData> for ExpectQuicTraffic {
         self.0
             .handle_new_ticket_tls13(cx, nst)?;
         Ok(self)
+    }
+
+    fn native_exporter(&self) -> Result<alloc::sync::Arc<dyn crate::NativeExporter>, Error> {
+        Ok(self.0.key_schedule.native_exporter())
     }
 
     fn export_keying_material(

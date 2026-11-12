@@ -14,7 +14,7 @@ use http::{Request, Response};
 use http_body::Body;
 use hyper::{
     body::Incoming,
-    rt::{Read, ReadBuf, Timer, Write},
+    rt::{Read, ReadBuf, Timer, Write, Sleep},
     service::Service,
 };
 
@@ -51,6 +51,17 @@ pub trait HttpServerConnExec<A, B: Body> {}
 #[cfg(not(feature = "http2"))]
 impl<A, B: Body, T> HttpServerConnExec<A, B> for T {}
 
+#[derive(Clone)]
+struct ProtocolTimeout {
+    duration: Duration,
+    timer: std::sync::Arc<dyn Timer + Send + Sync>,
+}
+impl std::fmt::Debug for ProtocolTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ProtocolTimeout").field(&self.duration).finish()
+    }
+}
+
 /// Http1 or Http2 connection builder.
 #[derive(Clone, Debug)]
 pub struct Builder<E> {
@@ -60,6 +71,7 @@ pub struct Builder<E> {
     http2: http2::Builder<E>,
     #[cfg(any(feature = "http1", feature = "http2"))]
     version: Option<Version>,
+    protocol_timeout: Option<ProtocolTimeout>,
     #[cfg(not(feature = "http2"))]
     _executor: E,
 }
@@ -97,9 +109,19 @@ impl<E> Builder<E> {
             http2: http2::Builder::new(executor),
             #[cfg(any(feature = "http1", feature = "http2"))]
             version: None,
+            protocol_timeout: None,
             #[cfg(not(feature = "http2"))]
             _executor: executor,
         }
+    }
+
+    /// Bound the initial protocol preface and preserve that absolute deadline
+    /// for the first HTTP/1 head. HTTP/2 uses its own stream/idle clocks after
+    /// classification, so an idle H2 connection is never a partial H1 head.
+    pub fn protocol_read_timeout<M>(&mut self, duration: Duration, timer: M) -> &mut Self
+    where M: Timer + Send + Sync + 'static {
+        self.protocol_timeout = Some(ProtocolTimeout { duration, timer: std::sync::Arc::new(timer) });
+        self
     }
 
     /// Http1 configuration.
@@ -243,7 +265,7 @@ impl<E> Builder<E> {
             }
             #[cfg(any(feature = "http1", feature = "http2"))]
             _ => ConnState::ReadVersion {
-                read_version: read_version(io),
+                read_version: read_version(io).with_timeout(self.protocol_timeout.as_ref()),
                 builder: Cow::Borrowed(self),
                 service: Some(service),
             },
@@ -277,7 +299,7 @@ impl<E> Builder<E> {
     {
         UpgradeableConnection {
             state: UpgradeableConnState::ReadVersion {
-                read_version: read_version(io),
+                read_version: read_version(io).with_timeout(self.protocol_timeout.as_ref()),
                 builder: Cow::Borrowed(self),
                 service: Some(service),
             },
@@ -312,6 +334,8 @@ where
         filled: 0,
         version: Version::H2,
         cancelled: false,
+        timeout: None,
+        deadline: None,
         _pin: PhantomPinned,
     }
 }
@@ -324,6 +348,8 @@ pin_project! {
         filled: usize,
         version: Version,
         cancelled: bool,
+        timeout: Option<Pin<Box<dyn Sleep>>>,
+        deadline: Option<std::time::Instant>,
         // Make this future `!Unpin` for compatibility with async trait methods.
         #[pin]
         _pin: PhantomPinned,
@@ -331,6 +357,14 @@ pin_project! {
 }
 
 impl<I> ReadVersion<I> {
+    fn with_timeout(mut self, timeout: Option<&ProtocolTimeout>) -> Self {
+        if let Some(timeout) = timeout {
+            let deadline = timeout.timer.now() + timeout.duration;
+            self.timeout = Some(timeout.timer.sleep_until(deadline));
+            self.deadline = Some(deadline);
+        }
+        self
+    }
     pub fn cancel(self: Pin<&mut Self>) {
         *self.project().cancelled = true;
     }
@@ -348,6 +382,9 @@ where
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelled")));
         }
 
+        if this.timeout.as_mut().is_some_and(|sleep| sleep.as_mut().poll(cx).is_ready()) {
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, "HTTP protocol header timeout")));
+        }
         let mut buf = ReadBuf::uninit(&mut *this.buf);
         // SAFETY: `this.filled` tracks how many bytes have been read (and thus initialized) and
         // we're only advancing by that many.
@@ -524,12 +561,15 @@ where
                     builder,
                     service,
                 } => {
+                    let initial_header_deadline = read_version.as_ref().get_ref().deadline;
                     let (version, io) = ready!(read_version.poll(cx))?;
                     let service = service.take().unwrap();
                     match version {
                         #[cfg(feature = "http1")]
                         Version::H1 => {
-                            let conn = builder.http1.serve_connection(io, service);
+                            let mut http1 = builder.http1.clone();
+                            if let Some(deadline) = initial_header_deadline { http1.initial_header_read_deadline(deadline); }
+                            let conn = http1.serve_connection(io, service);
                             this.state.set(ConnState::H1 { conn });
                         }
                         #[cfg(feature = "http2")]
@@ -679,12 +719,15 @@ where
                     builder,
                     service,
                 } => {
+                    let initial_header_deadline = read_version.as_ref().get_ref().deadline;
                     let (version, io) = ready!(read_version.poll(cx))?;
                     let service = service.take().unwrap();
                     match version {
                         #[cfg(feature = "http1")]
                         Version::H1 => {
-                            let conn = builder.http1.serve_connection(io, service).with_upgrades();
+                            let mut http1 = builder.http1.clone();
+                            if let Some(deadline) = initial_header_deadline { http1.initial_header_read_deadline(deadline); }
+                            let conn = http1.serve_connection(io, service).with_upgrades();
                             this.state.set(UpgradeableConnState::H1 { conn });
                         }
                         #[cfg(feature = "http2")]
@@ -865,6 +908,13 @@ impl<E> Http1Builder<'_, E> {
         self.inner.http1.header_read_timeout(read_timeout);
         self
     }
+
+    /// Set the application idle timeout, independently of active requests.
+    pub fn idle_timeout(&mut self, timeout: impl Into<Option<Duration>>) -> &mut Self {
+        self.inner.http1.idle_timeout(timeout);
+        self
+    }
+
 
     /// Set whether HTTP/1 connections should try to use vectored writes,
     /// or always flatten into a single buffer.
@@ -1097,6 +1147,13 @@ impl<E> Http2Builder<'_, E> {
         self.inner.http2.keep_alive_timeout(timeout);
         self
     }
+
+    /// Set the application idle timeout, independently of active requests.
+    pub fn idle_timeout(&mut self, timeout: impl Into<Option<Duration>>) -> &mut Self {
+        self.inner.http2.idle_timeout(timeout);
+        self
+    }
+
 
     /// Set the maximum write buffer size for each HTTP/2 stream.
     ///

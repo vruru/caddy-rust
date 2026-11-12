@@ -1,5 +1,5 @@
 //! Shared path-pattern matcher used by HTTP routing and configuration adaptation.
-pub(crate) fn go_path_glob(pattern: &str, value: &str) -> bool {
+pub(crate) fn compile_go_path_glob(pattern: &str) -> Option<regex::Regex> {
     let mut regex = String::from("^");
     let mut chars = pattern.chars();
     while let Some(c) = chars.next() {
@@ -7,9 +7,7 @@ pub(crate) fn go_path_glob(pattern: &str, value: &str) -> bool {
             '*' => regex.push_str("[^/]*"),
             '?' => regex.push_str("[^/]"),
             '\\' => {
-                let Some(c) = chars.next() else {
-                    return false;
-                };
+                let c = chars.next()?;
                 regex.push_str(&regex::escape(&c.to_string()));
             }
             '[' => {
@@ -28,9 +26,7 @@ pub(crate) fn go_path_glob(pattern: &str, value: &str) -> bool {
                         continue;
                     }
                     if c == '\\' {
-                        let Some(c) = chars.next() else {
-                            return false;
-                        };
+                        let c = chars.next()?;
                         regex.push_str(&regex::escape(&c.to_string()));
                     } else if c == '-' {
                         regex.push('-');
@@ -41,7 +37,7 @@ pub(crate) fn go_path_glob(pattern: &str, value: &str) -> bool {
                     any = true;
                 }
                 if !closed || !any {
-                    return false;
+                    return None;
                 }
                 regex.push(']');
             }
@@ -49,5 +45,7 @@ pub(crate) fn go_path_glob(pattern: &str, value: &str) -> bool {
         }
     }
     regex.push('$');
-    regex::Regex::new(&regex).is_ok_and(|r| r.is_match(value))
+    regex::Regex::new(&regex).ok()
 }
+
+pub(crate) fn go_path_glob(pattern:&str,value:&str)->bool{compile_go_path_glob(pattern).is_some_and(|pattern|pattern.is_match(value))}

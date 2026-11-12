@@ -27,7 +27,9 @@ fn null_compression_required() {
 #[test]
 fn server_ignores_sni_with_ip_address() {
     let mut ch = minimal_client_hello();
-    ch.extensions.server_name = Some(ServerNamePayload::IpAddress);
+    ch.extensions.server_name = Some(ServerNamePayload::IpAddress(
+        PayloadU16::new(b"127.0.0.1".to_vec()),
+    ));
     std::println!("{:?}", ch.extensions);
     assert_eq!(test_process_client_hello(ch), Ok(()));
 }

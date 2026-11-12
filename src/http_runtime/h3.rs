@@ -197,21 +197,29 @@ fn udp_socket(address: SocketAddr) -> std::io::Result<UdpSocket> {
     socket.bind(&address.into())?;
     Ok(socket.into())
 }
+struct Preselected {
+    certificate: crate::tls_resolver::CertificateSelection,
+    chain: [u8; 32],
+    protocols: Vec<Vec<u8>>,
+    schemes: Vec<rustls::SignatureScheme>,
+}
 
-/// A handshake records exactly the selected leaf, never the best matching
-/// candidate at a later instant. QUIC does not consult the TCP proof resolver.
 struct SeenCert {
     selected_policy: Arc<tls_policies::PreparedPolicy>,
     local_ip: String,
     selection: Arc<sessions::SelectionSlot>,
     inspected_name: Option<String>,
     policy: PolicyScope,
+    preselected: Option<Preselected>,
+    acquired: Option<AcquiredCertificate>,
 }
+
 impl fmt::Debug for SeenCert {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Http3Certificate").finish_non_exhaustive()
     }
 }
+
 impl ResolvesServerCert for SeenCert {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let wire_name = hello.offered_server_name().unwrap_or_default();
@@ -250,25 +258,66 @@ impl ResolvesServerCert for SeenCert {
                 .provider
                 .as_ref()
                 .is_some_and(|provider| provider.should_probe_before_fallback(&name));
+        if let Some(p) = &self.preselected {
+            if !p
+                .protocols
+                .iter()
+                .map(Vec::as_slice)
+                .eq(protocols.iter().copied())
+                || p.schemes.as_slice() != hello.signature_schemes()
+                || !p.certificate.signature_compatibility.allows(version)
+                || !p
+                    .certificate
+                    .leaf_state
+                    .as_ref()
+                    .is_some_and(|leaf| leaf.admission().allow_certificate)
+            {
+                self.selection.poison();
+                return None;
+            }
+        }
+        // A repeated real hello may reuse the pinned signer, but never a
+        // retired acquisition receipt. This check also runs after HRR.
+        if let Some(acquired) = &self.acquired
+            && acquired.select(&resolver.managed, hello.signature_schemes(), Some(version)).is_none()
+        {
+            self.selection.poison();
+            return None;
+        }
         let selected =
             self.selection
                 .select(&session_name, wire_name, self.policy.digest, || {
-                    self.selected_policy
-                        .definition
-                        .certificate_names(&name, &self.local_ip)
-                        .into_iter()
-                        .take(if primary_only { 1 } else { 3 })
-                        .flatten()
-                        .filter(|name| !name.is_empty())
-                        .find_map(|name| {
-                            resolver.select_for_version(
-                                Some(name),
+                    if let Some(acquired) = &self.acquired {
+                        acquired.select(&resolver.managed, hello.signature_schemes(), Some(version))
+                    } else if let Some(p) = &self.preselected {
+                        Some(p.certificate.clone())
+                    } else {
+                        if resolver.certificate_selection.is_some() {
+                            return None;
+                        }
+                        resolver
+                            .choose(
+                                super::certificate_choice::eligible_names(
+                                    &self.selected_policy.definition,
+                                    &name,
+                                    &self.local_ip,
+                                    primary_only,
+                                ),
+                                (!name.is_empty()).then_some(name.as_str()),
                                 &protocols,
                                 hello.signature_schemes(),
-                                version,
+                                Some(version),
                             )
-                        })
+                            .selected()
+                            .map(|(cert, _)| cert)
+                    }
                 })?;
+        if let Some(p) = &self.preselected {
+            if super::connection_identity::chain_hash(&selected.certificate.key) != p.chain {
+                self.selection.poison();
+                return None;
+            }
+        }
         let key = &selected.certificate.key;
         if key.key.choose_scheme(hello.signature_schemes()).is_none() {
             self.selection.poison();
@@ -277,7 +326,6 @@ impl ResolvesServerCert for SeenCert {
         Some(key.clone())
     }
 }
-
 enum FlightState {
     Unchanged,
     Incomplete(usize),
@@ -365,59 +413,69 @@ async fn inspect_hello(
 }
 
 enum Prepared {
-    Ready,
+    Ready(Option<AcquiredCertificate>),
     Retry,
 }
 
-async fn prepare_certificate(
-    incoming: &quinn::Incoming,
+fn probe_cached_certificate(
     policy: &tls_policies::PreparedPolicy,
-    hello: &hello::Hello,
-    provider: &dyn ScopedCertificateProvider,
     name: &str,
-    lanes: (&PreflightLanes, &PreflightLanes),
-) -> Option<Prepared> {
-    let validated = incoming.remote_address_validated();
-    let protocols = hello
-        .protocols
-        .iter()
-        .map(Vec::as_slice)
-        .collect::<Vec<_>>();
+    offered: &str,
+    protocols: &[Vec<u8>],
+    schemes: &[rustls::SignatureScheme],
+) -> (certificate_choice::Choice, bool) {
+    let protocols = protocols.iter().map(Vec::as_slice).collect::<Vec<_>>();
     let resolver = &policy.resolver;
-    let selected = resolver.select_for_version_with_origin(
-        Some(name),
+    let primary = resolver.choose(
+        [Some(name), None, None],
+        (!offered.is_empty()).then_some(offered),
         &protocols,
-        &hello.signatures,
-        rustls::ProtocolVersion::TLSv1_3,
+        schemes,
+        Some(rustls::ProtocolVersion::TLSv1_3),
     );
-    let has_fallback = policy
+    let fallback = policy
         .definition
         .fallback_sni
         .as_deref()
         .is_some_and(|fallback| {
-            resolver
-                .select_for_version(
-                    Some(fallback),
+            matches!(
+                resolver.choose(
+                    [None, None, Some(fallback)],
+                    (!offered.is_empty()).then_some(offered),
                     &protocols,
-                    &hello.signatures,
-                    rustls::ProtocolVersion::TLSv1_3,
-                )
-                .is_some()
+                    schemes,
+                    Some(rustls::ProtocolVersion::TLSv1_3)
+                ),
+                certificate_choice::Choice::Selected(..)
+            )
         });
-    let probe_fallback = has_fallback && provider.should_probe_before_fallback(name);
-    if selected
-        .as_ref()
-        .is_some_and(|(_, origin)| *origin == CertificateOrigin::Manual)
+    (primary, fallback)
+}
+
+async fn prepare_certificate(
+    incoming: &quinn::Incoming,
+    current: Option<CertificateOrigin>,
+    has_fallback: bool,
+    provider: &dyn ScopedCertificateProvider,
+    request: CertificateRequest,
+    lanes: (&PreflightLanes, &PreflightLanes),
+    event:&mut super::tls_events::Admission<'_>,
+) -> Option<Prepared> {
+    let validated = incoming.remote_address_validated();
+    let probe_fallback = has_fallback && provider.should_probe_before_fallback(&request.origin);
+    if current == Some(CertificateOrigin::Manual)
         || (has_fallback && !probe_fallback)
-        || (!probe_fallback && !provider.can_acquire_quic_name(name))
+        || (!probe_fallback && !provider.can_acquire_quic_name(&request.origin))
     {
-        return Some(Prepared::Ready);
+        return Some(Prepared::Ready(None));
     }
     if !validated {
-        return Some(if selected.is_none() {
+        return Some(if current.is_none()
+            || (current == Some(CertificateOrigin::Managed) && provider.maintenance_due_for(&request))
+        {
             Prepared::Retry
         } else {
-            Prepared::Ready
+            Prepared::Ready(None)
         });
     }
     // A hit can become unusable before ensure() so even a validated cache hit
@@ -427,13 +485,14 @@ async fn prepare_certificate(
         lanes.1.issuance.try_acquire(),
     ) {
         (Ok(a), Ok(b)) => (a, b),
-        _ if selected.is_some() => return Some(Prepared::Ready),
+        _ if current.is_some() => return Some(Prepared::Ready(None)),
         _ => return None,
     };
     let cancel = CancellationToken::new();
     let _cancel_on_drop = cancel.clone().drop_guard();
-    provider.ensure(name.to_owned(), cancel).await.ok()?;
-    Some(Prepared::Ready)
+    event.run().await.ok()?;
+    let acquired = provider.ensure_request(request, cancel).await.ok()?;
+    Some(Prepared::Ready(acquired))
 }
 
 async fn accept_loop(
@@ -502,10 +561,14 @@ async fn accept_loop(
             let budget = server.plan.read_header_timeout.min(Duration::from_secs(15));
             let deadline = Instant::now() + budget;
             let Some(first) = server.tls_policies.first() else { return; };
+            let certificate_ip = if local.ip().is_unspecified() { String::new() }
+                else { crate::tls_resolver::canonical_certificate_ip(local.ip()) };
             let preflight = server.tls_policies.len() != 1
+                || server.events.as_ref().is_some_and(|events|events.should_emit("tls_get_certificate"))
                 || first.definition.has_custom_settings()
+                || first.resolver.certificate_selection.is_some()
                 || first.resolver.provider.as_ref().is_some_and(|p| p.needs_quic_preflight());
-            let (index, policy, inspected_name) = if preflight {
+            let (index, policy, inspected_name, preselected, acquired) = if preflight {
                 let prepared = tokio::select! {
                     biased;
                     _=activity.superseded.cancelled()=>return,
@@ -542,37 +605,140 @@ async fn accept_loop(
                 if policy.definition.drop || policy.definition.protocol_max == Some(crate::tls_policy::ProtocolVersion::Tls12) {
                     return;
                 }
-                if !name.is_empty() && name.parse::<std::net::IpAddr>().is_err()
-                    && let Some(provider) = policy.resolver.provider.as_deref().filter(|p| {
+                let mut event=super::tls_events::Admission::new(server.events.as_ref(),&hello.event,&runtime.resources,
+                    (peer,local,super::tls_events::Transport::Quic),&activity.admission_closed);
+                let typed = name.is_empty() || name.parse::<std::net::IpAddr>().is_ok();
+                let primary_name = if name.is_empty() { certificate_ip.as_str() } else { name.as_str() };
+                let mut acquired = None;
+                if let Some(provider) = policy.resolver.provider.as_deref().filter(|p| {
                         p.needs_quic_preflight() || policy.definition.fallback_sni.is_some()
                     })
                 {
-                    let prepared = tokio::select! {
-                        biased;
-                        _=activity.superseded.cancelled()=>return,
-                        _=activity.admission_closed.cancelled()=>return,
-                        _=activity.hard_stop.cancelled()=>return,
-                        value=tokio::time::timeout_at(deadline, prepare_certificate(&incoming, &policy, &hello, provider, &name, (&binding.preflight, &runtime.quic_limits.preflight)))=>value.ok().flatten(),
+                    // The permission/storage decision sees primary availability
+                    // separately from the exact fallback, matching TCP. A
+                    // manual fallback must not suppress a required probe.
+                    let availability = if policy.definition.certificate_selection.is_some() {
+                        let choice_policy = policy.clone();
+                        let choice_name = primary_name.to_owned();
+                        let choice_offered = name.clone();
+                        let choice_protocols = hello.protocols.clone();
+                        let choice_schemes = hello.signatures.clone();
+                        tokio::select! {
+                            biased;
+                            _=activity.superseded.cancelled()=>return,
+                            _=activity.admission_closed.cancelled()=>return,
+                            _=activity.hard_stop.cancelled()=>return,
+                            value=tokio::time::timeout_at(deadline, runtime.resources.metadata.run(move || {
+                                probe_cached_certificate(&choice_policy, &choice_name, &choice_offered, &choice_protocols, &choice_schemes)
+                            }))=>value.ok().and_then(|result| result.ok()),
+                        }
+                    } else {
+                        // No explicit selector: the two bounded alias lookups
+                        // retain the existing direct preflight path.
+                        Some(probe_cached_certificate(&policy, primary_name, &name, &hello.protocols, &hello.signatures))
                     };
-                    match prepared {
-                        Some(Prepared::Ready) => {}
-                        Some(Prepared::Retry) => { let _ = incoming.retry(); return; }
-                        None => return,
+                    let Some((primary, fallback)) = availability else { return; };
+                    let primary_hit = matches!(primary, certificate_choice::Choice::Selected(..));
+                    let (current, skip_probe, cached_target) = match primary {
+                        certificate_choice::Choice::Selected(certificate, origin, _) => {
+                            let target = if origin == CertificateOrigin::Managed {
+                                certificate.instance.and_then(|instance| policy.resolver.managed.scoped_instance(instance))
+                                    .map(|(receipt, slot)| AcquiredCertificate {
+                                        subject: primary_name.to_owned(), receipt, slot, external: None,
+                                    })
+                            } else { None };
+                            (Some(origin), origin == CertificateOrigin::Manual, target)
+                        }
+                        certificate_choice::Choice::Missing
+                        | certificate_choice::Choice::Unusable { managed: true, global: false } => (None, false, None),
+                        certificate_choice::Choice::Unusable { .. } => return,
+                    };
+                    let skip_probe = if typed { !provider.should_probe_before_fallback(&name) } else { skip_probe };
+                    if !skip_probe {
+                        let subject = if typed && !primary_hit && name.is_empty() {
+                            policy.definition.default_sni.clone().unwrap_or_else(|| certificate_ip.clone())
+                        } else { primary_name.to_owned() };
+                        let force_lookup = if typed { !primary_hit }
+                            else { policy.definition.certificate_selection.is_some() && !primary_hit };
+                        let request = CertificateRequest { origin: name.clone(), subject: subject.clone(), force_lookup, cached: cached_target,
+                            hello: Some(CertificateHello { server_name: hello.event.server_name.clone(),
+                                signatures: hello.event.signature_schemes.clone().unwrap_or_default(),
+                                ciphers: hello.event.cipher_suites.clone(), local_ip: local.ip() }),
+                            selection: Some(WarmSelection { filter: policy.resolver.certificate_selection.clone(),
+                                schemes: hello.signatures.clone(), version: Some(rustls::ProtocolVersion::TLSv1_3) }),
+                        };
+                        let prepared = tokio::select! {
+                            biased;
+                            _=activity.superseded.cancelled()=>return,
+                            _=activity.admission_closed.cancelled()=>return,
+                            _=activity.hard_stop.cancelled()=>return,
+                            value=tokio::time::timeout_at(deadline, prepare_certificate(&incoming, current, !typed && fallback, provider, request, (&binding.preflight, &runtime.quic_limits.preflight),&mut event))=>value.ok().flatten(),
+                        };
+                        match prepared {
+                            Some(Prepared::Ready(value)) => {
+                                if value.as_ref().is_some_and(|certificate| certificate.subject != subject) { return; }
+                                acquired = value;
+                            }
+                            Some(Prepared::Retry) => { let _ = incoming.retry(); return; }
+                            None => return,
+                        }
                     }
                 }
-                (index, policy, Some(inspected_name))
+                if event.run().await.is_err(){return;}
+                // Global explicit selection runs on the bounded metadata
+                // worker before accept_with can acquire the endpoint lock.
+                let preselected = if acquired.is_some() || policy.definition.certificate_selection.is_some() {
+                let choice_acquired = acquired.clone();
+                let choice_policy = policy.clone();
+                let choice_name = name.clone();
+                let choice_ip = certificate_ip.clone();
+                let choice_protocols = hello.protocols.clone();
+                let choice_schemes = hello.signatures.clone();
+                let choice = tokio::select! {
+                    biased;
+                    _=activity.superseded.cancelled()=>return,
+                    _=activity.admission_closed.cancelled()=>return,
+                    _=activity.hard_stop.cancelled()=>return,
+                    value=tokio::time::timeout_at(deadline, runtime.resources.metadata.run(move || {
+                        let protocols = choice_protocols.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                        let resolver = &choice_policy.resolver;
+                        if let Some(acquired) = choice_acquired {
+                            return acquired.select(&resolver.managed, &choice_schemes, Some(rustls::ProtocolVersion::TLSv1_3))
+                                .map_or(certificate_choice::Choice::Missing, |certificate|
+                                    certificate_choice::Choice::Selected(certificate, CertificateOrigin::Managed, false));
+                        }
+                        let primary_only = (choice_name.is_empty() || choice_name.parse::<std::net::IpAddr>().is_ok())
+                            && resolver.provider.as_ref().is_some_and(|provider| provider.should_probe_before_fallback(&choice_name));
+                        resolver.choose(certificate_choice::eligible_names(&choice_policy.definition,
+                            &choice_name, &choice_ip, primary_only),
+                            (!choice_name.is_empty()).then_some(choice_name.as_str()),
+                            &protocols, &choice_schemes, Some(rustls::ProtocolVersion::TLSv1_3))
+                    }))=>value,
+                };
+                let Ok(Ok(certificate_choice::Choice::Selected(certificate, _, _))) = choice else { return; };
+                if !certificate.signature_compatibility.allows(rustls::ProtocolVersion::TLSv1_3)
+                    || !certificate.leaf_state.as_ref().is_some_and(|leaf| leaf.admission().allow_certificate) {
+                    return;
+                }
+                Some(Preselected {
+                    chain: connection_identity::chain_hash(&certificate.key),
+                    certificate, protocols: hello.protocols, schemes: hello.signatures,
+                })
+                } else { None };
+                (index, policy, Some(inspected_name), preselected, acquired)
             } else {
-                (0, first.clone(), None)
+                (0, first.clone(), None, None, None)
             };
             if activity.superseded.is_cancelled() || activity.admission_closed.is_cancelled() {
                 return;
             }
             let seen = Arc::new(SeenCert {
                 selected_policy: policy.clone(),
-                local_ip: if local.ip().is_unspecified() { String::new() }
-                    else { crate::tls_resolver::canonical_certificate_ip(local.ip()) },
+                local_ip: certificate_ip,
                 selection: Arc::new(sessions::SelectionSlot::default()),
                 inspected_name,
+                preselected,
+                acquired,
                 policy: PolicyScope::new(&server, index, &policy),
             });
             let mut crypto = (*policy.tls).clone();
@@ -594,7 +760,11 @@ async fn accept_loop(
             };
             drop((handshake_slot,process_handshake));
             let Some(selected) = seen.selection.current() else { return; };
-            let identity = QuicIdentity { leaf: selected.leaf().clone(), sni: selected.raw_sni.clone() };
+            let snapshot = Arc::new(ConnectionSnapshot::capture_quic(
+                &connection, &selected.raw_sni, &selected.certificate.key.cert,
+                policy.definition.client_auth.as_ref(),
+            ));
+            let identity = QuicIdentity { leaf: selected.leaf().clone(), sni: selected.raw_sni.clone(), snapshot };
             let peer = Peer {key,peer,local,scope:config.scope};
             if !peer.permits(&connection) { return; }
             serve_connection(runtime,connection,peer,server,activity,identity).await;
@@ -647,6 +817,7 @@ fn canonical(address: SocketAddr) -> SocketAddr {
 }
 
 struct QuicIdentity {
+    snapshot: Arc<ConnectionSnapshot>,
     leaf: Arc<LeafState>,
     sni: Arc<str>,
 }
@@ -659,7 +830,8 @@ async fn serve_connection(
     activity: Arc<BusinessGeneration>,
     identity: QuicIdentity,
 ) {
-    let QuicIdentity { leaf, sni } = identity;
+    let QuicIdentity { leaf, sni, snapshot } = identity;
+    let client_cert_cache = super::client_cert_facts::Cache::new(snapshot.clone());
     let sni = server.plan.strict_sni_host.then_some(sni);
     let mut builder = ::h3::server::builder();
     builder.max_field_section_size(16 * 1024);
@@ -675,7 +847,12 @@ async fn serve_connection(
     };
     let mut streams = JoinSet::new();
     let mut draining = false;
+    let mut idle_deadline = None;
     loop {
+        if !streams.is_empty() { idle_deadline = None; }
+        else if idle_deadline.is_none() {
+            idle_deadline = server.plan.idle_timeout.map(|duration| Instant::now() + duration);
+        }
         if draining && streams.is_empty() {
             // FIN and GOAWAY remain available for retransmission while the
             // client drains. A retirement never extends the business guard.
@@ -701,6 +878,15 @@ async fn serve_connection(
                 let _=tokio::time::timeout(Duration::from_millis(250),connection.shutdown(0)).await;
             },
             _=streams.join_next(),if !streams.is_empty()=>{},
+            _=async {
+                match idle_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            },if !draining && streams.is_empty()=>{
+                quic.close(::h3::error::Code::H3_NO_ERROR.value().try_into().expect("valid H3 code"), b"idle timeout");
+                break;
+            },
             next=connection.accept()=>{
                 let Ok(Some(resolver))=next else {break;};
                 if draining || streams.len()>=STREAMS || !leaf.admission().allow_certificate {
@@ -716,6 +902,8 @@ async fn serve_connection(
                 let activity=activity.clone();
                 let leaf=leaf.clone();
                 let sni = sni.clone();
+                let snapshot = snapshot.clone();
+                let client_cert_cache = client_cert_cache.clone();
                 let quic_for_stream=quic.clone();
                 streams.spawn(async move {
                     let _stream_slot=stream_slot;
@@ -735,6 +923,8 @@ async fn serve_connection(
                     let head=request.method()==Method::HEAD;
                     let Ok(metadata)=trailer_policy::prepare_request(&mut request) else{return;};
                     request.extensions_mut().insert(metadata);
+                    request.extensions_mut().insert(snapshot);
+                    request.extensions_mut().insert(client_cert_cache);
                     let Ok((request,wire))=stream::start(request,wire) else{return;};
                     let task=async move {
                         let (interim, receiver) = stream::interim_channel();

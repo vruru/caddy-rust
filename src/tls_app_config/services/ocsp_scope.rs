@@ -27,6 +27,9 @@ impl OcspScope {
             admission: Mutex::new(false),
         }))
     }
+    pub(super) fn is_cancelled(&self) -> bool { self.0.cancel.is_cancelled() }
+    pub(super) fn same(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+    pub(super) fn cancel(&self) { self.0.cancel.cancel(); }
     pub(super) fn start(&self, service: &Arc<CertificateServices>) -> Result<()> {
         let _parent = service
             .admission

@@ -54,13 +54,18 @@ impl ServerCertVerified {
 
 /// Zero-sized marker type representing verification of a client cert chain.
 #[derive(Debug)]
-pub struct ClientCertVerified(());
+pub struct ClientCertVerified(pub(crate) crate::ClientChainObservation);
 
 impl ClientCertVerified {
     /// Make a `ClientCertVerified`
     pub fn assertion() -> Self {
-        Self(())
+        Self(crate::ClientChainObservation::Unavailable(crate::ChainUnavailable::RootSourceUnknown))
     }
+    /// Attach only paths produced by the actual configured verifier.
+    pub fn with_observation(observation: crate::ClientChainObservation) -> Self {
+        Self(observation)
+    }
+
 }
 
 /// Something that can verify a server certificate chain, and verify
@@ -201,6 +206,12 @@ pub trait ClientCertVerifier: Debug + Send + Sync {
     /// [`CertificateRequest`]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.3.2
     /// [`certificate_authorities`]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.4
     fn root_hint_subjects(&self) -> &[DistinguishedName];
+
+    /// A verifying policy requires authenticated path observations on resumption.
+    fn resume_requires_verified_chains(&self) -> bool { false }
+    /// Digest of the actual trust and pin policy owning path observations.
+    fn chain_binding(&self) -> Option<[u8; 32]> { None }
+
 
     /// Verify the end-entity certificate `end_entity` is valid, acceptable,
     /// and chains to at least one of the trust anchors trusted by

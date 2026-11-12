@@ -13,10 +13,10 @@ struct Shape {
 }
 
 impl Shape {
-    fn advance(&mut self, byte: u8, max_depth: usize) -> Result<(), ConfigError> {
+    fn advance(&mut self, byte: u8, max_depth: usize, max_shape_tokens:usize) -> Result<(), ConfigError> {
         if matches!(byte, b'[' | b'{' | b',' | b':') {
             self.tokens += 1;
-            if self.tokens > MAX_SHAPE_TOKENS {
+            if self.tokens > max_shape_tokens {
                 return Err(ConfigError {
                     status: 413,
                     category: "configuration_materialization_limit",
@@ -58,7 +58,7 @@ pub(super) fn check_canonical(input: &[u8], max_depth: usize) -> Result<(), Conf
                 }
             }
         } else {
-            shape.advance(byte, max_depth)?;
+            shape.advance(byte,max_depth,MAX_SHAPE_TOKENS)?;
             in_string = byte == b'"';
         }
     }
@@ -75,7 +75,9 @@ pub(super) fn check_canonical(input: &[u8], max_depth: usize) -> Result<(), Conf
 /// - Outside strings: tracks `[`/`{` depth; saturating decrement on `]`/`}`;
 ///   rejects depth > max_depth.  All other bytes passed unchanged.
 /// - No unsafe, no unwrap, no panic, no allocation beyond the output Vec.
-pub(super) fn sanitize(input: &[u8], max_depth: usize) -> Result<Vec<u8>, ConfigError> {
+pub(super) fn sanitize(input:&[u8],max_depth:usize)->Result<Vec<u8>,ConfigError>{sanitize_bounded(input,max_depth,MAX_SHAPE_TOKENS)}
+
+pub(super) fn sanitize_bounded(input:&[u8],max_depth:usize,max_shape_tokens:usize)->Result<Vec<u8>,ConfigError>{
     let mut out: Vec<u8> = Vec::with_capacity(input.len().min(1024 * 1024));
     let mut shape = Shape::default();
     let mut in_string = false;
@@ -181,7 +183,7 @@ pub(super) fn sanitize(input: &[u8], max_depth: usize) -> Result<Vec<u8>, Config
             // Outside a JSON string. Colons count object values, commas
             // count array continuation, and delimiters count containers.
             // No byte within a string or escape advances this budget.
-            shape.advance(b, max_depth)?;
+            shape.advance(b,max_depth,max_shape_tokens)?;
             match b {
                 b'"' => {
                     in_string = true;

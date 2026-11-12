@@ -279,6 +279,38 @@ fn format_float_f(v: f64) -> String {
     out
 }
 
+/// CEL uses Go time.ParseDuration, without Caddy's extra day-unit syntax.
+/// Its caller prepays the input scan and allocation budget before invoking it.
+pub(crate) fn parse_cel_nanos(raw: &str) -> Result<i64, &'static str> {
+    parse_duration_go(raw).map_err(|_| "invalid CEL duration")
+}
+
+/// Retain the previously supported, complete scientific-number and signed
+/// component syntax as a CEL enhancement. An ignored trailing suffix is not a
+/// duration component. This check allocates nothing; the vendor supplies the
+/// existing arithmetic/range behavior after the caller's prepayment.
+pub(crate) fn cel_extension_syntax(raw: &str) -> bool {
+    let bytes=raw.as_bytes();let mut i=0;let mut components=0;
+    while i<bytes.len() {
+        if matches!(bytes[i],b'+'|b'-') {i+=1;}
+        let mut digits=0;
+        while i<bytes.len() && bytes[i].is_ascii_digit(){i+=1;digits+=1;}
+        if i<bytes.len() && bytes[i]==b'.' {i+=1;while i<bytes.len() && bytes[i].is_ascii_digit(){i+=1;digits+=1;}}
+        if digits==0{return false;}
+        if i<bytes.len() && matches!(bytes[i],b'e'|b'E') {
+            i+=1;if i<bytes.len() && matches!(bytes[i],b'+'|b'-'){i+=1;}
+            let start=i;while i<bytes.len() && bytes[i].is_ascii_digit(){i+=1;}
+            if start==i{return false;}
+        }
+        let rest=&bytes[i..];
+        if rest.starts_with(b"ms")||rest.starts_with(b"us")||rest.starts_with(b"ns"){i+=2;}
+        else if rest.first().is_some_and(|c|matches!(c,b'h'|b'm'|b's')){i+=1;}
+        else{return false;}
+        components+=1;
+    }
+    components!=0
+}
+
 pub fn parse_str(raw: &str) -> anyhow::Result<i64> {
     if raw.len() > MAX_INPUT_LEN {
         return Err(anyhow::anyhow!("parsing duration: input string too long"));
@@ -337,4 +369,57 @@ pub fn parse_value(value: &serde_json::Value) -> anyhow::Result<i64> {
         serde_json::Value::String(s) => parse_str(s),
         _ => Err(anyhow::anyhow!("parsing duration: invalid value type")),
     }
+}
+
+/// Standard Go duration parser, without Caddy's additional day unit.
+pub(crate) fn parse_go(raw:&str)->anyhow::Result<i64>{
+    anyhow::ensure!(raw.len()<=MAX_INPUT_LEN,"duration input limit exceeded");
+    parse_duration_go(raw).map_err(|e|anyhow::anyhow!("{e}"))
+}
+pub(crate) fn format(nano: i64) -> String {
+    if nano == 0 {
+        return "0s".into();
+    }
+    let negative = nano < 0;
+    let value = nano.unsigned_abs();
+    let mut result = if negative { "-" } else { "" }.to_owned();
+    if value < 1_000_000_000 {
+        let (scale, unit, width) = if value < 1000 {
+            (1, "ns", 0)
+        } else if value < 1_000_000 {
+            (1000, "µs", 3)
+        } else {
+            (1_000_000, "ms", 6)
+        };
+        result.push_str(&(value / scale).to_string());
+        append_fraction(&mut result, value % scale, width);
+        result.push_str(unit);
+        return result;
+    }
+    let seconds = value / 1_000_000_000;
+    let hours = seconds / 3600;
+    let minutes = (seconds / 60) % 60;
+    if hours > 0 {
+        result.push_str(&hours.to_string());
+        result.push('h');
+    }
+    if hours > 0 || minutes > 0 {
+        result.push_str(&minutes.to_string());
+        result.push('m');
+    }
+    result.push_str(&(seconds % 60).to_string());
+    append_fraction(&mut result, value % 1_000_000_000, 9);
+    result.push('s');
+    result
+}
+fn append_fraction(output: &mut String, value: u64, width: usize) {
+    if value == 0 {
+        return;
+    }
+    let mut digits = format!("{value:0width$}");
+    while digits.ends_with('0') {
+        digits.pop();
+    }
+    output.push('.');
+    output.push_str(&digits);
 }

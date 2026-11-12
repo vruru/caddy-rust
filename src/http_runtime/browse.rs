@@ -99,7 +99,7 @@ fn uri_entry(name: &str, dir: bool) -> String {
 }
 
 #[cfg(unix)]
-fn mode(meta: &fs::Metadata) -> u32 {
+pub(super) fn mode(meta: &fs::Metadata) -> u32 {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     let native = meta.permissions().mode();
     let ty = meta.file_type();
@@ -116,7 +116,7 @@ fn mode(meta: &fs::Metadata) -> u32 {
 }
 
 #[cfg(not(unix))]
-fn mode(meta: &fs::Metadata) -> u32 {
+pub(super) fn mode(meta: &fs::Metadata) -> u32 {
     let flags = (u32::from(meta.is_dir()) << 31) | (u32::from(meta.is_symlink()) << 27);
     flags
         | if meta.permissions().readonly() {

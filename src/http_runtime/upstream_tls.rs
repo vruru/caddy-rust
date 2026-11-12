@@ -10,7 +10,6 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioIo;
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tower_service::Service;
@@ -61,18 +60,28 @@ fn native_roots() -> &'static rustls::RootCertStore {
 /// Prepared off the reactor before a candidate generation is published.
 #[derive(Clone)]
 pub(super) struct PreparedTransport {
-    http: HttpConnector,
+    http: [HttpConnector<super::http_dial::FamilyResolver>; 3],
     tls: Option<Arc<ClientConfig>>,
     read: Option<Duration>,
     write: Option<Duration>,
     handshake: Option<Duration>,
+    connect_timeout: Duration,
 }
 impl PreparedTransport {
     pub(super) fn prepare(config: &ProxyConfig) -> Result<Self> {
-        let mut http = HttpConnector::new();
-        http.enforce_http(false);
-        http.set_connect_timeout(Some(config.dial_timeout));
-        http.set_nodelay(true);
+        let http = [
+            super::http_dial::Family::Any,
+            super::http_dial::Family::V4,
+            super::http_dial::Family::V6,
+        ]
+        .map(|family| {
+            let mut http =
+                HttpConnector::new_with_resolver(super::http_dial::FamilyResolver::new(family));
+            http.enforce_http(false);
+            http.set_connect_timeout(Some(config.dial_timeout));
+            http.set_nodelay(true);
+            http
+        });
         let tls = config
             .tls
             .as_ref()
@@ -85,6 +94,7 @@ impl PreparedTransport {
             read: config.read_timeout,
             write: config.write_timeout,
             handshake: config.tls.as_ref().and_then(|t| t.handshake_timeout),
+            connect_timeout:config.dial_timeout,
         })
     }
     pub(super) fn http1(&self) -> Self {
@@ -102,16 +112,30 @@ impl PreparedTransport {
     pub(super) fn connector(
         &self,
         dial: Uri,
+        family: super::http_dial::Family,
         server_name: Option<ServerName<'static>>,
+        unix_path:Option<&str>,
     ) -> FixedDialConnector {
         FixedDialConnector {
-            http: self.http.clone(),
-            tls: self.tls.clone(),
+            http: self.http[match family {
+                super::http_dial::Family::Any => 0,
+                super::http_dial::Family::V4 => 1,
+                super::http_dial::Family::V6 => 2,
+            }]
+            .clone(),
+            family,
+            tls: if dial.scheme_str() == Some("https") {
+                self.tls.clone()
+            } else {
+                None
+            },
             read: self.read,
             write: self.write,
             handshake: self.handshake,
             dial,
             server_name,
+            unix_path:unix_path.map(Arc::from),
+            connect_timeout:self.connect_timeout,
         }
     }
 }
@@ -140,14 +164,6 @@ fn certificates(bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
     Ok(certs)
 }
 fn provision(tls: &ProxyTls, enable_http2: bool) -> Result<ClientConfig> {
-    if let Some(name) = tls
-        .server_name
-        .as_ref()
-        .filter(|n| !n.is_empty() && !n.contains('{'))
-    {
-        ServerName::try_from(name.as_str())
-            .map_err(|_| anyhow::anyhow!("invalid configured upstream TLS server name"))?;
-    }
     ensure!(
         tls.client_certificate_file.is_some() == tls.client_certificate_key_file.is_some(),
         "client_certificate_file and client_certificate_key_file must be set together"
@@ -281,18 +297,33 @@ impl ServerCertVerifier for InsecureVerifier {
     }
 }
 
-pub(super) type TcpIo = TokioIo<TcpStream>;
-pub(super) type Output = MaybeHttpsStream<TimeoutIo<TcpIo>>;
+pub(super) type Output = MaybeHttpsStream<TimeoutIo<super::http_dial_io::DialIo>>;
 
 #[derive(Clone)]
 pub(super) struct FixedDialConnector {
-    pub(super) http: HttpConnector,
+    pub(super) http: HttpConnector<super::http_dial::FamilyResolver>,
+    family: super::http_dial::Family,
     pub(super) tls: Option<Arc<ClientConfig>>,
     pub(super) read: Option<Duration>,
     pub(super) write: Option<Duration>,
     pub(super) handshake: Option<Duration>,
     pub(super) dial: Uri,
     pub(super) server_name: Option<ServerName<'static>>,
+    unix_path:Option<Arc<str>>,
+    connect_timeout:Duration,
+}
+
+#[derive(Debug)]
+pub(super) struct TcpDialError(Box<dyn std::error::Error + Send + Sync>);
+impl std::fmt::Display for TcpDialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+impl std::error::Error for TcpDialError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
 }
 
 impl Service<Uri> for FixedDialConnector {
@@ -313,14 +344,29 @@ impl Service<Uri> for FixedDialConnector {
         let write = self.write;
         let handshake = self.handshake;
         let dial = self.dial.clone();
+        let family = self.family;
         let server_name = self.server_name.clone();
-
+        let unix_path=self.unix_path.clone();
+        let connect_timeout=self.connect_timeout;
         Box::pin(async move {
+            use super::http_dial_io::DialIo;
+            let tcp=if let Some(path)=unix_path {
+                #[cfg(unix)] {
+                    let connect=super::http_dial::connect_unix(&path);
+                    let stream=if connect_timeout.is_zero(){connect.await}else{tokio::time::timeout(connect_timeout,connect).await.map_err(|_|Box::new(TcpDialError(Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut,"Unix upstream dial timeout"))))as Self::Error)?}.map_err(|e|Box::new(TcpDialError(Box::new(e)))as Self::Error)?;
+                    DialIo::Unix(TokioIo::new(stream))
+                }
+                #[cfg(not(unix))] {let _=path;return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Unsupported,"Unix upstreams require Unix sockets"))as Self::Error);}
+            }else{
+            let tcp_dial = family
+                .literal_uri(&dial)
+                .map_err(|e| Box::new(TcpDialError(Box::new(e))) as Self::Error)?;
             let tcp = http
-                .call(dial.clone())
+                .call(tcp_dial)
                 .await
-                .map_err(|e| Box::new(e) as Self::Error)?;
-
+                .map_err(|e| Box::new(TcpDialError(Box::new(e))) as Self::Error)?;
+                DialIo::Tcp(tcp)
+            };
             let io = TimeoutIo::new(tcp, read, write);
 
             match tls {
@@ -332,10 +378,7 @@ impl Service<Uri> for FixedDialConnector {
                             let host = dial.host().ok_or("missing host in dial uri")?;
                             let host_str = host;
                             // Strip IPv6 brackets if present
-                            let clean_host = host_str
-                                .strip_prefix('[')
-                                .and_then(|s| s.strip_suffix(']'))
-                                .unwrap_or(host_str);
+                            let clean_host = super::http_dial::tls_host(host_str);
                             ServerName::try_from(clean_host.to_owned())
                                 .map_err(|e| Box::new(e) as Self::Error)?
                         }

@@ -59,7 +59,7 @@ impl EncodePlan {
     }
 }
 
-const DEFAULT_TYPES: &[&[u8]] = &[
+pub(super) const DEFAULT_TYPES: &[&[u8]] = &[
     b"application/atom+xml",
     b"application/eot",
     b"application/font",

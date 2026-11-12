@@ -1,5 +1,6 @@
 //! Handshake identity remains attached to its TLS connection; each new HTTP
 //! operation is admitted against the currently published route/TLS policy.
+use super::certificate_choice::{Choice, eligible_names};
 use super::*;
 use crate::leaf_guard::{LeafState, leaf_id};
 use crate::stek::ticket::ConnectionTickets;
@@ -13,6 +14,7 @@ pub(super) struct TlsIdentity {
     wire_sni: String,
     local_ip: String,
     primary_certificate_only: bool,
+    acquired: Option<AcquiredCertificate>,
     session_name: Arc<str>,
     offered_alpn: Vec<Vec<u8>>,
     schemes: Vec<SignatureScheme>,
@@ -24,6 +26,8 @@ pub(super) struct TlsIdentity {
     origin: CertificateOrigin,
     policy_index: usize,
     policy_identity: [u8; 32],
+    explicit_selector: bool,
+    instance: Option<crate::tls_resolver::CertificateInstance>,
 }
 pub(super) fn chain_hash(key: &CertifiedKey) -> [u8; 32] {
     let mut hash = Sha256::new();
@@ -70,21 +74,30 @@ impl TlsIdentity {
         }
         let policy = current.tls_policies.get(self.policy_index);
         let current_resolver = policy.map(|policy| &policy.resolver);
-        let Some(key) = policy.and_then(|policy| {
+        let Some((key, _)) = policy.and_then(|policy| {
+            if let Some(acquired) = &self.acquired {
+                return acquired.select(&policy.resolver.managed, &self.schemes, Some(self.version))
+                    .map(|key| (key, CertificateOrigin::Managed));
+            }
+            if self.explicit_selector {
+                return policy.resolver.choose_pinned(self.instance?, self.origin,
+                    (!self.sni.is_empty()).then_some(self.sni.as_str()), &self.schemes, self.version).selected();
+            }
             policy
-                .definition
-                .certificate_names(&self.sni, &self.local_ip)
-                .into_iter()
-                .take(if self.primary_certificate_only { 1 } else { 3 })
-                .flatten()
-                .find_map(|name| {
-                    policy.resolver.select_for_version(
-                        Some(name),
-                        &alpn,
-                        &self.schemes,
-                        self.version,
-                    )
-                })
+                .resolver
+                .choose(
+                    eligible_names(
+                        &policy.definition,
+                        &self.sni,
+                        &self.local_ip,
+                        self.primary_certificate_only,
+                    ),
+                    (!self.sni.is_empty()).then_some(self.sni.as_str()),
+                    &alpn,
+                    &self.schemes,
+                    Some(self.version),
+                )
+                .selected()
         }) else {
             // On-demand permission/storage errors can evict a managed cache
             // entry while an accepted connection still owns its valid identity.
@@ -111,7 +124,9 @@ impl TlsIdentity {
                 TlsVerdict::Reject
             };
         };
-        if chain_hash(&key.key) == self.chain_hash {
+        // select_pinned checked the full-chain identity and exact publication
+        // instance. No repeated DER hashing or global preference is needed.
+        if self.explicit_selector || chain_hash(&key.key) == self.chain_hash {
             TlsVerdict::Serve
         } else {
             TlsVerdict::ServeThenClose
@@ -126,6 +141,51 @@ struct FixedSelection {
     not_after: i64,
     leaf: Arc<LeafState>,
 }
+struct PinnedProof {
+    registry:crate::challenge::ChallengeRegistry,
+    sni:String,
+    registration:Option<crate::challenge::TlsRegistration>,
+}
+impl fmt::Debug for PinnedProof {fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.debug_struct("PinnedProof").finish_non_exhaustive()}}
+impl ResolvesServerCert for PinnedProof {
+    fn resolve(&self,hello:ClientHello<'_>)->Option<Arc<CertifiedKey>> {
+        let name=crate::tls_policy::normalized_offered_name(hello.offered_server_name().unwrap_or_default()).ok()?;
+        let protocols=hello.alpn()?.collect::<Vec<_>>();
+        let registration=self.registration.as_ref()?;
+        (name==self.sni && protocols==[ACME_ALPN] && self.registry.tls_generation_current(&name,registration.generation))
+            .then(||registration.certificate.clone())
+    }
+}
+async fn proof_event(inner:&Arc<Inner>,registration:Option<&crate::challenge::TlsRegistration>,
+    app:Option<&Arc<crate::events::EventsApp>>,fields:&super::tls_events::HelloFields,
+    peer_local:(SocketAddr,SocketAddr),cancel:&CancellationToken)->Result<()> {
+    let event_cancel=cancel.child_token();let _cancel_on_drop=event_cancel.clone().drop_guard();
+    let future=super::tls_events::emit(app,fields,&inner.resources,
+        (peer_local.0,peer_local.1,super::tls_events::Transport::Tcp),&event_cancel);
+    if let Some(registration)=registration {
+        tokio::select! {biased;
+            _=registration.cancel.cancelled()=>anyhow::bail!("TLS proof owner cancelled"),
+            _=tokio::time::sleep_until(registration.expires.into())=>anyhow::bail!("TLS proof expired"),
+            result=future=>result,
+        }
+    }else{future.await}
+}
+pub(super) async fn accept_proof<I>(inner:&Arc<Inner>,stream:I,config:Arc<rustls::ServerConfig>,
+    peer_local:(SocketAddr,SocketAddr),cancel:CancellationToken)->Result<()>
+where I:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin+Send+'static {
+    let start=tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(),stream).await?;
+    let hello=start.client_hello();let fields=super::tls_events::HelloFields::capture(&hello);
+    let name=crate::tls_policy::normalized_offered_name(hello.offered_server_name().unwrap_or_default())?;
+    let protocols=hello.alpn().map(|a|a.collect::<Vec<_>>()).unwrap_or_default();
+    ensure!(protocols==[ACME_ALPN],"TLS proof listener requires ACME ALPN");
+    let registration=inner.registry.tls_registration(&name,&protocols);
+    let app=registration.as_ref().and_then(|r|r.events.clone());
+    proof_event(inner,registration.as_ref(),app.as_ref(),&fields,peer_local,&cancel).await?;
+    let mut config=(*config).clone();
+    config.cert_resolver=Arc::new(PinnedProof{registry:inner.registry.clone(),sni:name,registration});
+    let executor=inner.tls_executor.get().ok_or_else(||anyhow::anyhow!("TLS executor unavailable"))?;
+    executor.execute_proof(async move {let stream=start.into_stream(Arc::new(config)).await?;drop(stream);Ok(())},cancel,None).await
+}
 struct FixedResolver {
     policy: Arc<tls_policies::PreparedPolicy>,
     state: Arc<connection_sessions::HandshakeState>,
@@ -134,6 +194,7 @@ struct FixedResolver {
     sni: String,
     local_ip: String,
     primary_certificate_only: bool,
+    acquired: Option<AcquiredCertificate>,
     acme: bool,
     offered_alpn: Vec<Vec<u8>>,
 }
@@ -171,21 +232,15 @@ impl ResolvesServerCert for FixedResolver {
         }
         let version = hello.negotiated_version()?;
         if self.selection.get().is_none() {
-            let (selection, origin) = self
-                .policy
-                .definition
-                .certificate_names(&self.sni, &self.local_ip)
-                .into_iter()
-                .take(if self.primary_certificate_only { 1 } else { 3 })
-                .flatten()
-                .find_map(|name| {
-                    self.policy.resolver.select_for_version_with_origin(
-                        Some(name),
-                        &protocols,
-                        hello.signature_schemes(),
-                        version,
-                    )
-                })?;
+            let (selection, origin) = if let Some(acquired) = &self.acquired {
+                let selection = acquired.select(&self.policy.resolver.managed, hello.signature_schemes(), Some(version))?;
+                (selection, CertificateOrigin::Managed)
+            } else {
+                self.policy.resolver.choose(eligible_names(&self.policy.definition, &self.sni,
+                    &self.local_ip, self.primary_certificate_only),
+                    (!self.sni.is_empty()).then_some(self.sni.as_str()), &protocols,
+                    hello.signature_schemes(), Some(version)).selected()?
+            };
             if !selection.signature_compatibility.allows(version) {
                 return None;
             }
@@ -255,6 +310,7 @@ impl ResolvesServerCert for FixedResolver {
 pub(super) struct AcceptedTls<I> {
     pub stream: tokio_rustls::server::TlsStream<I>,
     pub identity: Arc<TlsIdentity>,
+    pub snapshot: Arc<ConnectionSnapshot>,
     pub server: Arc<ActiveServer>,
 }
 fn same_business_view(
@@ -279,10 +335,16 @@ async fn server_for_hello(
     wire_sni: &str,
     alpn: &[&[u8]],
     schemes: &[SignatureScheme],
-    peer_local: (SocketAddr, SocketAddr),
-) -> Result<(Arc<ActiveServer>, usize, Arc<tls_policies::PreparedPolicy>)> {
-    let (peer, local) = peer_local;
+    connection: (SocketAddr, SocketAddr, &super::tls_events::HelloFields),
+) -> Result<(
+    Arc<ActiveServer>,
+    usize,
+    Arc<tls_policies::PreparedPolicy>,
+    Option<AcquiredCertificate>,
+)> {
+    let (peer, local, event_fields) = connection;
     let mut retries = 0usize;
+    let mut event_generation:Option<Arc<BusinessGeneration>>=None;
     'view: loop {
         retries += 1;
         if retries == 8 {
@@ -307,32 +369,154 @@ async fn server_for_hello(
             !policy.definition.drop,
             "TLS connection policy dropped the connection"
         );
+        if event_generation.as_ref().is_none_or(|g|!Arc::ptr_eq(g,&activity)) {
+            super::tls_events::emit(server.events.as_ref(),event_fields,&inner.resources,
+                (peer,local,super::tls_events::Transport::Tcp),&activity.admission_closed).await?;
+            event_generation=Some(activity.clone());
+            if !same_business_view(&inner.current.load_full(),&address,&server,&activity){continue 'view;}
+        }
         let resolver = &policy.resolver;
         // Never rewrite the actual Hello or its automation permission
         // target to the name of a resident fallback certificate.
-        let manual = !sni.is_empty()
-            && resolver
+        let (cached, fallback) = if sni.is_empty() || sni.parse::<std::net::IpAddr>().is_ok() {
+            (false, false)
+        } else if policy.definition.certificate_selection.is_some() {
+            let selected_policy = policy.clone();
+            let name = sni.to_owned();
+            let protocols = alpn.iter().map(|value| value.to_vec()).collect::<Vec<_>>();
+            let schemes = schemes.to_vec();
+            inner
+                .resources
+                .metadata
+                .run(move || -> Result<(bool, bool)> {
+                    let alpn = protocols.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                    let resolver = &selected_policy.resolver;
+                    match resolver.choose(
+                        [Some(&name), None, None],
+                        Some(&name),
+                        &alpn,
+                        &schemes,
+                        None,
+                    ) {
+                        Choice::Selected(_, CertificateOrigin::Managed, false)
+                        | Choice::Unusable {
+                            managed: true,
+                            global: false,
+                        } => Ok((false, false)),
+                        Choice::Selected(..) => Ok((true, false)),
+                        Choice::Unusable { .. } => {
+                            anyhow::bail!("explicit certificate selection is unusable")
+                        }
+                        Choice::Missing => {
+                            let fallback = selected_policy.definition.fallback_sni.as_deref();
+                            Ok((
+                                false,
+                                fallback.is_some_and(|fallback_name| {
+                                    matches!(
+                                        resolver.choose(
+                                            [None, None, Some(fallback_name)],
+                                            Some(&name),
+                                            &alpn,
+                                            &schemes,
+                                            None
+                                        ),
+                                        Choice::Selected(..)
+                                    )
+                                }),
+                            ))
+                        }
+                    }
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("TLS certificate policy worker unavailable"))??
+        } else {
+            let manual = resolver
                 .static_certificates
                 .select_candidate_filtered(Some(sni), alpn, schemes, &resolver.allowed_static)
                 .is_some();
-        let fallback = policy
-            .definition
-            .fallback_sni
-            .as_deref()
-            .is_some_and(|name| {
-                resolver
-                    .select_candidate(Some(name), alpn, schemes)
-                    .is_some()
-            });
-        if !sni.is_empty()
-            && sni.parse::<std::net::IpAddr>().is_err()
-            && !manual
-            && let Some(provider) = &resolver.provider
-            && (!fallback || provider.should_probe_before_fallback(sni))
+            let fallback = policy
+                .definition
+                .fallback_sni
+                .as_deref()
+                .is_some_and(|name| {
+                    matches!(
+                        resolver.choose([None, None, Some(name)], Some(sni), alpn, schemes, None),
+                        Choice::Selected(..)
+                    )
+                });
+            (manual, fallback)
+        };
+        let typed = sni.is_empty() || sni.parse::<std::net::IpAddr>().is_ok();
+        let local_ip = crate::tls_resolver::canonical_certificate_ip(local.ip());
+        let primary = if sni.is_empty() {
+            local_ip.as_str()
+        } else {
+            sni
+        };
+        let primary_hit = typed && matches!(resolver.choose([Some(primary), None, None],
+            (!sni.is_empty()).then_some(sni), alpn, schemes, None), Choice::Selected(..));
+        let capture_target = |policy: &tls_policies::PreparedPolicy, primary: &str,
+            offered: &str, protocols: &[Vec<u8>], schemes: &[SignatureScheme]| {
+            let alpn = protocols.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            match policy.resolver.choose([Some(primary), None, None],
+                (!offered.is_empty()).then_some(offered), &alpn, schemes, None) {
+                Choice::Selected(certificate, CertificateOrigin::Managed, _) => {
+                    let (receipt, slot) = policy.resolver.managed.scoped_instance(certificate.instance?)?;
+                    Some(AcquiredCertificate { subject: primary.to_owned(), receipt, slot, external: None })
+                }
+                _ => None,
+            }
+        };
+        let cached_target = if policy.definition.certificate_selection.is_some() {
+            let selected_policy = policy.clone();
+            let primary = primary.to_owned();
+            let offered = sni.to_owned();
+            let protocols = alpn.iter().map(|value| value.to_vec()).collect::<Vec<_>>();
+            let schemes = schemes.to_vec();
+            inner.resources.metadata.run(move ||
+                capture_target(&selected_policy, &primary, &offered, &protocols, &schemes))
+                .await.map_err(|_| anyhow::anyhow!("TLS certificate policy worker unavailable"))?
+        } else {
+            capture_target(&policy, primary, sni,
+                &alpn.iter().map(|value| value.to_vec()).collect::<Vec<_>>(), schemes)
+        };
+        let mut acquired = None;
+        if let Some(provider) = &resolver.provider
+            && if typed {
+                provider.should_probe_before_fallback(sni)
+            } else {
+                (cached_target.is_some() || !cached)
+                    && (!fallback || provider.should_probe_before_fallback(sni))
+            }
         {
             let cancel = CancellationToken::new();
             let _cancel_on_drop = cancel.clone().drop_guard();
-            let acquiring = provider.ensure(sni.to_owned(), cancel);
+            let effective = if typed {
+                if primary_hit {
+                    primary.to_owned()
+                } else if sni.is_empty() {
+                    policy
+                        .definition
+                        .default_sni
+                        .clone()
+                        .unwrap_or_else(|| local_ip.clone())
+                } else {
+                    sni.to_owned()
+                }
+            } else {
+                sni.to_owned()
+            };
+            let force_lookup = if typed { !primary_hit }
+                else { policy.definition.certificate_selection.is_some() && !cached && cached_target.is_none() };
+            let acquiring = provider.ensure_request(CertificateRequest {
+                origin: sni.to_owned(), subject: effective.clone(), force_lookup,
+                hello: Some(CertificateHello { server_name: event_fields.server_name.clone(),
+                    signatures: event_fields.signature_schemes.clone().unwrap_or_default(),
+                    ciphers: event_fields.cipher_suites.clone(), local_ip: local.ip() }),
+                cached: cached_target,
+                selection: Some(WarmSelection { filter: resolver.certificate_selection.clone(),
+                    schemes: schemes.to_vec(), version: None }),
+            }, cancel);
             tokio::pin!(acquiring);
             loop {
                 let changed = observed.activity.superseded.clone();
@@ -352,14 +536,16 @@ async fn server_for_hello(
                     result=&mut acquiring=>{
                         let latest=inner.current.load_full();
                         if !same_business_view(&latest,&address,&server,&activity) { continue 'view; }
-                        result?;
+                        acquired = result?;
+                        ensure!(acquired.as_ref().is_none_or(|certificate| certificate.subject == effective),
+                            "acquired certificate subject changed");
                         break;
                     },
                 }
             }
         }
         if same_business_view(&inner.current.load_full(), &address, &server, &activity) {
-            return Ok((server, policy_index, policy));
+            return Ok((server, policy_index, policy, acquired));
         }
     }
 }
@@ -407,6 +593,7 @@ where
     })
     .await?;
     let hello = start.client_hello();
+    let event_fields=super::tls_events::HelloFields::capture(&hello);
     let raw_sni = hello.offered_server_name().unwrap_or_default().to_owned();
     let sni = crate::tls_policy::normalized_offered_name(&raw_sni)?;
     let ip_sni = sni.parse::<std::net::IpAddr>().is_ok();
@@ -433,7 +620,10 @@ where
             "ACME proof requires an explicit DNS SNI"
         );
         connection_budget::classify_proof(&admission, deadline).await?;
+        let registration=inner.registry.tls_registration(&sni,&protocols);
+        let mut event_app=registration.as_ref().and_then(|r|r.events.clone());
         let config = if let Some((business, _)) = inner.current.load_full().business(&address) {
+            event_app=business.events.clone();
             let matching = business.clone();
             let proof_name = raw_sni.clone();
             let (_, policy) = inner
@@ -457,6 +647,10 @@ where
         } else {
             proof_tls_config(inner.challenge_resolver.clone())?
         };
+        proof_event(inner,registration.as_ref(),event_app.as_ref(),&event_fields,(peer,local),&inner.stopped).await?;
+        let mut config=(*config).clone();
+        config.cert_resolver=Arc::new(PinnedProof{registry:inner.registry.clone(),sni:sni.clone(),registration});
+        let config=Arc::new(config);
         let Some(executor) = inner.tls_executor.get() else {
             anyhow::bail!("TLS executor unavailable");
         };
@@ -474,8 +668,8 @@ where
         anyhow::bail!("TLS validation completed");
     }
     connection_budget::classify(&admission, connection_budget::ConnectionClass::Business)?;
-    let (server, policy_index, policy) = server_for_hello(
-        inner, address, &sni, &raw_sni, &protocols, &schemes, peer_local,
+    let (server, policy_index, policy, acquired) = server_for_hello(
+        inner, address, &sni, &raw_sni, &protocols, &schemes, (peer,local,&event_fields),
     )
     .await?;
     let resolver = &policy.resolver;
@@ -483,7 +677,8 @@ where
     // Go tries dynamic acquisition before serving any defaulted candidate.
     // Until typed no-SNI and IP admission are wired, fail closed on those
     // dynamic-policy misses; never reinterpret the candidate as a DNS request.
-    let primary_certificate_only = (sni.is_empty() || ip_sni)
+    let primary_certificate_only = acquired.is_none()
+        && (sni.is_empty() || ip_sni)
         && resolver
             .provider
             .as_ref()
@@ -491,15 +686,14 @@ where
     // Availability is not authorization; final protocol-bound selection still
     // runs in the real resolver callback before session lookup.
     ensure!(
-        policy
-            .definition
-            .certificate_names(&sni, &local_ip)
-            .into_iter()
-            .take(if primary_certificate_only { 1 } else { 3 })
-            .flatten()
-            .any(|name| resolver
-                .select_candidate(Some(name), &protocols, &schemes)
-                .is_some()),
+        if let Some(acquired) = &acquired {
+            acquired.select(&resolver.managed, &schemes, None).is_some()
+        } else {
+            policy.definition.certificate_selection.is_some()
+                || matches!(resolver.choose(eligible_names(&policy.definition, &sni, &local_ip,
+                    primary_certificate_only), (!sni.is_empty()).then_some(sni.as_str()),
+                    &protocols, &schemes, None), Choice::Selected(..))
+        },
         "{}",
         if primary_certificate_only {
             "typed no-SNI or IP certificate admission unavailable"
@@ -549,6 +743,7 @@ where
         sni: sni.clone(),
         local_ip: local_ip.clone(),
         primary_certificate_only,
+        acquired: acquired.clone(),
         acme: false,
         offered_alpn: protocols.iter().map(|p| p.to_vec()).collect(),
     });
@@ -569,11 +764,16 @@ where
                 && selection.leaf.admission().allow_certificate,
             "TLS selection identity changed"
         );
+        let snapshot = Arc::new(ConnectionSnapshot::capture_tcp(
+            stream.get_ref().1, &raw_sni, &selection.certificate.key.cert,
+            policy.definition.client_auth.as_ref(),
+        ));
         let identity = Arc::new(TlsIdentity {
             sni,
             wire_sni: raw_sni,
             local_ip,
             primary_certificate_only,
+            acquired,
             session_name,
             offered_alpn,
             schemes,
@@ -585,6 +785,8 @@ where
             origin: selection.origin,
             policy_index,
             policy_identity: server.policy_identity,
+            explicit_selector: policy.definition.certificate_selection.is_some(),
+            instance: selection.certificate.instance,
         });
         if stream.get_ref().1.handshake_kind() == Some(rustls::HandshakeKind::Resumed) {
             if let Some(tickets) = &tickets {
@@ -609,6 +811,7 @@ where
         Ok(AcceptedTls {
             stream,
             identity,
+            snapshot,
             server,
         })
     };

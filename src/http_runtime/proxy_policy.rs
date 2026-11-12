@@ -1,6 +1,9 @@
 //! Prepared static reverse proxy selection and per-host request admission.
 //! Policy names and key semantics follow Caddy v2.11.7 selectionpolicies.go.
+use super::proxy_health::ActiveState;
+use super::proxy_hosts::{HostState as Host, RUN_BUDGET};
 use super::{Body, BoxError, Bytes};
+use crate::http_config::proxy_ext::PassiveCfg;
 use hmac::{Hmac, Mac, digest::CtOutput};
 use http::{HeaderMap, HeaderValue, Version, header, uri::Uri};
 use http_body_util::BodyExt;
@@ -52,58 +55,215 @@ pub(crate) enum Selection {
 
 /// Per-HTTP-runtime, shared by all routes and overlapping generations. The
 /// raw configured dial is the key, including any placeholders it contains.
+pub(super) struct HostRegistry {
+    hosts: Mutex<HashMap<String, Weak<Host>>>,
+    inflight: Mutex<Inflight>,
+    failures: Arc<tokio::sync::Semaphore>,
+    dynamic: Mutex<HashMap<String, (Arc<Host>, tokio::time::Instant)>>,
+    dropped_failures: AtomicU64,
+    last_failure_warning: AtomicU64,
+}
 #[derive(Default)]
-pub(super) struct HostRegistry(Mutex<HashMap<String, Weak<Host>>>);
+struct Inflight { entries: HashMap<String,u64>, bytes: usize }
+impl Default for HostRegistry {
+    fn default() -> Self {
+        Self {
+            hosts: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(Inflight::default()),
+            failures: Arc::new(tokio::sync::Semaphore::new(RUN_BUDGET)),
+            dynamic: Mutex::new(HashMap::new()),
+            dropped_failures: AtomicU64::new(0),
+            last_failure_warning: AtomicU64::new(0),
+        }
+    }
+}
 
 impl HostRegistry {
+    /// Runs on the existing bounded blocking lane. Registry locks only copy
+    /// owned identities; failure-ledger expiration happens after releasing them.
+    pub(super) fn statuses(&self, configured: &std::collections::HashSet<&str>) -> anyhow::Result<Vec<crate::admin::UpstreamStatus>> {
+        const LIMIT: usize = 8 << 20;
+        const ROWS: usize = 65536;
+        let mut records: Vec<(String, Option<Arc<Host>>, u64)> = Vec::new();
+        let hint=self.hosts.lock().unwrap_or_else(|e|e.into_inner()).len()
+            .saturating_add(self.inflight.lock().unwrap_or_else(|e|e.into_inner()).entries.len())
+            .saturating_add(self.dynamic.lock().unwrap_or_else(|e|e.into_inner()).len()).min(ROWS);
+        records.try_reserve_exact(hint)?;
+        let mut charged = records.capacity().saturating_mul(std::mem::size_of::<(String, Option<Arc<Host>>, u64)>());
+        let mut add = |address: &str, host: Option<Arc<Host>>, count: u64| -> anyhow::Result<()> {
+            anyhow::ensure!(records.len()<ROWS,"upstream snapshot row limit exceeded");
+            // Configuration churn may grow a registry after the hint. A bounded
+            // geometric replacement is prepaid before either allocation moves.
+            if records.len()==records.capacity() {
+                let next=records.capacity().max(16).saturating_mul(2).min(ROWS);
+                let allocation=next.saturating_mul(std::mem::size_of::<(String, Option<Arc<Host>>, u64)>());
+                anyhow::ensure!(charged.saturating_add(allocation)<=LIMIT,"upstream snapshot capacity exceeded");
+                records.try_reserve_exact(next-records.len())?;
+                charged=charged.saturating_add(allocation);
+            }
+            charged = charged.checked_add(std::mem::size_of::<crate::admin::UpstreamStatus>()).and_then(|n| n.checked_add(address.len()))
+                .filter(|n| *n <= LIMIT).ok_or_else(|| anyhow::anyhow!("upstream snapshot limit exceeded"))?;
+            let mut key = String::new();key.try_reserve_exact(address.len())?;key.push_str(address);
+            records.push((key,host,count));Ok(())
+        };
+        {
+            let hosts=self.hosts.lock().unwrap_or_else(|e|e.into_inner());
+            for (address,weak) in hosts.iter() {
+                if configured.contains(address.as_str()) && let Some(host)=weak.upgrade(){add(address,Some(host),0)?;}
+            }
+            // No other path nests these two locks. This prevents a finished
+            // expanded-address request from being resurrected in the snapshot.
+            let inflight=self.inflight.lock().unwrap_or_else(|e|e.into_inner());
+            for (address,count) in inflight.entries.iter() {
+                if *count>0 && !(configured.contains(address.as_str()) && hosts.get(address).is_some_and(|weak|weak.strong_count()>0)){add(address,None,*count)?;}
+            }
+        }
+        {
+            let dynamic=self.dynamic.lock().unwrap_or_else(|e|e.into_inner());
+            for (address,(host,_)) in dynamic.iter(){add(address,Some(host.clone()),0)?;}
+        }
+        let now=tokio::time::Instant::now();
+        let mut out=Vec::new();out.try_reserve_exact(records.len())?;
+        for(address,host,count)in records {
+            let(num_requests,fails)=host.map_or((count,0),|host|(host.running.load(Ordering::Acquire),host.fails(now)));
+            out.push(crate::admin::UpstreamStatus{address,num_requests,fails});
+        }
+        Ok(out)
+    }
+    fn enter_address(self: &Arc<Self>, address: &str) -> anyhow::Result<AddressLease> {
+        let mut inflight=self.inflight.lock().unwrap_or_else(|e|e.into_inner());
+        if !inflight.entries.contains_key(address) {
+            anyhow::ensure!(inflight.entries.len()<65536,"expanded upstream status capacity exceeded");
+            anyhow::ensure!(address.len()<=65536,"expanded upstream status address too long");
+            // The request already owns the expanded address. Bound the shared
+            // retained copy independently of request-body or failure budgets.
+            anyhow::ensure!(inflight.bytes.saturating_add(address.len())<=8<<20,"expanded upstream status bytes exceeded");
+            inflight.entries.try_reserve(1)?;
+            inflight.bytes+=address.len();
+        }
+        let count=inflight.entries.entry(address.to_owned()).or_default();
+        *count=count.checked_add(1).ok_or_else(||anyhow::anyhow!("expanded upstream count overflow"))?;
+        Ok(AddressLease{registry:self.clone(),address:address.to_owned()})
+    }
+    pub(super) fn dropped_failures(&self) -> u64 {
+        self.dropped_failures.load(Ordering::Relaxed)
+    }
+    pub(super) fn record_dropped_failure(&self) -> bool {
+        self.dropped_failures.fetch_add(1, Ordering::Relaxed);
+        static CLOCK: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let second = CLOCK
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_secs()
+            .saturating_add(1);
+        self.last_failure_warning
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+                (previous < second).then_some(second)
+            })
+            .is_ok()
+    }
     pub(super) fn prune(&self) {
-        self.0
+        self.hosts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|_, host| host.strong_count() > 0);
     }
 
+    pub(super) fn clear_dynamic(&self) {
+        let removed = std::mem::take(&mut *self.dynamic.lock().unwrap_or_else(|e| e.into_inner()));
+        drop(removed);
+    }
+    /// Go fillDynamicHost never consults the static UsagePool. Dynamic
+    /// failures and request counts persist only in this separate idle map.
+    fn resolve_dynamic(&self, configs: &[Upstream]) -> anyhow::Result<Vec<Endpoint>> {
+        let now = tokio::time::Instant::now();
+        let mut retained = self.dynamic.lock().unwrap_or_else(|e| e.into_inner());
+        retained.retain(|_, (_, expires)| *expires > now);
+        let added = configs
+            .iter()
+            .map(|config| config.dial.as_str())
+            .filter(|key| !retained.contains_key(*key))
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        anyhow::ensure!(
+            retained.len().saturating_add(added) <= 65536,
+            "dynamic host-state capacity exceeded"
+        );
+        let expires = now + std::time::Duration::from_secs(3600);
+        Ok(configs
+            .iter()
+            .map(|config| {
+                let (host, seen) = retained
+                    .entry(config.dial.clone())
+                    .or_insert_with(|| (Arc::new(Host::new(self.failures.clone())), expires));
+                *seen = expires;
+                Endpoint {
+                    config: config.clone(),
+                    host: host.clone(),
+                    active: Arc::new(ActiveState::default()),
+                    passive: None,
+                }
+            })
+            .collect())
+    }
     fn resolve(&self, configs: &[Upstream]) -> Vec<Endpoint> {
-        let mut registry = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut registry = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
         configs
             .iter()
             .map(|config| {
                 let record = registry.entry(config.dial.clone()).or_default();
                 let host = record.upgrade().unwrap_or_else(|| {
-                    let host = Arc::new(Host::default());
+                    let host = Arc::new(Host::new(self.failures.clone()));
                     *record = Arc::downgrade(&host);
                     host
                 });
                 Endpoint {
                     config: config.clone(),
                     host,
+                    active: Arc::new(ActiveState::default()),
+                    passive: None,
                 }
             })
             .collect()
     }
 }
 
-#[derive(Default)]
-struct Host {
-    running: AtomicU64,
-}
-
 struct Endpoint {
     config: Upstream,
     host: Arc<Host>,
+    active: Arc<ActiveState>,
+    passive: Option<PassiveCfg>,
 }
 
 impl Endpoint {
     fn capacity(&self) -> u64 {
+        if self.config.max_requests == 0
+            && let Some(cfg) = &self.passive
+            && cfg.unhealthy_request_count > 0
+        {
+            return cfg.unhealthy_request_count as u64;
+        }
         u64::try_from(self.config.max_requests).unwrap_or(0)
     }
 
     fn available(&self) -> bool {
+        if !self.active.healthy() {
+            return false;
+        }
+        if let Some(cfg) = &self.passive
+            && (cfg.max_fails < 0
+                || self.host.fails(tokio::time::Instant::now()) >= cfg.max_fails as u64)
+        {
+            return false;
+        }
         let max = self.capacity();
         max == 0 || self.host.running.load(Ordering::Acquire) < max
     }
 
     fn reserve(&self) -> Option<(Arc<RequestLease>, u64)> {
+        if !self.available() {
+            return None;
+        }
         let max = self.capacity();
         let previous = self
             .host
@@ -115,21 +275,36 @@ impl Endpoint {
                 count.checked_add(1)
             })
             .ok()?;
-        Some((Arc::new(RequestLease(self.host.clone())), previous))
+        Some((Arc::new(RequestLease {host:self.host.clone(),address:Mutex::new(None)}), previous))
     }
 }
 
-pub(super) struct RequestLease(Arc<Host>);
+pub(super) struct RequestLease { host: Arc<Host>, address: Mutex<Option<AddressLease>> }
+struct AddressLease { registry: Arc<HostRegistry>, address: String }
+impl Drop for AddressLease {
+    fn drop(&mut self) {
+        let mut map=self.registry.inflight.lock().unwrap_or_else(|e|e.into_inner());
+        if let Some(count)=map.entries.get_mut(&self.address){*count=count.saturating_sub(1);if *count==0 {map.entries.remove(&self.address);map.bytes=map.bytes.saturating_sub(self.address.len());}}
+    }
+}
+impl RequestLease {
+    pub(super) fn bind_address(&self,registry:&Arc<HostRegistry>,address:&str)->anyhow::Result<()> {
+        let mut slot=self.address.lock().unwrap_or_else(|e|e.into_inner());
+        anyhow::ensure!(slot.is_none(),"upstream address already bound");
+        *slot=Some(registry.enter_address(address)?);Ok(())
+    }
+}
 impl Drop for RequestLease {
     fn drop(&mut self) {
-        let previous = self.0.running.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.host.running.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0);
     }
 }
 
 pub(super) struct PreparedSelection {
     pool: Vec<Endpoint>,
-    policy: Policy,
+    policy: Arc<Policy>,
+    passive: Option<PassiveCfg>,
 }
 
 pub(super) struct SelectionInput<'a> {
@@ -179,7 +354,9 @@ impl OwnedSelectionInput {
 }
 
 pub(super) struct Selected {
-    pub index: usize,
+    pub dial: String,
+    pub fails: u64,
+    pub host: Arc<Host>,
     pub max_requests: i64,
     pub prior_requests: u64,
     pub lease: Arc<RequestLease>,
@@ -190,12 +367,49 @@ impl PreparedSelection {
     pub(super) fn new(registry: &HostRegistry, policy: &Selection, upstreams: &[Upstream]) -> Self {
         Self {
             pool: registry.resolve(upstreams),
-            policy: Policy::new(policy, upstreams),
+            policy: Arc::new(Policy::new(policy)),
+            passive: None,
         }
     }
-
+    pub(super) fn new_health(
+        registry: &HostRegistry,
+        policy: &Selection,
+        upstreams: &[Upstream],
+        passive: Option<PassiveCfg>,
+    ) -> Self {
+        let mut prepared = Self::new(registry, policy, upstreams);
+        for endpoint in &mut prepared.pool {
+            endpoint.passive = passive.clone();
+        }
+        prepared.passive = passive;
+        prepared
+    }
+    pub(super) fn with_upstreams(
+        &self,
+        registry: &HostRegistry,
+        upstreams: &[Upstream],
+    ) -> anyhow::Result<Self> {
+        let mut pool = registry.resolve_dynamic(upstreams)?;
+        for endpoint in &mut pool {
+            endpoint.passive = self.passive.clone();
+        }
+        Ok(Self {
+            pool,
+            policy: self.policy.clone(),
+            passive: self.passive.clone(),
+        })
+    }
+    pub(super) fn active_states(&self) -> Vec<Arc<ActiveState>> {
+        self.pool.iter().map(|e| e.active.clone()).collect()
+    }
     pub(super) fn needs_worker(&self, input: &SelectionInput<'_>) -> bool {
-        self.policy.work(self.pool.len(), input) > 32 * 1024
+        let host_work = self.pool.iter().fold(0usize, |total, e| {
+            total.saturating_add(e.host.work_units().saturating_mul(64))
+        });
+        self.policy
+            .work(self.pool.len(), input)
+            .saturating_add(host_work)
+            > 32 * 1024
     }
 
     /// Re-select only before an upstream request exists. A racing contender
@@ -209,8 +423,10 @@ impl PreparedSelection {
             let endpoint = &self.pool[index];
             if let Some((lease, prior_requests)) = endpoint.reserve() {
                 return Ok(Some(Selected {
-                    index,
-                    max_requests: endpoint.config.max_requests,
+                    dial: endpoint.config.dial.clone(),
+                    fails: endpoint.host.fails(tokio::time::Instant::now()),
+                    host: endpoint.host.clone(),
+                    max_requests: endpoint.capacity() as i64,
                     prior_requests,
                     lease,
                     cookies,
@@ -239,13 +455,13 @@ enum Policy {
 
 struct CookiePolicy {
     name: String,
-    tags: Vec<Tag>,
+    secret: String,
     max_age_secs: u64,
     fallback: Box<Policy>,
 }
 
 impl Policy {
-    fn new(policy: &Selection, upstreams: &[Upstream]) -> Self {
+    fn new(policy: &Selection) -> Self {
         match policy {
             Selection::Random => Self::Random,
             Selection::First => Self::First,
@@ -257,33 +473,22 @@ impl Policy {
             Selection::ClientIp => Self::ClientIp,
             Selection::Uri => Self::Uri,
             Selection::Query { key, fallback } => {
-                Self::Query(key.clone(), Box::new(Self::new(fallback, upstreams)))
+                Self::Query(key.clone(), Box::new(Self::new(fallback)))
             }
             Selection::Header { field, fallback } => {
-                Self::Header(field.clone(), Box::new(Self::new(fallback, upstreams)))
+                Self::Header(field.clone(), Box::new(Self::new(fallback)))
             }
             Selection::Cookie {
                 name,
                 secret,
                 max_age_secs,
                 fallback,
-            } => {
-                let tags = upstreams
-                    .iter()
-                    .map(|u| {
-                        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-                            .expect("HMAC accepts any key size");
-                        mac.update(u.dial.as_bytes());
-                        mac.finalize()
-                    })
-                    .collect();
-                Self::Cookie(CookiePolicy {
-                    name: name.clone(),
-                    tags,
-                    max_age_secs: *max_age_secs,
-                    fallback: Box::new(Self::new(fallback, upstreams)),
-                })
-            }
+            } => Self::Cookie(CookiePolicy {
+                name: name.clone(),
+                secret: secret.clone(),
+                max_age_secs: *max_age_secs,
+                fallback: Box::new(Self::new(fallback)),
+            }),
         }
     }
 
@@ -366,7 +571,10 @@ impl Policy {
                 // weights still apply. Keep the common snapshot to one pass
                 // over live atomics and never index past the configured pool.
                 let entries: Vec<_> = available()
-                    .filter_map(|(i, _)| (weights[i] > 0).then_some((i, weights[i])))
+                    .filter_map(|(i, _)| {
+                        let w = weights.get(i).copied().unwrap_or(0);
+                        (w > 0).then_some((i, w))
+                    })
                     .collect();
                 let total: u64 = entries.iter().map(|(_, w)| w).sum();
                 if total == 0 {
@@ -449,6 +657,12 @@ impl Policy {
 }
 
 impl CookiePolicy {
+    fn tag(&self, dial: &str) -> Tag {
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.secret.as_bytes())
+            .expect("HMAC accepts any key size");
+        mac.update(dial.as_bytes());
+        mac.finalize()
+    }
     fn select(
         &self,
         pool: &[Endpoint],
@@ -459,7 +673,7 @@ impl CookiePolicy {
             cookie_value(input.headers, self.name.as_bytes()).and_then(parse_tag)
         {
             for (i, endpoint) in pool.iter().enumerate() {
-                if endpoint.available() && incoming == self.tags[i] {
+                if endpoint.available() && incoming == self.tag(&endpoint.config.dial) {
                     return Ok(Some(i));
                 }
             }
@@ -476,7 +690,7 @@ impl CookiePolicy {
         value.push_str(&self.name);
         value.push('=');
         use std::fmt::Write as _;
-        for b in self.tags[i].clone().into_bytes() {
+        for b in self.tag(&pool[i].config.dial).into_bytes() {
             write!(value, "{b:02x}").expect("String write");
         }
         value.push_str("; Path=/");

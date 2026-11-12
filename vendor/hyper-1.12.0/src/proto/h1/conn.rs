@@ -6,7 +6,7 @@ use std::marker::{PhantomData, Unpin};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 #[cfg(feature = "server")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::rt::{Read, Write};
 use bytes::{Buf, Bytes};
@@ -69,6 +69,14 @@ where
                 h1_header_read_timeout_fut: None,
                 #[cfg(feature = "server")]
                 h1_header_read_timeout_running: false,
+                #[cfg(feature = "server")]
+                h1_idle_timeout: None,
+                #[cfg(feature = "server")]
+                h1_idle_timeout_fut: None,
+                #[cfg(feature = "server")]
+                h1_waiting_next: false,
+                #[cfg(feature = "server")]
+                h1_initial_header_deadline: None,
                 #[cfg(feature = "server")]
                 date_header: true,
                 #[cfg(feature = "server")]
@@ -168,6 +176,16 @@ where
     }
 
     #[cfg(feature = "server")]
+    pub(crate) fn set_http1_initial_header_deadline(&mut self, deadline: Instant) {
+        self.state.h1_initial_header_deadline = Some(deadline);
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn set_http1_idle_timeout(&mut self, val: Option<Duration>) {
+        self.state.h1_idle_timeout = Some(val);
+    }
+
+    #[cfg(feature = "server")]
     pub(crate) fn set_http1_header_read_timeout(&mut self, val: Duration) {
         self.state.h1_header_read_timeout = Some(val);
     }
@@ -242,9 +260,39 @@ where
         trace!("Conn::read_head");
 
         #[cfg(feature = "server")]
+        if T::is_server() && self.state.h1_waiting_next {
+            // A buffered response is still active until it reaches the socket.
+            if let Poll::Ready(result) = Pin::new(&mut self.io).poll_flush(cx) {
+                if let Err(error) = result { return self.on_read_head_error(crate::Error::new_io(error)); }
+            } else { return Poll::Pending; }
+            if self.state.h1_idle_timeout_fut.is_none() {
+                if let Some(Some(duration)) = self.state.h1_idle_timeout {
+                    self.state.h1_idle_timeout_fut = Some(self.state.timer.sleep_until(self.state.timer.now() + duration));
+                }
+            }
+            // net/http waits for Peek(4) before starting the next header clock.
+            // Pipelined bytes already buffered need no idle wait.
+            while self.io.read_buf().len() < 4 {
+                if self.state.h1_idle_timeout_fut.as_mut().is_some_and(|sleep| sleep.as_mut().poll(cx).is_ready()) {
+                    self.state.close();
+                    return Poll::Ready(None);
+                }
+                match self.io.poll_read_from_io(cx) {
+                    Poll::Ready(Ok(0)) => { self.state.close(); return Poll::Ready(None); }
+                    Poll::Ready(Ok(_)) => {},
+                    Poll::Ready(Err(error)) => return self.on_read_head_error(crate::Error::new_io(error)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            self.state.h1_waiting_next = false;
+            self.state.h1_idle_timeout_fut = None;
+        }
+
+        #[cfg(feature = "server")]
         if !self.state.h1_header_read_timeout_running {
             if let Some(h1_header_read_timeout) = self.state.h1_header_read_timeout {
-                let deadline = self.state.timer.now() + h1_header_read_timeout;
+                let deadline = self.state.h1_initial_header_deadline.take()
+                    .unwrap_or_else(|| self.state.timer.now() + h1_header_read_timeout);
                 self.state.h1_header_read_timeout_running = true;
                 match &mut self.state.h1_header_read_timeout_fut {
                     Some(h1_header_read_timeout_fut) => {
@@ -1052,6 +1100,14 @@ struct State {
     #[cfg(feature = "server")]
     h1_header_read_timeout_running: bool,
     #[cfg(feature = "server")]
+    h1_idle_timeout: Option<Option<Duration>>,
+    #[cfg(feature = "server")]
+    h1_idle_timeout_fut: Option<Pin<Box<dyn Sleep>>>,
+    #[cfg(feature = "server")]
+    h1_waiting_next: bool,
+    #[cfg(feature = "server")]
+    h1_initial_header_deadline: Option<Instant>,
+    #[cfg(feature = "server")]
     date_header: bool,
     #[cfg(feature = "server")]
     timer: Time,
@@ -1237,6 +1293,11 @@ impl State {
 
         self.reading = Reading::Init;
         self.writing = Writing::Init;
+        #[cfg(feature = "server")]
+        {
+            self.h1_waiting_next = T::is_server() && self.h1_idle_timeout.is_some();
+            self.h1_idle_timeout_fut = None;
+        }
 
         // !T::should_read_first() means Client.
         //
@@ -1248,7 +1309,7 @@ impl State {
         }
 
         #[cfg(feature = "server")]
-        if self.h1_header_read_timeout.is_some() {
+        if self.h1_header_read_timeout.is_some() || self.h1_idle_timeout.is_some() {
             // Next read will start and poll the header read timeout,
             // so we can close the connection if another header isn't
             // received in a timely manner.

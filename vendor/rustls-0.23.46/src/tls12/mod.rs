@@ -378,3 +378,42 @@ mod tests {
         );
     }
 }
+
+struct NativeTls12Exporter {
+    master_secret: zeroize::Zeroizing<[u8; 48]>,
+    suite: &'static Tls12CipherSuite,
+    client_random: [u8; 32],
+    server_random: [u8; 32],
+    ems: bool,
+}
+impl crate::native_exporter::sealed::Sealed for NativeTls12Exporter {}
+impl crate::NativeExporter for NativeTls12Exporter {
+    fn export_keying_material(&self, output: &mut [u8], label: &[u8],
+        context: Option<&[u8]>) -> Result<(), Error> {
+        if !self.ems { return Err(Error::General("TLS 1.2 exporter requires EMS".into())); }
+        if matches!(label, b"client finished" | b"server finished" | b"master secret" | b"key expansion") {
+            return Err(Error::General("reserved TLS exporter label".into()));
+        }
+        if context.is_some_and(|context| context.len() > u16::MAX as usize) {
+            return Err(Error::General("TLS exporter context too long".into()));
+        }
+        if output.is_empty() { return Ok(()); }
+        let mut seed = Vec::with_capacity(64 + context.map_or(0, |value| value.len() + 2));
+        seed.extend_from_slice(&self.client_random);
+        seed.extend_from_slice(&self.server_random);
+        if let Some(context) = context {
+            seed.extend_from_slice(&(context.len() as u16).to_be_bytes());
+            seed.extend_from_slice(context);
+        }
+        self.suite.prf_provider.for_secret(output, self.master_secret.as_ref(), label, &seed);
+        Ok(())
+    }
+}
+impl ConnectionSecrets {
+    pub(crate) fn native_exporter(&self, ems: bool) -> alloc::sync::Arc<dyn crate::NativeExporter> {
+        alloc::sync::Arc::new(NativeTls12Exporter {
+            master_secret: zeroize::Zeroizing::new(self.master_secret), suite: self.suite,
+            client_random: self.randoms.client, server_random: self.randoms.server, ems,
+        })
+    }
+}

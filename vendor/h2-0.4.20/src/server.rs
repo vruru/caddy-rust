@@ -592,6 +592,13 @@ where
         self.connection.max_recv_streams()
     }
 
+    /// Whether application streams remain open or their serialized output
+    /// has not yet flushed. Closed application handles and control-only output
+    /// do not count as active requests.
+    pub fn has_active_streams(&self) -> bool {
+        self.connection.has_streams() || self.connection.has_pending_stream_output()
+    }
+
     // Could disappear at anytime.
     #[doc(hidden)]
     #[cfg(feature = "unstable")]

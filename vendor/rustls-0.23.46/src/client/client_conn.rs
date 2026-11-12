@@ -162,6 +162,9 @@ pub trait ResolvesClientCert: fmt::Debug + Send + Sync {
 /// [`RootCertStore`]: crate::RootCertStore
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
+    /// SCTs sent with a TLS1.3 client certificate only when the peer requests them.
+    /// Each item is the complete opaque RFC6962 SerializedSCT, not a TLS list wrapper.
+    pub native_client_signed_certificate_timestamps: Vec<Vec<u8>>,
     /// Which ALPN protocols we include in our client hello.
     /// If empty, no ALPN extension is sent.
     pub alpn_protocols: Vec<Vec<u8>>,
@@ -1073,6 +1076,8 @@ impl std::error::Error for EarlyDataError {}
 /// State associated with a client connection.
 #[derive(Debug)]
 pub struct ClientConnectionData {
+    pub(super) native_requested_ocsp: bool,
+    pub(super) native_requested_scts: bool,
     pub(super) early_data: EarlyData,
     pub(super) ech_status: EchStatus,
 }
@@ -1080,6 +1085,8 @@ pub struct ClientConnectionData {
 impl ClientConnectionData {
     fn new() -> Self {
         Self {
+            native_requested_ocsp: false,
+            native_requested_scts: false,
             early_data: EarlyData::new(),
             ech_status: EchStatus::NotOffered,
         }

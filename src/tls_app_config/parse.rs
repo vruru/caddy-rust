@@ -238,6 +238,7 @@ pub(super) fn parse(views: CertificateViews<'_>) -> Result<CertificatePlan> {
     }
     for policy in &plan.policies {
         if policy.on_demand
+            && policy.managers.is_empty()
             && plan.permission.is_none()
             && (policy.subjects.is_empty() || policy.subjects.iter().any(|name| name.contains('*')))
             && !(!policy.issuers.is_empty()
@@ -306,29 +307,30 @@ fn policy(value: &Value, path: &str) -> Result<Policy> {
         }
     }
     let managers = object.array("get_certificate")?;
+    if managers.len() > 16 { return Err(ConfigError::invalid(object.at("get_certificate"))); }
     for (index, manager) in managers.iter().enumerate() {
         let path = pointer(&object.at("get_certificate"), &index.to_string());
-        match discriminator(manager, "via", &path)? {
+        let parsed = match discriminator(manager, "via", &path)? {
             "http" => {
-                Object::new(Some(manager), ObjectKind::GetCertHttp, &path)?.string("url")?;
+                let object = Object::new(Some(manager), ObjectKind::GetCertHttp, &path)?;
+                let url = object.string("url")?;
+                if url.is_empty() || url.len() > 1024 * 1024 {
+                    return Err(ConfigError::invalid(object.at("url")));
+                }
+                super::external::Manager::Http(url.into())
             }
             "tailscale" => {
                 Object::new(Some(manager), ObjectKind::Tailscale, &path)?;
+                super::external::Manager::Tailscale
             }
-            _ => {
-                return Err(ConfigError::unsupported(
-                    path,
-                    "external_certificate_manager_module",
-                ));
-            }
-        }
+            _ => return Err(ConfigError::unsupported(path, "external_certificate_manager_module")),
+        };
+        policy.managers.push(parsed);
     }
-    if !managers.is_empty() {
-        return Err(ConfigError::unsupported(
-            object.at("get_certificate"),
-            "external_certificate_manager",
-        ));
-    }
+    // Caddy provisions a CertMagic OnDemandConfig for explicit managers even
+    // when on_demand is false. They are queried at handshake time, never issued
+    // eagerly while this generation is being prepared.
+    policy.on_demand |= !policy.managers.is_empty();
     if let Some(overrides) = object.map("ocsp_overrides")? {
         let mut values = BTreeMap::new();
         for (key, value) in overrides {

@@ -315,6 +315,9 @@ mod client_hello {
                         })
                         .filter(|resumedata| {
                             hs::can_resume(self.suite.into(), &cx.data.sni, false, resumedata)
+                        && crate::native_client_chains::resumption_allowed(
+                            self.config.verifier.as_ref(), resumedata)
+
                         });
 
                     let Some(resume) = maybe_resume_data else {
@@ -369,6 +372,9 @@ mod client_hello {
             }
 
             if let Some(resume) = &resumedata {
+                cx.data.native_peer_extras = resume.native_peer_extras.clone();
+                cx.data.native_client_chains = crate::native_client_chains::restored_observation(
+                    self.config.verifier.as_ref(), resume);
                 cx.data.received_resumption_data = Some(resume.application_data.0.clone());
                 cx.common
                     .peer_certificates
@@ -643,6 +649,7 @@ mod client_hello {
         transcript.rollup_for_hrr();
         transcript.add_message(&m);
         common.send_msg(m, false);
+        common.native_hrr = true;
         common.handshake_kind = Some(HandshakeKind::FullWithHelloRetryRequest);
     }
 
@@ -759,6 +766,8 @@ mod client_hello {
         let cr = CertificateRequestPayloadTls13 {
             context: PayloadU8::empty(),
             extensions: CertificateRequestExtensions {
+                native_status_request: Some(()),
+                native_scts_request: Some(()),
                 signature_algorithms: Some(
                     config
                         .verifier
@@ -1109,16 +1118,18 @@ impl State<ServerConnectionData> for ExpectCertificate {
             ));
         }
 
-        // We don't send any CertificateRequest extensions, so any extensions
-        // here are illegal.
+        // Only the client-certificate status and SCT extensions we requested are legal.
         if certp
             .entries
             .iter()
-            .any(|e| !e.extensions.only_contains(&[]))
+            .any(|e| !e.extensions.only_contains(&[crate::msgs::enums::ExtensionType::StatusRequest, crate::msgs::enums::ExtensionType::SCT]))
         {
             return Err(PeerMisbehaved::UnsolicitedCertExtension.into());
         }
 
+        let native_extras = crate::native_peer_extras::NativePeerExtras {
+            ocsp: certp.end_entity_ocsp(), scts: certp.native_end_entity_scts(),
+        };
         let client_cert = certp.into_certificate_chain();
 
         let mandatory = self
@@ -1147,13 +1158,15 @@ impl State<ServerConnectionData> for ExpectCertificate {
 
         let now = self.config.current_time()?;
 
-        self.config
+        let verified = self.config
             .verifier
             .verify_client_cert(end_entity, intermediates, now)
             .map_err(|err| {
                 cx.common
                     .send_cert_verify_error_alert(err)
             })?;
+        cx.data.native_client_chains = verified.0;
+        cx.data.native_peer_extras = native_extras;
 
         Ok(Box::new(ExpectCertificateVerify {
             config: self.config,
@@ -1303,7 +1316,7 @@ fn get_server_session_value(
 
     let secret = resumption.derive_ticket_psk(nonce);
 
-    persist::ServerSessionValue::new(
+    let mut value = persist::ServerSessionValue::new(
         cx.data.sni.as_ref(),
         version,
         suite.common.suite,
@@ -1313,7 +1326,11 @@ fn get_server_session_value(
         cx.data.resumption_data.clone(),
         time_now,
         age_obfuscation_offset,
-    )
+    );
+    value.native_client_chains = cx.data.native_client_chains.clone();
+    value.native_peer_extras = cx.data.native_peer_extras.clone();
+    value.native_curve_id = cx.common.negotiated_key_exchange_group().map(|group|u16::from(group.name()));
+    value
 }
 
 struct ExpectFinished {
@@ -1505,6 +1522,10 @@ impl State<ServerConnectionData> for ExpectTraffic {
         Ok(self)
     }
 
+    fn native_exporter(&self) -> Result<alloc::sync::Arc<dyn crate::NativeExporter>, Error> {
+        Ok(self.key_schedule.native_exporter())
+    }
+
     fn export_keying_material(
         &self,
         output: &mut [u8],
@@ -1570,6 +1591,10 @@ impl State<ServerConnectionData> for ExpectQuicTraffic {
     {
         // reject all messages
         Err(inappropriate_message(&m.payload, &[]))
+    }
+
+    fn native_exporter(&self) -> Result<alloc::sync::Arc<dyn crate::NativeExporter>, Error> {
+        Ok(self.key_schedule.native_exporter())
     }
 
     fn export_keying_material(

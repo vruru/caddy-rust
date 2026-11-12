@@ -32,39 +32,42 @@ pub(super) async fn prepare(
     if !server.tls {
         return Ok(Vec::new());
     }
+    let mut manual_tags = HashMap::<[u8; 32], Vec<String>>::new();
+    for certificate in manual.certificates.iter() {
+        manual_tags
+            .entry(certificate.identity)
+            .or_default()
+            .extend(certificate.tags.iter().cloned());
+    }
+    for tags in manual_tags.values_mut() {
+        tags.sort_unstable();
+        tags.dedup();
+    }
     let mut result = Vec::new();
     for definition in &server.tls_policies {
-        let tags = definition.any_tag.clone().unwrap_or_default();
-        let selected = manual
-            .certificates
+        let selection = definition.certificate_selection.clone();
+        let tagged = definition.requires_certificate_tags();
+        let allowed_static = manual_tags
             .iter()
-            .filter(|certificate| {
-                tags.is_empty() || certificate.tags.iter().any(|tag| tags.contains(tag))
+            .filter(|(_, tags)| {
+                selection
+                    .as_ref()
+                    .is_none_or(|filter| filter.allows_tags(tags.as_slice()))
             })
-            .collect::<Vec<_>>();
-        ensure!(
-            tags.is_empty() || !selected.is_empty(),
-            "TLS certificate tags matched no certificate"
-        );
-        let allowed_static = selected
-            .iter()
-            .map(|certificate| certificate.identity)
+            .map(|(identity, _)| *identity)
             .collect();
         let resolver = Arc::new(CandidateResolver {
             challenges: challenges.clone(),
             static_certificates: manual.resolver.clone(),
             managed: managed.clone(),
             allowed_static,
-            allowed_managed: if tags.is_empty() {
-                managed_names.to_vec()
+            certificate_selection: selection,
+            allowed_managed: if !tagged {
+                managed_names.iter().cloned().collect()
             } else {
-                Vec::new()
+                Default::default()
             },
-            provider: if tags.is_empty() {
-                provider.cloned()
-            } else {
-                None
-            },
+            provider: provider.cloned(),
         });
         let resolver_for_build = resolver.clone();
         let definition = definition.clone();

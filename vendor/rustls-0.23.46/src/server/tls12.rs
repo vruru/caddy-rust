@@ -154,6 +154,9 @@ mod client_hello {
                 .and_then(|x| persist::ServerSessionValue::read_bytes(&x).ok())
                 .filter(|resumedata| {
                     hs::can_resume(self.suite.into(), &cx.data.sni, self.using_ems, resumedata)
+                        && crate::native_client_chains::resumption_allowed(
+                            self.config.verifier.as_ref(), resumedata)
+
                 });
 
             if let Some(data) = resume_data {
@@ -286,6 +289,10 @@ mod client_hello {
             );
             cx.common
                 .start_encryption_tls12(&secrets, Side::Server);
+            cx.data.native_client_chains = crate::native_client_chains::restored_observation(
+                self.config.verifier.as_ref(), &resumedata);
+            cx.data.native_peer_extras = resumedata.native_peer_extras.clone();
+            cx.common.native_session_curve = resumedata.native_curve_id;
             cx.common.peer_certificates = resumedata.client_cert_chain;
             cx.common.handshake_kind = Some(HandshakeKind::Resumed);
 
@@ -487,13 +494,14 @@ impl State<ServerConnectionData> for ExpectCertificate {
             Some((end_entity, intermediates)) => {
                 let now = self.config.current_time()?;
 
-                self.config
+                let verified = self.config
                     .verifier
                     .verify_client_cert(end_entity, intermediates, now)
                     .map_err(|err| {
                         cx.common
                             .send_cert_verify_error_alert(err)
                     })?;
+                cx.data.native_client_chains = verified.0;
 
                 Some(cert_chain)
             }
@@ -772,6 +780,10 @@ fn get_server_connection_value_tls12(
         0,
     );
 
+    v.native_client_chains = cx.data.native_client_chains.clone();
+    v.native_peer_extras = cx.data.native_peer_extras.clone();
+    v.native_curve_id = cx.common.negotiated_key_exchange_group().map(|group|u16::from(group.name()))
+        .or(cx.common.native_session_curve);
     if using_ems {
         v.set_extended_ms_used();
     }
@@ -827,6 +839,7 @@ fn emit_finished(
 ) {
     let vh = transcript.current_hash();
     let verify_data = secrets.server_verify_data(&vh);
+    if common.native_tls_unique.is_none() { common.native_tls_unique = Some(verify_data.clone()); }
     let verify_data_payload = Payload::new(verify_data);
 
     let f = Message {
@@ -876,6 +889,9 @@ impl State<ServerConnectionData> for ExpectFinished {
                         .send_fatal_alert(AlertDescription::DecryptError, Error::DecryptError));
                 }
             };
+        if cx.common.native_tls_unique.is_none() {
+            cx.common.native_tls_unique = Some(expect_verify_data.clone());
+        }
 
         // Save connection, perhaps
         if !self.resuming && !self.session_id.is_empty() {
@@ -918,7 +934,9 @@ impl State<ServerConnectionData> for ExpectFinished {
 
         cx.common
             .start_traffic(&mut cx.sendable_plaintext);
+        cx.common.native_tls12_ems = self.using_ems;
         Ok(Box::new(ExpectTraffic {
+            using_ems: self.using_ems,
             secrets: self.secrets,
             _fin_verified,
         }))
@@ -931,6 +949,7 @@ impl State<ServerConnectionData> for ExpectFinished {
 
 // --- Process traffic ---
 struct ExpectTraffic {
+    using_ems: bool,
     secrets: ConnectionSecrets,
     _fin_verified: verify::FinishedMessageVerified,
 }
@@ -958,6 +977,10 @@ impl State<ServerConnectionData> for ExpectTraffic {
             }
         }
         Ok(self)
+    }
+
+    fn native_exporter(&self) -> Result<alloc::sync::Arc<dyn crate::NativeExporter>, Error> {
+        Ok(self.secrets.native_exporter(self.using_ems))
     }
 
     fn export_keying_material(

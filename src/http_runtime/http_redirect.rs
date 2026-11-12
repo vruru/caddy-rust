@@ -6,8 +6,7 @@
 mod replay;
 #[path = "http_redirect/request.rs"]
 mod request;
-#[path = "http_redirect/url.rs"]
-mod url;
+pub(super) use crate::go_url_compat as url;
 pub(super) use replay::ReplayIo;
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};

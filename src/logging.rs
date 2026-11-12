@@ -63,9 +63,9 @@ mod sampling;
 #[path = "logging/tcp_dial.rs"]
 mod tcp_dial;
 #[path = "logging/time_components.rs"]
-mod time_components;
+pub(crate) mod time_components;
 #[path = "logging/time_layout.rs"]
-mod time_layout;
+pub(crate) mod time_layout;
 #[path = "logging/types.rs"]
 mod types;
 #[path = "logging/writer_io.rs"]

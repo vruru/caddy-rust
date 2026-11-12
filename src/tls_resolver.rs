@@ -5,6 +5,7 @@
 
 use crate::challenge::{ACME_ALPN, ChallengeRegistry, normalize_domain};
 use crate::leaf_guard::{LeafGuard, LeafState, Observation, leaf_id};
+use crate::tls_policy::certificate_selection::{CertificateFacts, CertificateFilter};
 use anyhow::{Result, anyhow, ensure};
 use rustls::{
     ProtocolVersion, SignatureScheme,
@@ -104,8 +105,17 @@ impl SignatureCompatibility {
 #[derive(Clone)]
 pub struct CertificateSelection {
     pub key: Arc<CertifiedKey>,
+    pub(crate) instance: Option<CertificateInstance>,
     pub(crate) leaf_state: Option<Arc<LeafState>>,
     pub signature_compatibility: SignatureCompatibility,
+}
+
+/// Identifies the loaded instance which actually signed an accepted connection.
+/// Reading this receipt never allocates a new publication generation.
+#[derive(Clone, Copy)]
+pub(crate) struct CertificateInstance {
+    identity: [u8; 32],
+    generation: u64,
 }
 
 /// One generation's immutable manual-certificate metadata. Serving and OCSP
@@ -167,6 +177,14 @@ pub struct ScopedCertificate {
     names: Vec<String>,
 }
 impl ScopedCertificate {
+    pub(crate) fn names(&self) -> &[String] { &self.names }
+    pub(crate) fn owned_by(&self, owner: &CertificateScope) -> bool {
+        Arc::ptr_eq(&self.owner.0, &owner.0)
+    }
+    pub(crate) fn identity(&self) -> [u8; 32] {
+        self.identity
+    }
+
     pub(crate) fn same_instance(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.resolver, &other.resolver)
             && Arc::ptr_eq(&self.owner.0, &other.owner.0)
@@ -188,11 +206,18 @@ pub struct OcspCertificate {
     pub(crate) identity: [u8; 32],
     pub(crate) generation: u64,
     pub(crate) names: Vec<String>,
+    pub(crate) management_name: Arc<str>,
     pub(crate) chain_der: Vec<Vec<u8>>,
     pub(crate) leaf_state: Arc<LeafState>,
     pub(crate) leaf_sha256: [u8; 32],
+    pub(crate) key_state: Arc<crate::key_compromise::KeyState>,
+}
+pub(crate) struct OcspDescriptor {
+    pub(crate) identity: [u8; 32],
+    pub(crate) management_name: Arc<str>,
 }
 impl OcspCertificate {
+    pub(crate) fn management_name(&self) -> &str { &self.management_name }
     pub fn identity(&self) -> [u8; 32] {
         self.identity
     }
@@ -229,6 +254,8 @@ struct Staple {
 
 #[derive(Clone)]
 struct LoadedCertificate {
+    managed_key_veto: bool,
+    key_state: Arc<crate::key_compromise::KeyState>,
     key: Arc<CertifiedKey>,
     tls13_key: Option<Arc<CertifiedKey>>,
     leaf_state: Arc<LeafState>,
@@ -242,18 +269,23 @@ struct LoadedCertificate {
     not_after: i64,
     size: usize,
     signature_profile: SignatureProfile,
+    facts: Arc<CertificateFacts>,
+    management_name: Arc<str>,
+    san_names: Arc<Vec<String>>,
 }
 
 /// Public inventory retains only the immutable base key, never an optional
 /// stapled-key clone. Clearing a staple therefore cannot hide retained bytes
 /// from its independent cache budget.
 struct InventoryEntry {
+    key_state: Arc<crate::key_compromise::KeyState>,
     key: Arc<CertifiedKey>,
     leaf_state: Arc<LeafState>,
     leaf_sha256: [u8; 32],
     identity: [u8; 32],
     generation: u64,
     names: Vec<String>,
+    management_name: Arc<str>,
     residency: Option<Arc<CertificateResidency>>,
 }
 impl InventoryEntry {
@@ -265,6 +297,7 @@ impl InventoryEntry {
             identity: self.identity,
             generation: self.generation,
             names: self.names.clone(),
+            management_name: self.management_name.clone(),
             chain_der: self
                 .key
                 .cert
@@ -273,6 +306,7 @@ impl InventoryEntry {
                 .collect(),
             leaf_state: self.leaf_state.clone(),
             leaf_sha256: self.leaf_sha256,
+            key_state: self.key_state.clone(),
         }
     }
 }
@@ -285,12 +319,14 @@ fn certificate_inventory(
             let entry = result
                 .entry(certificate.instance_generation)
                 .or_insert_with(|| InventoryEntry {
+                    key_state: certificate.key_state.clone(),
                     key: certificate.key.clone(),
                     leaf_state: certificate.leaf_state.clone(),
                     leaf_sha256: certificate.leaf_sha256,
                     identity: certificate.identity,
                     generation: certificate.instance_generation,
                     names: Vec::new(),
+                    management_name: certificate.management_name.clone(),
                     residency: certificate.residency.clone(),
                 });
             entry.names.push(name.clone());
@@ -303,16 +339,30 @@ fn certificate_inventory(
     Arc::new(result)
 }
 
+fn certificate_identity_inventory(inventory: &HashMap<u64, InventoryEntry>)
+    -> Arc<HashMap<[u8; 32], u64>>
+{
+    let mut identities = HashMap::new();
+    for entry in inventory.values() {
+        identities.entry(entry.identity).and_modify(|generation: &mut u64| {
+            *generation = (*generation).max(entry.generation);
+        }).or_insert(entry.generation);
+    }
+    Arc::new(identities)
+}
+
 #[derive(Default)]
 struct Snapshot {
     generation: u64,
     names: HashMap<String, Vec<Arc<LoadedCertificate>>>,
     inventory: Arc<HashMap<u64, InventoryEntry>>,
+    identity_index: Arc<HashMap<[u8; 32], u64>>,
 }
 
 /// Each map is an immutable snapshot behind one short-held lock. Returning an
 /// Arc keeps old signing material alive for handshakes/connections using it.
 pub struct HotCertificateResolver {
+    managed_keys: bool,
     challenges: ChallengeRegistry,
     leaf_guard: Arc<LeafGuard>,
     certificates: RwLock<Arc<Snapshot>>,
@@ -332,12 +382,21 @@ impl HotCertificateResolver {
     /// guard. Repackaging a leaf in another chain must not forget its status.
     pub fn with_leaf_guard(challenges: ChallengeRegistry, leaf_guard: Arc<LeafGuard>) -> Self {
         Self {
+            managed_keys: false,
             challenges,
             leaf_guard,
             certificates: RwLock::new(Arc::new(Snapshot::default())),
             next_instance: AtomicU64::new(1),
             scope_identity: Arc::new(()),
         }
+    }
+
+    /// Administrative managed inventories use unscoped publication but still
+    /// share the instance's key veto. Manual inventories keep their own mode.
+    pub fn with_managed_leaf_guard(challenges: ChallengeRegistry, leaf_guard: Arc<LeafGuard>) -> Self {
+        let mut resolver = Self::with_leaf_guard(challenges, leaf_guard);
+        resolver.managed_keys = true;
+        resolver
     }
 
     pub fn leaf_guard(&self) -> Arc<LeafGuard> {
@@ -375,6 +434,8 @@ impl HotCertificateResolver {
                 .ok_or_else(|| anyhow!("certificate data limit exceeded"))?;
             ensure!(bytes <= MAX_TOTAL_BYTES, "certificate data limit exceeded");
             let (names, mut cert) = load_certificate(input, &self.leaf_guard)?;
+            cert.managed_key_veto = self.managed_keys;
+            if cert.managed_key_veto && cert.key_state.banned() { return Err(crate::key_compromise::KeyCompromised.into()); }
             cert.instance_generation = self.instance_generation()?;
             inherit_staple(&mut cert, &base.names, now);
             let cert = Arc::new(cert);
@@ -402,11 +463,15 @@ impl HotCertificateResolver {
             .generation
             .checked_add(1)
             .ok_or_else(|| anyhow!("certificate generation exhausted"))?;
+        if self.managed_keys && inventory.values().any(|entry|entry.key_state.banned()) {
+            return Err(crate::key_compromise::KeyCompromised.into());
+        }
         let previous = std::mem::replace(
             &mut *guard,
             Arc::new(Snapshot {
                 generation,
                 names: next,
+                identity_index: certificate_identity_inventory(&inventory),
                 inventory,
             }),
         );
@@ -454,6 +519,130 @@ impl HotCertificateResolver {
         .ok_or_else(|| anyhow!("certificate scope unavailable"))
     }
 
+    /// Warm replacement keeps the current connection's cached-selection
+    /// constraints. Cold acquisition deliberately does not call this helper.
+    /// The caller runs on the bounded certificate CPU worker before publication.
+    pub(crate) fn candidate_allowed(
+        &self,
+        input: &CertificateInput<'_>,
+        tags: &[String],
+        filter: Option<&CertificateFilter>,
+        schemes: &[SignatureScheme],
+        version: Option<ProtocolVersion>,
+    ) -> Result<bool> {
+        let (_, certificate) = load_certificate(input, &self.leaf_guard)?;
+        Ok(filter.is_none_or(|filter| filter.allows_tags(tags)
+                && filter.allows_facts(&certificate.facts))
+            && select_loaded(&certificate, schemes, version, clock_now()?).is_some())
+    }
+
+    /// Capture the actual selected managed instance. No name lookup may
+    /// substitute another authority's certificate for this observation.
+    pub(crate) fn scoped_instance(
+        &self,
+        instance: CertificateInstance,
+    ) -> Option<(ScopedCertificate, Arc<CertificateResidency>)> {
+        let snapshot = self.certificates.read().ok()?.clone();
+        let inventory = snapshot.inventory.get(&instance.generation)?;
+        if inventory.identity != instance.identity || !inventory.live() { return None; }
+        let entry = snapshot.names.get(inventory.names.first()?)?.iter()
+            .find(|entry| entry.instance_generation == instance.generation
+                && entry.identity == instance.identity)?;
+        let slot = entry.residency.clone()?;
+        let owner = entry.owner.clone()?;
+        Some((ScopedCertificate { resolver: self.scope_identity.clone(), owner,
+            identity: instance.identity, instance_generation: instance.generation,
+            names: inventory.names.clone() }, slot))
+    }
+
+    /// Exact current-publication metadata check; this does not select a
+    /// certificate, allocate an instance or apply a new handshake policy.
+    pub(crate) fn receipt_current(
+        &self,
+        receipt: &ScopedCertificate,
+        slot: &Arc<CertificateResidency>,
+    ) -> Result<bool> {
+        if !Arc::ptr_eq(&receipt.resolver, &self.scope_identity) || !slot.live() {
+            return Ok(false);
+        }
+        let snapshot = self.certificates.read()
+            .map_err(|_| anyhow!("certificate state unavailable"))?.clone();
+        Ok(snapshot.inventory.get(&receipt.instance_generation).is_some_and(|entry|
+            entry.identity == receipt.identity && entry.names == receipt.names
+                && entry.residency.as_ref().is_some_and(|actual| Arc::ptr_eq(actual, slot))
+                && entry.live()))
+    }
+
+    /// Validate a borrowed exact instance without replacing or reordering it.
+    pub(crate) fn select_receipt(
+        &self,
+        receipt: &ScopedCertificate,
+        slot: &Arc<CertificateResidency>,
+        schemes: &[SignatureScheme],
+        version: Option<ProtocolVersion>,
+    ) -> Option<CertificateSelection> {
+        if !Arc::ptr_eq(&receipt.resolver, &self.scope_identity)
+            || receipt.names.is_empty() || !slot.live()
+        { return None; }
+        let snapshot = self.certificates.read().ok()?.clone();
+        let exact = |entry: &&Arc<LoadedCertificate>| {
+            entry.identity == receipt.identity
+                && entry.instance_generation == receipt.instance_generation
+                && entry.owner.as_ref().is_some_and(|owner| Arc::ptr_eq(&owner.0, &receipt.owner.0))
+                && entry.residency.as_ref().is_some_and(|actual| Arc::ptr_eq(actual, slot))
+        };
+        if !receipt.names.iter().all(|name| snapshot.names.get(name)
+            .is_some_and(|entries| entries.iter().any(|entry| exact(&entry))))
+        { return None; }
+        let entry = snapshot.names.get(receipt.names.first()?)?.iter().find(exact)?;
+        select_loaded(entry, schemes, version, clock_now().ok()?)
+    }
+
+    /// Validate a borrowed exact instance without replacing or reordering it.
+    /// The hook keeps the same resolver -> ledger -> physical-cache lock order
+    /// as publication. It must not perform I/O or acquire a resolver lock.
+    pub(crate) fn with_current_receipt(
+        &self,
+        receipt: &ScopedCertificate,
+        slot: &Arc<CertificateResidency>,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit: impl FnOnce() -> Result<bool>,
+    ) -> Result<Option<ScopedCertificate>> {
+        ensure!(!cancel.is_cancelled(), "certificate publication cancelled");
+        if !Arc::ptr_eq(&receipt.resolver, &self.scope_identity) || receipt.names.is_empty() {
+            return Ok(None);
+        }
+        // instance_generation() allocates a publication ID. An existing
+        // receipt is checked against snapshot instances, never the allocator.
+        let guard = self.certificates.write()
+            .map_err(|_| anyhow!("certificate state unavailable"))?;
+        ensure!(!cancel.is_cancelled(), "certificate publication cancelled");
+        if !slot.live() {
+            return Ok(None);
+        }
+        let present = receipt.names.iter().all(|name| {
+            guard.names.get(name).is_some_and(|candidates| {
+                candidates.iter().any(|old| {
+                    old.identity == receipt.identity
+                        && old.instance_generation == receipt.instance_generation
+                        && old.owner.as_ref().is_some_and(|owner| {
+                            Arc::ptr_eq(&owner.0, &receipt.owner.0)
+                        })
+                        && old.residency.as_ref().is_some_and(|source| Arc::ptr_eq(source, slot))
+                })
+            })
+        });
+        if !present {
+            return Ok(None);
+        }
+        if guard.inventory.get(&receipt.instance_generation).is_some_and(|entry|entry.key_state.banned()) {
+            return Err(crate::key_compromise::KeyCompromised.into());
+        }
+        let admitted = commit()?;
+        drop(guard);
+        Ok(admitted.then(|| receipt.clone()))
+    }
+
     pub(crate) fn upsert_checked(
         &self,
         input: &CertificateInput<'_>,
@@ -485,6 +674,7 @@ impl HotCertificateResolver {
         };
         check_active()?;
         let (names, mut cert) = load_certificate(input, &self.leaf_guard)?;
+        cert.managed_key_veto = self.managed_keys;
         cert.instance_generation = self.instance_generation()?;
         cert.owner = owner.clone();
         cert.residency = residency.clone();
@@ -556,9 +746,11 @@ impl HotCertificateResolver {
                 .generation
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("certificate generation exhausted"))?;
+            let inventory = certificate_inventory(&next);
             let candidate = Arc::new(Snapshot {
                 generation,
-                inventory: certificate_inventory(&next),
+                identity_index: certificate_identity_inventory(&inventory),
+                inventory,
                 names: next,
             });
             let mut guard = self
@@ -570,6 +762,9 @@ impl HotCertificateResolver {
                 continue;
             }
             check_active()?;
+            if (cert.managed_key_veto || cert.owner.is_some()) && cert.key_state.banned() {
+                return Err(crate::key_compromise::KeyCompromised.into());
+            }
             // The cache admission hook only commits short in-memory state;
             // all key validation and snapshot construction already succeeded.
             // Nothing fallible follows the hook in this publication.
@@ -630,12 +825,14 @@ impl HotCertificateResolver {
                 }
             }
             names.retain(|_, candidates| !candidates.is_empty());
+            let inventory = certificate_inventory(&names);
             let candidate = Arc::new(Snapshot {
                 generation: base
                     .generation
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("certificate generation exhausted"))?,
-                inventory: certificate_inventory(&names),
+                identity_index: certificate_identity_inventory(&inventory),
+                inventory,
                 names,
             });
             let mut guard = self
@@ -696,12 +893,14 @@ impl HotCertificateResolver {
             if !changed {
                 return Ok(());
             }
+            let inventory = certificate_inventory(&names);
             let next = Arc::new(Snapshot {
                 generation: base
                     .generation
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("certificate generation exhausted"))?,
-                inventory: certificate_inventory(&names),
+                identity_index: certificate_identity_inventory(&inventory),
+                inventory,
                 names,
             });
             let mut guard = self
@@ -726,6 +925,28 @@ impl HotCertificateResolver {
 
     /// Clone only public certificate data, outside the short snapshot lock.
     /// Call this from a bounded worker when inventories are large.
+    pub(crate) fn ocsp_descriptors(&self) -> Result<Vec<OcspDescriptor>> {
+        let snapshot = self.certificates.read()
+            .map_err(|_| anyhow!("certificate state unavailable"))?.clone();
+        Ok(snapshot.identity_index.values().filter_map(|id| snapshot.inventory.get(id))
+            .filter(|entry| entry.live()).map(|entry| OcspDescriptor {
+                identity: entry.identity, management_name: entry.management_name.clone(),
+            }).collect())
+    }
+    pub(crate) fn ocsp_descriptor(&self, identity: &[u8; 32]) -> Result<Option<OcspDescriptor>> {
+        let snapshot = self.certificates.read()
+            .map_err(|_| anyhow!("certificate state unavailable"))?.clone();
+        Ok(snapshot.identity_index.get(identity).and_then(|id| snapshot.inventory.get(id))
+            .filter(|entry| entry.live()).map(|entry| OcspDescriptor {
+                identity: entry.identity, management_name: entry.management_name.clone(),
+            }))
+    }
+    pub(crate) fn ocsp_current_certificate(&self, identity: &[u8; 32]) -> Result<Option<OcspCertificate>> {
+        let snapshot = self.certificates.read()
+            .map_err(|_| anyhow!("certificate state unavailable"))?.clone();
+        Ok(snapshot.identity_index.get(identity).and_then(|id| snapshot.inventory.get(id))
+            .filter(|entry| entry.live()).map(InventoryEntry::certificate))
+    }
     pub fn ocsp_certificates(&self) -> Result<Vec<OcspCertificate>> {
         let snapshot = self
             .certificates
@@ -735,32 +956,6 @@ impl HotCertificateResolver {
         let mut result = snapshot
             .inventory
             .values()
-            .filter(|entry| entry.live())
-            .map(InventoryEntry::certificate)
-            .collect::<Vec<_>>();
-        result.sort_by_key(|certificate| certificate.generation);
-        Ok(result)
-    }
-    /// Scope filtering precedes DER cloning, but each returned record retains
-    /// its complete actual alias set for exact-instance publication checks.
-    pub(crate) fn ocsp_certificates_for_names(
-        &self,
-        names: &HashSet<String>,
-    ) -> Result<Vec<OcspCertificate>> {
-        let snapshot = self
-            .certificates
-            .read()
-            .map_err(|_| anyhow!("certificate state unavailable"))?
-            .clone();
-        let ids = names
-            .iter()
-            .filter_map(|name| snapshot.names.get(name))
-            .flatten()
-            .map(|certificate| certificate.instance_generation)
-            .collect::<HashSet<_>>();
-        let mut result = ids
-            .into_iter()
-            .filter_map(|id| snapshot.inventory.get(&id))
             .filter(|entry| entry.live())
             .map(InventoryEntry::certificate)
             .collect::<Vec<_>>();
@@ -860,6 +1055,7 @@ impl HotCertificateResolver {
                     .generation
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("certificate generation exhausted"))?,
+                identity_index: base.identity_index.clone(),
                 inventory: base.inventory.clone(),
                 names,
             });
@@ -974,6 +1170,7 @@ impl HotCertificateResolver {
             key.key.choose_scheme(signature_schemes)?;
             return Some(CertificateSelection {
                 key,
+                instance: None,
                 signature_compatibility: SignatureCompatibility::Tls12Or13,
                 leaf_state: None,
             });
@@ -987,35 +1184,7 @@ impl HotCertificateResolver {
                 if allowed_identities.is_some_and(|allowed| !allowed.contains(&entry.identity)) {
                     return None;
                 }
-                if entry.residency.as_ref().is_some_and(|slot| !slot.live()) {
-                    return None;
-                }
-                let admission = entry.leaf_state.admission();
-                if !admission.allow_certificate || now < entry.not_before || now >= entry.not_after
-                {
-                    return None;
-                }
-                let staple = entry
-                    .staple
-                    .as_ref()
-                    .filter(|staple| admission.allow_staple && now < staple.valid_until);
-                let key = if version == Some(ProtocolVersion::TLSv1_3) {
-                    staple
-                        .and_then(|s| s.tls13_key.clone())
-                        .or_else(|| entry.tls13_key.clone())?
-                } else {
-                    staple.map_or_else(|| entry.key.clone(), |s| s.key.clone())
-                };
-                key.key.choose_scheme(signature_schemes)?;
-                Some(CertificateSelection {
-                    key,
-                    leaf_state: Some(entry.leaf_state.clone()),
-                    signature_compatibility: if entry.tls13_key.is_some() {
-                        SignatureCompatibility::Tls12Or13
-                    } else {
-                        SignatureCompatibility::Tls12Only
-                    },
-                })
+                select_loaded(entry, signature_schemes, version, now)
             })
         };
         if let Some(key) = snapshot.names.get(&sni).and_then(select) {
@@ -1026,6 +1195,213 @@ impl HotCertificateResolver {
         }
         let (_, suffix) = sni.split_once('.')?;
         snapshot.names.get(&format!("*.{suffix}")).and_then(select)
+    }
+}
+
+fn select_loaded(
+    entry: &LoadedCertificate,
+    signature_schemes: &[SignatureScheme],
+    version: Option<ProtocolVersion>,
+    now: i64,
+) -> Option<CertificateSelection> {
+    if entry.residency.as_ref().is_some_and(|slot| !slot.live()) {
+        return None;
+    }
+    // Scoped entries are managed publications; manual inventories have no
+    // owner. A signed key veto immediately covers different leaves/stores.
+    if (entry.managed_key_veto || entry.owner.is_some()) && entry.key_state.banned() {
+        return None;
+    }
+    let admission = entry.leaf_state.admission();
+    if !admission.allow_certificate || now < entry.not_before || now >= entry.not_after {
+        return None;
+    }
+    let staple = entry
+        .staple
+        .as_ref()
+        .filter(|staple| admission.allow_staple && now < staple.valid_until);
+    let key = if version == Some(ProtocolVersion::TLSv1_3) {
+        staple
+            .and_then(|s| s.tls13_key.clone())
+            .or_else(|| entry.tls13_key.clone())?
+    } else {
+        staple.map_or_else(|| entry.key.clone(), |s| s.key.clone())
+    };
+    key.key.choose_scheme(signature_schemes)?;
+    Some(CertificateSelection {
+        key,
+        instance: Some(CertificateInstance {
+            identity: entry.identity,
+            generation: entry.instance_generation,
+        }),
+        leaf_state: Some(entry.leaf_state.clone()),
+        signature_compatibility: if entry.tls13_key.is_some() {
+            SignatureCompatibility::Tls12Or13
+        } else {
+            SignatureCompatibility::Tls12Only
+        },
+    })
+}
+
+pub(crate) enum PolicyMatch {
+    NoViable,
+    Unusable,
+    Selected(CertificateSelection, bool),
+}
+
+pub(crate) struct PolicyQuery<'a> {
+    filter: Option<&'a CertificateFilter>,
+    offered_name: Option<&'a str>,
+    signature_schemes: &'a [SignatureScheme],
+    version: Option<ProtocolVersion>,
+    now: i64,
+}
+
+impl<'a> PolicyQuery<'a> {
+    pub(crate) fn new(
+        filter: Option<&'a CertificateFilter>,
+        offered_name: Option<&'a str>,
+        signature_schemes: &'a [SignatureScheme],
+        version: Option<ProtocolVersion>,
+    ) -> Option<Self> {
+        if version.is_some_and(|version| {
+            !matches!(version, ProtocolVersion::TLSv1_2 | ProtocolVersion::TLSv1_3)
+        }) {
+            return None;
+        }
+        Some(Self {
+            filter,
+            offered_name,
+            signature_schemes,
+            version,
+            now: clock_now().ok()?,
+        })
+    }
+}
+
+pub(crate) struct PolicyInventory(Arc<Snapshot>);
+
+impl PolicyInventory {
+    /// One inventory lookup and one bounded alias bucket. Existing connections
+    /// validate their signed instance instead of rerunning global preference.
+    pub(crate) fn select_pinned(
+        &self,
+        instance: CertificateInstance,
+        allow_reloaded_identity: bool,
+        query: &PolicyQuery<'_>,
+        allowed: impl Fn(&[u8; 32], &[String]) -> bool,
+    ) -> PolicyMatch {
+        let current = self.0.inventory.get(&instance.generation)
+            .filter(|entry| entry.identity == instance.identity)
+            .or_else(|| {
+                if !allow_reloaded_identity { return None; }
+                self.0.inventory.get(self.0.identity_index.get(&instance.identity)?)
+                    .filter(|entry| entry.identity == instance.identity)
+            });
+        let entry = current.and_then(|current| self.0.names.get(current.names.first()?)
+            .and_then(|entries| entries.iter().find(|entry| {
+                entry.instance_generation == current.generation
+                    && entry.identity == instance.identity
+            })));
+
+        self.scan(entry.into_iter().map(|entry| entry.as_ref()), query, allowed)
+    }
+
+    /// Raw presence is checked before tags, algorithms, age, or scope
+    /// permissions. A filtered list is not an absent name.
+    pub(crate) fn has_name(&self, name: &str) -> bool {
+        self.0
+            .names
+            .get(name)
+            .is_some_and(|entries| !entries.is_empty())
+    }
+
+    pub(crate) fn select_named(
+        &self,
+        name: &str,
+        query: &PolicyQuery<'_>,
+        allowed: impl Fn(&[u8; 32], &[String]) -> bool,
+    ) -> PolicyMatch {
+        let entries = self
+            .0
+            .names
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(Arc::as_ref);
+        self.scan(entries, query, allowed)
+    }
+
+    pub(crate) fn select_global(
+        &self,
+        query: &PolicyQuery<'_>,
+        allowed: impl Fn(&[u8; 32], &[String]) -> bool,
+    ) -> PolicyMatch {
+        // The existing immutable inventory deduplicates SAN aliases. Resolve
+        // each entry from its first alias; that bucket has at most eight
+        // revisions. This scans at most once per selector query and never
+        // copies certificates, stacks, or optional staples.
+        let entries = self.0.inventory.values().filter_map(|item| {
+            self.0
+                .names
+                .get(item.names.first()?)?
+                .iter()
+                .find(|entry| entry.instance_generation == item.generation)
+                .map(Arc::as_ref)
+        });
+        self.scan(entries, query, allowed)
+    }
+
+    fn scan<'a>(
+        &self,
+        entries: impl Iterator<Item = &'a LoadedCertificate>,
+        query: &PolicyQuery<'_>,
+        allowed: impl Fn(&[u8; 32], &[String]) -> bool,
+    ) -> PolicyMatch {
+        let mut viable = false;
+        let mut best_effort = None;
+        for entry in entries {
+            if query
+                .filter
+                .is_some_and(|filter| !filter.allows_facts(&entry.facts))
+            {
+                continue;
+            }
+            let Some(inventory) = self.0.inventory.get(&entry.instance_generation) else {
+                continue;
+            };
+            if !allowed(&entry.identity, &inventory.names) {
+                continue;
+            }
+            viable = true;
+            let preferred = query
+                .offered_name
+                .is_none_or(|name| entry.san_names.iter().any(|san| covers(san, name)));
+            if !preferred && best_effort.is_some() {
+                continue;
+            }
+            if let Some(selection) =
+                select_loaded(entry, query.signature_schemes, query.version, query.now)
+            {
+                if preferred {
+                    return PolicyMatch::Selected(selection, true);
+                }
+                best_effort = Some(selection);
+            }
+        }
+        if let Some(selection) = best_effort {
+            PolicyMatch::Selected(selection, false)
+        } else if viable {
+            PolicyMatch::Unusable
+        } else {
+            PolicyMatch::NoViable
+        }
+    }
+}
+
+impl HotCertificateResolver {
+    pub(crate) fn policy_inventory(&self) -> Option<PolicyInventory> {
+        Some(PolicyInventory(self.certificates.read().ok()?.clone()))
     }
 }
 
@@ -1099,6 +1475,52 @@ pub fn certificate_chain_identity(chain: &[CertificateDer<'_>]) -> [u8; 32] {
     }
     identity.finalize().into()
 }
+
+pub(crate) fn certificate_management_name(leaf: &x509_parser::certificate::X509Certificate<'_>) -> anyhow::Result<std::sync::Arc<str>> {
+    if let Some(attribute) = leaf.subject().iter_common_name().last() {
+        let value = crate::tls_policy::certificate_selection::attribute_string(attribute)
+            .ok_or_else(|| anyhow::anyhow!("failed to decode CommonName attribute"))?;
+        if !value.is_empty() {
+            let lowered = value.chars().map(|ch| ch.to_lowercase().next().unwrap_or(ch)).collect::<String>();
+            return Ok(std::sync::Arc::from(lowered));
+        }
+    }
+
+    let san_ext = leaf.subject_alternative_name()?;
+    if let Some(ext) = san_ext {
+        let general_names = &ext.value.general_names;
+
+        for gn in general_names {
+            if let x509_parser::extensions::GeneralName::DNSName(s) = gn {
+                let lowered: String = s.chars().map(|c| c.to_lowercase().next().unwrap_or(c)).collect();
+                if !lowered.is_empty() {
+                    return Ok(std::sync::Arc::from(lowered.as_str()));
+                }
+            }
+        }
+
+        for gn in general_names {
+            if let x509_parser::extensions::GeneralName::IPAddress(ip_bytes) = gn {
+                let ip_addr = match ip_bytes.len() {
+                    4 => {
+                        let arr: [u8; 4] = (*ip_bytes).try_into().map_err(|_| anyhow::anyhow!("invalid IPv4 address length in SAN"))?;
+                        std::net::IpAddr::from(arr)
+                    }
+                    16 => {
+                        let arr: [u8; 16] = (*ip_bytes).try_into().map_err(|_| anyhow::anyhow!("invalid IPv6 address length in SAN"))?;
+                        std::net::IpAddr::from(arr)
+                    }
+                    _ => continue,
+                };
+                let canonical = canonical_certificate_ip(ip_addr);
+                return Ok(std::sync::Arc::from(canonical.as_str()));
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!("no suitable name found in certificate"))
+}
+
 
 fn load_certificate(
     input: &CertificateInput<'_>,
@@ -1205,16 +1627,25 @@ fn load_certificate(
     } else {
         0
     };
+    let facts = Arc::new(CertificateFacts::from_leaf(&leaf));
+    let management_name = certificate_management_name(&leaf)?;
     let size = input
         .certificate_pem
         .len()
         .checked_add(input.private_key_pem.len())
         .and_then(|v| v.checked_add(extra_key_bytes))
+        .and_then(|v| v.checked_add(facts.retained_bytes()))
+        .and_then(|v| v.checked_add(leaf.public_key().raw.len()))
+        .and_then(|v| v.checked_add(management_name.len() + 2 * std::mem::size_of::<usize>()))
+        .and_then(|v| v.checked_add(san_names.capacity() * std::mem::size_of::<String>()))
+        .and_then(|v| v.checked_add(san_names.iter().map(String::capacity).sum::<usize>()))
         .ok_or_else(|| anyhow!("certificate size overflow"))?;
     let leaf_sha256 = leaf_id(&blocks[0].1);
     Ok((
         names,
         LoadedCertificate {
+            managed_key_veto: false,
+            key_state: leaf_guard.key_deny().register_spki(Arc::from(leaf.public_key().raw))?,
             key,
             tls13_key,
             leaf_state: leaf_guard.intern(leaf_sha256, leaf.validity().not_after.timestamp())?,
@@ -1225,6 +1656,9 @@ fn load_certificate(
             residency: None,
             staple: None,
             signature_profile,
+            facts,
+            management_name,
+            san_names: Arc::new(san_names),
             size,
             not_before: leaf.validity().not_before.timestamp(),
             not_after: leaf.validity().not_after.timestamp(),
@@ -1321,7 +1755,7 @@ fn validate_snapshot_size_with_limit(
         if unique.insert(Arc::as_ptr(cert)) {
             ensure!(unique.len() <= limit, "certificate count limit exceeded");
             size = size
-                .checked_add(cert.size)
+                .checked_add(cert.size).and_then(|size| size.checked_add(96))
                 .ok_or_else(|| anyhow!("certificate data limit exceeded"))?;
             ensure!(size <= MAX_TOTAL_BYTES, "certificate data limit exceeded");
             if let Some(staple) = &cert.staple {

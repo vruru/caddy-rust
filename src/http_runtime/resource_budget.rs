@@ -190,6 +190,13 @@ impl BlockingBudget {
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ResourceDiagnostics {
+    pub tls_event_metadata_bytes:usize,
+    pub client_certificate_metadata_bytes: usize,
+    pub proxy_health_events_coalesced: u64,
+    pub cel_body_capture_bytes: usize,
+    pub cel_dynamic_entries: usize,
+    pub cel_dynamic_bytes: usize,
+    pub cel_compile: BudgetSnapshot,
     pub auth: BudgetSnapshot,
     pub auth_comparisons: u64,
     pub auth_cache_rejected: u64,
@@ -202,6 +209,8 @@ pub struct ResourceDiagnostics {
     pub file_reads: BudgetSnapshot,
     pub compression: super::CompressionDiagnostics,
     pub proxy_selection: BudgetSnapshot,
+    pub proxy_passive_dropped: u64,
+    pub proxy_dns_background_rejected: u64,
     pub request_regexp: BudgetSnapshot,
     pub directory_listing: BudgetSnapshot,
     pub access_capture_rejected: u64,
@@ -210,6 +219,13 @@ pub struct ResourceDiagnostics {
 }
 
 pub(crate) struct Resources {
+    pub(super) proxy_health_events_coalesced: Arc<AtomicU64>,
+    pub(super) cel_body_bytes: Arc<Semaphore>,
+    pub(crate) client_cert_bytes: Arc<Semaphore>,
+    pub(crate) tls_event_bytes:Arc<Semaphore>,
+    pub(super) cel_dynamic: Arc<super::cel_matcher::DynamicCache>,
+    pub(super) cel_compile: BlockingBudget,
+    pub templates: super::templates::Budget,
     pub auth: BlockingBudget,
     pub auth_leaders: Arc<Semaphore>,
     pub auth_followers: Arc<Semaphore>,
@@ -227,6 +243,11 @@ pub(crate) struct Resources {
     pub(super) compression: super::encode_body::CompressionBudget,
     pub(super) proxy_hosts: Arc<super::proxy_policy::HostRegistry>,
     pub proxy_selection: BlockingBudget,
+    pub(super) proxy_flush: Arc<Semaphore>,
+    pub(super) proxy_health: Arc<Semaphore>,
+    pub(super) proxy_health_schedulers: Arc<Semaphore>,
+    pub(super) proxy_dns: Arc<super::proxy_dynamic::DnsShared>,
+    pub(super) proxy_cleanup: Arc<super::proxy_cleanup::Coordinator>,
     pub request_regexp: BlockingBudget,
     pub directory_listing: BlockingBudget,
     pub directory_listing_bytes: Arc<Semaphore>,
@@ -333,7 +354,14 @@ impl Resources {
             Duration::from_secs(2),
         )?;
         Ok(Self {
+            proxy_health_events_coalesced: Arc::new(AtomicU64::new(0)),
+            cel_body_bytes: Arc::new(Semaphore::new(super::cel_body::POOL_UNITS)),
+            tls_event_bytes:Arc::new(Semaphore::new(super::tls_events::POOL_UNITS)),
+            cel_dynamic: super::cel_matcher::DynamicCache::new(),
+            cel_compile: BlockingBudget::new(cpu.clamp(1, 4), 64, Duration::from_secs(2))?,
+            templates: super::templates::Budget::new(cpu.clamp(1,8))?,
             request_body_bytes: Arc::new(Semaphore::new(super::request_body::REPLACEMENT_UNITS)),
+            client_cert_bytes: Arc::new(Semaphore::new(super::client_cert_facts::POOL_UNITS)),
             auth,
             metadata,
             streams,
@@ -352,6 +380,31 @@ impl Resources {
             )?,
             proxy_hosts: Arc::new(super::proxy_policy::HostRegistry::default()),
             proxy_selection,
+            proxy_flush: Arc::new(Semaphore::new(1024)),
+            proxy_health: Arc::new(Semaphore::new(cpu.saturating_mul(4).clamp(4, 64))),
+            proxy_health_schedulers: Arc::new(Semaphore::new(
+                2 * super::proxy_health::MAX_SCHEDULERS,
+            )),
+            proxy_cleanup: super::proxy_cleanup::Coordinator::new()?,
+            proxy_dns: super::proxy_dynamic::DnsShared::new(
+                TaskTracker::new(),
+                tokio_util::sync::CancellationToken::new(),
+                Arc::new(Semaphore::new(128)),
+                Arc::new(AtomicU64::new(0)),
+                super::proxy_dynamic::DnsLimits {
+                    lookup_concurrency: cpu.clamp(2, 32),
+                    max_queued: 256,
+                },
+                Arc::new(|input| {
+                    crate::http_config::helpers::replace(
+                        input,
+                        false,
+                        crate::http_config::helpers::global_lookup,
+                    )
+                }),
+                fastcgi_dns.clone(),
+                None,
+            )?,
             request_regexp,
             directory_listing,
             directory_listing_bytes: Arc::new(Semaphore::new(
@@ -367,6 +420,9 @@ impl Resources {
         })
     }
     pub(crate) fn close(&self) {
+        self.cel_compile.tasks.close();
+        self.proxy_cleanup.close();
+        self.proxy_dns.close();
         self.auth_tasks.close();
         self.auth.tasks.close();
         self.metadata.tasks.close();
@@ -374,6 +430,7 @@ impl Resources {
         self.reads.tasks.close();
         self.fastcgi.tasks.close();
         self.compression.close();
+        self.templates.close();
         self.proxy_selection.tasks.close();
         self.request_regexp.tasks.close();
         self.directory_listing.tasks.close();
@@ -382,6 +439,14 @@ impl Resources {
         self.fastcgi_admission.diagnostics.close();
     }
     pub(crate) async fn wait(&self) {
+        self.cel_compile.tasks.wait().await;
+        self.proxy_cleanup.wait().await;
+        self.proxy_dns.shutdown().await;
+        let hosts = self.proxy_hosts.clone();
+        let _ = self
+            .proxy_selection
+            .run(move || hosts.clear_dynamic())
+            .await;
         // Parents complete before children: a cache leader may still submit a
         // bcrypt worker after graceful stop, and existing file bodies may read.
         self.auth_tasks.wait().await;
@@ -391,6 +456,7 @@ impl Resources {
         self.reads.tasks.wait().await;
         self.fastcgi.tasks.wait().await;
         self.compression.wait().await;
+        self.templates.wait().await;
         self.proxy_selection.tasks.wait().await;
         self.request_regexp.tasks.wait().await;
         self.directory_listing.tasks.wait().await;
@@ -401,7 +467,15 @@ impl Resources {
     pub(crate) fn snapshot(&self) -> ResourceDiagnostics {
         let (access_capture_rejected, access_capture_reduced, access_response_headers_omitted) =
             self.access_capture.stats();
+        let (cel_dynamic_entries, cel_dynamic_bytes) = self.cel_dynamic.snapshot();
         ResourceDiagnostics {
+            proxy_health_events_coalesced: self.proxy_health_events_coalesced.load(Ordering::Relaxed),
+            cel_body_capture_bytes: (super::cel_body::POOL_UNITS - self.cel_body_bytes.available_permits()) * super::cel_body::UNIT,
+            client_certificate_metadata_bytes: (super::client_cert_facts::POOL_UNITS-self.client_cert_bytes.available_permits())*1024,
+            tls_event_metadata_bytes:(super::tls_events::POOL_UNITS-self.tls_event_bytes.available_permits())*1024,
+            cel_dynamic_entries,
+            cel_dynamic_bytes,
+            cel_compile: self.cel_compile.snapshot(),
             access_capture_rejected,
             access_capture_reduced,
             access_response_headers_omitted,
@@ -417,6 +491,8 @@ impl Resources {
             file_reads: self.reads.snapshot(),
             compression: self.compression.snapshot(),
             proxy_selection: self.proxy_selection.snapshot(),
+            proxy_passive_dropped: self.proxy_hosts.dropped_failures(),
+            proxy_dns_background_rejected: self.proxy_dns.rejected_background_spawns(),
             request_regexp: self.request_regexp.snapshot(),
             directory_listing: self.directory_listing.snapshot(),
         }

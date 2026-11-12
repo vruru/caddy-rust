@@ -86,6 +86,10 @@ pub(super) struct Inner {
     pub adapt_egress: super::byte_budget::Pool,
     pub adapted_configs: super::byte_budget::Pool,
     config_egress: super::byte_budget::Pool,
+    pki_snapshots: super::byte_budget::Pool,
+    pki_egress: super::byte_budget::Pool,
+    upstream_snapshots: super::byte_budget::Pool,
+    upstream_egress: super::byte_budget::Pool,
     pub bulk_cpu: Arc<tokio::sync::Semaphore>,
     pub cpu: Arc<tokio::sync::Semaphore>,
     pub cancel: tokio_util::sync::CancellationToken,
@@ -242,6 +246,10 @@ impl AdminController {
             adapt_egress,
             adapted_configs,
             config_egress,
+            pki_snapshots: super::byte_budget::Pool::new(64<<20,"admin_pki_snapshot_capacity_exceeded"),
+            pki_egress: super::byte_budget::Pool::new(64<<20,"admin_pki_egress_capacity_exceeded"),
+            upstream_snapshots: super::byte_budget::Pool::new(64<<20,"admin_upstream_snapshot_capacity_exceeded"),
+            upstream_egress: super::byte_budget::Pool::new(64<<20,"admin_upstream_egress_capacity_exceeded"),
             bulk_cpu: Arc::new(tokio::sync::Semaphore::new(cpu_count)),
             cpu: Arc::new(tokio::sync::Semaphore::new(cpu_count)),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -491,6 +499,48 @@ impl AdminController {
         self.inner
             .enqueue(Work::Stop(Authorization { grant, local }))
             .await
+    }
+    pub(super) async fn upstreams_authorized(
+        &self,grant:Option<super::remote::Grant>,local:Option<super::local_access::LocalAdmission>,
+    )->Result<Bytes,AdminError>{
+        let inner=self.inner.clone();inner.check_readable()?;
+        if let Some(local)=&local{local.check()?;}
+        if let Some(grant)=&grant{inner.state.load().authorize(grant,None)?;}
+        let credit=inner.upstream_snapshots.reserve(16<<20)?;
+        let rows=inner.backend.upstream_statuses().await?;
+        let owner=inner.clone();
+        inner.offload(move||{
+            let _credit=credit;owner.check_readable()?;
+            let response=super::upstreams::encode(&rows,&owner.upstream_egress)?;
+            owner.check_readable()?;
+            if let Some(local)=&local{local.check()?;}
+            if let Some(grant)=&grant{owner.state.load().authorize(grant,None)?;}
+            Ok(response)
+        }).await
+    }
+    pub(super) async fn pki_authorized(
+        &self,id:String,pem:bool,grant:Option<super::remote::Grant>,local:Option<super::local_access::LocalAdmission>,
+    )->Result<Bytes,AdminError>{
+        let inner=self.inner.clone();
+        inner.check_readable()?;
+        if let Some(local)=&local{local.check()?;}
+        if let Some(grant)=&grant{inner.state.load().authorize(grant,None)?;}
+        // Admit the bounded public snapshot and encoding work before asking
+        // the CA manager to materialize any certificate data. This lease is
+        // released after encoding; only actual response capacity stays held.
+        let snapshot_credit=inner.pki_snapshots.reserve(8<<20)?;
+        let info=inner.backend.pki_info(id).await?;
+        let owner=inner.clone();
+        let response=inner.offload(move||{
+            let _snapshot_credit=snapshot_credit;
+            owner.check_readable()?;
+            let response=super::pki::encode(&info,pem,&owner.pki_egress)?;
+            owner.check_readable()?;
+            if let Some(local)=&local{local.check()?;}
+            if let Some(grant)=&grant{owner.state.load().authorize(grant,None)?;}
+            Ok(response)
+        }).await?;
+        Ok(response)
     }
     pub(super) async fn read_authorized(
         &self,

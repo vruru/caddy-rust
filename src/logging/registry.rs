@@ -224,6 +224,13 @@ impl Logging {
         let scope = self.current().ok_or(AdmissionError::Closed)?;
         dispatch::emit(scope, event, std::panic::Location::caller())
     }
+    /// Match the same module and logger routing as emit, before sampling or
+    /// queue admission. This is the equivalent of zap.Core.Enabled.
+    pub fn module_enabled(&self,module:&str,logger:&str,level:Level)->bool {
+        self.current().is_some_and(|scope|scope.logs.iter().any(|destination|
+            level>=destination.level && destination.routing.as_ref().is_some_and(|route|
+                route.allows(module,true)&&route.allows(logger,false))))
+    }
     /// Stop admitting a generation immediately, without closing writers
     /// shared by the next generation. Already accepted jobs own their scope.
     pub fn retire(&self) {

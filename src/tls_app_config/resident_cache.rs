@@ -7,20 +7,58 @@ use anyhow::{Result, ensure};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone)]
+pub(super) struct Receipt {
+    pub chain: [u8; 32],
+    pub id: u64,
+    pub slot: Arc<CertificateResidency>,
+    pub revision: Arc<CertificateResidency>,
+}
+impl Receipt {
+    pub(super) fn is(&self, entry: &CacheEntry) -> bool {
+        self.chain == entry.material.identity
+            && self.id == entry.id
+            && Arc::ptr_eq(&self.slot, &entry.slot)
+            && Arc::ptr_eq(&self.revision, &entry.revision)
+    }
+}
+
+#[derive(Copy, Clone)]
+pub(super) enum Effect {
+    Fresh,
+    Same,
+    Renewed,
+    Merged { retired: u64 },
+}
+
 pub(super) struct CacheEntry {
     pub(super) id: u64,
     pub(super) material: Arc<Material>,
     pub(super) issuer: String,
+    pub(super) origin: String,
     pub(super) renew_at: i64,
     pub(super) ari_after: i64,
     pub(super) slot: Arc<CertificateResidency>,
+    pub(super) revision: Arc<CertificateResidency>,
     pub(super) import_gate: tokio::sync::Mutex<()>,
     birth_epoch: u64,
+}
+
+impl CacheEntry {
+    pub(super) fn receipt(&self) -> Receipt {
+        Receipt {
+            chain: self.material.identity,
+            id: self.id,
+            slot: self.slot.clone(),
+            revision: self.revision.clone(),
+        }
+    }
 }
 
 pub(super) struct Revision {
     pub(super) material: Arc<Material>,
     pub(super) issuer: String,
+    pub(super) origin: String,
     pub(super) renew_at: i64,
     pub(super) ari_after: i64,
 }
@@ -28,9 +66,20 @@ pub(super) struct Revision {
 pub(super) struct Publication {
     pub(super) entry: Arc<CacheEntry>,
     epoch: Arc<Epoch>,
-    expected: Option<Arc<CacheEntry>>,
+    expected_old: Option<Arc<CacheEntry>>,
+    expected_target: Option<Arc<CacheEntry>>,
     capacity: usize,
-    fresh: bool,
+    effect: Effect,
+}
+
+impl Publication {
+    pub(super) fn receipt(&self) -> Receipt {
+        self.entry.receipt()
+    }
+
+    pub(super) fn effect(&self) -> Effect {
+        self.effect
+    }
 }
 
 #[derive(Debug)]
@@ -47,6 +96,7 @@ const BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 fn bytes(entry: &CacheEntry) -> usize {
     // Each admitted leaf/key pair is bounded before resolver publication.
     entry.material.certificate.len() + entry.material.key.len()
+        + entry.material.retained_san_bytes()
 }
 
 pub(super) struct Epoch {
@@ -59,7 +109,8 @@ pub(super) struct Epoch {
 
 struct State {
     active: Arc<Epoch>,
-    entries: HashMap<Vec<String>, Arc<CacheEntry>>,
+    entries: HashMap<[u8; 32], Arc<CacheEntry>>,
+    order: Vec<[u8; 32]>,
     bytes: usize,
     next_id: u64,
     next_epoch: u64,
@@ -71,7 +122,7 @@ pub(super) struct ResidentCache {
 }
 
 fn is_eligible(epoch: &Epoch, entry: &CacheEntry) -> bool {
-    if !epoch.enabled || !entry.slot.live() {
+    if !epoch.enabled || !entry.slot.live() || !entry.revision.live() {
         return false;
     }
     if epoch.blocked.contains(&entry.id) {
@@ -101,6 +152,7 @@ impl ResidentCache {
             state: Mutex::new(State {
                 active,
                 entries: HashMap::new(),
+                order: Vec::new(),
                 bytes: 0,
                 next_id: 0,
                 next_epoch: 1,
@@ -111,6 +163,7 @@ impl ResidentCache {
     pub(super) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<u64> {
         self.events.subscribe()
     }
+
     pub(super) fn prepare(
         &self,
         registered: HashMap<String, String>,
@@ -122,7 +175,13 @@ impl ResidentCache {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("resident cache state unavailable"))?;
             let old = st.active.clone();
-            let entries: Vec<Arc<CacheEntry>> = st.entries.values().cloned().collect();
+            // Preserve global insertion order to keep candidate ordering stable
+            // across generation boundaries (mirroring Go's slice index order).
+            let entries: Vec<Arc<CacheEntry>> = st
+                .order
+                .iter()
+                .filter_map(|key| st.entries.get(key).cloned())
+                .collect();
             let eid = st.next_epoch;
             st.next_epoch = st
                 .next_epoch
@@ -168,68 +227,75 @@ impl ResidentCache {
         std::mem::replace(&mut st.active, epoch)
     }
 
+    pub(super) fn is_active(&self, epoch: &Arc<Epoch>) -> Result<bool> {
+        let state = self.state.lock()
+            .map_err(|_| anyhow::anyhow!("resident cache state unavailable"))?;
+        Ok(Arc::ptr_eq(&state.active, epoch))
+    }
+
     pub(super) fn plan(
         &self,
         epoch: &Arc<Epoch>,
         revision: Revision,
         capacity: usize,
-        previous: Option<&Arc<CertificateResidency>>,
+        previous: Option<&Receipt>,
     ) -> Result<Option<Publication>> {
-        let mut st = self
-            .state
-            .lock()
+        let mut st = self.state.lock()
             .map_err(|_| anyhow::anyhow!("resident cache state unavailable"))?;
         if !Arc::ptr_eq(&st.active, epoch) || !epoch.enabled {
             return Ok(None);
         }
         ensure!(capacity > 0, "invalid managed cache capacity");
-        let expected = st.entries.get(&revision.material.names).cloned();
-        let eligible = expected.as_ref().filter(|entry| is_eligible(epoch, entry));
-        if let Some(previous) = previous
-            && !eligible.is_some_and(|entry| Arc::ptr_eq(previous, &entry.slot))
-        {
-            return Err(CacheChanged.into());
-        }
-        let (id, birth_epoch, slot, fresh) = match eligible {
-            Some(entry) => (entry.id, entry.birth_epoch, entry.slot.clone(), false),
-            None => {
-                let id = st.next_id;
-                st.next_id = id
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("certificate cache slot IDs exhausted"))?;
-                (
-                    id,
-                    epoch.id,
-                    Arc::new(CertificateResidency::default()),
-                    true,
-                )
-            }
+        let chain = revision.material.identity;
+        let target = st.entries.get(&chain).cloned();
+        let old = if let Some(previous) = previous {
+            let old = st.entries.get(&previous.chain).filter(|entry| {
+                previous.is(entry)
+                    && is_eligible(epoch, entry)
+            }).ok_or(CacheChanged)?;
+            Some(old.clone())
+        } else {
+            None
         };
-        let entry = Arc::new(CacheEntry {
-            id,
-            birth_epoch,
-            slot,
-            import_gate: tokio::sync::Mutex::new(()),
-            material: revision.material,
-            issuer: revision.issuer,
-            renew_at: revision.renew_at,
-            ari_after: revision.ari_after,
-        });
-        ensure!(
-            bytes(&entry) <= BYTE_CAPACITY,
-            "resident certificate byte capacity exceeded"
-        );
+        let usable_target = target.as_ref().filter(|entry| is_eligible(epoch, entry));
+        let reused = match (&old, usable_target) {
+            (None, Some(target)) => Some((Effect::Same, target.clone())),
+            (Some(old), Some(target)) if old.material.identity != chain => {
+                Some((Effect::Merged { retired: old.id }, target.clone()))
+            }
+            _ => None,
+        };
+        let (effect, entry) = if let Some(reused) = reused {
+            reused
+        } else {
+            let (effect, id, birth_epoch, slot, revision_slot) = if let Some(old) = &old {
+                (Effect::Renewed, old.id, old.birth_epoch, old.slot.clone(), Arc::new(old.slot.projection()))
+            } else {
+                let id = st.next_id;
+                st.next_id = id.checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("certificate cache slot IDs exhausted"))?;
+                let slot = Arc::new(CertificateResidency::default());
+                (Effect::Fresh, id, epoch.id, slot.clone(), Arc::new(slot.projection()))
+            };
+            let entry = Arc::new(CacheEntry {
+                id, birth_epoch, slot, revision: revision_slot,
+                import_gate: tokio::sync::Mutex::new(()),
+                material: revision.material,
+                issuer: revision.issuer,
+                origin: revision.origin,
+                renew_at: revision.renew_at,
+                ari_after: revision.ari_after,
+            });
+            (effect, entry)
+        };
+        ensure!(bytes(&entry) <= BYTE_CAPACITY, "resident certificate byte capacity exceeded");
         Ok(Some(Publication {
-            entry,
-            epoch: epoch.clone(),
-            expected,
-            capacity,
-            fresh,
+            entry, epoch: epoch.clone(), expected_old: old,
+            expected_target: target, capacity, effect,
         }))
     }
 
-    /// Runs only after the resolver has validated its candidate snapshot.
-    /// No I/O or acquisition of a resolver lock is permitted here.
+    /// Runs only after resolver validation; the hook performs no I/O or await.
     pub(super) fn commit(&self, plan: Publication) -> Result<()> {
         self.commit_replacing(plan, None)
     }
@@ -239,83 +305,111 @@ impl ResidentCache {
         plan: Publication,
         victim: Option<(&[String], &Arc<CertificateResidency>)>,
     ) -> Result<()> {
-        let mut st = self
-            .state
-            .lock()
+        let mut st = self.state.lock()
             .map_err(|_| anyhow::anyhow!("resident cache state unavailable"))?;
-        let key = &plan.entry.material.names;
-        let matches = match (&plan.expected, st.entries.get(key)) {
+        if !Arc::ptr_eq(&st.active, &plan.epoch)
+            || !plan.entry.slot.live()
+            || !plan.entry.revision.live()
+        {
+            return Err(CacheChanged.into());
+        }
+        if let Some(old) = &plan.expected_old {
+            ensure!(st.entries.get(&old.material.identity)
+                .is_some_and(|actual| Arc::ptr_eq(actual, old)), CacheChanged);
+        }
+        let target_matches = match (
+            &plan.expected_target, st.entries.get(&plan.entry.material.identity)
+        ) {
             (Some(expected), Some(actual)) => Arc::ptr_eq(expected, actual),
             (None, None) => true,
             _ => false,
         };
-        if !matches || !Arc::ptr_eq(&st.active, &plan.epoch) || !plan.entry.slot.live() {
-            return Err(CacheChanged.into());
-        }
-        let mut count = st.entries.len() + usize::from(plan.expected.is_none());
-        let mut size = st
-            .bytes
-            .checked_sub(plan.expected.as_deref().map_or(0, bytes))
-            .and_then(|size| size.checked_add(bytes(&plan.entry)))
-            .ok_or_else(|| anyhow::anyhow!("resident cache accounting failed"))?;
-        let mut victims = Vec::new();
-        if let Some((names, source)) = victim
-            && names != key
-            && let Some(entry) = st.entries.get(names)
-            && Arc::ptr_eq(&entry.slot, source)
+        ensure!(target_matches, CacheChanged);
+        let mut removed: Vec<Arc<CacheEntry>> = Vec::new();
+        if !matches!(plan.effect, Effect::Same)
+            && let Some(old) = &plan.expected_old
         {
-            count -= 1;
-            size = size
-                .checked_sub(bytes(entry))
-                .ok_or_else(|| anyhow::anyhow!("resident cache accounting failed"))?;
-            victims.push(entry.clone());
+            removed.push(old.clone());
         }
-        if count > plan.capacity || size > BYTE_CAPACITY {
-            let (mut ineligible, mut eligible): (Vec<_>, Vec<_>) = st
-                .entries
-                .iter()
-                .filter(|(names, entry)| {
-                    *names != key
-                        && victims
-                            .first()
-                            .is_none_or(|victim| !Arc::ptr_eq(victim, entry))
-                })
-                .map(|(_, entry)| entry)
-                .partition(|entry| !is_eligible(&plan.epoch, entry));
-            while count > plan.capacity || size > BYTE_CAPACITY {
-                let victim = if let Some(ineligible) = ineligible.pop() {
-                    ineligible
-                } else {
-                    ensure!(
-                        plan.fresh,
-                        "resident certificate byte or count capacity exceeded on renewal"
-                    );
-                    let index = random_index(eligible.len())?;
-                    eligible.swap_remove(index)
-                };
-                count -= 1;
-                size = size
-                    .checked_sub(bytes(victim))
-                    .ok_or_else(|| anyhow::anyhow!("resident cache accounting failed"))?;
-                victims.push(victim.clone());
+        if let Some(target) = &plan.expected_target
+            && !Arc::ptr_eq(target, &plan.entry)
+            && !removed.iter().any(|entry| Arc::ptr_eq(entry, target))
+        {
+            removed.push(target.clone());
+        }
+        let protected = |entry: &Arc<CacheEntry>| {
+            entry.material.identity == plan.entry.material.identity
+                || plan.expected_old.as_ref().is_some_and(|old| Arc::ptr_eq(old, entry))
+                || plan.expected_target.as_ref().is_some_and(|old| Arc::ptr_eq(old, entry))
+        };
+        if let Some((_, source)) = victim
+            && let Some(victim) = st.entries.values().find(|entry| {
+                Arc::ptr_eq(&entry.slot, source) && !protected(entry)
+                    && !removed.iter().any(|old| Arc::ptr_eq(old, entry))
+            })
+        {
+            removed.push(victim.clone());
+        }
+        let add_new = usize::from(matches!(plan.effect, Effect::Fresh | Effect::Renewed));
+        let mut count = st.entries.len().checked_sub(removed.len())
+            .and_then(|count| count.checked_add(add_new))
+            .ok_or_else(|| anyhow::anyhow!("resident certificate count accounting failed"))?;
+        let mut size = st.bytes;
+        for entry in &removed {
+            size = size.checked_sub(bytes(entry))
+                .ok_or_else(|| anyhow::anyhow!("resident certificate byte accounting failed"))?;
+        }
+        if add_new > 0 {
+            size = size.checked_add(bytes(&plan.entry))
+                .ok_or_else(|| anyhow::anyhow!("resident certificate byte accounting failed"))?;
+        }
+        let (mut ineligible, mut eligible): (Vec<_>, Vec<_>) = st.entries.values()
+            .filter(|entry| !protected(entry)
+                && !removed.iter().any(|old| Arc::ptr_eq(old, entry)))
+            .cloned().partition(|entry| !is_eligible(&plan.epoch, entry));
+        while count > plan.capacity || size > BYTE_CAPACITY {
+            let victim = if let Some(victim) = ineligible.pop() {
+                victim
+            } else {
+                let index = random_index(eligible.len())?;
+                eligible.swap_remove(index)
+            };
+            count = count.checked_sub(1)
+                .ok_or_else(|| anyhow::anyhow!("resident certificate count accounting failed"))?;
+            size = size.checked_sub(bytes(&victim))
+                .ok_or_else(|| anyhow::anyhow!("resident certificate byte accounting failed"))?;
+            removed.push(victim);
+        }
+        // No fallible work follows. A normal renewal keeps the source slot alive.
+        let mut retired = Vec::new();
+        for entry in removed {
+            st.entries.remove(&entry.material.identity);
+            st.order.retain(|chain| *chain != entry.material.identity);
+
+            // Check if slots are the same physical residency (S)
+            let same_slot = Arc::ptr_eq(&entry.slot, &plan.entry.slot);
+
+            if !Arc::ptr_eq(&entry.revision, &plan.entry.revision) {
+                entry.revision.retire();
+                retired.push(entry.id);
+            }
+
+            // Retire the slot (S) ONLY if it is NOT the new entry's slot (S)
+            // If they are the same slot, we preserved S for the new entry (plan.entry.slot).
+            // If they are different, we must retire the old S.
+            if !same_slot {
+                entry.slot.retire();
             }
         }
-        // All fallible planning is complete. Retire victims before they can
-        // be selected by any generation that still has their resolver keys.
-        if let Some(expected) = plan.expected
-            && !Arc::ptr_eq(&expected.slot, &plan.entry.slot)
-        {
-            victims.push(expected);
+        if add_new > 0 {
+            let chain = plan.entry.material.identity;
+            st.entries.insert(chain, plan.entry);
+            st.order.push(chain);
         }
-        for victim in &victims {
-            victim.slot.retire();
-            st.entries.remove(&victim.material.names);
-        }
-        st.entries.insert(key.clone(), plan.entry);
         st.bytes = size;
         drop(st);
-        for victim in victims {
-            let _ = self.events.send(victim.id);
+        for id in retired {
+            let _ = self.events.send(id);
         }
         Ok(())
     }
@@ -340,7 +434,7 @@ impl ResidentCache {
             || !is_eligible(epoch, entry)
             || !st
                 .entries
-                .get(&entry.material.names)
+                .get(&entry.material.identity)
                 .is_some_and(|actual| Arc::ptr_eq(actual, entry))
         {
             return Err(CacheChanged.into());
@@ -385,13 +479,16 @@ impl ResidentCache {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("resident cache state unavailable"))?;
-        let mut result = Vec::new();
         if epoch.id < st.active.id {
-            return Ok(result);
+            return Ok(vec![]);
         }
-        for entry in st.entries.values() {
-            if is_eligible(epoch, entry) {
-                result.push(entry.clone());
+        // Return in global insertion order
+        let mut result = Vec::with_capacity(st.entries.len());
+        for key in &st.order {
+            if let Some(entry) = st.entries.get(key) {
+                if is_eligible(epoch, entry) {
+                    result.push(entry.clone());
+                }
             }
         }
         Ok(result)
@@ -406,19 +503,23 @@ impl ResidentCache {
             && is_eligible(epoch, entry)
             && st
                 .entries
-                .get(&entry.material.names)
+                .get(&entry.material.identity)
                 .is_some_and(|actual| Arc::ptr_eq(actual, entry)))
     }
 
     pub(super) fn find(&self, epoch: &Arc<Epoch>, query: &str) -> Result<Option<Arc<CacheEntry>>> {
         let entries = self.snapshot(epoch)?;
+        // Exact match on names
         if let Some(entry) = entries
             .iter()
             .find(|entry| entry.material.names.iter().any(|name| name == query))
         {
             return Ok(Some(entry.clone()));
         }
-        if let Some((_, suffix)) = query.split_once('.') {
+        // Single-label wildcard (not IP)
+        if query.parse::<std::net::IpAddr>().is_err()
+            && let Some((_, suffix)) = query.split_once('.')
+        {
             let wildcard = format!("*.{suffix}");
             return Ok(entries
                 .into_iter()
@@ -436,19 +537,25 @@ impl ResidentCache {
         if !Arc::ptr_eq(&st.active, epoch) {
             return Ok(false);
         }
-        let names = &entry.material.names;
+        let identity = &entry.material.identity;
         if st
             .entries
-            .get(names)
+            .get(identity)
             .is_some_and(|actual| Arc::ptr_eq(actual, entry))
         {
             let remaining = st
                 .bytes
                 .checked_sub(bytes(entry))
                 .ok_or_else(|| anyhow::anyhow!("resident cache accounting failed"))?;
+
+            entry.revision.retire();
             entry.slot.retire();
+
             st.bytes = remaining;
-            st.entries.remove(names);
+            st.entries.remove(identity);
+            if let Some(pos) = st.order.iter().position(|k| *k == *identity) {
+                st.order.remove(pos);
+            }
             drop(st);
             let _ = self.events.send(entry.id);
             return Ok(true);
@@ -465,19 +572,28 @@ impl ResidentCache {
             return Ok(());
         }
         let mut victims = Vec::new();
-        st.entries.retain(|_, entry| {
-            let keep = is_eligible(epoch, entry);
-            if !keep {
-                entry.slot.retire();
-                victims.push(entry.clone());
+        let mut new_entries = HashMap::new();
+        let mut new_order = Vec::new();
+        let mut new_bytes = 0usize;
+
+        for key in st.order.iter() {
+            if let Some(entry) = st.entries.get(key) {
+                if is_eligible(epoch, entry) {
+                    new_entries.insert(*key, entry.clone());
+                    new_order.push(*key);
+                    new_bytes += bytes(entry);
+                } else {
+                    entry.revision.retire();
+                    entry.slot.retire();
+                    victims.push(entry.clone());
+                }
             }
-            keep
-        });
-        st.bytes = st
-            .entries
-            .values()
-            .map(|entry| entry.material.certificate.len() + entry.material.key.len())
-            .sum();
+        }
+
+        st.entries = new_entries;
+        st.order = new_order;
+        st.bytes = new_bytes;
+
         drop(st);
         for victim in victims {
             let _ = self.events.send(victim.id);
@@ -493,21 +609,42 @@ fn remove_projection_source(
     let Some((names, source)) = victim else {
         return Ok(None);
     };
-    let Some(entry) = state
-        .entries
-        .get(names)
-        .filter(|entry| Arc::ptr_eq(&entry.slot, source))
-    else {
+
+    // Find entry by identity where slot matches
+    let mut found_id: Option<u64> = None;
+    let mut found_key: Option<[u8; 32]> = None;
+
+    for (key, entry) in state.entries.iter() {
+        // Check names match the victim names (exact set comparison)
+        // Source is compared against the Physical Slot (S)
+        if entry.material.names == *names && Arc::ptr_eq(&entry.slot, source) {
+            found_id = Some(entry.id);
+            found_key = Some(*key);
+            break;
+        }
+    }
+
+    let Some(id) = found_id else {
         return Ok(None);
     };
+    let Some(key) = found_key else {
+        return Ok(None);
+    };
+
+    let entry = state.entries.get(&key).unwrap(); // Safe: just found it
     let remaining = state
         .bytes
         .checked_sub(bytes(entry))
         .ok_or_else(|| anyhow::anyhow!("resident cache accounting failed"))?;
-    let id = entry.id;
+
+    entry.revision.retire();
     entry.slot.retire();
     state.bytes = remaining;
-    state.entries.remove(names);
+    state.entries.remove(&key);
+    if let Some(pos) = state.order.iter().position(|k| *k == key) {
+        state.order.remove(pos);
+    }
+
     Ok(Some(id))
 }
 

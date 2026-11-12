@@ -11,9 +11,26 @@ license = "Apache-2.0"
 native-run = []
 
 [dependencies]
+opentelemetry = { version = "=0.33.1", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "=0.33.1", default-features = false, features = ["metrics", "experimental_metrics_custom_reader", "experimental_metrics_bound_instruments"] }
+opentelemetry-otlp = { version = "=0.33.1", default-features = false, features = ["metrics", "http-proto", "grpc-tonic", "gzip-http", "gzip-tonic", "tls-provider-agnostic", "tls-roots"] }
+opentelemetry-http = { version = "=0.33.1", default-features = false }
+async-trait = "=0.1.92"
+prometheus = { version = "=0.14.0", default-features = false, features = ["protobuf"] }
+argon2 = {path="vendor/argon2-0.5.3",version="=0.5.3",default-features=false,features=["zeroize","go-compat"]}
+memchr = "=2.8.3"
+chrono-tz = "=0.10.4"
+getrandom = "=0.3.4"
+heck = "=0.5.0"
+toml = "=1.1.2"
+unsafe-libyaml = {path="vendor/unsafe-libyaml-0.2.11",features=["allocation-scope"]}
+data-encoding = "=2.11.1"
+bigdecimal = "=0.4.11"
+gotmpl = {version="=0.6.1",path="vendor/gotmpl-0.6.1",default-features=false,features=["std"]}
+cel = {path="vendor/cel",default-features=false,features=["chrono","parser_pratt"]}
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["float_roundtrip", "unbounded_depth"] }
+serde_json = { version = "1", features = ["float_roundtrip", "unbounded_depth", "raw_value"] }
 sha2 = { version = "0.10", features = ["oid"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "aws_lc_rs", "std", "tls12"] }
 rustls-pemfile = "2"
@@ -52,6 +69,7 @@ percent-encoding = "2"
 mime_guess = "2"
 socket2 = { version = "0.6", features = ["all"] }
 httpdate = "1"
+futures-io = "0.3"
 futures-util = "0.3"
 backtrace = "=0.3.76"
 flate2 = "=1.1.11"
@@ -68,13 +86,14 @@ libc = "0.2"
 hostname = "0.4"
 chrono = { version = "0.4", features = ["clock"] }
 
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "http2", "socks"] }
 webpki = { package = "rustls-webpki", version = "0.103", features = ["ring", "std", "aws-lc-rs"] }
 
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 p384 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
 hmac = "0.12"
+hickory-resolver = { path = "vendor/hickory-resolver-0.26.3", version = "=0.26.3", default-features = false, features = ["system-config", "tokio"] }
 
 aws-lc-rs="1.19.0"
 x509-ocsp={version="0.2.1",features=["std"]}
@@ -104,6 +123,7 @@ linux-raw-sys = { version = "0.12", default-features = false, features = ["std",
 
 [profile.release]
 debug = 1
+strip = "none"
 
 [profile.release.package."*"]
 debug = 0

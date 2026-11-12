@@ -1,12 +1,19 @@
 //! Generation-owned on-demand acquisition. Admission is separate from CA and
 //! CPU budgets, so queued handshakes cannot consume a permit needed by proofs.
 use super::*;
-use crate::http_runtime::ScopedCertificateProvider;
+use crate::http_runtime::{AcquiredCertificate, ScopedCertificateProvider};
 use crate::tls_resolver::{CertificatePublicationConflict, CertificateResidencyRetired};
 use futures_util::{FutureExt, future::BoxFuture};
 use std::sync::{RwLock, Weak, atomic::AtomicUsize};
 
-type Outcome = std::result::Result<(), Arc<str>>;
+type Outcome = std::result::Result<Option<AcquiredCertificate>, Arc<str>>;
+struct ActionOutcome {
+    maintain: bool,
+    acquired: Option<AcquiredCertificate>,
+}
+impl ActionOutcome {
+    fn cached() -> Self { Self { maintain: false, acquired: None } }
+}
 #[derive(Clone, Copy)]
 enum Action {
     Miss,
@@ -23,6 +30,8 @@ struct Resident {
     renew_at: i64,
     ari_after: i64,
     next_check: AtomicI64,
+    retry_after: AtomicI64,
+    origin: String,
 }
 #[derive(Clone, Copy)]
 enum PendingKind {
@@ -42,8 +51,14 @@ struct PendingRestore {
     kind: PendingKind,
 }
 struct Flight {
+    action: Action,
+    policy_index: Option<usize>,
+    force_lookup: bool,
+    quiet: CancellationToken,
     _admission: tokio::sync::OwnedSemaphorePermit,
     residency: Option<Arc<CertificateResidency>>,
+    target: Option<Arc<Resident>>,
+    selection: Option<crate::http_runtime::WarmSelection>,
     cancel: CancellationToken,
     result: Mutex<Option<Outcome>>,
     done: tokio::sync::Notify,
@@ -51,6 +66,7 @@ struct Flight {
     background: bool,
 }
 pub(super) struct OnDemand {
+    key_deny: Arc<crate::key_compromise::KeyDeny>,
     pub(super) active: AtomicBool,
     pending: Mutex<HashMap<[u8; 32], PendingRestore>>,
     pending_changed: tokio::sync::Notify,
@@ -65,8 +81,12 @@ pub(super) struct OnDemand {
     attach_changed: tokio::sync::Notify,
 }
 impl OnDemand {
-    pub(super) fn new(receiver: broadcast::Receiver<u64>) -> Self {
+    pub(super) fn external_waiter(&self)->Result<tokio::sync::OwnedSemaphorePermit> {
+        self.waiters.clone().try_acquire_owned().map_err(|_|anyhow!("external certificate waiter capacity exceeded"))
+    }
+    pub(super) fn new(receiver: broadcast::Receiver<u64>, key_deny: Arc<crate::key_compromise::KeyDeny>) -> Self {
         Self {
+            key_deny,
             active: AtomicBool::new(false),
             pending: Mutex::new(HashMap::new()),
             pending_changed: tokio::sync::Notify::new(),
@@ -94,12 +114,16 @@ impl OnDemand {
             entries.get(name).and_then(|residents| {
                 residents
                     .iter()
-                    .rev()
-                    .find(|resident| resident.binding.slot.live() && predicate(resident))
+                    .find(|resident| resident.binding.slot.live()
+                        && resident.material.key_allowed(&self.key_deny)
+                        && predicate(resident))
                     .cloned()
             })
         };
         select(name).or_else(|| {
+            if name.parse::<std::net::IpAddr>().is_ok() {
+                return None;
+            }
             name.split_once('.')
                 .and_then(|(_, rest)| select(&format!("*.{rest}")))
         })
@@ -152,9 +176,10 @@ impl OnDemand {
             })
         };
         valid(entries.get(name))
-            || name
-                .split_once('.')
-                .is_some_and(|(_, rest)| valid(entries.get(&format!("*.{rest}"))))
+            || (name.parse::<std::net::IpAddr>().is_err()
+                && name
+                    .split_once('.')
+                    .is_some_and(|(_, rest)| valid(entries.get(&format!("*.{rest}")))))
     }
     pub(super) fn references_group(&self, group: &Arc<Group>) -> bool {
         self.resident.read().is_ok_and(|entries| {
@@ -175,6 +200,11 @@ impl OnDemand {
             resident.material.names == names && resident.material.identity == identity
         })
         .map(|resident| resident.material.clone())
+    }
+    fn resident_receipt(&self, cached: &AcquiredCertificate) -> Option<Arc<Resident>> {
+        self.resident_if(cached.receipt.names().first()?, |resident|
+            resident.receipt.same_instance(&cached.receipt)
+                && Arc::ptr_eq(&resident.binding.slot, &cached.slot))
     }
     fn cached(&self, name: &str) -> bool {
         let Ok(at) = now() else { return false };
@@ -199,6 +229,7 @@ impl OnDemand {
     pub(super) fn imported_binding(
         &self,
         names: &[String],
+        identity: Option<[u8; 32]>,
     ) -> Option<(
         CertificateScope,
         ScopedCertificate,
@@ -208,6 +239,7 @@ impl OnDemand {
     )> {
         let resident = self.resident_if(names.first()?, |resident| {
             resident.material.names == names && resident.group.get().is_none()
+                && identity.is_none_or(|identity| resident.material.identity == identity)
         })?;
         Some((
             resident.scope.clone(),
@@ -243,6 +275,7 @@ impl OnDemand {
         scope: CertificateScope,
         receipt: ScopedCertificate,
         schedule: (i64, i64),
+        origin: String,
     ) {
         let resident = Arc::new(Resident {
             material: material.clone(),
@@ -255,6 +288,8 @@ impl OnDemand {
             renew_at: schedule.0,
             ari_after: schedule.1,
             next_check: AtomicI64::new(schedule.0.min(schedule.1)),
+            retry_after: AtomicI64::new(0),
+            origin,
         });
         self.index(&resident);
     }
@@ -280,6 +315,8 @@ impl OnDemand {
             renew_at: group.renew_at.load(Ordering::Acquire),
             ari_after: group.ari_after.load(Ordering::Acquire),
             next_check: AtomicI64::new(next_check),
+            retry_after: AtomicI64::new(0),
+            origin: group.origin.clone(),
         });
         self.index(&resident);
     }
@@ -296,24 +333,73 @@ struct Provider {
     state: Arc<OnDemand>,
 }
 impl ScopedCertificateProvider for Provider {
-    fn needs_quic_preflight(&self) -> bool {
-        self.service.upgrade().is_some_and(|service| {
-            service.plan.policies.iter().any(|policy| policy.on_demand)
+    fn ensure_request(
+        &self,
+        request: crate::http_runtime::CertificateRequest,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<Option<AcquiredCertificate>>> {
+        let service = self.service.upgrade();
+        Box::pin(async move {
+            service
+                .ok_or_else(|| anyhow!("certificate services stopped"))?
+                .on_demand_ensure_request(
+                    request.origin,
+                    request.subject,
+                    request.force_lookup,
+                    request.cached,
+                    request.selection,
+                    request.hello,
+                    cancel,
+                )
+                .await
         })
+    }
+
+    fn needs_quic_preflight(&self) -> bool {
+        self.service
+            .upgrade()
+            .is_some_and(|service| service.plan.policies.iter().any(|policy| policy.on_demand)
+                || service.implicit_tailscale.get().is_some_and(|names|!names.is_empty()))
     }
     fn can_acquire_quic_name(&self, name: &str) -> bool {
         self.service.upgrade().is_some_and(|service| {
-            service.policy_index(name).is_some_and(|index| service.plan.policies[index].on_demand)
+            service.policy(name).on_demand
         })
     }
     fn should_probe_before_fallback(&self, name: &str) -> bool {
         self.service.upgrade().is_none_or(|service| {
-            service.policy(name).on_demand
-                || self.state.almost_full(service.plan.cache_capacity)
+            service.policy(name).on_demand || self.state.almost_full(service.plan.cache_capacity)
         })
     }
     fn cached_name(&self, name: &str) -> bool {
         self.state.cached(name)
+    }
+    fn maintenance_due(&self, name: &str) -> bool {
+        let Some(service) = self.service.upgrade() else { return false; };
+        let Ok(at) = now() else { return false; };
+        if !self.state.active.load(Ordering::Acquire)
+            || service.context.cancel.is_cancelled()
+            || !service.policy(name).on_demand
+            || self.state.manual(name, at)
+        {
+            return false;
+        }
+        self.state.resident_if(name, |resident| resident.usable(at))
+            .is_some_and(|resident| {
+                service.current_maintenance_at(name, &resident).is_ok_and(|due| due <= at)
+                    || resident.leaf.needs_renewal()
+            })
+    }
+    fn maintenance_due_for(&self, request: &crate::http_runtime::CertificateRequest) -> bool {
+        let Some(cached) = &request.cached else { return self.maintenance_due(&request.subject); };
+        let Some(service) = self.service.upgrade() else { return false; };
+        let Ok(at) = now() else { return false; };
+        self.state.active.load(Ordering::Acquire)
+            && !service.context.cancel.is_cancelled()
+            && service.policy_for_origin(&request.origin).on_demand
+            && self.state.resident_receipt(cached).is_some_and(|resident|
+                resident.usable(at) && (service.current_maintenance_at(&request.origin, &resident)
+                    .is_ok_and(|due| due <= at) || resident.leaf.needs_renewal()))
     }
     fn ensure(&self, name: String, cancel: CancellationToken) -> BoxFuture<'static, Result<()>> {
         let service = self.service.upgrade();
@@ -354,16 +440,146 @@ impl Drop for Waiter {
 }
 
 impl CertificateServices {
+    fn current_maintenance_at(&self, origin: &str, resident: &Resident) -> Result<i64> {
+        let policy = self.policy_for_origin(origin);
+        let scheduled = resident.next_check.load(Ordering::Acquire);
+        if self.policy_index(origin) == self.policy_index(&resident.origin)
+            && !matches!(policy.issuers.as_slice(), [Issuer::Internal { .. }])
+        { return Ok(scheduled); }
+        let ordinary = self.current_renewal_time(&resident.material, &policy)?;
+        // Preserve an already selected ARI/refresh deadline across a policy
+        // change; current-policy lifetime checks can only make it earlier.
+        Ok(if resident.ari_after == i64::MAX { ordinary } else { ordinary.min(scheduled) })
+    }
+    /// One service-owned worker handles authenticated revocation facts for
+    /// all managed physical chains, including on-demand acquisitions. The
+    /// notification is only a hint; every wake and initial pass rescans state.
+    pub(super) async fn run_revoked_business(self: Arc<Self>) {
+        tokio::join!(self.clone().run_revoked_scan(), self.run_key_compromise_flush());
+    }
+    async fn run_revoked_scan(self: Arc<Self>) {
+        let mut key_changes = self.context.leaf_guard.key_deny().subscribe();
+        loop {
+            if self.context.cancel.is_cancelled() { break; }
+            let changed = self.context.resources.revoked.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.reconcile_revoked_business().await.is_err() {
+                let _ = self.events.send(CertificateEvent {
+                    kind: "revoked_certificate_maintenance_failed", names: Vec::new(),
+                });
+            }
+            tokio::select! { biased;
+                _ = self.context.cancel.cancelled() => break,
+                _ = &mut changed => {},
+                _ = key_changes.changed() => {},
+                _ = tokio::time::sleep(self.plan.renew_interval) => {},
+            }
+        }
+    }
+    async fn run_key_compromise_flush(self: Arc<Self>) {
+        let mut key_changes = self.context.leaf_guard.key_deny().subscribe();
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            if self.context.cancel.is_cancelled() { break; }
+            let delay = match self.context.leaf_guard.key_deny().flush(self.context.resources.cpu.clone(),
+                self.context.cancel.child_token()).await {
+                Ok(()) => { backoff = Duration::from_secs(1); self.plan.renew_interval },
+                Err(_) => {
+                    let _ = self.events.send(CertificateEvent {
+                        kind: "key_compromise_not_durable", names: Vec::new(),
+                    });
+                    let delay = backoff;
+                    backoff = backoff.saturating_mul(2).min(Duration::from_secs(30));
+                    delay
+                },
+            };
+            tokio::select! { biased;
+                _ = self.context.cancel.cancelled() => break,
+                _ = key_changes.changed() => {},
+                _ = tokio::time::sleep(delay) => {},
+            }
+        }
+    }
+
+    async fn reconcile_revoked_business(&self) -> Result<()> {
+        if !self.on_demand.active.load(Ordering::Acquire) { return Ok(()); }
+        let Some(epoch) = self.cache_epoch.get().cloned() else { return Ok(()); };
+        if !self.context.resources.resident_cache.is_active(&epoch)? { return Ok(()); }
+        let indexed = self.on_demand.clone();
+        let key_deny = self.context.leaf_guard.key_deny().clone();
+        let targets = crate::cert_cpu::run(self.context.resources.cpu.clone(),
+            self.context.cancel.clone(), move || {
+                let indexed = indexed.resident.read()
+                    .map_err(|_| anyhow!("certificate resident index unavailable"))?;
+                let mut seen = std::collections::HashSet::new();
+                let mut targets = Vec::new();
+                for resident in indexed.values().flatten() {
+                    if resident.binding.slot.live()
+                        && (resident.leaf.pending_revocation()?.is_some()
+                            || !resident.material.key_allowed(&key_deny))
+                        && seen.insert(resident.material.identity)
+                    { targets.push(resident.clone()); }
+                }
+                Ok(targets)
+            }).await?;
+        // Snapshot all physical targets before any failure withdraws their
+        // shared leaf. Distinct chains containing that leaf are still jobs.
+        let outcomes = stream::iter(targets).map(|resident| {
+            let epoch = epoch.clone();
+            async move {
+            if !self.context.resources.resident_cache.is_active(&epoch)?
+                || self.context.cancel.is_cancelled() || !self.on_demand.indexed(&resident)
+                || !self.context.resolver.receipt_current(&resident.receipt, &resident.binding.slot)?
+            { return Ok(()); }
+            let name0 = resident.material.management_name.to_string();
+            // CertMagic selects current management config using real Names[0].
+            // Existing managed worknames retain renewal authority even when
+            // another alias now matches a different policy; this is not a new
+            // Hello permission decision or authority to expand SAN scope.
+            let bound = self.state.lock().await.bound.clone().unwrap_or_default();
+            // Existing managed material supplies renewal authority. Unlike a
+            // new Hello acquisition, Go background forceRenew does not ask.
+            // Current Name0 policy selects issuer/storage; retained worknames
+            // are never expanded to unrelated names from the certificate.
+            let group = self.replacement_group(resident.material.names.clone(),
+                &bound, self.context.cancel.clone(), name0).await?;
+            self.ensure_group_target(group.clone(), false, Some(RenewalTarget {
+                material: resident.material.clone(), receipt: resident.receipt.clone(),
+                binding: resident.binding.clone(), leaf: resident.leaf.clone(), selection: None,
+            }), self.context.cancel.clone()).await?;
+            group.background.store(true, Ordering::Release);
+            self.maintenance_changed.notify_one();
+            let maintenance = self.ocsp_manager(&group).await;
+            // Retire the exact revoked projection even if status-handle
+            // preparation failed. Conversely, retirement failure cannot
+            // prevent the new publication's periodic maintenance rescan.
+            let retirement = if self.context.resolver.receipt_current(&resident.receipt, &resident.binding.slot)? {
+                self.evict_resident(resident, self.context.cancel.clone()).await
+            } else { Ok(()) };
+            maintenance?;
+            retirement?;
+            Ok::<_, anyhow::Error>(())
+            }
+        }).buffer_unordered(10).collect::<Vec<_>>().await;
+        for outcome in outcomes { outcome?; }
+        Ok(())
+    }
+
     pub(super) async fn publish_restored_resident(
         &self,
         retained: RetainedMaterial,
         cancel: CancellationToken,
     ) -> Result<()> {
+        // Rollback capability retains in-process material and the shared
+        // authenticated LeafGuard. This path must remain memory-only: status
+        // handles and raw-store restoration start after actual activation.
         let resolver = self.context.resolver.clone();
         let guard = self.context.leaf_guard.clone();
         let state = self.on_demand.clone();
         let publication_cancel = cancel.clone();
         let capacity = self.plan.cache_capacity;
+        let changed = self.maintenance_changed.clone();
         super::super::loaders::blocking(self.context.resources.cpu.clone(), cancel, move || {
             let material = retained.material;
             material.validate_at(now()?, false)?;
@@ -386,7 +602,7 @@ impl CertificateServices {
                 || {
                     if state
                         .capacity
-                        .admit(&material.names, &binding, capacity, |_| Ok(()))?
+                        .admit(&material.names, &binding, None, capacity, |_| Ok(()))?
                     {
                         state.cleanup_changed.notify_one();
                     }
@@ -400,7 +616,9 @@ impl CertificateServices {
                 scope,
                 receipt,
                 (retained.renew_at, retained.ari_after),
+                retained.origin,
             );
+            changed.notify_one();
             Ok(())
         })
         .await
@@ -453,16 +671,71 @@ impl CertificateServices {
             .map(|_| ())
     }
     async fn import_shared_name(&self, name: &str, cancel: CancellationToken) -> Result<bool> {
-        let Some(epoch) = self.cache_epoch.get().cloned() else {
-            return Ok(false);
-        };
-        let entry = self
-            .shared_entry(epoch.clone(), name, cancel.clone())
-            .await?;
-        if let Some(entry) = entry {
-            return self.import_shared_entry(epoch, entry, cancel).await;
+        let Some(epoch) = self.cache_epoch.get().cloned() else { return Ok(false); };
+        let mut prior = None;
+        for _ in 0..3 {
+            let Some(entry) = self.shared_entry(epoch.clone(), name, cancel.clone()).await? else {
+                return Ok(false);
+            };
+            if prior.as_ref().is_some_and(|old| Arc::ptr_eq(old, &entry)) { return Ok(false); }
+            if self.import_shared_entry(epoch.clone(), entry.clone(), cancel.clone()).await? {
+                return Ok(true);
+            }
+            prior = Some(entry);
         }
-        Ok(false)
+        Err(super::super::resident_cache::CacheChanged.into())
+    }
+
+    /// Repair an actual warm selection from the current shared revision before
+    /// permission or issuance. Filtering precedes any resolver/ledger mutation.
+    async fn import_shared_selected(&self, name: &str,
+        selection: &crate::http_runtime::WarmSelection,
+        cancel: CancellationToken) -> Result<Option<AcquiredCertificate>> {
+        let Some(epoch) = self.cache_epoch.get().cloned() else { return Ok(None); };
+        for _ in 0..3 {
+            let cache = self.context.resources.resident_cache.clone();
+            let lookup_epoch = epoch.clone();
+            let subject = name.to_owned();
+            let resolver = self.context.resolver.clone();
+            let selection = selection.clone();
+            let guard = self.context.leaf_guard.clone();
+            let entry = super::super::loaders::blocking(self.context.resources.cpu.clone(),
+                cancel.clone(), move || {
+                    let entries = cache.snapshot(&lookup_epoch)?;
+                    let wildcard = if subject.parse::<std::net::IpAddr>().is_err() {
+                        subject.split_once('.').map(|(_, suffix)| format!("*.{suffix}"))
+                    } else { None };
+                    for exact in [true, false] {
+                        for entry in &entries {
+                            let named = if exact { entry.material.names.contains(&subject) }
+                                else { wildcard.as_ref().is_some_and(|name|
+                                    entry.material.names.contains(name)) };
+                            if !named || guard.key_deny().check_spki_der(&entry.material.spki_der).is_err() {
+                                continue;
+                            }
+                            let input = CertificateInput { names: &entry.material.names,
+                                certificate_pem: &entry.material.certificate,
+                                private_key_pem: &entry.material.key };
+                            if resolver.candidate_allowed(&input, &entry.material.tags,
+                                selection.filter.as_deref(), &selection.schemes, selection.version)? {
+                                return Ok(Some(entry.clone()));
+                            }
+                        }
+                    }
+                    Ok(None)
+                }).await?;
+            let Some(entry) = entry else { return Ok(None); };
+            if !self.import_shared_entry(epoch.clone(), entry.clone(), cancel.clone()).await? {
+                continue;
+            }
+            if let Some(resident) = self.on_demand.resident_if(name, |resident|
+                resident.cache_entry.as_ref().is_some_and(|cached| Arc::ptr_eq(cached, &entry))
+                    && resident.usable(now().unwrap_or(i64::MAX))) {
+                return Ok(Some(AcquiredCertificate { subject: name.to_owned(),
+                    receipt: resident.receipt.clone(), slot: resident.binding.slot.clone(), external: None }));
+            }
+        }
+        Err(super::super::resident_cache::CacheChanged.into())
     }
     async fn shared_entry(
         &self,
@@ -486,7 +759,7 @@ impl CertificateServices {
         let gate_owner = entry.clone();
         let _import = tokio::select! {biased;
             _=cancel.cancelled()=>return Err(anyhow!("certificate cache import cancelled")),
-            _=gate_owner.slot.retired()=>return Ok(false),
+            _=gate_owner.revision.retired()=>return Ok(false),
             guard=gate_owner.import_gate.lock()=>guard,
         };
         if self
@@ -509,14 +782,25 @@ impl CertificateServices {
             }
             return Err(error);
         }
+        entry.material.register_key(self.context.leaf_guard.key_deny())?;
+        if let Err(error) = self.context.leaf_guard.key_deny().check_spki_der(&entry.material.spki_der) {
+            if !error.is::<crate::key_compromise::KeyCompromised>() { return Err(error); }
+            let cleanup = cache.clone(); let stale = entry.clone(); let view = epoch.clone();
+            super::super::loaders::blocking(self.context.resources.cpu.clone(), cancel.clone(),
+                move || { cleanup.remove(&view, &stale)?; Ok(()) }).await?;
+            return Ok(false);
+        }
+        self.prime_material_status(entry.material.clone(), false, cancel.clone()).await?;
         let material = entry.material.clone();
         let guard = self.context.leaf_guard.clone();
         let resolver = self.context.resolver.clone();
         let state = self.on_demand.clone();
         let retain = material.clone();
+        let origin = entry.origin.clone();
         let pending_entry = entry.clone();
         let publication_cancel = cancel.clone();
         let capacity = self.plan.cache_capacity;
+        let changed = self.maintenance_changed.clone();
         let imported = super::super::loaders::blocking(
             self.context.resources.cpu.clone(),
             cancel.clone(),
@@ -526,6 +810,12 @@ impl CertificateServices {
                 let Ok(validity) = material.classify_at(at) else {
                     return Ok(SharedImport::Drop);
                 };
+                match guard.key_deny().check_spki_der(&material.spki_der) {
+                    Ok(()) => {},
+                    Err(error) if error.is::<crate::key_compromise::KeyCompromised>() =>
+                        return Ok(SharedImport::Drop),
+                    Err(error) => return Err(error),
+                }
                 let (_, expiry) = material.times()?;
                 let leaf = guard.intern(material.leaf_id, expiry)?;
                 if let Some(revoked) = leaf.revocation()? {
@@ -546,10 +836,10 @@ impl CertificateServices {
                 let binding = state
                     .resident_if(&material.names[0], |resident| {
                         resident.material.names == material.names
-                            && resident.binding.projects(&entry.slot)
+                            && resident.binding.projects(&entry)
                     })
                     .map_or_else(
-                        || ResidencyBinding::shared(&entry.slot),
+                        || ResidencyBinding::shared(&entry),
                         |resident| resident.binding.clone(),
                     );
                 let receipt = match resolver.upsert_resident(
@@ -564,7 +854,8 @@ impl CertificateServices {
                     || {
                         if state
                             .capacity
-                            .admit(&material.names, &binding, capacity, |victim| {
+                            .admit(&material.names, &binding, None, capacity, |victim| {
+                                guard.key_deny().check_spki_der(&material.spki_der)?;
                                 cache.commit_import(&epoch, &entry, shared_victim(victim))
                             })?
                         {
@@ -574,6 +865,8 @@ impl CertificateServices {
                     },
                 ) {
                     Ok(receipt) => receipt,
+                    Err(error) if error.is::<crate::key_compromise::KeyCompromised>() =>
+                        return Ok(SharedImport::Drop),
                     Err(error)
                         if error.is::<super::super::resident_cache::CacheChanged>()
                             || publication_displaced(&error, &binding.slot) =>
@@ -593,8 +886,11 @@ impl CertificateServices {
                     renew_at: entry.renew_at,
                     ari_after: entry.ari_after,
                     next_check: AtomicI64::new(entry.renew_at.min(entry.ari_after)),
+                    retry_after: AtomicI64::new(0),
+                    origin: entry.origin.clone(),
                 });
                 state.index(&resident);
+                changed.notify_one();
                 if !binding.slot.live() {
                     // The retirement event can arrive before the resident
                     // index sees this import; make the recheck explicit.
@@ -618,12 +914,13 @@ impl CertificateServices {
                     return Ok(false);
                 }
                 state.material.retain(|item| {
-                    item.identity || item.managed_names.as_ref() != Some(&retain.names)
+                    item.identity || item.material.identity != retain.identity
                 });
                 state.material.push(RetainedMaterial {
                     managed_names: Some(retain.names.clone()),
                     material: retain,
                     identity: false,
+                    origin: origin.clone(),
                     renew_at: pending_entry.renew_at,
                     ari_after: pending_entry.ari_after,
                 });
@@ -631,7 +928,7 @@ impl CertificateServices {
             }
             SharedImport::Pending(kind) => {
                 if self.restore.is_none()
-                    && (!self.policy(&retain.names[0]).on_demand
+                    && (!self.policy_for_origin(&origin).on_demand
                         || matches!(kind, PendingKind::Withdrawn))
                 {
                     let mut queue = self
@@ -851,7 +1148,7 @@ impl CertificateServices {
                 .await?;
                 return Ok(());
             }
-            if self.policy(&entry.material.names[0]).on_demand {
+            if self.policy_for_origin(&entry.origin).on_demand {
                 return Ok(());
             }
             if let PendingKind::Future(not_before) = kind {
@@ -965,11 +1262,12 @@ impl CertificateServices {
             Some(group) => group.clone(),
             None => {
                 let group = self
-                    .group(
+                    .group_with_origin(
                         resident.material.names.clone(),
                         false,
                         bound,
                         self.context.cancel.child_token(),
+                        resident.origin.clone(),
                     )
                     .await?;
                 let _gate = tokio::select! {biased;
@@ -993,6 +1291,8 @@ impl CertificateServices {
                     *binding = Some(resident.binding.clone());
                     group.renew_at.store(resident.renew_at, Ordering::Release);
                     group.ari_after.store(resident.ari_after, Ordering::Release);
+                    *group.spki.lock().map_err(|_| anyhow!("certificate key state unavailable"))? =
+                        Some(resident.material.spki_der.clone());
                     *group
                         .leaf_state
                         .lock()
@@ -1042,24 +1342,53 @@ impl CertificateServices {
         caller: CancellationToken,
     ) -> Result<()> {
         let name = cert_automation::normalize_names(&[name])?.remove(0);
+        self.on_demand_ensure_request(name.clone(), name, false, None, None, None, caller)
+            .await.map(|_| ())
+    }
+    async fn on_demand_ensure_request(
+        self: Arc<Self>,
+        origin: String,
+        name: String,
+        force_lookup: bool,
+        cached: Option<AcquiredCertificate>,
+        selection: Option<crate::http_runtime::WarmSelection>,
+        hello: Option<crate::http_runtime::CertificateHello>,
+        caller: CancellationToken,
+    ) -> Result<Option<AcquiredCertificate>> {
+        let name = match name.parse::<std::net::IpAddr>() {
+            Ok(ip) => crate::tls_resolver::canonical_certificate_ip(ip),
+            Err(_) => cert_automation::normalize_names(&[name])?.remove(0),
+        };
         ensure!(
             !name.contains('*'),
             "wildcard is not a TLS client server name"
         );
+        let policy = self.policy_for_origin(&origin);
+        let typed = origin.is_empty() || name.parse::<std::net::IpAddr>().is_ok();
+        let typed_allowed = self.policy_index(&origin).is_some()
+            && policy.on_demand
+            && matches!(policy.issuers.as_slice(), [Issuer::Internal { .. }]);
         let at = now()?;
-        if self.on_demand.manual(&name, at) {
-            return Ok(());
+        if !force_lookup && cached.is_none() && self.on_demand.manual(&name, at) {
+            return Ok(None);
         }
-        if let Some(resident) = self
-            .on_demand
-            .resident_if(&name, |resident| resident.usable(at))
+        let selected = if let Some(cached) = &cached {
+            self.on_demand.resident_receipt(cached)
+        } else {
+            self.on_demand.resident_if(&name, |resident| resident.usable(at))
+        };
+        if !force_lookup
+            && let Some(resident) = selected
         {
-            let scheduled = resident.next_check.load(Ordering::Acquire);
+            let due = self.current_maintenance_at(&origin, &resident)?;
+            let scheduled = resident.retry_after.load(Ordering::Acquire);
             let pending = resident.leaf.needs_renewal();
-            if self.policy(&name).on_demand
-                && (scheduled <= at || pending)
+            if policy.on_demand
+                && (!typed || typed_allowed)
+                && (due <= at || pending)
+                && scheduled <= at
                 && resident
-                    .next_check
+                    .retry_after
                     .compare_exchange(
                         scheduled,
                         at.saturating_add(1),
@@ -1072,9 +1401,33 @@ impl CertificateServices {
             {
                 // A valid resident certificate is returned immediately; ask is
                 // only performed if a renewal becomes necessary in this job.
-                let _ = self.start_flight(name, Action::Maintenance, true);
+                let _ = self.start_flight(
+                    name,
+                    origin.clone(),
+                    false,
+                    Action::Maintenance,
+                    true,
+                    Some(resident.clone()),
+                    selection.clone(),
+                );
             }
-            return Ok(());
+            return Ok(None);
+        }
+        if !policy.managers.is_empty() {
+            ensure!(self.on_demand.active.load(Ordering::Acquire), "certificate generation is not committed");
+            let hello = hello.ok_or_else(|| anyhow!("external certificate manager requires ClientHello"))?;
+            if let Some(certificate) = self.acquire_external(policy.clone(), name.clone(), hello,
+                selection.clone(), caller.clone()).await? { return Ok(Some(certificate)); }
+            let tailscale_only=!policy.subjects.is_empty() && policy.issuers.is_empty()
+                && policy.subjects.iter().all(|name|name.to_ascii_lowercase().ends_with(".ts.net"))
+                && policy.managers.iter().any(|manager|matches!(manager,super::super::external::Manager::Tailscale));
+            ensure!(!tailscale_only,"Tailscale manager yielded no certificate and this policy has no issuer");
+        }
+        if typed {
+            ensure!(
+                typed_allowed,
+                "typed on-demand acquisition requires an internal issuer policy"
+            );
         }
         ensure!(
             self.on_demand.active.load(Ordering::Acquire),
@@ -1089,7 +1442,8 @@ impl CertificateServices {
         self.owned(caller, move |this, token| {
             Box::pin(async move {
                 let _permit = permit;
-                let (flight, leader) = this.start_flight(name, Action::Miss, false)?;
+                let (flight, leader) =
+                    this.start_flight(name, origin, force_lookup, Action::Miss, false, None, selection)?;
                 let mut waiter = Waiter {
                     flight: flight.clone(),
                     state: this.on_demand.clone(),
@@ -1119,8 +1473,12 @@ impl CertificateServices {
     fn start_flight(
         self: &Arc<Self>,
         name: String,
+        origin: String,
+        force_lookup: bool,
         action: Action,
         background: bool,
+        target: Option<Arc<Resident>>,
+        selection: Option<crate::http_runtime::WarmSelection>,
     ) -> Result<(Arc<Flight>, bool)> {
         let _admission = self
             .admission
@@ -1130,6 +1488,7 @@ impl CertificateServices {
             !self.context.cancel.is_cancelled(),
             "certificate services stopped"
         );
+        let policy = self.policy_index(&origin);
         let mut flights = self
             .on_demand
             .flights
@@ -1139,9 +1498,16 @@ impl CertificateServices {
         if let Some(previous) = &predecessor
             && previous.residency.as_ref().is_some_and(|slot| !slot.live())
         {
-            previous.cancel.cancel();
+            previous.cancel.cancel(); // generation 退役，不是 handshake 取消
         }
         if let Some(flight) = &predecessor
+            && match (&flight.target, &target) {
+                (Some(previous), Some(current)) => previous.receipt.same_instance(&current.receipt),
+                (None, None) => true,
+                _ => false,
+            }
+            && flight.policy_index == policy
+            && (!force_lookup || (flight.force_lookup && matches!(flight.action, Action::Miss)))
             && !flight.cancel.is_cancelled()
             && flight
                 .result
@@ -1158,93 +1524,183 @@ impl CertificateServices {
             predecessor.is_some() || flights.len() < 256,
             "on-demand queue capacity exceeded"
         );
-        // Count every real leader, including cancelled predecessors whose
-        // cleanup is still joining; map replacement cannot grow an unbounded
-        // successor chain for a single repeatedly-aborted SNI.
         let admission = self
             .on_demand
             .flight_slots
             .clone()
             .try_acquire_owned()
             .map_err(|_| anyhow!("on-demand live flight capacity exceeded"))?;
-        let residency = if matches!(action, Action::Maintenance) {
-            Some(
-                self.on_demand
-                    .resident_if(&name, |resident| resident.usable(now().unwrap_or(i64::MAX)))
-                    .ok_or(super::super::resident_cache::CacheChanged)?
-                    .binding
-                    .slot
-                    .clone(),
-            )
-        } else {
-            None
-        };
+        let target = if matches!(action, Action::Maintenance) {
+            Some(target.or_else(|| self.on_demand.resident_if(&name,
+                |resident| resident.usable(now().unwrap_or(i64::MAX))))
+                .ok_or(super::super::resident_cache::CacheChanged)?)
+        } else { None };
+        // Warm replacement can itself retire its observed old slot (Merged).
+        // It remains generation-owned through commit; the physical receipt CAS
+        // rejects external displacement without cancelling our own publication.
+        let residency = None;
         let flight = Arc::new(Flight {
+            action,
+            policy_index: policy,
+            force_lookup,
             _admission: admission,
             residency,
+            target,
+            selection,
             cancel: self.context.cancel.child_token(),
+            quiet: CancellationToken::new(),
             result: Mutex::new(None),
             done: tokio::sync::Notify::new(),
             waiters: AtomicUsize::new(usize::from(!background)),
             background,
         });
         flights.insert(name.clone(), flight.clone());
+        // 只持前驱的 quiet latch，不持 Arc<Flight>，链内存不累积
+        let prior = predecessor.map(|p| p.quiet.clone());
         let this = self.clone();
         let worker = flight.clone();
         self.tasks.spawn(async move {
-            let retired=async {
+            use super::super::resident_cache::CacheChanged;
+            let timeout = if matches!(action, Action::Maintenance) {
+                Duration::from_secs(300)
+            } else {
+                Duration::from_secs(180)
+            };
+            let deadline = tokio::time::Instant::now() + timeout;
+            let retired = async {
                 match &worker.residency {
-                    Some(slot)=>slot.retired().await,
-                    None=>std::future::pending::<()>().await,
+                    Some(slot) => slot.retired().await,
+                    None => std::future::pending::<()>().await,
                 }
             };
-            let operation=async {
-                // A successor may be admitted while its cancelled predecessor
-                // drains, but cannot overlap its actual storage/CA operation.
-                if let Some(previous)=predecessor {let _=flight_result(&previous).await;}
-                this.on_demand_action(&name,action,worker.residency.as_ref(),worker.cancel.clone()).await
+            tokio::pin!(retired);
+            let prior_quiet = async move {
+                if let Some(t) = prior {
+                    t.cancelled().await
+                }
             };
-            let operation=std::panic::AssertUnwindSafe(operation).catch_unwind();tokio::pin!(operation);
-            let timeout=if matches!(action,Action::Maintenance){Duration::from_secs(300)}else{Duration::from_secs(180)};
-            let result=tokio::select! {biased;
-                _=worker.cancel.cancelled()=>{let _=operation.await;Err(anyhow!("on-demand operation cancelled"))},
-                _=retired=>{worker.cancel.cancel();let _=operation.await;Err(super::super::resident_cache::CacheChanged.into())},
-                _=tokio::time::sleep(timeout)=>{worker.cancel.cancel();let _=operation.await;Err(anyhow!("on-demand acquisition deadline exceeded"))},
-                result=&mut operation=>result.unwrap_or_else(|_|Err(anyhow!("on-demand worker panicked"))),
+            tokio::pin!(prior_quiet);
+            // 阶段1：只等前驱 quiet，自己的 cancel/retired/deadline 可立即退出
+            let waited: Result<()> = tokio::select! { biased;
+                _ = worker.cancel.cancelled() => Err(anyhow!("on-demand operation cancelled")),
+                _ = &mut retired => { worker.cancel.cancel(); Err(CacheChanged.into()) },
+                _ = tokio::time::sleep_until(deadline) => {
+                    worker.cancel.cancel();
+                    Err(anyhow!("on-demand acquisition deadline exceeded"))
+                },
+                _ = &mut prior_quiet => Ok(()),
             };
-            let maintain=result.as_ref().is_ok_and(|maintain|*maintain);
-            if result.is_err() {let _=this.events.send(CertificateEvent {kind:"on_demand_failed",names:vec![name.clone()]});}
-            let outcome=result.map(|_|()).map_err(|error|Arc::<str>::from(error.to_string()));
-            *worker.result.lock().unwrap_or_else(|error|error.into_inner())=Some(outcome);
-            {let mut flights=this.on_demand.flights.lock().unwrap_or_else(|e|e.into_inner());if flights.get(&name).is_some_and(|current|Arc::ptr_eq(current,&worker)){flights.remove(&name);}}
-            worker.done.notify_waiters();
-            if maintain {let _=this.start_flight(name.clone(),Action::Maintenance,true);}
+            let started = waited.is_ok();
+            let result: Result<ActionOutcome> = match waited {
+                Err(error) => Err(error),
+                Ok(()) => {
+                    // 阶段2：前驱已 quiet，排空只受本操作响应 cancel 的速度约束
+                    let operation = std::panic::AssertUnwindSafe(this.on_demand_action(
+                        &name,
+                        &origin,
+                        force_lookup,
+                        action,
+                        worker.target.as_ref(),
+                        worker.selection.as_ref(),
+                        worker.cancel.clone(),
+                    ))
+                    .catch_unwind();
+                    tokio::pin!(operation);
+                    tokio::select! { biased;
+                        _ = worker.cancel.cancelled() => {
+                            let _ = operation.await;
+                            Err(anyhow!("on-demand operation cancelled"))
+                        },
+                        _ = &mut retired => {
+                            worker.cancel.cancel();
+                            let _ = operation.await;
+                            Err(CacheChanged.into())
+                        },
+                        _ = tokio::time::sleep_until(deadline) => {
+                            worker.cancel.cancel();
+                            let _ = operation.await;
+                            Err(anyhow!("on-demand acquisition deadline exceeded"))
+                        },
+                        result = &mut operation =>
+                            result.unwrap_or_else(|_| Err(anyhow!("on-demand worker panicked"))),
+                    }
+                }
+            };
+            let maintain = result.as_ref().is_ok_and(|outcome| outcome.maintain);
+            let maintain_target = result.as_ref().ok()
+                .and_then(|outcome| outcome.acquired.as_ref())
+                .and_then(|acquired| this.on_demand.resident_receipt(acquired));
+            if result.is_err() {
+                let _ = this.events.send(CertificateEvent {
+                    kind: "on_demand_failed",
+                    names: vec![name.clone()],
+                });
+            }
+            let outcome = result
+                .map(|outcome| outcome.acquired)
+                .map_err(|e| Arc::<str>::from(e.to_string()));
+            *worker.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+            worker.done.notify_waiters(); // waiter 立即拿到结果
+            // 未启动：留在 map（不可 join）作为前驱代理，直到前驱链 quiet
+            if !started {
+                prior_quiet.await;
+            }
+            worker.quiet.cancel();
+            {
+                let mut flights = this
+                    .on_demand
+                    .flights
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if flights.get(&name).is_some_and(|c| Arc::ptr_eq(c, &worker)) {
+                    flights.remove(&name);
+                }
+            }
+            if maintain && maintain_target.is_some() {
+                let _ = this.start_flight(
+                    name.clone(),
+                    origin.clone(),
+                    false,
+                    Action::Maintenance,
+                    true,
+                    maintain_target,
+                    worker.selection.clone(),
+                );
+            }
         });
         Ok((flight, true))
     }
+
     async fn on_demand_action(
         self: &Arc<Self>,
         name: &str,
+        origin: &str,
+        force_lookup: bool,
         action: Action,
-        residency: Option<&Arc<CertificateResidency>>,
+        target: Option<&Arc<Resident>>,
+        selection: Option<&crate::http_runtime::WarmSelection>,
         cancel: CancellationToken,
-    ) -> Result<bool> {
-        let resident = if let Some(slot) = residency {
-            Some(
-                self.on_demand
-                    .resident_if(name, |resident| Arc::ptr_eq(slot, &resident.binding.slot))
-                    .ok_or(super::super::resident_cache::CacheChanged)?,
-            )
-        } else {
-            self.on_demand.resident(name)
-        };
-        if matches!(action, Action::Miss) && self.on_demand.cached(name) {
-            return Ok(false);
+    ) -> Result<ActionOutcome> {
+        let resident = if let Some(resident) = target {
+            ensure!(resident.binding.slot.live(), super::super::resident_cache::CacheChanged);
+            Some(resident.clone())
+        } else { self.on_demand.resident(name) };
+        if !force_lookup && matches!(action, Action::Miss) && self.on_demand.cached(name) {
+            return Ok(ActionOutcome::cached());
         }
-        if matches!(action, Action::Miss) && self.import_shared_name(name, cancel.clone()).await? {
-            return Ok(false);
+        if !force_lookup
+            && matches!(action, Action::Miss)
+            && self.import_shared_name(name, cancel.clone()).await?
+        {
+            return Ok(ActionOutcome::cached());
         }
-        let policy = self.policy(name);
+        if force_lookup && matches!(action, Action::Miss)
+            && let Some(selection) = selection
+            && let Some(acquired) = self.import_shared_selected(name, selection, cancel.clone()).await?
+        {
+            return Ok(ActionOutcome { maintain: false, acquired: Some(acquired) });
+        }
+        let policy = self.policy_for_origin(origin);
         if !policy.on_demand {
             ensure!(
                 matches!(action, Action::Miss)
@@ -1261,7 +1717,7 @@ impl CertificateServices {
             let group = self
                 .storage_probe_group(vec![name.to_owned()], &bound, cancel.clone())
                 .await?;
-            let loaded = self.probe_group(group.clone(), cancel).await;
+            let loaded = self.probe_group(group.clone(), cancel.clone()).await;
             if loaded.is_err() || !self.on_demand.cached(name) {
                 self.discard_storage_probe(group).await?;
                 loaded?;
@@ -1272,10 +1728,15 @@ impl CertificateServices {
             group.background.store(true, Ordering::Release);
             self.ocsp_manager(&group).await?;
             self.maintenance_changed.notify_one();
-            return Ok(false);
+            return Ok(ActionOutcome { maintain: false,
+                acquired: Some(self.acquired_group(&group, name, cancel.clone()).await?) });
         }
         if matches!(action, Action::Maintenance)
             && let Some(resident) = &resident
+            && self.policy_index(&resident.origin) == self.policy_index(origin)
+            && resident.group.get().is_none_or(|group|
+                group.publication.lock().is_ok_and(|receipt| receipt.as_ref()
+                    .is_some_and(|receipt| receipt.same_instance(&resident.receipt))))
         {
             let group = if let Some(group) = resident.group.get().cloned() {
                 group
@@ -1302,14 +1763,15 @@ impl CertificateServices {
                         resident
                             .next_check
                             .store(next_check(&group, now()?), Ordering::Release);
-                        return Ok(false);
+                        return Ok(ActionOutcome::cached());
                     }
                 }
-            } else if group.renew_at.load(Ordering::Acquire) > now()? {
+            } else if !resident.leaf.needs_renewal()
+                && self.current_renewal_time(&resident.material, &policy)? > now()? {
                 resident
                     .next_check
                     .store(next_check(&group, now()?), Ordering::Release);
-                return Ok(false);
+                return Ok(ActionOutcome::cached());
             }
         }
         if let Some(permission) = self
@@ -1333,42 +1795,50 @@ impl CertificateServices {
             .bound
             .clone()
             .ok_or_else(|| anyhow!("candidate listener plan is missing"))?;
-        let mut seeded = false;
-        let group = match &resident {
-            Some(resident) if resident.group.get().is_some() => {
-                resident.group.get().unwrap().clone()
-            }
-            _ => {
-                let seed = if let Some(epoch) = self.cache_epoch.get() {
-                    let entry = self
-                        .shared_entry(epoch.clone(), name, cancel.clone())
-                        .await?;
-                    if let Some(entry) = entry {
-                        let leaf = self
-                            .context
-                            .leaf_guard
-                            .intern(entry.material.leaf_id, entry.material.times()?.1)?;
-                        leaf.pending_revocation()?.map(|_| entry)
-                    } else {
-                        None
-                    }
+        let seed = if matches!(action, Action::Miss) && resident
+            .as_ref()
+            .is_none_or(|resident| resident.group.get().is_none())
+        {
+            if let Some(epoch) = self.cache_epoch.get() {
+                if let Some(entry) = self
+                    .shared_entry(epoch.clone(), name, cancel.clone())
+                    .await?
+                {
+                    let leaf = self
+                        .context
+                        .leaf_guard
+                        .intern(entry.material.leaf_id, entry.material.times()?.1)?;
+                    leaf.pending_revocation()?.map(|_| entry)
                 } else {
                     None
-                };
-                if let Some(seed) = seed {
-                    seeded = true;
-                    self.seeded_group(seed, &bound, cancel.clone(), false)
-                        .await?
-                } else {
-                    self.group(vec![name.to_owned()], false, &bound, cancel.clone())
-                        .await?
                 }
+            } else {
+                None
             }
+        } else {
+            None
         };
+        let seeded = seed.is_some();
+        let group = self
+            .authorized_on_demand_group(
+                vec![name.to_owned()],
+                &bound,
+                cancel.clone(),
+                origin.to_owned(),
+                seed,
+            )
+            .await?;
         if let Err(error) = self
-            .ensure_group(
+            .ensure_group_target(
                 group.clone(),
                 matches!(action, Action::Miss) && !seeded,
+                if matches!(action, Action::Maintenance) {
+                    resident.as_ref().map(|resident| RenewalTarget {
+                        material: resident.material.clone(), receipt: resident.receipt.clone(),
+                        binding: resident.binding.clone(), leaf: resident.leaf.clone(),
+                        selection: selection.cloned(),
+                    })
+                } else { None },
                 cancel.clone(),
             )
             .await
@@ -1385,8 +1855,34 @@ impl CertificateServices {
         }
         self.ocsp_manager(&group).await?;
         let due = group.renew_at.load(Ordering::Acquire) <= now()?;
-        Ok(matches!(action, Action::Miss) && due)
+        Ok(ActionOutcome {
+            maintain: matches!(action, Action::Miss) && due,
+            acquired: Some(self.acquired_group(&group, name, cancel).await?),
+        })
     }
+    async fn acquired_group(
+        &self,
+        group: &Arc<Group>,
+        subject: &str,
+        cancel: CancellationToken,
+    ) -> Result<AcquiredCertificate> {
+        let _gate = tokio::select! { biased;
+            _ = cancel.cancelled() => return Err(anyhow!("certificate acquisition cancelled")),
+            _ = group.cancel.cancelled() => return Err(anyhow!("certificate scope retired")),
+            gate = group.gate.lock() => gate,
+        };
+        let binding = group.residency.lock()
+            .map_err(|_| anyhow!("certificate residency unavailable"))?.clone()
+            .ok_or_else(|| anyhow!("acquired certificate residency missing"))?;
+        let receipt = group.publication.lock()
+            .map_err(|_| anyhow!("certificate publication unavailable"))?.clone()
+            .ok_or_else(|| anyhow!("acquired certificate publication missing"))?;
+        ensure!(binding.slot.live(), super::super::resident_cache::CacheChanged);
+        ensure!(binding.receipt.as_ref().is_none_or(|physical| physical.chain == receipt.identity()),
+            super::super::resident_cache::CacheChanged);
+        Ok(AcquiredCertificate { subject: subject.to_owned(), receipt, slot: binding.slot, external: None })
+    }
+
     async fn evict_resident(
         &self,
         resident: Arc<Resident>,
@@ -1395,21 +1891,18 @@ impl CertificateServices {
         if !resident.binding.slot.live() {
             return self.sweep_resident(resident, cancel).await;
         }
-        let key = group_key(&resident.material.names, false);
         let group = {
             let state = self.state.lock().await;
-            state
-                .groups
-                .get(&key)
-                .filter(|group| {
-                    group.residency.lock().is_ok_and(|binding| {
-                        binding.as_ref().is_some_and(|binding| {
-                            Arc::ptr_eq(&binding.slot, &resident.binding.slot)
-                        })
-                    })
-                })
-                .cloned()
+            state.groups.values().find(|group| {
+                resident.receipt.owned_by(&group.scope)
+                    && group.publication.lock().is_ok_and(|publication|
+                        publication.as_ref().is_some_and(|receipt| receipt.same_instance(&resident.receipt)))
+                    && group.residency.lock().is_ok_and(|binding|
+                        binding.as_ref().is_some_and(|binding|
+                            Arc::ptr_eq(&binding.slot, &resident.binding.slot)))
+            }).cloned()
         };
+        let key = group.as_ref().map(|group| group.key.clone()).unwrap_or_default();
         // A concurrent renewal of this Group can replace the receipt. Wait
         // for its actual publication before checking any cleanup authority.
         let gate = if let Some(group) = &group {
@@ -1441,7 +1934,7 @@ impl CertificateServices {
                     evicted.binding.slot.retire();
                     state
                         .capacity
-                        .remove(&evicted.material.names, &evicted.binding.slot);
+                        .remove(&evicted.binding);
                 }
                 // The old exact receipt is now absent even if another scope
                 // already replaced it. Retire only this local index entry; a
@@ -1518,7 +2011,16 @@ impl CertificateServices {
     ) -> Result<()> {
         let slot = resident.binding.slot.clone();
         let names = resident.material.names.clone();
-        let key = group_key(&names, false);
+        let key = {
+            let state = self.state.lock().await;
+            state.groups.values().find(|group| {
+                resident.receipt.owned_by(&group.scope)
+                    && group.publication.lock().is_ok_and(|publication|
+                        publication.as_ref().is_some_and(|receipt| receipt.same_instance(&resident.receipt)))
+                    && group.residency.lock().is_ok_and(|binding|
+                        binding.as_ref().is_some_and(|binding| Arc::ptr_eq(&binding.slot, &slot)))
+            }).map(|group| group.key.clone()).unwrap_or_default()
+        };
         let owner = resident.scope.clone();
         let (group, ocsp) = {
             let mut state = self.state.lock().await;
@@ -1574,7 +2076,8 @@ impl CertificateServices {
         self.on_demand.unindex(&resident);
         self.on_demand
             .capacity
-            .remove(&resident.material.names, &resident.binding.slot);
+            .remove(&resident.binding);
+        self.maintenance_changed.notify_one();
         Ok(())
     }
     pub(super) async fn publish_group(
@@ -1583,9 +2086,12 @@ impl CertificateServices {
         material: Arc<Material>,
         renew_at: i64,
         ari_after: i64,
+        intent: PublishIntent,
         cancel: CancellationToken,
         lease: Option<&crate::certstore::StorageLease>,
     ) -> Result<()> {
+        self.prime_material_status(material.clone(), group.identity, cancel.clone()).await?;
+        reject_revoked(&material, &self.context.leaf_guard, true)?;
         if let Some(lease) = lease {
             lease.check().await?;
         }
@@ -1605,6 +2111,7 @@ impl CertificateServices {
         for attempt in 0..4 {
             let work_group = group.clone();
             let material = material.clone();
+            let work_intent = intent.clone();
             let lost = lost.clone();
             let state = self.on_demand.clone();
             let cache = self.context.resources.resident_cache.clone();
@@ -1612,12 +2119,14 @@ impl CertificateServices {
             let capacity = self.plan.cache_capacity;
             let leaf_guard = self.context.leaf_guard.clone();
             let publication_cancel = cancel.clone();
+            let changed = self.maintenance_changed.clone();
             let result = crate::cert_cpu::run_committed(
                 self.context.resources.cpu.clone(),
                 cancel.clone(),
                 move || {
                     let group = work_group;
                     material.validate_at(now()?, false)?;
+                    leaf_guard.key_deny().check_spki_der(&material.spki_der)?;
                     let leaf = leaf_guard.intern(material.leaf_id, material.times()?.1)?;
                     ensure!(
                         leaf.revocation()?.is_none(),
@@ -1634,13 +2143,23 @@ impl CertificateServices {
                         certificate_pem: &material.certificate,
                         private_key_pem: &material.key,
                     };
+                    let warm_selection = match &work_intent {
+                        PublishIntent::ReplaceTarget { selection, .. }
+                        | PublishIntent::WarmInsert { selection } => selection.as_ref(),
+                        _ => None,
+                    };
+                    if let Some(selection) = warm_selection {
+                        ensure!(group.resolver.candidate_allowed(&input, &material.tags,
+                            selection.filter.as_deref(), &selection.schemes, selection.version)?,
+                            "managed warm certificate does not satisfy connection selection");
+                    }
                     if group.identity {
-                        return group
-                            .resolver
-                            .upsert_checked(&input, &publication_cancel, || {
-                                ensure!(active(), "certificate publication cancelled");
-                                Ok(())
-                            });
+                        let result = group.resolver.upsert_checked(&input, &publication_cancel, || {
+                            ensure!(active(), "certificate publication cancelled");
+                            Ok(())
+                        });
+                        if result.is_ok() { changed.notify_one(); }
+                        return result;
                     }
                     let previous = group
                         .residency
@@ -1651,10 +2170,21 @@ impl CertificateServices {
                         previous.as_ref().is_none_or(|binding| binding.slot.live()),
                         super::super::resident_cache::CacheChanged
                     );
+                    let physical_previous = match &work_intent {
+                        PublishIntent::Insert | PublishIntent::WarmInsert { .. } => None,
+                        PublishIntent::Renew { old } | PublishIntent::ReplaceTarget { old, .. } => Some(old),
+                    };
+                    let ledger_previous = match &work_intent {
+                        PublishIntent::ReplaceTarget { binding, .. } => Some(binding),
+                        PublishIntent::Renew { .. } => previous.as_ref(),
+                        PublishIntent::Insert | PublishIntent::WarmInsert { .. } => None,
+                    };
+                    let cache_binding = match &work_intent {
+                        PublishIntent::ReplaceTarget { binding, .. } => Some(binding),
+                        _ => previous.as_ref(),
+                    };
                     let plan = if let Some(epoch) = &epoch
-                        && previous
-                            .as_ref()
-                            .is_none_or(|binding| binding.source.is_some())
+                        && cache_binding.is_none_or(|binding| binding.source.is_some())
                     {
                         cache.plan(
                             epoch,
@@ -1663,66 +2193,93 @@ impl CertificateServices {
                                 issuer: issuer_class(&group.policy),
                                 renew_at,
                                 ari_after,
+                                origin: group.origin.clone(),
                             },
                             crate::tls_resolver::MAX_CERTIFICATES,
-                            previous
-                                .as_ref()
-                                .and_then(|binding| binding.source.as_ref()),
+                        physical_previous,
                         )?
                     } else {
                         None
                     };
                     let cached = plan.as_ref().map(|plan| plan.entry.clone());
-                    let binding = cached
-                        .as_ref()
-                        .map(|entry| {
-                            previous
-                                .as_ref()
-                                .filter(|binding| binding.projects(&entry.slot))
-                                .cloned()
-                                .unwrap_or_else(|| ResidencyBinding::shared(&entry.slot))
-                        })
-                        .or(previous)
-                        .unwrap_or_else(ResidencyBinding::local);
-                    let receipt = group
-                        .resolver
-                        .upsert_resident(
-                            &input,
-                            &group.scope,
-                            &binding.slot,
-                            &publication_cancel,
+                    let target_exists = match plan.as_ref() {
+                        Some(plan) => match plan.effect() {
+                            super::super::resident_cache::Effect::Same => true,
+                            super::super::resident_cache::Effect::Merged { retired } => {
+                                ensure!(retired != plan.entry.id, super::super::resident_cache::CacheChanged);
+                                true
+                            }
+                            _ => false,
+                        },
+                        None => false,
+                    };
+                    let physical_receipt = plan.as_ref().map(|plan| plan.receipt());
+                    let material = cached.as_ref().map_or(material, |entry| entry.material.clone());
+                    let (renew_at, ari_after) = cached.as_ref()
+                        .map_or((renew_at, ari_after), |entry| (entry.renew_at, entry.ari_after));
+                    let borrowed = if target_exists {
+                        cached.as_ref().and_then(|entry| state.resident_if(&material.names[0], |resident| {
+                            resident.material.identity == material.identity
+                                && resident.receipt.identity() == material.identity
+                                && resident.binding.receipt.as_ref().is_some_and(|receipt| receipt.is(entry))
+                        }))
+                    } else { None };
+                    let mut binding = borrowed.as_ref().map(|resident| resident.binding.clone())
+                        .or_else(|| cached.as_ref().map(|entry| {
+                            previous.as_ref().filter(|binding| binding.projects(&entry))
+                                .cloned().unwrap_or_else(|| ResidencyBinding::shared(entry))
+                        }))
+                        .or_else(|| previous.clone()).unwrap_or_else(ResidencyBinding::local);
+                    if physical_receipt.is_some() { binding.receipt = physical_receipt; }
+                    let receipt = if let Some(borrowed) = &borrowed {
+                        let receipt = group.resolver.with_current_receipt(
+                            &borrowed.receipt, &binding.slot, &publication_cancel,
                             || {
                                 ensure!(active(), "certificate acquisition cancelled");
-                                if state.capacity.admit(
-                                    &material.names,
-                                    &binding,
-                                    capacity,
-                                    |victim| {
+                                let plan = plan.ok_or_else(|| anyhow!("missing borrowed cache plan"))?;
+                                if ledger_previous.is_none() {
+                                    return state.capacity.reuse(&binding, || cache.commit(plan));
+                                }
+                                if state.capacity.admit(&material.names, &binding, ledger_previous,
+                                    capacity, |victim| {
+                                        cache.commit_replacing(plan, shared_victim(victim))
+                                    })? {
+                                    state.cleanup_changed.notify_one();
+                                }
+                                Ok(true)
+                            },
+                        )?;
+                        receipt.ok_or(super::super::resident_cache::CacheChanged)?
+                    } else {
+                        let input = CertificateInput {
+                            names: &material.names,
+                            certificate_pem: &material.certificate,
+                            private_key_pem: &material.key,
+                        };
+                        group.resolver.upsert_resident(
+                            &input, &group.scope, &binding.slot, &publication_cancel,
+                            || {
+                                ensure!(active(), "certificate acquisition cancelled");
+                                if state.capacity.admit(&material.names, &binding, ledger_previous,
+                                    capacity, |victim| {
                                         let victim = shared_victim(victim);
                                         if let Some(plan) = plan {
-                                            if victim.is_some() {
-                                                cache.commit_replacing(plan, victim)?;
-                                            } else {
-                                                cache.commit(plan)?;
-                                            }
+                                            cache.commit_replacing(plan, victim)?;
                                         } else if let Some(epoch) = &epoch {
                                             cache.retire_projection(epoch, victim)?;
                                         }
                                         Ok(())
-                                    },
-                                )? {
+                                    })? {
                                     state.cleanup_changed.notify_one();
                                 }
                                 Ok(())
                             },
-                        )
-                        .map_err(|error| {
+                        ).map_err(|error| {
                             if active() && publication_displaced(&error, &binding.slot) {
                                 super::super::resident_cache::CacheChanged.into()
-                            } else {
-                                error
-                            }
-                        })?;
+                            } else { error }
+                        })?
+                    };
                     *group
                         .residency
                         .lock()
@@ -1733,14 +2290,12 @@ impl CertificateServices {
                         .unwrap_or_else(|error| error.into_inner()) = Some(receipt.clone());
                     group.renew_at.store(renew_at, Ordering::Release);
                     group.ari_after.store(ari_after, Ordering::Release);
-                    state.record(
-                        group.clone(),
-                        material,
-                        receipt,
-                        cached,
-                        binding.clone(),
-                        leaf,
-                    );
+                    // Same/Merged target already has one exact resident projection.
+                    // Preserve its original receipt, schedule, index order and OCSP context.
+                    if borrowed.is_none() {
+                        state.record(group.clone(), material, receipt, cached, binding.clone(), leaf);
+                    }
+                    changed.notify_one();
                     if !binding.slot.live() {
                         state.cleanup_changed.notify_one();
                         return Err(super::super::resident_cache::CacheChanged.into());
@@ -1765,6 +2320,16 @@ impl CertificateServices {
                         || error.is::<super::super::resident_cache::CacheChanged>() =>
                 {
                     last = Some(error);
+                }
+                Ok(()) => {
+                    if let PublishIntent::Renew { old } | PublishIntent::ReplaceTarget { old, .. } = &intent {
+                        self.state.lock().await.material.retain(|item|
+                            item.identity || item.material.identity != old.chain);
+                    }
+                    if !group.identity && !group.cache_event_emitted.swap(true,Ordering::AcqRel) {
+                        crate::cert_events::cached(self.context.events.as_ref(),true,&group.names,&cancel).await;
+                    }
+                    return Ok(());
                 }
                 result => return result,
             }

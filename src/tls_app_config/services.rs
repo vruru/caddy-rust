@@ -35,6 +35,8 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 mod capacity;
 #[path = "services/group.rs"]
 mod group;
+#[path = "services/external.rs"]
+mod external;
 #[path = "services/identity.rs"]
 mod identity;
 #[path = "services/maintenance.rs"]
@@ -42,12 +44,16 @@ mod maintenance;
 #[path = "services/ocsp_scope.rs"]
 mod ocsp_scope;
 use ocsp_scope::OcspScope;
+#[path = "services/physical_ocsp.rs"]
+mod physical_ocsp;
+use physical_ocsp::physical_ocsp_key;
 #[path = "services/on_demand.rs"]
 mod on_demand;
 #[path = "services/solver.rs"]
 mod solver;
 
 pub struct PrepareContext {
+    pub events: Option<Arc<crate::events::EventsApp>>,
     pub paths: CertificatePaths,
     pub resources: Arc<CertificateResources>,
     pub challenges: ChallengeRegistry,
@@ -67,7 +73,7 @@ pub struct RetainedCertificates {
     material: Vec<RetainedMaterial>,
     permission: Option<PermissionSetting>,
     business_names: Vec<Vec<String>>,
-    on_demand_names: Vec<Vec<String>>,
+    on_demand_names: Vec<(Vec<String>, String)>,
     capacity_displaced: std::collections::HashSet<Vec<String>>,
 }
 #[derive(Clone)]
@@ -77,6 +83,7 @@ struct RetainedMaterial {
     managed_names: Option<Vec<String>>,
     renew_at: i64,
     ari_after: i64,
+    origin: String,
 }
 pub enum PrepareMode {
     Normal,
@@ -97,7 +104,9 @@ enum GroupIssuer {
     },
 }
 struct Group {
+    key: String,
     names: Vec<String>,
+    origin: String,
     policy: Policy,
     store: Arc<Store>,
     resolver: Arc<HotCertificateResolver>,
@@ -106,6 +115,7 @@ struct Group {
     gate: AsyncMutex<()>,
     solver: Option<Arc<solver::SolverBroker>>,
     leaf_state: Mutex<Option<Arc<crate::leaf_guard::LeafState>>>,
+    spki: Mutex<Option<Arc<[u8]>>>,
     scope: CertificateScope,
     residency: Mutex<Option<ResidencyBinding>>,
     publication: Arc<Mutex<Option<ScopedCertificate>>>,
@@ -113,6 +123,7 @@ struct Group {
     ari_after: AtomicI64,
     background: AtomicBool,
     restoring: AtomicBool,
+    cache_event_emitted: AtomicBool,
     cancel: CancellationToken,
     tasks: TaskTracker,
     started: Mutex<bool>,
@@ -122,24 +133,59 @@ struct Group {
 struct ResidencyBinding {
     slot: Arc<CertificateResidency>,
     source: Option<Arc<CertificateResidency>>,
+    receipt: Option<super::resident_cache::Receipt>,
+}
+#[derive(Clone)]
+struct RenewalTarget {
+    material: Arc<Material>,
+    receipt: ScopedCertificate,
+    binding: ResidencyBinding,
+    leaf: Arc<crate::leaf_guard::LeafState>,
+    selection: Option<crate::http_runtime::WarmSelection>,
+}
+#[derive(Clone)]
+enum PublishIntent {
+    Insert,
+    Renew { old: super::resident_cache::Receipt },
+    ReplaceTarget { old: super::resident_cache::Receipt, binding: ResidencyBinding,
+        selection: Option<crate::http_runtime::WarmSelection> },
+    WarmInsert { selection: Option<crate::http_runtime::WarmSelection> },
 }
 impl ResidencyBinding {
     fn local() -> Self {
         Self {
             slot: Arc::new(CertificateResidency::default()),
             source: None,
+            receipt: None,
         }
     }
-    fn shared(source: &Arc<CertificateResidency>) -> Self {
+    fn shared(entry: &super::resident_cache::CacheEntry) -> Self {
         Self {
-            slot: Arc::new(source.projection()),
-            source: Some(source.clone()),
+            slot: Arc::new(entry.revision.projection()),
+            source: Some(entry.slot.clone()),
+            receipt: Some(entry.receipt()),
         }
     }
-    fn projects(&self, source: &Arc<CertificateResidency>) -> bool {
+    fn projects(&self, source: &super::resident_cache::CacheEntry) -> bool {
         self.source
             .as_ref()
-            .is_some_and(|actual| Arc::ptr_eq(actual, source))
+            .is_some_and(|s| Arc::ptr_eq(s, &source.slot))
+            && self.receipt
+                .as_ref()
+                .is_some_and(|r| r.is(source))
+    }
+    fn superseded(&self) -> bool {
+        !self.slot.live()
+            && self.source
+                .as_ref()
+                .is_some_and(|s| s.live())
+            && self.receipt
+                .as_ref()
+                .map(|r| !r.revision.live())
+                .unwrap_or(false)
+    }
+    fn occupies(&self) -> bool {
+        self.slot.live() || self.superseded()
     }
 }
 struct State {
@@ -169,12 +215,13 @@ pub struct CertificateServices {
     admission: Mutex<()>,
     activate: Mutex<Option<oneshot::Sender<()>>>,
     events: broadcast::Sender<CertificateEvent>,
-    maintenance_changed: tokio::sync::Notify,
+    maintenance_changed: Arc<tokio::sync::Notify>,
     on_demand: Arc<on_demand::OnDemand>,
     permission: OnceCell<Option<Arc<super::permission::HttpPermission>>>,
     group_slots: Arc<tokio::sync::Semaphore>,
     cache_epoch: OnceCell<Arc<super::resident_cache::Epoch>>,
     effective_tls: AtomicBool,
+    implicit_tailscale: std::sync::OnceLock<std::collections::HashSet<String>>,
 }
 
 impl CertificateServices {
@@ -205,7 +252,7 @@ impl CertificateServices {
                 Some(retained)
             }
         };
-        let identity_resolver = Arc::new(HotCertificateResolver::with_leaf_guard(
+        let identity_resolver = Arc::new(HotCertificateResolver::with_managed_leaf_guard(
             context.challenges.clone(),
             context.leaf_guard.clone(),
         ));
@@ -222,6 +269,8 @@ impl CertificateServices {
         let tasks = TaskTracker::new();
         let cancel = context.cancel.clone();
         let cache_receiver = context.resources.resident_cache.subscribe();
+        let on_demand = Arc::new(on_demand::OnDemand::new(cache_receiver,
+            context.leaf_guard.key_deny().clone()));
         let this = Arc::new(Self {
             plan,
             context,
@@ -247,14 +296,15 @@ impl CertificateServices {
             admission: Mutex::new(()),
             activate: Mutex::new(Some(activate)),
             events,
-            maintenance_changed: tokio::sync::Notify::new(),
-            on_demand: Arc::new(on_demand::OnDemand::new(cache_receiver)),
+            maintenance_changed: Arc::new(tokio::sync::Notify::new()),
+            on_demand,
             permission: OnceCell::new(),
             // Inventory capacity and the admission headroom needed to replace
             // a resident certificate are distinct from running job limits.
             group_slots: Arc::new(tokio::sync::Semaphore::new(capacity::GROUP_LIMIT)),
             cache_epoch: OnceCell::new(),
             effective_tls: AtomicBool::new(true),
+            implicit_tailscale: std::sync::OnceLock::new(),
         });
         let weak = Arc::downgrade(&this);
         tasks.spawn(async move {
@@ -265,6 +315,27 @@ impl CertificateServices {
             }
         });
         Ok(this)
+    }
+    /// Read/provision public authority data under this generation's ownership.
+    /// An implicit default CA requested only by the Admin API is deliberately
+    /// not registered for background trust installation.
+    pub(crate) async fn public_ca(self:&Arc<Self>,id:String,cancel:CancellationToken)->Result<Option<crate::admin::PkiInfo>> {
+        self.owned(cancel,move|this,token|Box::pin(async move {
+            if id!="local" && !this.plan.authorities.contains_key(&id) {return Ok(None);}
+            let configured=this.plan.authorities.contains_key(&id);
+            let existing=this.state.lock().await.pki.get(&id).cloned();
+            let pki=if let Some(pki)=existing {pki} else if configured {this.authority(&id,token.clone()).await?} else {
+                let storage=this.plan.storage.as_ref().unwrap_or(&this.context.paths.default_storage).clone();
+                let store=this.context.resources.store(storage,&this.context.paths,token.clone()).await?;
+                let config=crate::local_pki::CaConfig{install_trust:false,..Default::default()};
+                LocalPki::with_resources(store.fs.clone(),vec![config],this.context.resources.pki.clone())?
+            };
+            let snapshot=pki.provision(&id,token.clone()).await?;
+            let (name,root_common_name,intermediate_common_name)=pki.public_names(&id)?;
+            Ok(Some(crate::admin::PkiInfo{id:snapshot.id,name,root_common_name,intermediate_common_name,
+                root_certificate:String::from_utf8(snapshot.root_certificate_pem)?,
+                intermediate_certificate:String::from_utf8(snapshot.intermediate_chain_pem)?}))
+        })).await
     }
     pub fn business_resolver(&self) -> Arc<HotCertificateResolver> {
         self.context.resolver.clone()
@@ -455,7 +526,18 @@ impl CertificateServices {
                 .into_iter()
                 .flatten()
                 .filter(|names| self.policy(&names[0]).on_demand)
-                .cloned()
+                .map(|names| (names.clone(), names[0].clone()))
+                .chain(
+                    state
+                        .material
+                        .iter()
+                        .filter_map(|item| {
+                            item.managed_names
+                                .as_ref()
+                                .map(|names| (names.clone(), item.origin.clone()))
+                        })
+                        .filter(|(_, origin)| self.policy(origin).on_demand),
+                )
                 .collect(),
             capacity_displaced: self.on_demand.displaced_groups()?,
         })
@@ -513,6 +595,7 @@ impl CertificateServices {
     async fn prepare_inner(&self, cancel: CancellationToken) -> Result<()> {
         self.prepare_permission(cancel.clone()).await?;
         if let Some(retained) = &self.restore {
+            self.context.leaf_guard.key_deny().require_loaded()?;
             self.on_demand
                 .set_configured_groups(&retained.business_names, &retained.capacity_displaced)?;
             let mut manual = Vec::new();
@@ -520,7 +603,8 @@ impl CertificateServices {
             for item in &retained.material {
                 ensure!(!cancel.is_cancelled(), "certificate preparation cancelled");
                 item.material.validate_at(now()?, false)?;
-                reject_revoked(&item.material, &self.context.leaf_guard)?;
+                reject_revoked(&item.material, &self.context.leaf_guard,
+                    item.identity || item.managed_names.is_some())?;
                 if !item.identity && item.managed_names.is_none() {
                     manual.push(item.material.clone());
                 } else {
@@ -552,6 +636,13 @@ impl CertificateServices {
             }
             return Ok(());
         }
+        // Instance-owned signed veto history is loaded before every managed
+        // load; this never borrows any policy's certificate-store authority.
+        let deny_store = self.context.resources.store(
+            self.context.paths.state_root.join("key-compromise"), &self.context.paths,
+            cancel.child_token()).await?;
+        self.context.leaf_guard.key_deny().load(deny_store.fs.clone(),
+            self.context.resources.cpu.clone(), cancel.child_token()).await?;
         // Files and caches are loaded before staged listeners can serve traffic.
         let storage = self
             .plan
@@ -563,6 +654,7 @@ impl CertificateServices {
                 .await?;
         let materials = materials.into_iter().map(Arc::new).collect::<Vec<_>>();
         self.install_manual(&materials, cancel.clone()).await?;
+        for material in &materials {crate::cert_events::cached(self.context.events.as_ref(),false,&material.names,&cancel).await;}
         self.state.lock().await.material = materials
             .into_iter()
             .map(|material| RetainedMaterial {
@@ -571,6 +663,7 @@ impl CertificateServices {
                 managed_names: None,
                 renew_at: 0,
                 ari_after: i64::MAX,
+                origin: String::new(),
             })
             .collect();
         self.manual_ocsp(cancel).await?;
@@ -582,10 +675,11 @@ impl CertificateServices {
         key: zeroize::Zeroizing<Vec<u8>>,
         cancel: CancellationToken,
     ) -> Result<Material> {
+        let deny=self.context.leaf_guard.key_deny().clone();
         super::loaders::blocking(self.context.resources.cpu.clone(), cancel, move || {
-            Material::from_pem(certificate, key)
-        })
-        .await
+            let material=Material::from_pem(certificate,key)?;
+            material.register_key(&deny)?;Ok(material)
+        }).await
     }
     async fn publish_material(
         &self,
@@ -702,6 +796,10 @@ impl CertificateServices {
                 return Ok(());
             }
         }
+        self.implicit_tailscale.get_or_init(|| names.iter().flat_map(|group|group.iter())
+            .filter(|name|name.to_ascii_lowercase().ends_with(".ts.net")
+                && !self.plan.policies.iter().any(|policy|policy.subjects.iter().any(|subject|subject==*name)))
+            .cloned().collect());
         self.prepare_resident_cache(&names, cancel.clone()).await?;
         if self.restore.is_some() {
             self.validate_retained_groups(&names, false).await?;
@@ -790,9 +888,31 @@ impl CertificateServices {
         })
     }
     fn policy(&self, name: &str) -> Policy {
-        self.policy_index(name)
-            .map(|index| self.plan.policies[index].clone())
-            .unwrap_or_default()
+        let mut policy=self.policy_index(name)
+            .map(|index| self.plan.policies[index].clone()).unwrap_or_default();
+        if let Some(subject)=self.implicit_tailscale.get()
+            .and_then(|names|names.get(name).or_else(||names.iter().find(|subject|subject.contains('*') && matches_subject(name,subject)))) {
+            policy.subjects=vec![subject.clone()];
+            policy.issuers.clear();
+            policy.managers.push(super::external::Manager::Tailscale);
+            policy.on_demand=true;
+        } else if policy.on_demand && policy.managers.is_empty() {
+            // HTTP's on-demand convenience manager is tried before the real
+            // permission endpoint. For other suffixes it performs no IO.
+            policy.managers.push(super::external::Manager::Tailscale);
+        }
+        policy
+    }
+    fn policy_for_origin(&self, origin: &str) -> Policy {
+        self.policy(origin)
+    }
+    // Management jobs use the current policy; physical cache entries are
+    // separately identified by the complete chain, never by this key.
+    fn management_key(&self, names: &[String], identity: bool, origin: &str) -> String {
+        let key = group_key(names, identity);
+        if !identity && self.policy_for_origin(origin).on_demand {
+            format!("{key}:on-demand:{:?}", self.policy_index(origin))
+        } else { key }
     }
     async fn validate_retained_groups(&self, names: &[Vec<String>], identity: bool) -> Result<()> {
         let material = self.state.lock().await.material.clone();
@@ -806,8 +926,9 @@ impl CertificateServices {
                 if !identity
                     && self.restore.as_ref().is_some_and(|retained| {
                         retained.capacity_displaced.contains(names)
-                            || (self.policy(&names[0]).on_demand
-                                && retained.on_demand_names.contains(names))
+                            || retained.on_demand_names.iter().any(|(n, origin)| {
+                                n == names && self.policy_for_origin(origin).on_demand
+                            })
                     })
                 {
                     continue;
@@ -820,7 +941,7 @@ impl CertificateServices {
             if identity {
                 retained.material.validate_at(now()?, true)?;
             }
-            reject_revoked(&retained.material, &self.context.leaf_guard)?;
+            reject_revoked(&retained.material, &self.context.leaf_guard, true)?;
         }
         Ok(())
     }
@@ -869,7 +990,9 @@ fn matches_subject(name: &str, pattern: &str) -> bool {
     }
     false
 }
-fn reject_revoked(material: &Material, guard: &LeafGuard) -> Result<()> {
+fn reject_revoked(material: &Material, guard: &LeafGuard, key_veto: bool) -> Result<()> {
+    let key=material.register_key(guard.key_deny())?;
+    if key_veto { guard.key_deny().check_state(&key)?; }
     let (_, expiry) = material.times()?;
     ensure!(
         guard

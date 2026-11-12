@@ -4,6 +4,21 @@ use crate::cert_automation::AcmeIssuerConfig;
 use crate::local_pki::CaConfig;
 
 impl CertificateServices {
+    pub(super) fn current_renewal_time(&self, material: &Material, policy: &Policy) -> Result<i64> {
+        let (begin, end) = material.times()?;
+        let ordinary = cert_automation::renewal_time(begin, end, policy.renewal_ratio, None, "")?;
+        if !matches!(policy.issuers.as_slice(), [Issuer::Internal { .. }]) {
+            return Ok(ordinary);
+        }
+        // CertMagic's emergency window applies even to exceptionally short
+        // internal certificates. Keep this same calculation inside the lease,
+        // so preflight cannot ask early and then republish unchanged material.
+        let interval = self.plan.renew_interval.checked_mul(5).unwrap_or(Duration::MAX);
+        let seconds = interval.as_secs().saturating_add(u64::from(interval.subsec_nanos() > 0));
+        let emergency = end.saturating_sub(i64::try_from(seconds).unwrap_or(i64::MAX));
+        let fraction = cert_automation::renewal_time(begin, end, 1.0 / 50.0, None, "")?;
+        Ok(ordinary.min(emergency).min(fraction))
+    }
     pub(super) async fn group(
         &self,
         names: Vec<String>,
@@ -11,7 +26,7 @@ impl CertificateServices {
         bound: &[StagedAddress],
         cancel: CancellationToken,
     ) -> Result<Arc<Group>> {
-        self.group_inner(names, identity, bound, cancel, true, None)
+        self.group_inner(names, identity, bound, cancel, true, None, None)
             .await
     }
     pub(super) async fn storage_probe_group(
@@ -20,7 +35,7 @@ impl CertificateServices {
         bound: &[StagedAddress],
         cancel: CancellationToken,
     ) -> Result<Arc<Group>> {
-        self.group_inner(names, false, bound, cancel, false, None)
+        self.group_inner(names, false, bound, cancel, false, None, None)
             .await
     }
     pub(super) async fn seeded_group(
@@ -37,10 +52,52 @@ impl CertificateServices {
             bound,
             cancel,
             background,
-            Some(seed),
+            Some(seed.clone()),
+            Some(seed.origin.clone()),
         )
         .await
     }
+    pub(super) async fn group_with_origin(
+        &self,
+        names: Vec<String>,
+        identity: bool,
+        bound: &[StagedAddress],
+        cancel: CancellationToken,
+        origin: String,
+    ) -> Result<Arc<Group>> {
+        self.group_inner(names, identity, bound, cancel, true, None, Some(origin))
+            .await
+    }
+    pub(super) async fn replacement_group(
+        &self,
+        names: Vec<String>,
+        bound: &[StagedAddress],
+        cancel: CancellationToken,
+        origin: String,
+    ) -> Result<Arc<Group>> {
+        self.group_inner(names, false, bound, cancel, false, None, Some(origin)).await
+    }
+
+    /// This path is entered only after this flight's permission check. Reuse a
+    /// scope only under the same immutable policy; a due handover joins the old
+    /// owner before the replacement can perform storage or signing work.
+    fn residency_current(&self, group: &Group) -> Result<bool> {
+        let binding = group.residency.lock()
+            .map_err(|_| anyhow!("certificate residency unavailable"))?;
+        Ok(binding.as_ref().is_none_or(|binding| binding.slot.live()))
+    }
+
+    pub(super) async fn authorized_on_demand_group(
+        &self,
+        names: Vec<String>,
+        bound: &[StagedAddress],
+        cancel: CancellationToken,
+        origin: String,
+        seed: Option<Arc<super::super::resident_cache::CacheEntry>>,
+    ) -> Result<Arc<Group>> {
+        self.group_inner(names, false, bound, cancel, true, seed, Some(origin)).await
+    }
+
     async fn group_inner(
         &self,
         names: Vec<String>,
@@ -49,12 +106,15 @@ impl CertificateServices {
         cancel: CancellationToken,
         background: bool,
         seed: Option<Arc<super::super::resident_cache::CacheEntry>>,
+        origin: Option<String>,
     ) -> Result<Arc<Group>> {
-        let key = group_key(&names, identity);
+        let origin = origin.unwrap_or_else(|| names[0].clone());
+        let key = self.management_key(&names, identity, &origin);
         let restoring = seed.is_some() && !background;
         let background = background || seed.is_some();
         let (retired, retired_ocsp) = {
             let mut state = self.state.lock().await;
+
             let retired = state.groups.get(&key).is_some_and(|group| {
                 group.cancel.is_cancelled()
                     || group.residency.lock().is_ok_and(|binding| {
@@ -91,6 +151,7 @@ impl CertificateServices {
         let existing = {
             let state = self.state.lock().await;
             let existing = state.groups.get(&key).cloned();
+
             if let Some(group) = &existing {
                 if let Some(seed) = &seed {
                     let material = &seed.material;
@@ -99,7 +160,7 @@ impl CertificateServices {
                         .lock()
                         .map_err(|_| anyhow!("certificate residency unavailable"))?;
                     if binding.is_none() {
-                        *binding = Some(ResidencyBinding::shared(&seed.slot));
+                        *binding = Some(ResidencyBinding::shared(seed));
                     }
                     let mut leaf = group
                         .leaf_state
@@ -123,11 +184,84 @@ impl CertificateServices {
             existing
         };
         if let Some(group) = existing {
+            if !identity && self.policy_index(&group.origin) != self.policy_index(&origin) {
+                return Err(anyhow!(
+                    "certificate group origin changed; authorized replacement required"
+                ));
+            }
             if background {
                 self.maintenance_changed.notify_one();
             }
             return Ok(group);
         }
+        let candidate = self
+            .build_candidate(
+                names,
+                identity,
+                bound,
+                cancel,
+                background,
+                restoring,
+                seed,
+                origin.clone(),
+            )
+            .await?;
+        let mut state = self.state.lock().await;
+        ensure!(
+            state.groups.len() < super::capacity::GROUP_LIMIT,
+            "certificate group capacity exceeded"
+        );
+        let group = state
+            .groups
+            .entry(key)
+            .or_insert_with(|| candidate.clone())
+            .clone();
+        ensure!(
+            self.residency_current(&group)?,
+            super::super::resident_cache::CacheChanged
+        );
+        if !identity
+            && !Arc::ptr_eq(&group, &candidate)
+            && self.policy_index(&group.origin) != self.policy_index(&origin)
+        {
+            return Err(anyhow!(
+                "certificate group origin changed; authorized replacement required"
+            ));
+        }
+        if !Arc::ptr_eq(&group, &candidate) && restoring {
+            let mut current = group
+                .leaf_state
+                .lock()
+                .map_err(|_| anyhow!("certificate leaf state unavailable"))?;
+            if current.is_none() {
+                *current = candidate
+                    .leaf_state
+                    .lock()
+                    .map_err(|_| anyhow!("certificate leaf state unavailable"))?
+                    .clone();
+            }
+            group.restoring.store(true, Ordering::Release);
+        }
+        if background {
+            group.background.store(true, Ordering::Release);
+        }
+        drop(state);
+        self.maintenance_changed.notify_one();
+        Ok(group)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_candidate(
+        &self,
+        names: Vec<String>,
+        identity: bool,
+        bound: &[StagedAddress],
+        cancel: CancellationToken,
+        background: bool,
+        restoring: bool,
+        seed: Option<Arc<super::super::resident_cache::CacheEntry>>,
+        origin: String,
+    ) -> Result<Arc<Group>> {
         let group_admission = self
             .group_slots
             .clone()
@@ -144,11 +278,11 @@ impl CertificateServices {
                 ..Policy::default()
             }
         } else {
-            self.policy(&names[0])
+            self.policy_for_origin(&origin)
         };
 
         if policy.issuers.is_empty() {
-            if !identity && self.policy_index(&names[0]).is_none() && internal_name(&names[0]) {
+            if !identity && self.policy_index(&origin).is_none() && internal_name(&names[0]) {
                 policy.issuers.push(Issuer::Internal {
                     ca: "local".into(),
                     options: InternalIssuerOptions::default(),
@@ -165,6 +299,17 @@ impl CertificateServices {
                     distributed: true,
                     timeout: None,
                 }))];
+            }
+        }
+        // HTTP application's internal port overrides are defaults for business
+        // ACME solvers only. Explicit issuer alternate ports retain priority,
+        // and the independently managed Admin identity is unaffected.
+        if !identity {
+            for issuer in &mut policy.issuers {
+                if let Issuer::Acme(settings)=issuer {
+                    if settings.http_port.is_none(){settings.http_port=self.plan.http_challenge_port;}
+                    if settings.alpn_port.is_none(){settings.alpn_port=self.plan.alpn_challenge_port;}
+                }
             }
         }
         let storage = if identity {
@@ -249,6 +394,9 @@ impl CertificateServices {
                 self.context.resources.issuance.clone(),
                 Some(broker.callback()),
             )?
+            // Caddy admin identity uses a separate certmagic.Config without
+            // tlsApp.onEvent; only business certificates join the TLS app.
+            .with_events((!identity).then(|| self.context.events.clone()).flatten())?
             .storage_only()?;
             solver = Some(broker);
             GroupIssuer::Acme(manager)
@@ -265,32 +413,35 @@ impl CertificateServices {
         } else {
             return Err(anyhow!("mixed issuer fallback is not yet integrated"));
         };
+        let seed_identity = seed.as_ref().map(|entry| entry.material.identity);
         let retained = self
             .state
             .lock()
             .await
             .material
             .iter()
-            .find(|item| item.identity == identity && item.managed_names.as_ref() == Some(&names))
+            .find(|item| (identity || !policy.on_demand)
+                && item.identity == identity && item.managed_names.as_ref() == Some(&names))
             .map(|item| item.material.clone());
         let seed_binding = seed
             .as_ref()
-            .map(|entry| ResidencyBinding::shared(&entry.slot));
-        let leaf_state = seed
-            .map(|entry| entry.material.clone())
-            .or(retained)
-            .map(|material| {
+            .map(|entry| ResidencyBinding::shared(entry));
+        let seed_material = seed.map(|entry| entry.material.clone()).or(retained);
+        let spki = seed_material.as_ref().map(|material| material.spki_der.clone());
+        let leaf_state = seed_material.map(|material| {
                 let (_, end) = material.times()?;
                 self.context.leaf_guard.intern(material.leaf_id, end)
             })
             .transpose()?;
-        let imported = if identity {
+        let imported = if identity || (policy.on_demand && seed_identity.is_none()) {
             None
         } else {
-            self.on_demand.imported_binding(&names)
+            self.on_demand.imported_binding(&names, seed_identity)
         };
         let group = Arc::new(Group {
+            key: self.management_key(&names, identity, &origin),
             names,
+            origin: origin.clone(),
             policy,
             store,
             resolver,
@@ -299,6 +450,7 @@ impl CertificateServices {
             gate: AsyncMutex::new(()),
             solver,
             leaf_state: Mutex::new(leaf_state),
+            spki: Mutex::new(spki),
             scope: imported
                 .as_ref()
                 .map(|binding| binding.0.clone())
@@ -316,41 +468,16 @@ impl CertificateServices {
             ari_after: AtomicI64::new(imported.as_ref().map_or(i64::MAX, |binding| binding.3)),
             background: AtomicBool::new(background),
             restoring: AtomicBool::new(restoring),
+            cache_event_emitted: AtomicBool::new(restoring || imported.is_some()),
             cancel: self.context.cancel.child_token(),
             tasks: TaskTracker::new(),
             started: Mutex::new(false),
             _admission: group_admission,
         });
-        let mut state = self.state.lock().await;
         ensure!(
-            state.groups.len() < super::capacity::GROUP_LIMIT,
-            "certificate group capacity exceeded"
+            self.residency_current(&group)?,
+            super::super::resident_cache::CacheChanged
         );
-        let candidate = group;
-        let group = state
-            .groups
-            .entry(key)
-            .or_insert_with(|| candidate.clone())
-            .clone();
-        if !Arc::ptr_eq(&group, &candidate) && restoring {
-            let mut current = group
-                .leaf_state
-                .lock()
-                .map_err(|_| anyhow!("certificate leaf state unavailable"))?;
-            if current.is_none() {
-                *current = candidate
-                    .leaf_state
-                    .lock()
-                    .map_err(|_| anyhow!("certificate leaf state unavailable"))?
-                    .clone();
-            }
-            group.restoring.store(true, Ordering::Release);
-        }
-        if background {
-            group.background.store(true, Ordering::Release);
-        }
-        drop(state);
-        self.maintenance_changed.notify_one();
         Ok(group)
     }
 
@@ -425,7 +552,7 @@ impl CertificateServices {
     }
 
     pub(super) async fn discard_storage_probe(&self, group: Arc<Group>) -> Result<()> {
-        let key = group_key(&group.names, group.identity);
+        let key = group.key.clone();
         let removed = {
             let mut state = self.state.lock().await;
             let owns = state
@@ -451,7 +578,7 @@ impl CertificateServices {
         Ok(())
     }
     pub(super) async fn discard_failed_on_demand(&self, group: Arc<Group>) -> Result<()> {
-        let key = group_key(&group.names, group.identity);
+        let key = group.key.clone();
         let (removed, ocsp) = {
             let mut state = self.state.lock().await;
             let owns = state
@@ -485,7 +612,7 @@ impl CertificateServices {
         Ok(())
     }
     pub(super) async fn discard_failed_restore(&self, group: Arc<Group>) -> Result<()> {
-        let key = group_key(&group.names, group.identity);
+        let key = group.key.clone();
         let removed = {
             let mut state = self.state.lock().await;
             let owns = state
@@ -570,13 +697,27 @@ impl CertificateServices {
         cached_first: bool,
         cancel: CancellationToken,
     ) -> Result<i64> {
+        self.ensure_group_target(group, cached_first, None, cancel).await
+    }
+    pub(super) async fn ensure_group_target(
+        &self,
+        group: Arc<Group>,
+        cached_first: bool,
+        target: Option<RenewalTarget>,
+        cancel: CancellationToken,
+    ) -> Result<i64> {
         let _gate = tokio::select! { biased; _ = cancel.cancelled() => return Err(anyhow!("certificate acquisition cancelled")),_=group.cancel.cancelled()=>return Err(anyhow!("certificate scope retired")), gate = group.gate.lock() => gate };
         ensure!(!group.cancel.is_cancelled(), "certificate scope retired");
-        let previous = group
-            .leaf_state
-            .lock()
-            .map_err(|_| anyhow!("certificate leaf state unavailable"))?
-            .clone();
+        if let Some(target) = &target {
+            ensure!(target.receipt.identity() == target.material.identity,
+                super::super::resident_cache::CacheChanged);
+            ensure!(group.resolver.receipt_current(&target.receipt, &target.binding.slot)?,
+                super::super::resident_cache::CacheChanged);
+        }
+        let previous = if let Some(target) = &target { Some(target.leaf.clone()) } else {
+            group.leaf_state.lock()
+                .map_err(|_| anyhow!("certificate leaf state unavailable"))?.clone()
+        };
         let pending = match previous {
             Some(leaf) => leaf.pending_revocation()?.map(|version| (leaf, version)),
             None => None,
@@ -590,11 +731,10 @@ impl CertificateServices {
         let watcher = group.tasks.spawn(async move {
             tokio::select! {biased;_=scoped.cancelled()=>worker.cancel(),_=stop.cancelled()=>{}}
         });
-        let slot = group
-            .residency
-            .lock()
-            .map_err(|_| anyhow!("certificate residency unavailable"))?
-            .clone();
+        let slot = if target.is_some() { None } else {
+            group.residency.lock()
+                .map_err(|_| anyhow!("certificate residency unavailable"))?.clone()
+        };
         let retirement = slot.map(|binding| {
             let work = work.clone();
             let stop = stop_watch.clone();
@@ -602,7 +742,7 @@ impl CertificateServices {
                 tokio::select! {biased;_ = binding.slot.retired() => work.cancel(),_ = stop.cancelled() => {}}
             })
         });
-        let result = self.acquire(&group, cached_first, work.clone()).await;
+        let result = self.acquire(&group, cached_first, target.as_ref(), work.clone()).await;
         work.cancel();
         stop_watch.cancel();
         let _ = watcher.await;
@@ -649,7 +789,8 @@ impl CertificateServices {
     async fn remember_material(&self, group: &Arc<Group>, mut material: Material) -> Result<()> {
         material.names = group.names.clone();
         material.validate_at(now()?, false)?;
-        reject_revoked(&material, &self.context.leaf_guard)?;
+        reject_revoked(&material, &self.context.leaf_guard, true)?;
+        *group.spki.lock().map_err(|_| anyhow!("certificate key state unavailable"))? = Some(material.spki_der.clone());
         let (_, expiry) = material.times()?;
         let leaf = self.context.leaf_guard.intern(material.leaf_id, expiry)?;
         *group
@@ -685,20 +826,23 @@ impl CertificateServices {
         {
             return Err(super::super::resident_cache::CacheChanged.into());
         }
-        state.material.retain(|item| {
-            !(item.identity == group.identity && item.managed_names.as_ref() == Some(&group.names))
-        });
-        state.material.push(RetainedMaterial {
-            material: material.clone(),
-            identity: group.identity,
-            managed_names: Some(group.names.clone()),
-            renew_at: group.renew_at.load(Ordering::Acquire),
-            ari_after: group.ari_after.load(Ordering::Acquire),
-        });
-        let ocsp = state
-            .ocsp
-            .get(&group_key(&group.names, group.identity))
-            .cloned();
+        if group.identity {
+            state.material.retain(|item| !(item.identity
+                && item.managed_names.as_ref() == Some(&group.names)));
+        }
+        if group.identity || !state.material.iter().any(|item| !item.identity
+            && item.material.identity == material.identity)
+        {
+            state.material.push(RetainedMaterial {
+                material: material.clone(), identity: group.identity,
+                managed_names: Some(group.names.clone()), origin: group.origin.clone(),
+                renew_at: group.renew_at.load(Ordering::Acquire),
+                ari_after: group.ari_after.load(Ordering::Acquire),
+            });
+        }
+        let ocsp = group.publication.lock().ok().and_then(|receipt|
+            receipt.as_ref().and_then(|receipt| state.ocsp
+                .get(&physical_ocsp_key(group.identity, receipt.identity())).cloned()));
         drop(state);
         if let Some(ocsp) = ocsp {
             ocsp.notify_changed();
@@ -789,6 +933,8 @@ impl CertificateServices {
             .parse_material(bundle.chain_pem, bundle.private_key_pem, cancel.clone())
             .await?;
         material.names = group.names.clone();
+        self.prime_material_status(Arc::new(material.clone()), group.identity, cancel.clone()).await?;
+        *group.spki.lock().map_err(|_| anyhow!("certificate key state unavailable"))? = Some(material.spki_der.clone());
         let (begin, end) = material.times()?;
         let leaf = self.context.leaf_guard.intern(material.leaf_id, end)?;
         let revoked = leaf.revocation()?.is_some();
@@ -823,6 +969,7 @@ impl CertificateServices {
             Arc::new(material.clone()),
             due,
             ari_after,
+            PublishIntent::Insert,
             cancel.clone(),
             lease,
         )
@@ -834,11 +981,45 @@ impl CertificateServices {
         &self,
         group: &Arc<Group>,
         cached_first: bool,
+        target: Option<&RenewalTarget>,
         cancel: CancellationToken,
     ) -> Result<(i64, Material)> {
+        let intent = if cached_first || group.identity || target.is_some() {
+            PublishIntent::Insert
+        } else {
+            group.residency.lock()
+                .map_err(|_| anyhow!("certificate residency unavailable"))?
+                .as_ref().and_then(|binding| binding.receipt.clone())
+                .map_or(PublishIntent::Insert, |old| PublishIntent::Renew { old })
+        };
+        let intent_for = |material: &Material| -> Result<PublishIntent> {
+            let Some(target) = target else { return Ok(intent.clone()); };
+            ensure!(material.identity != target.material.identity,
+                "managed warm certificate made no publication progress");
+            if target.leaf.revocation()?.is_some_and(|revoked| revoked.version.reason == Some(1)) {
+                ensure!(material.spki_id != target.material.spki_id,
+                    "compromised certificate replacement reused the old public key");
+            }
+            let preserved_name0 = group.names.as_slice() == [target.material.management_name.as_ref()]
+                && material.san_names() == target.material.san_names();
+            ensure!(material.san_names() == group.names || preserved_name0,
+                "managed warm certificate SAN does not match authorized subjects");
+            if material.san_names() == target.material.san_names()
+                && let Some(old) = &target.binding.receipt
+            {
+                return Ok(PublishIntent::ReplaceTarget {
+                    old: old.clone(), binding: target.binding.clone(), selection: target.selection.clone(),
+                });
+            }
+            // The new material covers a separately authorized Hello subject.
+            // Retain every other alias and authority of the observed old chain.
+            Ok(PublishIntent::WarmInsert { selection: target.selection.clone() })
+        };
         match &group.issuer {
             GroupIssuer::Acme(manager) => {
-                let loaded = if cached_first {
+                let mut authenticated_retry = false;
+                loop {
+                let loaded = if cached_first && !authenticated_retry {
                     manager.load_cached(&group.names, cancel.clone()).await?
                 } else {
                     None
@@ -877,22 +1058,37 @@ impl CertificateServices {
                         "managed certificate changed before publication; retry required"
                     );
                     material.validate_at(now()?, false)?;
-                    reject_revoked(&material, &self.context.leaf_guard)?;
                     material.names = group.names.clone();
+                    self.prime_material_status(Arc::new(material.clone()), group.identity,
+                        cancel.clone()).await?;
+                    if self.context.leaf_guard.key_deny().check_spki_der(&material.spki_der).is_err()
+                        || self.context.leaf_guard.intern(material.leaf_id, material.times()?.1)?
+                        .revocation()?.is_some()
+                    {
+                        // Release this actual lease before the manager's
+                        // next fresh-key ensure, which takes the same lease.
+                        return Ok(None);
+                    }
                     lease.check().await?;
                     self.publish_group(
                         group,
                         Arc::new(material.clone()),
                         info.renew_at_unix,
                         ari_after,
+                        intent_for(&material)?,
                         cancel.clone(),
                         Some(&lease),
                     )
                     .await?;
-                    Ok((info.renew_at_unix, material))
+                    Ok(Some((info.renew_at_unix, material)))
                 }
                 .await;
-                self.finish_publication_lease(group, lease, result).await
+                match self.finish_publication_lease(group, lease, result).await? {
+                    Some(material) => return Ok(material),
+                    None if !info.obtained && !authenticated_retry => authenticated_retry = true,
+                    None => return Err(anyhow!("managed certificate remains revoked after fresh acquisition")),
+                }
+                }
             }
             GroupIssuer::Internal { pki, ca, options } => {
                 let lease = group
@@ -902,12 +1098,15 @@ impl CertificateServices {
                     .await?;
                 let result = async {
                     let key = names_key(&group.names)?;
+                    let mut previous_event = None;
                     group
                         .store
                         .fs
                         .recover_certificate_with_lease(ca, &key, &lease)
                         .await?;
+                    let mut renewal_names = None;
                     if let Some(bundle) = group.store.fs.load_certificate(ca, &key).await? {
+                        let preserved = crate::certstore::name0_renewal_names(&bundle, &key)?;
                         let mut material = self
                             .parse_material(
                                 bundle.chain_pem,
@@ -916,19 +1115,30 @@ impl CertificateServices {
                             )
                             .await?;
                         material.names = group.names.clone();
+                        self.prime_material_status(Arc::new(material.clone()), group.identity, cancel.clone()).await?;
+                        if self.context.leaf_guard.key_deny().check_spki_der(&material.spki_der)
+                            .is_err_and(|error| error.is::<crate::key_compromise::KeyCompromised>()) {
+                            let archived = group.store.fs.archive_compromised_key(ca, &key,
+                                material.spki_id, &group.names, &lease).await;
+                            let _ = self.events.send(CertificateEvent {
+                                names: group.names.clone(), kind: match archived {
+                                    Ok(true) => "compromised_key_archived",
+                                    Ok(false) => "compromised_key_not_archived",
+                                    Err(_) => "compromised_key_archive_failed",
+                                },
+                            });
+                        }
+                        if material.key_allowed(self.context.leaf_guard.key_deny()) && !self.context.leaf_guard.intern(material.leaf_id, material.times()?.1)?.revocation()?.is_some_and(|r| r.version.reason == Some(1)) {
+                            renewal_names = preserved;
+                        }
                         let (begin, end) = material.times()?;
                         if begin > now()? {
                             return Err(cert_automation::FutureCertificate(begin).into());
                         }
-                        let due = cert_automation::renewal_time(
-                            begin,
-                            end,
-                            group.policy.renewal_ratio,
-                            None,
-                            &key,
-                        )?;
+                        let due = self.current_renewal_time(&material, &group.policy)?;
+                        let revoked = reject_revoked(&material, &self.context.leaf_guard, true).is_err();
                         if material.validate_at(now()?, false).is_ok()
-                            && reject_revoked(&material, &self.context.leaf_guard).is_ok()
+                            && !revoked
                             && (cached_first || due > now()?)
                         {
                             self.publish_group(
@@ -936,25 +1146,36 @@ impl CertificateServices {
                                 Arc::new(material.clone()),
                                 due,
                                 i64::MAX,
-                                cancel.clone(),
+                                intent_for(&material)?,
+                        cancel.clone(),
                                 Some(&lease),
                             )
                             .await?;
                             return Ok((due, material));
                         }
+                        previous_event=Some((end,revoked));
                     }
                     // LocalPki registration/provisioning precedes issuance and
                     // never installs trust; trust is a post-commit operation.
                     pki.provision(ca, cancel.clone()).await?;
-                    let names = group.names.clone();
+                    let lifecycle=crate::cert_events::Attempt::new(&group.names[0],previous_event.map(|p|p.0));
+                    let events=(!group.identity).then(||self.context.events.as_ref()).flatten();
+                    lifecycle.obtaining(events,ca,previous_event.is_some_and(|p|p.1),&cancel).await?;
+                    let issuance_names = renewal_names.unwrap_or_else(|| group.names.clone());
+                    let names = issuance_names.clone();
                     let kind = group.policy.key_type;
-                    let (csr, private_key_pem) = loaders::blocking(
+                    let key_registry=self.context.leaf_guard.key_deny().clone();
+                    let (csr,private_key_pem,_key_reservation)=loaders::blocking(
                         self.context.resources.io.clone(),
                         cancel.clone(),
-                        move || cert_automation::generate_csr(&names, kind),
+                        move || cert_automation::generate_csr(&names,kind,&key_registry),
                     )
                     .await?;
-                    let chain_pem = pki.issue(ca, csr, options.clone(), cancel.clone()).await?;
+                    let event_csr=csr.clone();
+                    let chain_pem = match pki.issue(ca, csr, options.clone(), cancel.clone()).await {
+                        Ok(chain)=>chain,
+                        Err(error)=>{lifecycle.failed(events,std::slice::from_ref(ca),&error,&cancel).await;return Err(error)},
+                    };
                     let mut material = self
                         .parse_material(chain_pem.clone(), private_key_pem.clone(), cancel.clone())
                         .await?;
@@ -963,7 +1184,7 @@ impl CertificateServices {
                     let bundle = CertificateBundle {
                         chain_pem,
                         private_key_pem,
-                        metadata: json!({"sans":group.names,"issuer_data":{"ca":ca}}),
+                        metadata: json!({"sans":issuance_names,"issuer_data":{"ca":ca}}),
                     };
                     lease.check().await?;
                     group
@@ -971,20 +1192,15 @@ impl CertificateServices {
                         .fs
                         .save_certificate(ca, &key, &bundle, &lease)
                         .await?;
+                    lifecycle.obtained(events,ca,&group.names,&event_csr,&cancel).await;
                     lease.check().await?;
-                    let (begin, end) = material.times()?;
-                    let due = cert_automation::renewal_time(
-                        begin,
-                        end,
-                        group.policy.renewal_ratio,
-                        None,
-                        &key,
-                    )?;
+                    let due = self.current_renewal_time(&material, &group.policy)?;
                     self.publish_group(
                         group,
                         Arc::new(material.clone()),
                         due,
                         i64::MAX,
+                        intent_for(&material)?,
                         cancel.clone(),
                         Some(&lease),
                     )
@@ -1059,7 +1275,7 @@ impl CertificateServices {
                     .ocsp_certificates()?
                     .into_iter()
                     .map(|certificate| {
-                        (group_key(certificate.names(), identity_scope), certificate)
+                        (physical_ocsp_key(identity_scope, certificate.identity()), certificate)
                     })
                     .collect::<Vec<_>>();
                 let manual = if identity_scope {
@@ -1207,75 +1423,21 @@ impl CertificateServices {
     }
 
     pub(super) async fn ocsp_manager(&self, group: &Group) -> Result<Option<OcspScope>> {
-        // No certificate status work or per-group event ring is necessary
-        // when this policy disables OCSP. A shared authenticated LeafGuard
-        // fact still applies independently of the stapling policy.
-        if self.plan.disable_ocsp || group.policy.disable_ocsp {
-            return Ok(None);
-        }
-        let key = group_key(&group.names, group.identity);
-        {
-            let state = self.state.lock().await;
-            ensure!(
-                state
-                    .groups
-                    .get(&key)
-                    .is_some_and(|current| std::ptr::eq(current.as_ref(), group))
-                    && !group.cancel.is_cancelled(),
-                "certificate status scope retired"
-            );
-            if let Some(manager) = state.ocsp.get(&key).cloned() {
-                return Ok(Some(manager));
-            }
-        }
-        let overrides: std::collections::HashMap<String, String> =
-            group.policy.ocsp_overrides.clone().into_iter().collect();
-        let policy = Arc::new(move |_: &crate::tls_resolver::OcspCertificate| {
-            Ok(OcspConfig {
-                responder_overrides: overrides.clone(),
-                ..OcspConfig::default()
-            })
-        });
-        let (max_concurrent, max_concurrent_per_responder) = self.context.resources.ocsp.limits();
-        let options = OcspOptions {
-            check_interval: self.plan.ocsp_interval,
-            max_concurrent,
-            max_concurrent_per_responder,
-            ..OcspOptions::default()
+        let identity = if group.identity {
+            self.state.lock().await.material.iter()
+                .find(|item| item.identity && item.material.names == group.names)
+                .map(|item| item.material.identity)
+        } else {
+            group.publication.lock()
+                .map_err(|_| anyhow!("certificate publication unavailable"))?
+                .as_ref().map(ScopedCertificate::identity)
         };
-        let names = group.names.clone();
-        let inventory = Arc::new(move |certificate: &crate::tls_resolver::OcspCertificate| {
-            certificate.names().len() == names.len()
-                && certificate.names().iter().all(|name| names.contains(name))
-        });
-        let manager = OcspManager::with_resources_and_inventory_cpu(
-            group.store.fs.clone(),
-            group.resolver.clone(),
-            options,
-            policy,
-            inventory,
-            self.context.resources.ocsp.clone(),
-            self.context.resources.cpu.clone(),
-        )?
-        .with_names_scope(group.names.clone())?;
-        let mut state = self.state.lock().await;
-        ensure!(
-            state
-                .groups
-                .get(&key)
-                .is_some_and(|current| std::ptr::eq(current.as_ref(), group))
-                && !group.cancel.is_cancelled()
-                && group.residency.lock().is_ok_and(|binding| binding
-                    .as_ref()
-                    .is_none_or(|binding| binding.slot.live())),
-            "certificate status scope retired"
-        );
-        let scope = OcspScope::new(manager, group.names.clone(), &group.cancel);
-        let manager = state.ocsp.entry(key).or_insert(scope).clone();
-        drop(state);
-        self.maintenance_changed.notify_one();
-        Ok(Some(manager))
+        match identity {
+            Some(identity) => self.prepare_physical_ocsp(group.identity, identity).await,
+            None => Ok(None),
+        }
     }
+
 }
 
 fn internal_name(name: &str) -> bool {

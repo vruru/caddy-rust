@@ -42,6 +42,7 @@ pub(super) struct Policy {
     pub renewal_ratio: f64,
     pub key_type: KeyType,
     pub on_demand: bool,
+    pub managers: Vec<super::external::Manager>,
     pub disable_ocsp: bool,
     pub ocsp_overrides: BTreeMap<String, String>,
 }
@@ -55,6 +56,7 @@ impl Default for Policy {
             renewal_ratio: 1.0 / 3.0,
             key_type: KeyType::P256,
             on_demand: false,
+            managers: Vec::new(),
             disable_ocsp: false,
             ocsp_overrides: BTreeMap::new(),
         }
@@ -96,6 +98,8 @@ pub(super) struct Identity {
 #[derive(Clone)]
 pub struct CertificatePlan {
     pub(super) storage: Option<PathBuf>,
+    pub(super) http_challenge_port: Option<u16>,
+    pub(super) alpn_challenge_port: Option<u16>,
     pub(super) ticket_mode: TicketMode,
     pub(super) policies: Vec<Policy>,
     pub(super) authorities: BTreeMap<String, Authority>,
@@ -116,6 +120,8 @@ impl Default for CertificatePlan {
     fn default() -> Self {
         Self {
             storage: None,
+            http_challenge_port: None,
+            alpn_challenge_port: None,
             ticket_mode: TicketMode::RuntimeDefault,
             policies: Vec::new(),
             authorities: BTreeMap::new(),
@@ -135,6 +141,12 @@ impl Default for CertificatePlan {
 }
 
 impl CertificatePlan {
+    pub(crate) fn explicit_subjects(&self)->std::collections::BTreeSet<String>{
+        self.policies.iter().flat_map(|policy|policy.subjects.iter().cloned()).collect()
+    }
+    pub(crate) fn http_application_ports(&mut self,http:u16,https:u16){
+        self.http_challenge_port=Some(http);self.alpn_challenge_port=Some(https);
+    }
     /// Typed configuration, available to provisioning/inspection callers.
     /// The actual native process activates it only after Root publication.
     pub fn session_tickets(&self) -> &TicketMode {

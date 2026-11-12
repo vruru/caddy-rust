@@ -1,0 +1,21 @@
+[package]
+name = "gotmpl"
+version = "0.6.1"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+repository = "https://github.com/phsym/gotmpl-rs"
+
+[features]
+default = ["std", "glob"]
+std = ["serde?/std", "dep:parking_lot"]
+glob = ["std", "dep:glob"]
+html = []
+serde = ["dep:serde"]
+
+[dependencies]
+parking_lot = { version = "=0.12.5", optional = true }
+thiserror = "2"
+smol_str = { version = "0.3", default-features = false }
+glob = { version = "0.3", optional = true }
+serde = { version = "1", default-features = false, features = ["alloc"], optional = true }

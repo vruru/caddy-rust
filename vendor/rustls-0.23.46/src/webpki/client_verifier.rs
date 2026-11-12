@@ -663,3 +663,62 @@ mod tests {
         }
     }
 }
+
+/// One path observed only after webpki has checked signatures and constraints.
+#[derive(Clone, Debug)]
+pub struct RawClientPath {
+    /// Index in the verifier's actual trust-anchor list.
+    pub anchor_index: usize,
+    /// Indexes in the peer's intermediates slice (leaf excluded).
+    pub intermediate_indexes: Vec<usize>,
+}
+/// All observed paths within webpki's own shared verification budget.
+pub struct ClientPathEnumeration {
+    pub paths: Vec<RawClientPath>,
+    pub complete: bool,
+}
+/// Preserve the stock no-CRL verification decision while collecting paths.
+/// A bounded incomplete observation never changes an accepted handshake.
+pub fn enumerate_client_cert_paths(roots: &RootCertStore,
+    algorithms: &WebPkiSupportedAlgorithms, leaf: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>], now: UnixTime,
+    max_paths: usize) -> Result<ClientPathEnumeration, Error> {
+    use core::cell::{Cell, RefCell};
+    if max_paths == 0 || max_paths > 16 {
+        return Err(Error::General("invalid client path observation limit".into()));
+    }
+    let cert = ParsedCertificate::try_from(leaf)?;
+    let paths = RefCell::new(Vec::new());
+    let seen = Cell::new(false);
+    let complete = Cell::new(true);
+    let observe = |path: &webpki::VerifiedPath<'_>| -> Result<(), webpki::Error> {
+        seen.set(true);
+        let Some(anchor_index) = roots.roots.iter().position(|anchor|
+            core::ptr::eq(anchor, path.anchor())) else {
+            complete.set(false); return Err(webpki::Error::UnknownIssuer);
+        };
+        let mut indexes = Vec::new();
+        for certificate in path.intermediate_certificates() {
+            let der = certificate.der();
+            let Some(index) = intermediates.iter().position(|input|
+                input.as_ref().as_ptr() == der.as_ref().as_ptr() && input.len() == der.len()) else {
+                complete.set(false); return Err(webpki::Error::UnknownIssuer);
+            };
+            indexes.push(index);
+        }
+        if let Ok(mut paths) = paths.try_borrow_mut() {
+            if paths.len() < max_paths { paths.push(RawClientPath { anchor_index,
+                intermediate_indexes: indexes }); } else { complete.set(false); }
+        } else { complete.set(false); }
+        // Deliberately continue path building; every callback invocation was
+        // already a valid path, so seen retains the stock success decision.
+        Err(webpki::Error::UnknownIssuer)
+    };
+    let outcome = cert.0.verify_for_usage(algorithms.all, &roots.roots,
+        intermediates, now, webpki::KeyUsage::client_auth(), None, Some(&observe));
+    if !seen.get() { return Err(pki_error(outcome.err().unwrap_or(webpki::Error::UnknownIssuer))); }
+    if matches!(outcome, Err(webpki::Error::MaximumSignatureChecksExceeded
+        | webpki::Error::MaximumPathBuildCallsExceeded
+        | webpki::Error::MaximumNameConstraintComparisonsExceeded)) { complete.set(false); }
+    Ok(ClientPathEnumeration { paths: paths.into_inner(), complete: complete.get() })
+}

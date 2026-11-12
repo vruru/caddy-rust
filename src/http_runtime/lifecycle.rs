@@ -32,7 +32,7 @@ struct Pending {
     retirement: HttpRetirement,
 }
 struct ListenerControl {
-    admission:Arc<connection_budget::ListenerBudget>,
+    admission: Arc<connection_budget::ListenerBudget>,
     cancel: CancellationToken,
     actual: SocketAddr,
     proof: Arc<ArcSwap<ProofListener>>,
@@ -56,7 +56,7 @@ struct LeaseRecord {
 /// The completion token is signalled only after the actual descriptor closes,
 /// including an unpolled or unwinding accept task.
 pub(super) struct ListenerSocket {
-    pub(super) admission:Arc<connection_budget::ListenerBudget>,
+    pub(super) admission: Arc<connection_budget::ListenerBudget>,
     socket: Option<TcpListener>,
     finished: CancellationToken,
 }
@@ -302,7 +302,10 @@ impl HttpStage {
             return CommitOutcome::Discarded;
         };
         let generation = next.id;
-        if tickets.as_ref().is_some_and(|activation| activation.generation() != generation) {
+        if tickets
+            .as_ref()
+            .is_some_and(|activation| activation.generation() != generation)
+        {
             return CommitOutcome::Discarded;
         }
         let (previous, old_listeners) = {
@@ -312,6 +315,7 @@ impl HttpStage {
                 .as_ref()
                 .is_some_and(|p| Arc::ptr_eq(&p.identity, &self.guard.identity))
                 || !matches!(control.phase, Phase::Running | Phase::StopRequested)
+                || self.inner.stopped.is_cancelled()
             {
                 return CommitOutcome::Discarded;
             }
@@ -331,6 +335,9 @@ impl HttpStage {
                 tickets.commit();
             }
             let previous = self.inner.current.swap(next);
+            if let Some(cleanup) = &previous.proxy_cleanup {
+                cleanup.retire(&self.inner.resources.proxy_cleanup);
+            }
             let old_listeners = std::mem::replace(&mut control.listeners, listeners);
             control
                 .retirements
@@ -367,7 +374,13 @@ impl HttpRuntime {
             &self.inner.registry,
             &self.inner.managed,
             &self.inner.challenge_resolver,
-            ServingMaterial{manual:None,provider:None,logging:None,tickets:None,validate_only:true},
+            ServingMaterial {
+                manual: None,
+                provider: None,
+                logging: None,
+                tickets: None,
+                validate_only: true,
+            },
             &self.inner.resources,
         );
         tokio::select! {
@@ -405,7 +418,13 @@ impl HttpRuntime {
             &self.inner.registry,
             managed,
             &self.inner.challenge_resolver,
-            ServingMaterial{manual:Some(manual),provider:None,logging:None,tickets:None,validate_only:true},
+            ServingMaterial {
+                manual: Some(manual),
+                provider: None,
+                logging: None,
+                tickets: None,
+                validate_only: true,
+            },
             &self.inner.resources,
         );
         tokio::select! {
@@ -552,7 +571,13 @@ impl HttpRuntime {
             &self.inner.registry,
             &managed,
             &self.inner.challenge_resolver,
-            ServingMaterial { manual: manual.as_ref(), provider: provider.as_ref(), logging: logging.as_ref(), tickets: tickets.as_ref(), validate_only:false },
+            ServingMaterial {
+                manual: manual.as_ref(),
+                provider: provider.as_ref(),
+                logging: logging.as_ref(),
+                tickets: tickets.as_ref(),
+                validate_only: false,
+            },
             &self.inner.resources,
         );
         let (servers, managed_names) = tokio::select! {
@@ -569,7 +594,7 @@ impl HttpRuntime {
         let proof_tls = proof_tls_config(self.inner.challenge_resolver.clone())?;
         let bindings = servers
             .iter()
-            .filter(|(_,server)|h3::tcp_enabled(server))
+            .filter(|(_, server)| h3::tcp_enabled(server))
             .map(|(address, server)| (*address, ListenerKind::of(server)))
             .collect::<HashMap<_, _>>();
         let (listeners, mut addresses) = loop {
@@ -645,17 +670,24 @@ impl HttpRuntime {
             }
         };
         let quic = {
-            let mut state=self.control.lock();
+            let mut state = self.control.lock();
             ensure!(!guard.cancel.is_cancelled(), "HTTP candidate was stopped");
-            h3::stage(&self.inner,&mut state.quic_pool,&servers,&addresses)?
+            h3::stage(&self.inner, &mut state.quic_pool, &servers, &addresses)?
         };
         for (&declared, listener) in &quic {
             if !bindings.contains_key(&declared) {
                 addresses.push(StagedAddress {
-                    declared, actual: listener.binding.actual,
-                    reused: self.inner.current.load().quic.get(&declared)
-                        .is_some_and(|old|Arc::ptr_eq(&old.binding,&listener.binding)),
-                    http01:false,tls_alpn01:false,
+                    declared,
+                    actual: listener.binding.actual,
+                    reused: self
+                        .inner
+                        .current
+                        .load()
+                        .quic
+                        .get(&declared)
+                        .is_some_and(|old| Arc::ptr_eq(&old.binding, &listener.binding)),
+                    http01: false,
+                    tls_alpn01: false,
                 });
             }
         }
@@ -709,18 +741,28 @@ impl HttpRuntime {
             retirement.clone(),
             RetirementTaskGuard(Some(retirement.clone())),
         ));
+        let owners = proxy_cleanup::dedup_owners(
+            servers
+                .values()
+                .flat_map(|server| server.clients.values())
+                .filter_map(|client| client.passive.as_ref()),
+        );
+        let proxy_cleanup = self.inner.resources.proxy_cleanup.reserve(owners).await?;
+        let next = Arc::new(Generation {
+            id: generation,
+            activity: activity.clone(),
+            servers,
+            quic,
+            retiring,
+            drain: activity.drain.clone(),
+            managed_names,
+            proxy_cleanup,
+        });
+        proxy::prepare_health(&self.inner, &next, guard.retirement.clone()).await?;
         Ok(HttpStage {
             inner: self.inner.clone(),
             guard,
-            next: Some(Arc::new(Generation {
-                id: generation,
-                activity: activity.clone(),
-                servers,
-                quic,
-                retiring,
-                drain: activity.drain.clone(),
-                managed_names,
-            })),
+            next: Some(next),
             listeners: Some(listeners),
             addresses,
             retirement,
@@ -728,10 +770,21 @@ impl HttpRuntime {
         })
     }
     /// Currently owned accepting descriptors. Old streams remain in global counts.
-    pub fn listener_connection_diagnostics(&self)->Vec<(SocketAddr,SocketAddr,ConnectionDiagnostics)> {
-        let state=self.control.lock();
-        let mut rows=state.pool.iter().filter_map(|(key,slot)|slot.owner.upgrade().map(|owner|(*key,slot.actual,owner.admission.snapshot()))).collect::<Vec<_>>();
-        rows.sort_by_key(|row|row.0);rows
+    pub fn listener_connection_diagnostics(
+        &self,
+    ) -> Vec<(SocketAddr, SocketAddr, ConnectionDiagnostics)> {
+        let state = self.control.lock();
+        let mut rows = state
+            .pool
+            .iter()
+            .filter_map(|(key, slot)| {
+                slot.owner
+                    .upgrade()
+                    .map(|owner| (*key, slot.actual, owner.admission.snapshot()))
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| row.0);
+        rows
     }
     pub async fn bound_addresses(&self) -> Vec<SocketAddr> {
         self.control
@@ -838,6 +891,9 @@ impl HttpRuntime {
             executor.close();
         }
         let current = self.inner.current.load_full();
+        if let Some(cleanup) = &current.proxy_cleanup {
+            cleanup.retire(&self.inner.resources.proxy_cleanup);
+        }
         current.drain.cancel();
         self.inner.tasks.close();
         self.inner.upgrades.close();
@@ -903,6 +959,9 @@ async fn stop_runtime(inner: Arc<Inner>, lifecycle: Arc<Lifecycle>, signal: Http
             }
             for slot in state.pool.values() {
                 slot.cancel.cancel();
+            }
+            if let Some(cleanup) = &current.proxy_cleanup {
+                cleanup.retire(&inner.resources.proxy_cleanup);
             }
             forced
         };
@@ -1000,7 +1059,7 @@ fn own_socket(
     tls: &Arc<rustls::ServerConfig>,
     coverage: bool,
     launches: &mut Vec<Launch>,
-    connections:&Arc<connection_budget::Budgets>,
+    connections: &Arc<connection_budget::Budgets>,
 ) -> Result<(Arc<ListenerControl>, bool)> {
     if let Some(key) = pool_key(control, address, coverage) {
         ensure!(
@@ -1021,9 +1080,9 @@ fn own_socket(
     let socket =
         bind_listener(address).map_err(|_| anyhow::anyhow!("HTTP listener bind failed"))?;
     let finished = CancellationToken::new();
-    let admission=connections.listener();
+    let admission = connections.listener();
     let socket = ListenerSocket {
-        admission:admission.clone(),
+        admission: admission.clone(),
         socket: Some(socket),
         finished: finished.clone(),
     };
@@ -1233,8 +1292,15 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
                         let mut modes = Vec::new();
                         let mut launches = Vec::new();
                         for (address, kind) in &bindings {
-                            let (owner, reused) =
-                                own_socket(&mut state, *address, *kind, &tls, true, &mut launches,&inner.connections)?;
+                            let (owner, reused) = own_socket(
+                                &mut state,
+                                *address,
+                                *kind,
+                                &tls,
+                                true,
+                                &mut launches,
+                                &inner.connections,
+                            )?;
                             let key =
                                 pool_key(&state, *address, true).expect("new or pinned listener");
                             // Separate input addresses can resolve to one wildcard

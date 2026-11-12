@@ -1,4 +1,4 @@
-//! auth_cache.rs — per-generation bcrypt verification cache.
+//! auth_cache.rs — per-generation password verification cache.
 //! No TTL or implicit authentication deadline. Accepted owned leaders continue
 //! after their HTTP waiters cancel; their work and follower counts are bounded.
 //! Result keys retain HMAC digests, never plaintext credentials.
@@ -19,6 +19,7 @@ use tokio::sync::{OwnedSemaphorePermit, watch};
 use zeroize::Zeroizing;
 
 use super::resource_budget::{BudgetError, Resources};
+use super::auth_hash::Algorithm;
 
 type HmacSha256 = Hmac<Sha256>;
 type Digest = [u8; 32];
@@ -101,9 +102,9 @@ impl AuthCache {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn digest(&self, hash: &str, pw: &[u8]) -> Digest {
+    fn digest(&self, algorithm:Algorithm, hash: &str, pw: &[u8]) -> Digest {
         let mut mac = HmacSha256::new_from_slice(&*self.secret).expect("32-byte key");
-        let scheme = b"bcrypt";
+        let scheme = algorithm.name().as_bytes();
         mac.update(b"caddy-auth-cache/v1\0");
         mac.update(&(scheme.len() as u64).to_be_bytes());
         mac.update(scheme);
@@ -121,7 +122,14 @@ impl AuthCache {
         hash: String,
         password: Zeroizing<Vec<u8>>,
     ) -> Result<bool, AuthError> {
-        let d = self.digest(&hash, password.as_slice());
+        self.verify_with_algorithm(resources,Algorithm::Bcrypt,hash,password).await
+    }
+
+    pub(crate) async fn verify_with_algorithm(
+        self:&Arc<Self>,resources:Arc<Resources>,algorithm:Algorithm,
+        hash:String,password:Zeroizing<Vec<u8>>,
+    )->Result<bool,AuthError>{
+        let d = self.digest(algorithm,&hash, password.as_slice());
         let mut credentials = Some((hash, password));
         // No await between recording a flight and giving its job an owner.
         // Spawn only after unlocking: dropping an unpolled task must be able
@@ -180,6 +188,7 @@ impl AuthCache {
                 cache: self.clone(),
                 resources: resources.clone(),
                 hash,
+                algorithm,
                 password,
                 d,
                 id,
@@ -248,6 +257,7 @@ struct Job {
     cache: Arc<AuthCache>,
     resources: Arc<Resources>,
     hash: String,
+    algorithm: Algorithm,
     password: Zeroizing<Vec<u8>>,
     d: Digest,
     id: Arc<()>,
@@ -260,6 +270,7 @@ fn spawn_job(job: Job) {
             cache,
             resources,
             hash,
+            algorithm,
             password,
             d,
             id,
@@ -272,10 +283,7 @@ fn spawn_job(job: Job) {
             // Runs under a real worker permit; password zeroized on drop.
             let pw = password;
             comparisons.fetch_add(1, Ordering::Relaxed);
-            match bcrypt::verify(pw.as_slice(), &hash) {
-                Ok(v) => Ok(v),
-                Err(_) => Err(AuthError::HashInvalid),
-            }
+            algorithm.compare(&hash,pw.as_slice())
         };
 
         let result = match resources.auth.run(closure).await {

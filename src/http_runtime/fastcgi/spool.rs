@@ -1,11 +1,14 @@
 //! Positional access to an anonymous request buffer. Credits live as long
 //! as the actual open file, including an in-flight worker after cancellation.
 use super::super::{
+    Body, BoxError,
     request::{Context, budget_failure, failure, file_io_failure},
-    resource_budget::BlockingBudget,
+    resource_budget::{BlockingBudget, BudgetError},
 };
 use bytes::Bytes;
 use http::StatusCode;
+use http_body_util::{BodyExt, StreamBody};
+use hyper::body::Frame;
 use std::{
     fs::File,
     io,
@@ -14,7 +17,7 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const UNIT: usize = 64 * 1024;
-pub(super) const MEMORY_PREFIX: usize = 128 * 1024;
+pub(in crate::http_runtime) const MEMORY_PREFIX: usize = 128 * 1024;
 
 struct Storage {
     file: File,
@@ -22,7 +25,7 @@ struct Storage {
     credits: Mutex<Vec<OwnedSemaphorePermit>>,
 }
 
-pub(super) struct Spool {
+pub(in crate::http_runtime) struct Spool {
     storage: Arc<Storage>,
     io: BlockingBudget,
     credits: Arc<Semaphore>,
@@ -31,7 +34,7 @@ pub(super) struct Spool {
 }
 
 impl Spool {
-    pub(super) async fn create(ctx: &mut Context) -> anyhow::Result<Self> {
+    pub(in crate::http_runtime) async fn create(ctx: &mut Context) -> anyhow::Result<Self> {
         let io = ctx.resources.fastcgi_spool_io.clone();
         let budget = ctx.resources.fastcgi_spool_fds.clone();
         let fd = budget
@@ -56,7 +59,11 @@ impl Spool {
         })
     }
 
-    pub(super) async fn append(&mut self, ctx: &mut Context, bytes: Bytes) -> anyhow::Result<()> {
+    pub(in crate::http_runtime) async fn append(
+        &mut self,
+        ctx: &mut Context,
+        bytes: Bytes,
+    ) -> anyhow::Result<()> {
         let size = self
             .size
             .checked_add(bytes.len() as u64)
@@ -90,11 +97,74 @@ impl Spool {
         Ok(())
     }
 
-    pub(super) async fn read(
+    pub(in crate::http_runtime) async fn read(
         &self,
         ctx: &mut Context,
         start: u64,
     ) -> anyhow::Result<Option<Bytes>> {
+        self.reader()
+            .read_at(start)
+            .await
+            .map_err(|error| error.to_failure(ctx))
+    }
+
+    pub(in crate::http_runtime) fn reader(&self) -> SpoolReader {
+        SpoolReader {
+            storage: self.storage.clone(),
+            io: self.io.clone(),
+            size: self.size,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(in crate::http_runtime) enum SpoolReadError {
+    Budget(BudgetError),
+    Io(io::Error),
+}
+impl std::fmt::Display for SpoolReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Budget(_) => f.write_str("spool read admission unavailable"),
+            Self::Io(error) => write!(f, "spool read failed: {error}"),
+        }
+    }
+}
+impl std::error::Error for SpoolReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Budget(_) => None,
+        }
+    }
+}
+impl SpoolReadError {
+    pub(in crate::http_runtime) fn to_failure(&self, ctx: &mut Context) -> anyhow::Error {
+        match self {
+            Self::Io(error) => file_io_failure(ctx, error),
+            Self::Budget(BudgetError::Overloaded) => budget_failure(ctx, BudgetError::Overloaded),
+            Self::Budget(BudgetError::WorkerFailed) => {
+                budget_failure(ctx, BudgetError::WorkerFailed)
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(in crate::http_runtime) struct SpoolReader {
+    storage: Arc<Storage>,
+    io: BlockingBudget,
+    size: u64,
+}
+impl SpoolReader {
+    pub(in crate::http_runtime) fn len(&self) -> u64 {
+        self.size
+    }
+
+    pub(in crate::http_runtime) async fn read_at(
+        &self,
+        start: u64,
+    ) -> Result<Option<Bytes>, SpoolReadError> {
         let Some(remaining @ 1..) = self.size.checked_sub(start) else {
             return Ok(None);
         };
@@ -108,9 +178,27 @@ impl Spool {
                 Ok::<_, io::Error>(Bytes::from(bytes))
             })
             .await
-            .map_err(|error| budget_failure(ctx, error))?
-            .map_err(|error| file_io_failure(ctx, &error))?;
+            .map_err(SpoolReadError::Budget)?
+            .map_err(SpoolReadError::Io)?;
         Ok(Some(bytes))
+    }
+
+    pub(in crate::http_runtime) fn into_body(self) -> Body {
+        let stream =
+            futures_util::stream::try_unfold((self, 0u64), |(reader, offset)| async move {
+                match reader.read_at(offset).await? {
+                    Some(bytes) => {
+                        let next = offset + bytes.len() as u64;
+                        Ok::<_, SpoolReadError>(Some((Frame::data(bytes), (reader, next))))
+                    }
+                    None => Ok(None),
+                }
+            });
+        // This stream has an unknown hint. ReplayBuffer supplies its known
+        // complete entity length independently when preparing the request.
+        StreamBody::new(stream)
+            .map_err(|error| -> BoxError { Box::new(error) })
+            .boxed_unsync()
     }
 }
 

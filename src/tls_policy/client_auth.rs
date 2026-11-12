@@ -128,14 +128,16 @@ pub(super) fn prepare(config: Option<&ClientAuth>) -> Result<PreparedAuth> {
         load_system(&mut budget, &mut roots)?;
     }
     use sha2::{Digest, Sha256};
+    let mut root_ders = Vec::new();
     let mut raw_seen = std::collections::HashSet::new();
     let mut retained_root_bytes = 0usize;
     for root in roots {
         if !raw_seen.insert(<Sha256 as Digest>::digest(root.as_ref())) {
             continue;
         }
-        pool.add(root)
+        pool.add(root.clone())
             .map_err(|_| anyhow::anyhow!("invalid client trust anchor"))?;
+        root_ders.push(root);
     }
     let platform_system = explicit_system
         && cfg!(any(
@@ -165,7 +167,11 @@ pub(super) fn prepare(config: Option<&ClientAuth>) -> Result<PreparedAuth> {
         "client CA hints exceed TLS CertificateRequest capacity"
     );
     let mut digest = Sha256::new();
-    digest.update(b"caddy-client-auth-material-v2");
+    digest.update(b"caddy-client-auth-material-v3");
+    for root in &root_ders {
+        digest.update((root.len() as u64).to_be_bytes());
+        digest.update(root.as_ref());
+    }
     let mandatory = !pin_groups.is_empty()
         || matches!(
             mode,
@@ -219,34 +225,28 @@ pub(super) fn prepare(config: Option<&ClientAuth>) -> Result<PreparedAuth> {
     let mut retained_bytes = pin_bytes
         .saturating_add(hints.capacity() * std::mem::size_of::<DistinguishedName>())
         .saturating_add(hint_bytes);
-    let normal = if verify_chain && !pool.is_empty() {
-        retained_bytes = retained_bytes
-            .saturating_add(
-                pool.roots.capacity()
-                    * std::mem::size_of::<rustls::pki_types::TrustAnchor<'static>>(),
-            )
-            .saturating_add(retained_root_bytes);
-        // The stock verifier defaults to a second copy of CA hints; we use
-        // its path verifier only and explicitly clear the unused copy.
-        Some(
-            rustls::server::WebPkiClientVerifier::builder_with_provider(
-                Arc::new(pool),
-                provider.clone(),
-            )
-            .clear_root_hint_subjects()
-            .build()
-            .map_err(|_| anyhow::anyhow!("client trust verifier unavailable"))?,
-        )
-    } else {
-        None
-    };
+    let roots = if verify_chain && !pool.is_empty() {
+        retained_bytes = retained_bytes.saturating_add(
+            pool.roots.capacity() * std::mem::size_of::<rustls::pki_types::TrustAnchor<'static>>())
+            .saturating_add(retained_root_bytes)
+            .saturating_add(root_ders.capacity() * std::mem::size_of::<CertificateDer<'static>>())
+            .saturating_add(root_ders.iter().map(|root| root.len()).sum::<usize>());
+        Some(Arc::new(pool))
+    } else { None };
+    let platform_observation = (implicit_system || explicit_system)
+        && cfg!(any(target_os="macos",target_os="ios",target_os="windows"))
+        && ["SSL_CERT_FILE","SSL_CERT_DIR"].iter().all(|name|
+            std::env::var_os(name).is_none_or(|value| value.is_empty()));
     Ok(PreparedAuth {
         retained_bytes,
         digest,
         verifier: Some(Arc::new(Verifier {
             mode,
             verify_chain,
-            normal,
+            roots,
+            root_ders: root_ders.into(),
+            binding: digest,
+            platform_observation,
             hints,
             pin_groups,
             algorithms: provider.signature_verification_algorithms,
@@ -513,7 +513,10 @@ fn load_pool(
 struct Verifier {
     mode: ClientAuthMode,
     verify_chain: bool,
-    normal: Option<Arc<dyn ClientCertVerifier>>,
+    roots: Option<Arc<RootCertStore>>,
+    root_ders: Arc<[CertificateDer<'static>]>,
+    binding: [u8;32],
+    platform_observation: bool,
     hints: Vec<DistinguishedName>,
     pin_groups: Vec<Vec<CertificateDer<'static>>>,
     algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
@@ -538,6 +541,9 @@ impl ClientCertVerifier for Verifier {
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
         &self.hints
     }
+    fn resume_requires_verified_chains(&self) -> bool { self.verify_chain }
+    fn chain_binding(&self) -> Option<[u8;32]> { Some(self.binding) }
+
     fn verify_client_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -551,14 +557,14 @@ impl ClientCertVerifier for Verifier {
         for cert in std::iter::once(end_entity).chain(intermediates.iter()) {
             parse_certificate(cert).map_err(|_| invalid())?;
         }
-        if self.verify_chain {
-            self.normal
-                .as_ref()
-                .ok_or(Error::InvalidCertificate(
-                    rustls::CertificateError::UnknownIssuer,
-                ))?
-                .verify_client_cert(end_entity, intermediates, now)?;
-        }
+        let observation = if self.verify_chain {
+            let roots = self.roots.as_ref().ok_or(Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer))?;
+            let enumeration = rustls::server::enumerate_client_cert_paths(roots,
+                &self.algorithms, end_entity, intermediates, now, 16)?;
+            super::client_paths::observe(end_entity, intermediates, &self.root_ders,
+                enumeration, self.binding, self.platform_observation)
+        } else { rustls::ClientChainObservation::NotVerified };
         if self
             .pin_groups
             .iter()
@@ -568,7 +574,7 @@ impl ClientCertVerifier for Verifier {
                 rustls::CertificateError::ApplicationVerificationFailure,
             ));
         }
-        Ok(ClientCertVerified::assertion())
+        Ok(ClientCertVerified::with_observation(observation))
     }
     fn verify_tls12_signature(
         &self,
@@ -576,7 +582,11 @@ impl ClientCertVerifier for Verifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+        let (rest,parsed)=x509_parser::parse_x509_certificate(cert.as_ref())
+            .map_err(|_|Error::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+        if !rest.is_empty(){return Err(Error::InvalidCertificate(rustls::CertificateError::BadEncoding));}
+        let spki=rustls::pki_types::SubjectPublicKeyInfoDer::from(parsed.public_key().raw);
+        rustls::crypto::verify_tls12_signature_with_raw_key(message, &spki, dss, &self.algorithms)
     }
     fn verify_tls13_signature(
         &self,
@@ -584,7 +594,11 @@ impl ClientCertVerifier for Verifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+        let (rest,parsed)=x509_parser::parse_x509_certificate(cert.as_ref())
+            .map_err(|_|Error::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+        if !rest.is_empty(){return Err(Error::InvalidCertificate(rustls::CertificateError::BadEncoding));}
+        let spki=rustls::pki_types::SubjectPublicKeyInfoDer::from(parsed.public_key().raw);
+        rustls::crypto::verify_tls13_signature_with_raw_key(message, &spki, dss, &self.algorithms)
     }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.algorithms.supported_schemes()
