@@ -678,7 +678,7 @@ field. This is a Rust source interface extension, not a cross-language plugin
 ABI. Signing-key/control input residency is distinct from certificate-chain
 payload pools; this feature does not claim a whole-process heap or RSS bound.
 `test_ca`, the independent ZeroSSL API issuer, DNS solver/resolver/ECH options,
-and client-auth storage/HTTP CA providers remain explicitly unfinished.
+and client-auth HTTP CA providers remain explicitly unfinished.
 
 Controlled HTTP/2 informational output
 ------------------------------------
@@ -720,4 +720,26 @@ worker. Persistent prepared configuration/trust outputs retain their existing
 control/output ownership boundary; this is not a whole-process heap bound.
 A failed reload keeps the previous working TLS configuration. This entry
 covers server client-authentication pools; other consumers of CA providers,
-and the storage/HTTP client-authentication providers, remain separate gaps.
+and the HTTP client-authentication provider, remain separate gaps.
+
+
+Server client-authentication storage CA sources
+---------------------------------------------
+
+The storage trust provider resolves configured PEM keys from the selected
+FileStorage or the generation’s global storage before TLS activation. Nested
+combined providers and key order are preserved. Independent providers and
+independent key reads each use at most four concurrent futures; certificate
+decoding and config transformation run on the bounded CPU lane. The existing
+FD-relative NOFOLLOW, ownership, stable-read, regular-file and size checks also
+apply to CA reads. No filesystem or network operation is added to handshakes.
+
+An explicitly empty pool does not inherit old or system trust. A forced reload
+rereads the same key, and a failed candidate preserves its working predecessor.
+Provider depth, key count, aggregate PEM/DER bytes and certificate count have
+explicit limits. Actual input and transformation scratch retain their shared
+credits until the real worker releases them. Prepared trust output then enters
+the existing configuration ownership boundary; this is not a whole-process RSS
+bound. System-root scanning propagates resource exhaustion instead of silently
+skipping a valid root. HTTP providers and upstream-provider consumers remain
+separate integration work.

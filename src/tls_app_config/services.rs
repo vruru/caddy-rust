@@ -33,6 +33,8 @@ use tokio::sync::{Mutex as AsyncMutex, OnceCell, broadcast, oneshot};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 #[path = "services/ca_pools.rs"]
 mod ca_pools;
+#[path = "services/storage_pools.rs"]
+mod storage_pools;
 #[path = "services/capacity.rs"]
 mod capacity;
 #[path = "services/group.rs"]

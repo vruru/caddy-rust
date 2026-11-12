@@ -634,6 +634,13 @@ impl FsStore {
         Ok(())
     }
 
+    /// Read-only caller-selected CA input. FD-relative nofollow/owner/size
+    /// validation is identical to other store reads; credit follows actual bytes.
+    pub(crate) async fn load_ca_input(&self,key:&str)->Result<Option<crate::cert_transient::Bytes>> {
+        ensure!(key.len()<=4096,"client trust storage key exceeds bounds");
+        let key=key.to_owned();
+        self.blocking(move|c|c.data.load_owned(&key,key.ends_with(".key"),crate::cert_transient::Lifetime::Temporary)).await
+    }
     pub async fn load(&self, key: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
         let key = key.to_owned();
         self.blocking(move |c| c.data.load(&key, key.ends_with(".key")))

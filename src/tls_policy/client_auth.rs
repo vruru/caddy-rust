@@ -282,8 +282,7 @@ impl Budget {
     }
 }
 fn parse_certificate(bytes: &[u8]) -> Result<()> {
-    let (rest, _) = x509_parser::parse_x509_certificate(bytes)
-        .map_err(|_| anyhow::anyhow!("invalid client certificate DER"))?;
+    let (rest, _parsed) = crate::cert_transient::parse_certificate(bytes)?;
     ensure!(rest.is_empty(), "trailing client certificate DER");
     Ok(())
 }
@@ -344,6 +343,11 @@ fn pem_line(mut line: &[u8]) -> &[u8] {
     line
 }
 
+/// Storage/HTTP CA sources share exactly the file-provider PEM semantics.
+/// Run on the caller's bounded CPU lane with owned input and output allowance.
+pub(crate) fn source_certificates(data:&[u8])->Result<Vec<CertificateDer<'static>>>{
+    parse_pem(data,PemSource::Ca,&mut Budget{count:0,bytes:0})
+}
 fn parse_pem(
     data: &[u8],
     source: PemSource,
@@ -444,7 +448,12 @@ fn load_system(budget: &mut Budget, out: &mut Vec<CertificateDer<'static>>) -> R
     for cert in rustls_native_certs::load_native_certs().certs {
         // System stores may contain unusable entries. Skip malformed anchors
         // without weakening explicitly configured file/inline trust material.
-        if parse_certificate(&cert).is_err() || webpki::anchor_from_trusted_cert(&cert).is_err() {
+        match parse_certificate(&cert) {
+            Ok(()) => {},
+            Err(error) if crate::cert_transient::is_resource(&error) => return Err(error),
+            Err(_) => continue,
+        }
+        if webpki::anchor_from_trusted_cert(&cert).is_err() {
             continue;
         }
         budget.accept(&cert)?;

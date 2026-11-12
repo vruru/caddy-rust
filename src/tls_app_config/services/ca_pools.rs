@@ -187,7 +187,7 @@ fn transform(
 }
 impl CertificateServices {
     #[cfg(feature = "native-run")]
-    pub(crate) async fn prepare_client_pools(
+    pub(super) async fn prepare_pki_pools(
         self: &Arc<Self>,
         config: crate::http_config::PreparedConfig,
         cancel: CancellationToken,
