@@ -120,13 +120,14 @@ impl ActiveServer {
     pub(super) fn policy(
         &self,
         sni: &str,
-        peer: SocketAddr,
-        local: SocketAddr,
+        peer: impl Into<crate::net_address::NetAddress>,
+        local: impl Into<crate::net_address::NetAddress>,
     ) -> Option<(usize, Arc<PreparedPolicy>)> {
+        let peer=peer.into().tls_ip();let local=local.into().tls_ip();
         let hello = HelloInfo {
             sni,
-            remote: peer.ip(),
-            local: local.ip(),
+            remote:peer.map(|v|v.0),local:local.map(|v|v.0),
+            remote_has_zone:peer.is_some_and(|v|v.1),local_has_zone:local.is_some_and(|v|v.1),
         };
         for (index, policy) in self.tls_policies.iter().enumerate() {
             if policy.definition.match_captures(&hello).ok()?.is_some() {

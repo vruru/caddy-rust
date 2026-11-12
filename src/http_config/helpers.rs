@@ -58,8 +58,8 @@ pub(crate) fn replace(
 }
 
 fn append_replacement(
-    output: &mut String,
-    text: &str,
+    output: &mut Vec<u8>,
+    text: &[u8],
     charge: &mut impl FnMut(usize) -> Result<()>,
 ) -> Result<()> {
     let length = output.len().checked_add(text.len()).ok_or_else(|| anyhow::anyhow!("replacement length overflow"))?;
@@ -71,7 +71,7 @@ fn append_replacement(
         charge(capacity * 2)?;
         output.try_reserve_exact(capacity - output.len()).map_err(|_| anyhow::anyhow!("replacement allocation unavailable"))?;
     }
-    output.push_str(text);
+    output.extend_from_slice(text);
     Ok(())
 }
 
@@ -79,22 +79,32 @@ pub(crate) fn replace_accounted(
     input: &str,
     unknown_empty: bool,
     lookup: impl Fn(&str) -> Option<String>,
-    mut charge: impl FnMut(usize) -> Result<()>,
+    charge: impl FnMut(usize) -> Result<()>,
 ) -> Result<String> {
+    let bytes=replace_bytes_accounted(input,unknown_empty,|name|lookup(name).map(String::into_bytes),charge)?;
+    String::from_utf8(bytes).map_err(|_|anyhow::anyhow!("invalid UTF-8 replacement"))
+}
+
+/// Byte-valued network addresses retain their original bytes in Go strings.
+/// Both entry points use the same scanner, escaping rules and allocation bounds.
+pub(crate) fn replace_bytes(input:&str,unknown_empty:bool,lookup:impl Fn(&str)->Option<Vec<u8>>)->Result<Vec<u8>>{
+    replace_bytes_accounted(input,unknown_empty,lookup,|_|Ok(()))
+}
+fn replace_bytes_accounted(input:&str,unknown_empty:bool,lookup:impl Fn(&str)->Option<Vec<u8>>,mut charge:impl FnMut(usize)->Result<()>)->Result<Vec<u8>>{
     ensure!(
         input.len() <= 1024 * 1024,
         "replacement input exceeds limit"
     );
     let bytes = input.as_bytes();
     charge(input.len().checked_mul(2).ok_or_else(|| anyhow::anyhow!("replacement capacity overflow"))?)?;
-    let mut out = String::new();
+    let mut out = Vec::new();
     out.try_reserve_exact(input.len()).map_err(|_| anyhow::anyhow!("replacement allocation unavailable"))?;
     let mut cursor = 0;
     let mut i = 0;
     let mut unclosed = 0;
     while i < bytes.len() {
         if i > 0 && bytes[i - 1] == b'\\' && matches!(bytes[i], b'{' | b'}') {
-            append_replacement(&mut out, &input[cursor..i - 1], &mut charge)?;
+            append_replacement(&mut out, &bytes[cursor..i - 1], &mut charge)?;
             cursor = i;
             i += 1;
             continue;
@@ -115,7 +125,7 @@ pub(crate) fn replace_accounted(
             i += 1;
             continue;
         }
-        append_replacement(&mut out, &input[cursor..i], &mut charge)?;
+        append_replacement(&mut out, &bytes[cursor..i], &mut charge)?;
         match lookup(&input[i + 1..end]) {
             Some(value) => append_replacement(&mut out, &value, &mut charge)?,
             None if !unknown_empty => {
@@ -128,7 +138,7 @@ pub(crate) fn replace_accounted(
         i = end + 1;
         cursor = i;
     }
-    append_replacement(&mut out, &input[cursor..], &mut charge)?;
+    append_replacement(&mut out, &bytes[cursor..], &mut charge)?;
     Ok(out)
 }
 

@@ -47,3 +47,7 @@ pub(crate) mod cel_engine;
 pub mod events;
 pub mod cert_events;
 pub(crate) mod json_float;
+
+pub mod net_address;
+
+pub(crate) mod proxy_protocol;

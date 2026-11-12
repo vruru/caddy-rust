@@ -27,16 +27,9 @@ impl Manager {
                 Self::Http(endpoint) => {
                     let signatures = hex_list(&hello.signatures);
                     let ciphers = hex_list(&hello.ciphers);
-                    let ip = hello.local_ip.to_string();
-                    let (request, target) = super::permission::external_request(
-                        endpoint,
-                        &[
-                            ("server_name", &hello.server_name),
-                            ("signature_schemes", &signatures),
-                            ("cipher_suites", &ciphers),
-                            ("local_ip", &ip),
-                        ],
-                    )?;
+                    let mut parameters=vec![("server_name",hello.server_name.as_bytes()),("signature_schemes",signatures.as_bytes()),("cipher_suites",ciphers.as_bytes())];
+                    if let Some(ip)=&hello.local_ip{parameters.push(("local_ip",ip.as_slice()));}
+                    let (request, target) = super::permission::external_request(endpoint,&parameters)?;
                     let (status, body) =
                         fetch_http(request, Some(target), resources, &cancel).await?;
                     if status == 204 {

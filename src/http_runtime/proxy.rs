@@ -578,13 +578,14 @@ async fn serve_once(
         state.selection.clone()
     };
     let selection = {
+        let peer_ip=ctx.peer.raw_host();let client_ip=ctx.client_ip.map_or_else(String::new,|ip|ip.to_string());
         let input = SelectionInput {
             authority: &ctx.authority,
             uri: ctx.req().uri(),
             version: ctx.req().version(),
             headers: ctx.req().headers(),
-            peer_ip: ctx.peer.ip(),
-            client_ip: ctx.client_ip,
+            peer_ip: &peer_ip,
+            client_ip: &client_ip,
             secure: secure_cookie,
         };
         if policy.needs_worker(&input) {
@@ -1169,26 +1170,19 @@ pub(super) fn proxy_headers(
         None
     };
     remove_hop_headers(&mut headers, is_upgrade, true);
-    headers.insert(
-        "x-forwarded-for",
-        HeaderValue::from_str(&if old_xff.is_empty() {
-            ctx.peer.ip().to_string()
-        } else {
-            format!("{old_xff}, {}", ctx.peer.ip())
-        })?,
-    );
-    headers.insert(
-        "x-forwarded-host",
-        forwarded_host.unwrap_or(HeaderValue::from_str(&original_host)?),
-    );
-    headers.insert(
-        "x-forwarded-proto",
-        forwarded_proto.unwrap_or(HeaderValue::from_static(if ctx.tls {
-            "https"
-        } else {
-            "http"
-        })),
-    );
+    if let Some((peer_host,_))=ctx.peer.host_port_bytes().filter(|(host,_)|!host.is_empty()) {
+        let peer_host=peer_host.split(|b|*b==b'%').next().unwrap_or_default();
+        let mut xff=Vec::with_capacity(old_xff.len()+peer_host.len()+2);
+        if !old_xff.is_empty(){xff.extend_from_slice(old_xff.as_bytes());xff.extend_from_slice(b", ");}
+        xff.extend_from_slice(peer_host);
+        headers.insert("x-forwarded-for",HeaderValue::from_bytes(&xff)?);
+        headers.insert("x-forwarded-host",forwarded_host.unwrap_or(HeaderValue::from_str(&original_host)?));
+        headers.insert("x-forwarded-proto",forwarded_proto.unwrap_or(HeaderValue::from_static(if ctx.tls{"https"}else{"http"})));
+    } else {
+        // An absent or unparseable peer host cannot authenticate supplied
+        // forwarding headers. Never substitute the physical proxy's IP.
+        for name in ["x-forwarded-for","x-forwarded-host","x-forwarded-proto"]{headers.remove(name);}
+    }
     if !headers.contains_key(http::header::HOST) {
         headers.insert(http::header::HOST, HeaderValue::from_str(&original_host)?);
     }

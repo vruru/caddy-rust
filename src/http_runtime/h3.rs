@@ -663,7 +663,7 @@ async fn accept_loop(
                         let request = CertificateRequest { origin: name.clone(), subject: subject.clone(), force_lookup, cached: cached_target,
                             hello: Some(CertificateHello { server_name: hello.event.server_name.clone(),
                                 signatures: hello.event.signature_schemes.clone().unwrap_or_default(),
-                                ciphers: hello.event.cipher_suites.clone(), local_ip: local.ip() }),
+                                ciphers: hello.event.cipher_suites.clone(), local_ip: Some(local.ip().to_canonical().to_string().into_bytes()) }),
                             selection: Some(WarmSelection { filter: policy.resolver.certificate_selection.clone(),
                                 schemes: hello.signatures.clone(), version: Some(rustls::ProtocolVersion::TLSv1_3) }),
                         };
@@ -928,7 +928,7 @@ async fn serve_connection(
                     let Ok((request,wire))=stream::start(request,wire) else{return;};
                     let task=async move {
                         let (interim, receiver) = stream::interim_channel();
-                        let response = request::handle_business(runtime,server,request,request::RequestOrigin { peer:canonical(peer.peer), local:canonical(peer.local), tls:true, sni:sni.as_deref() },business.clone(),Some(request::InformationalOutput::Quic(interim)));
+                        let response = request::handle_business(runtime,server,request,request::RequestOrigin { peer:crate::net_address::NetAddress::udp(canonical(peer.peer)), local:crate::net_address::NetAddress::udp(canonical(peer.local)), tls:true, sni:sni.as_deref() },business.clone(),Some(request::InformationalOutput::Quic(interim)));
                         let _=stream::drive(wire,receiver,response,head).await;
                         drop(business);
                     };

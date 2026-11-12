@@ -246,12 +246,12 @@ fn permission_client(cache: &Mutex<Option<CachedClient>>, url: &Url) -> Result<r
 
 /// Reuse the permission transport's Go-compatible authority/path parser without
 /// adding its domain argument or normalizing encoded dot/slash path segments.
-pub(super) fn external_request(input: &str, replacements: &[(&str,&str)])
+pub(super) fn external_request(input: &str, replacements: &[(&str,&[u8])])
     -> Result<(reqwest::Request,http::uri::PathAndQuery)> {
     let target = target::Target::parse(input, "")?;
     let original_query = input.split('#').next().unwrap_or(input)
         .split_once('?').map_or("", |(_,query)| query);
-    let query = query::query_with_values(original_query, replacements);
+    let query = query::query_with_bytes(original_query, replacements);
     let raw = format!("{}?{}",target.target.path(),query);
     let mut request = reqwest::Request::new(http::Method::GET, target.origin);
     request.headers_mut().insert(http::header::HOST,target.host);

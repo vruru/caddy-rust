@@ -6,6 +6,10 @@ pub(super) fn query_with_domain(query: &str, domain: &str) -> String {
     query_with_values(query, &[("domain", domain)])
 }
 pub(super) fn query_with_values(query: &str, replacements: &[(&str, &str)]) -> String {
+    let values=replacements.iter().map(|(key,value)|(*key,value.as_bytes())).collect::<Vec<_>>();
+    query_with_bytes(query,&values)
+}
+pub(super) fn query_with_bytes(query:&str,replacements:&[(&str,&[u8])])->String{
     let mut values: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
     let count = query.bytes().filter(|byte| *byte == b'&').count() + 1;
     let custom = std::env::var("GODEBUG").ok().and_then(|setting| {
@@ -32,7 +36,7 @@ pub(super) fn query_with_values(query: &str, replacements: &[(&str, &str)]) -> S
         values.entry(key).or_default().push(value);
     }
     for (key,value) in replacements {
-        values.insert(key.as_bytes().to_vec(), vec![value.as_bytes().to_vec()]);
+        values.insert(key.as_bytes().to_vec(), vec![value.to_vec()]);
     }
     let mut result = String::new();
     for (key, values) in values {

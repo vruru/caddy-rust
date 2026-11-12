@@ -25,8 +25,10 @@ const REGEX_SIZE_LIMIT: usize = 8 * 1024 * 1024;
 
 pub struct HelloInfo<'a> {
     pub sni: &'a str,
-    pub remote: IpAddr,
-    pub local: IpAddr,
+    pub remote: Option<IpAddr>,
+    pub local: Option<IpAddr>,
+    pub remote_has_zone: bool,
+    pub local_has_zone: bool,
 }
 
 // ─── ProtocolVersion ──────────────────────────────────────────────────────────
@@ -803,14 +805,14 @@ impl Matcher {
                 )
                 .is_ok_and(|captures| captures.is_some()),
             Self::RemoteIp { ranges, not_ranges } => {
-                let in_ranges =
-                    ranges.is_empty() || ranges.iter().any(|n| n.contains(&hello.remote));
-                let not_excluded =
-                    not_ranges.is_empty() || !not_ranges.iter().any(|n| n.contains(&hello.remote));
-                in_ranges && not_excluded
+                hello.remote.is_some_and(|ip|{
+                    let in_ranges=ranges.is_empty()||(!hello.remote_has_zone&&ranges.iter().any(|n|n.contains(&ip)));
+                    let not_excluded=not_ranges.is_empty()||hello.remote_has_zone||!not_ranges.iter().any(|n|n.contains(&ip));
+                    in_ranges&&not_excluded
+                })
             }
             Self::LocalIp { ranges } => {
-                ranges.is_empty() || ranges.iter().any(|n| n.contains(&hello.local))
+                hello.local.is_some_and(|ip|ranges.is_empty()||(!hello.local_has_zone&&ranges.iter().any(|n|n.contains(&ip))))
             }
         }
     }

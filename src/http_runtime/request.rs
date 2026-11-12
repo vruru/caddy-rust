@@ -1,3 +1,4 @@
+use crate::net_address::NetAddress;
 use super::*;
 #[path = "log_append.rs"]
 mod log_append;
@@ -30,13 +31,13 @@ pub(super) struct Context {
     pub(super) await_h2_response_head: bool,
     pub(super) original_framing: super::request_body::OriginalFraming,
     pub resources: Arc<super::resource_budget::Resources>,
-    pub peer: SocketAddr,
-    pub local: SocketAddr,
+    pub peer: NetAddress,
+    pub local: NetAddress,
     pub tls: bool,
     access_names: Option<Vec<String>>,
     skip_access: bool,
     pub authority: String,
-    pub client_ip: IpAddr,
+    pub client_ip: Option<IpAddr>,
     pub trusted: bool,
     pub drain: CancellationToken,
     pub business: Arc<BusinessGuard>,
@@ -114,13 +115,13 @@ impl Context {
             original_framing,
             request_content_length,
             resources,
-            peer: zero, // 占位；REMOTE_* 由 D2 置空，SERVER_ADDR 由 D3 移除
-            local: zero,
+            peer: zero.into(), // 占位；REMOTE_* 由 D2 置空，SERVER_ADDR 由 D3 移除
+            local: zero.into(),
             tls: false, // FastCGI 健康 scheme 恒为 http：无 HTTPS/SSL_*
             access_names: None,
             skip_access: true,
             authority,
-            client_ip: zero.ip(),
+            client_ip: Some(zero.ip()),
             trusted: false,
             drain: business.generation().drain.clone(),
             business,
@@ -159,6 +160,19 @@ impl Context {
     pub fn expand(&self, s: &str) -> Result<String> {
         replace(s, true, |name| self.lookup(name))
     }
+    pub fn expand_bytes(&self,s:&str)->Result<Vec<u8>>{
+        crate::http_config::helpers::replace_bytes(s,true,|name|self.lookup_bytes(name))
+    }
+    pub fn lookup_bytes(&self,name:&str)->Option<Vec<u8>>{
+        if !self.probe && !self.values.contains_key(name){
+            let address=match name{
+                "http.request.remote"|"http.request.remote.host"|"http.request.remote.port"=>Some(&self.peer),
+                "http.request.local"|"http.request.local.host"|"http.request.local.port"=>Some(&self.local),_=>None,
+            };
+            if let Some(address)=address{return Some(if name.ends_with(".host"){address.raw_host().into_owned()}else if name.ends_with(".port"){address.raw_port().into_owned()}else{address.raw_text().into_owned()});}
+        }
+        self.lookup(name).map(String::into_bytes)
+    }
     pub fn lookup(&self, name: &str) -> Option<String> {
         self.lookup_depth(name, 0)
     }
@@ -196,12 +210,12 @@ impl Context {
                 .map(|p| p.to_string())
                 .unwrap_or_default(),
             "http.request.remote" => self.peer.to_string(),
-            "http.request.remote.host" => self.peer.ip().to_string(),
-            "http.request.remote.port" => self.peer.port().to_string(),
+            "http.request.remote.host" => self.peer.host(),
+            "http.request.remote.port" => self.peer.port_text(),
             "http.request.local" => self.local.to_string(),
-            "http.request.local.host" => self.local.ip().to_string(),
-            "http.request.local.port" => self.local.port().to_string(),
-            "http.request.client_ip" => self.client_ip.to_string(),
+            "http.request.local.host" => self.local.host(),
+            "http.request.local.port" => self.local.port_text(),
+            "http.request.client_ip" | "http.vars.client_ip" => self.client_ip.map_or_else(String::new,|ip|ip.to_string()),
             "http.request.scheme" => {
                 if self.tls {
                     "https".into()
@@ -374,8 +388,8 @@ fn proof_for_authority<B>(
     None
 }
 pub(super) struct RequestOrigin<'a> {
-    pub peer: SocketAddr,
-    pub local: SocketAddr,
+    pub peer: NetAddress,
+    pub local: NetAddress,
     pub tls: bool,
     pub sni: Option<&'a str>,
 }
@@ -406,8 +420,8 @@ where
         .plan
         .trusted_proxies
         .iter()
-        .any(|range| range.contains(&peer.ip()));
-    let client_ip = client_ip(request.headers(), peer.ip(), trusted, &server.plan);
+        .any(|range| peer.ip().is_some_and(|ip|range.contains(&ip)));
+    let client_ip = peer.ip().map(|ip|client_ip(request.headers(), ip, trusted, &server.plan));
     let access = server
         .plan
         .access_logs
@@ -419,7 +433,7 @@ where
                 config,
                 &request,
                 &authority,
-                peer,
+                &peer,
                 client_ip,
                 &inner.resources.access_capture,
             )
@@ -947,7 +961,7 @@ fn handlers<'a>(
                     headers,
                     close,
                 } => {
-                    let bytes = replace(body, false, |name| ctx.lookup(name))?;
+                    let bytes = crate::http_config::helpers::replace_bytes(body, false, |name| ctx.lookup_bytes(name))?;
                     let mut fields = std::mem::take(&mut ctx.immediate);
                     if *close && ctx.req().version() != Version::HTTP_2 {
                         ctx.close_after_response = true;
@@ -1539,8 +1553,8 @@ pub(super) fn matches<'a>(
             Matcher::Tls(complete) => ctx.tls && *complete != Some(false),
             Matcher::UrlPattern(plan) => plan.matches(ctx).await?,
             Matcher::Not(sets) => !match_sets(sets, ctx).await?,
-            Matcher::RemoteIp(ranges) => ranges.iter().any(|r| r.contains(&ctx.peer.ip())),
-            Matcher::ClientIp(ranges) => ranges.iter().any(|r| r.contains(&ctx.client_ip)),
+            Matcher::RemoteIp(ranges) => ctx.peer.matcher_ip().is_some_and(|ip|ranges.iter().any(|r|r.contains(&ip))),
+            Matcher::ClientIp(ranges) => ctx.client_ip.is_some_and(|ip|ranges.iter().any(|r|r.contains(&ip))),
             Matcher::Protocol(protocol) => match protocol.as_str() {
                 "http" => !ctx.tls,
                 "https" => ctx.tls,
@@ -1582,7 +1596,7 @@ pub(super) fn matches<'a>(
 fn static_informational<'a>(
     ctx: &'a mut Context,
     status: StatusCode,
-    bytes: String,
+    bytes: Vec<u8>,
 ) -> ResponseFuture<'a> {
     Box::pin(async move {
         if status == StatusCode::SWITCHING_PROTOCOLS && ctx.req().version() != Version::HTTP_11 {
@@ -1611,7 +1625,7 @@ fn static_informational<'a>(
         let body = if status == StatusCode::SWITCHING_PROTOCOLS {
             fields.remove(http::header::CONTENT_LENGTH);
             fields.remove(http::header::TRANSFER_ENCODING);
-            String::new()
+            Vec::new()
         } else {
             bytes
         };
@@ -1634,7 +1648,7 @@ fn static_informational<'a>(
     })
 }
 
-fn static_head_length(ctx: &Context, body: &str) -> Option<StaticHeadLength> {
+fn static_head_length(ctx: &Context, body: &[u8]) -> Option<StaticHeadLength> {
     (ctx.req().method() == Method::HEAD && !body.is_empty()).then_some(StaticHeadLength(body.len()))
 }
 
@@ -1643,7 +1657,7 @@ fn apply_static_headers(
     fields: &mut HeaderMap,
     operations: &HeaderOps,
     ctx: &Context,
-    body: &str,
+    body: &[u8],
 ) -> Result<()> {
     for (name, values) in &operations.set {
         let name = HeaderName::try_from(replace(name, false, |name| ctx.lookup(name))?)?;
@@ -1651,7 +1665,7 @@ fn apply_static_headers(
         for value in values {
             fields.append(
                 name.clone(),
-                HeaderValue::from_str(&replace(value, false, |name| ctx.lookup(name))?)?,
+                HeaderValue::from_bytes(&crate::http_config::helpers::replace_bytes(value, false, |name| ctx.lookup_bytes(name))?)?,
             );
         }
     }
@@ -1660,11 +1674,9 @@ fn apply_static_headers(
             .get(http::header::CONTENT_TYPE)
             .is_none_or(|value| value.is_empty())
     {
-        let trimmed = body.trim();
-        let json = trimmed.len() > 2
-            && ((trimmed.starts_with('{') && trimmed.ends_with('}'))
-                || (trimmed.starts_with('[') && trimmed.ends_with(']')))
-            && serde_json::from_str::<serde_json::Value>(trimmed).is_ok();
+        let json=std::str::from_utf8(body).is_ok_and(|text|{
+            let trimmed=text.trim();trimmed.len()>2 && ((trimmed.starts_with('{')&&trimmed.ends_with('}'))||(trimmed.starts_with('[')&&trimmed.ends_with(']'))) && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
+        });
         fields.insert(
             http::header::CONTENT_TYPE,
             HeaderValue::from_static(if json {
@@ -1798,6 +1810,7 @@ pub(super) fn apply_headers(
     ctx: &Context,
 ) -> Result<()> {
     let expand = |value: &str| replace(value, false, |name| ctx.lookup(name));
+    let expand_value=|value:&str|crate::http_config::helpers::replace_bytes(value,false,|name|ctx.lookup_bytes(name));
     // Caddy clears '*' first, then adds, sets, and finally deletes matching
     // names. Unknown placeholders are preserved by ReplaceKnown.
     if operations
@@ -1813,22 +1826,22 @@ pub(super) fn apply_headers(
     for (name, values) in &operations.add {
         let name = HeaderName::try_from(expand(name)?)?;
         for value in values {
-            headers.append(name.clone(), HeaderValue::from_str(&expand(value)?)?);
+            headers.append(name.clone(), HeaderValue::from_bytes(&expand_value(value)?)?);
         }
     }
     for (name, values) in &operations.set {
         let name = HeaderName::try_from(expand(name)?)?;
         let values = values
             .iter()
-            .map(|s| expand(s))
+            .map(|s| expand_value(s))
             .collect::<Result<Vec<_>>>()?;
         headers.remove(&name);
         if name == http::header::SET_COOKIE && values.len() > 1 {
             for value in values {
-                headers.append(name.clone(), HeaderValue::from_str(&value)?);
+                headers.append(name.clone(), HeaderValue::from_bytes(&value)?);
             }
         } else {
-            headers.insert(name, HeaderValue::from_str(&values.join(","))?);
+            headers.insert(name, HeaderValue::from_bytes(&values.join(b",".as_slice()))?);
         }
     }
     for pattern in &operations.delete {

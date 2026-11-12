@@ -83,41 +83,41 @@ pub enum Transport {
     Tcp,
     Quic,
 }
-#[derive(Clone, Debug, Serialize)]
-pub struct Address {
-    #[serde(rename = "IP")]
-    pub ip: String,
-    #[serde(rename = "Port")]
-    pub port: u16,
-    #[serde(rename = "Zone")]
-    pub zone: String,
-    #[serde(skip)]
-    pub transport: Transport,
+#[derive(Clone,Debug,Serialize)]
+#[serde(untagged)]
+pub enum Address{
+    Socket{
+        #[serde(rename="IP")]ip:String,
+        #[serde(rename="Port")]port:u16,
+        #[serde(rename="Zone")]zone:String,
+        #[serde(skip)]transport:Transport,
+    },
+    Unix{
+        #[serde(rename="Name",serialize_with="address_name_json")]name:Vec<u8>,
+        #[serde(rename="Net")]net:String,
+    },
 }
-impl Address {
-    fn new(address: SocketAddr, transport: Transport) -> Self {
-        let scope = match address {
-            SocketAddr::V6(v) => v.scope_id(),
-            _ => 0,
-        };
-        let zone = if scope == 0 {
-            String::new()
-        } else {
-            zone_name(scope)
-        };
-        Self {
-            ip: address.ip().to_canonical().to_string(),
-            port: address.port(),
-            zone,
-            transport,
+// Go encoding/json replaces each malformed UTF-8 byte individually, including
+// incomplete multi-byte tails. Keep bytes until this diagnostic boundary.
+fn address_name_json<S:serde::Serializer>(bytes:&[u8],serializer:S)->Result<S::Ok,S::Error>{
+    let mut text=String::with_capacity(bytes.len());let mut rest=bytes;
+    loop{match std::str::from_utf8(rest){
+        Ok(valid)=>{text.push_str(valid);break;},
+        Err(error)=>{let at=error.valid_up_to();text.push_str(std::str::from_utf8(&rest[..at]).expect("valid UTF-8 prefix"));text.push(char::REPLACEMENT_CHARACTER);rest=&rest[at+1..];}
+    }}
+    serializer.serialize_str(&text)
+}
+impl Address{
+    fn new(address:crate::net_address::NetAddress,transport:Transport)->Self{
+        match address{
+            crate::net_address::NetAddress::Socket{address,datagram}=>{
+                let scope=match address{SocketAddr::V6(v)=>v.scope_id(),_=>0};
+                Self::Socket{ip:address.ip().to_canonical().to_string(),port:address.port(),zone:if scope==0{String::new()}else{zone_name(scope)},transport:if datagram{Transport::Quic}else{transport}}
+            },
+            crate::net_address::NetAddress::Unix{path,datagram}=>Self::Unix{name:path.to_vec(),net:if datagram{"unixgram"}else{"unix"}.into()},
         }
     }
-    pub fn network(&self) -> &'static str {
-        match self.transport {
-            Transport::Tcp => "tcp",
-            Transport::Quic => "udp",
-        }
-    }
+    pub fn network(&self)->&str{match self{Self::Socket{transport:Transport::Tcp,..}=>"tcp",Self::Socket{transport:Transport::Quic,..}=>"udp",Self::Unix{net,..}=>net}}
 }
 #[cfg(unix)]
 fn zone_name(index: u32) -> String {
@@ -151,7 +151,7 @@ pub(super) async fn emit(
     app: Option<&Arc<EventsApp>>,
     fields: &HelloFields,
     resources: &Resources,
-    connection: (SocketAddr, SocketAddr, Transport),
+    connection: (crate::net_address::NetAddress,crate::net_address::NetAddress,Transport),
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
     let Some(app) = app.filter(|app| app.should_emit("tls_get_certificate")) else {
@@ -198,7 +198,7 @@ pub(super) struct Admission<'a> {
     app: Option<&'a Arc<EventsApp>>,
     fields: &'a HelloFields,
     resources: &'a Resources,
-    connection: (SocketAddr, SocketAddr, Transport),
+    connection: (crate::net_address::NetAddress,crate::net_address::NetAddress,Transport),
     cancel: &'a CancellationToken,
     done: bool,
 }
@@ -207,14 +207,14 @@ impl<'a> Admission<'a> {
         app: Option<&'a Arc<EventsApp>>,
         fields: &'a HelloFields,
         resources: &'a Resources,
-        connection: (SocketAddr, SocketAddr, Transport),
+        connection: (impl Into<crate::net_address::NetAddress>,impl Into<crate::net_address::NetAddress>,Transport),
         cancel: &'a CancellationToken,
     ) -> Self {
         Self {
             app,
             fields,
             resources,
-            connection,
+            connection:(connection.0.into(),connection.1.into(),connection.2),
             cancel,
             done: false,
         }
@@ -225,7 +225,7 @@ impl<'a> Admission<'a> {
                 self.app,
                 self.fields,
                 self.resources,
-                self.connection,
+                self.connection.clone(),
                 self.cancel,
             )
             .await?;

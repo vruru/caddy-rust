@@ -729,8 +729,8 @@ pub(super) async fn serve(
         host,
         protocol,
         software: "Caddy/v2.11.7",
-        remote: ctx.peer,
-        local: ctx.local,
+        remote: ctx.peer.clone(),
+        local: ctx.local.clone(),
         tls: tls
             .zip(cipher.as_deref())
             .map(|(tls, cipher)| (tls.version, cipher)),
@@ -748,7 +748,7 @@ pub(super) async fn serve(
     let mut overrides = BTreeMap::new();
     let mut env_size = 0usize;
     for (key, template) in &transport.env {
-        let value = ctx.expand(template)?.into_bytes();
+        let value = ctx.expand_bytes(template)?;
         env_size = env_size
             .checked_add(key.len())
             .and_then(|n| n.checked_add(value.len()))

@@ -116,7 +116,7 @@ own validation. Unimplemented semantics are never represented by silently
 accepting their module name. Go plugins have no cross-language binary ABI;
 their configuration and behavior require native implementations.
 
-Known development gaps still include PROXY-protocol listener integration,
+Known development gaps still include remaining listener/address combinations,
 metrics/OTLP and distributed tracing, the ACME server handler, push and timeout
 handlers, remaining template receiver methods and custom directory templates,
 TLS 1.0/1.1, full Go PKIX edge semantics and remaining issuer/trust-loader
@@ -240,3 +240,50 @@ receiver ownership, commit and update metadata, unlock all receiver guards, and
 only then drop the ticket or convert its allocation-free error. Nonempty atomic
 writes without std are explicitly unsupported. These host primitives do not
 establish completion of the remaining template methods or composite copy.
+
+
+Ordered PROXY listener transport
+--------------------------------
+
+`proxy_protocol` listener wrappers execute in their configured order on each
+side of the TLS marker. Native reads PROXY v1 and v2 IPv4/IPv6 TCP/UDP and Unix
+stream/datagram addresses. IGNORE consumes a valid header without adopting its
+addresses; USE adopts them; REJECT rejects a supplied valid header; REQUIRE
+rejects absence or timeout; SKIP performs no header I/O. Deny CIDRs precede
+allow CIDRs, then the fallback applies. Zero or omitted wrapper timeout uses the
+pinned implementation's actual ten-second default; negative values disable only
+that wrapper timer, not the server's outer classification deadline. Stacks are
+bounded to 64 entries and each CIDR list to 1024 entries.
+
+The incremental reader permits 107-byte v1 headers and the full uint16 v2
+payload. Its independent 32 MiB prepaid staging pool retains consumed partial
+bytes until replay drains or the connection is dropped. Exhaustion affects the
+individual connection. Empty wrapper groups add no boxed stream. Proof listener
+leases preserve the same configured transport: an uncommitted candidate serves
+only challenge proofs, and conflicting candidates cannot replace a transport
+still used by a challenge lease. Unchanged stacks retain keepalive connections
+through route reload; a changed stack rejects new operations on an older
+connection while already admitted transfers retain their original scope.
+
+Addresses retain their declared family and raw path bytes rather than borrowing
+the physical proxy's IP. Direct response/header placeholders, templates and
+FastCGI preserve byte-valued Unix names. Access logs retain host/port fallback
+semantics and per-invalid-byte JSON diagnostics. The external certificate HTTP
+manager percent-encodes raw local-host bytes and preserves the original query
+when the connection has no nonempty, structurally split host.
+HTTP remote-IP matching, trusted-proxy
+client-IP extraction and TLS matching use their respective parsing rules;
+non-IP addresses cannot satisfy an IP matcher merely because its positive
+range list is empty. IP-shaped Unix names and scoped IPv6 have separate parsing
+coverage. No-SNI lookup uses the local host (including a bare IP or DNS-shaped
+Unix name) before a configured default, while separate raw address bytes scope
+sessions and IP-hash selection without lossy UTF-8 collisions. This does not
+establish every address, mapping or module combination.
+
+Two observed upstream defects are deliberately repaired. An after-TLS PROXY
+wrapper does not erase real TLS state or relabel an encrypted request as HTTP.
+An empty/unparseable untrusted source host cannot preserve client-supplied
+forwarding headers. Native removes X-Forwarded-For/Host/Proto in that case,
+instead of inventing a source IP or forwarding unauthenticated assertions. An
+explicit leading TLS marker is also accepted: it has the same valid meaning as
+the implicit marker, despite the pinned baseline rejecting the redundant form.

@@ -7,7 +7,7 @@ use std::{net::{IpAddr,Ipv4Addr,SocketAddr},sync::Arc};
 fn error(message:&str)->gotmpl::TemplateError{gotmpl::TemplateError::Exec(message.into())}
 #[derive(Clone)]
 pub(super) struct VirtualTarget {pub uri:Uri}
-pub(super) fn make(inner:Arc<Inner>,server:Arc<ActiveServer>,business:Arc<BusinessGuard>,parent:RequestData,tree:Arc<Tree>,depth:u8,local:SocketAddr)->VirtualInclude{
+pub(super) fn make(inner:Arc<Inner>,server:Arc<ActiveServer>,business:Arc<BusinessGuard>,parent:RequestData,tree:Arc<Tree>,depth:u8,local:crate::net_address::NetAddress)->VirtualInclude{
     let runtime=tokio::runtime::Handle::current();
     Arc::new(move|target,control|{
         control.check()?;
@@ -30,7 +30,7 @@ pub(super) fn make(inner:Arc<Inner>,server:Arc<ActiveServer>,business:Arc<Busine
         let inner=inner.clone();let server=server.clone();let business=business.clone();
         runtime.block_on(async{
             let future=async{
-                let origin=RequestOrigin{peer:SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST),10_000),local,tls:false,sni:None};
+                let origin=RequestOrigin{peer:SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST),10_000).into(),local:local.clone(),tls:false,sni:None};
                 let response=Box::pin(handle_business(inner,server,request,origin,business,None)).await;
                 let status=response.status();let mut body=response.into_body();let mut bytes=Vec::new();
                 while let Some(frame)=body.frame().await{

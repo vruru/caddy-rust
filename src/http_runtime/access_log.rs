@@ -10,7 +10,7 @@ use http::{HeaderMap, Request, Response, Version, header};
 use http_body_util::BodyExt;
 use hyper::body::{Body as HyperBody, Frame, SizeHint};
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     pin::Pin,
     sync::{
         Arc,
@@ -234,8 +234,8 @@ impl Access {
         config: &AccessLogConfig,
         request: &Request<T>,
         authority: &str,
-        peer: SocketAddr,
-        client: IpAddr,
+        peer: &crate::net_address::NetAddress,
+        client: Option<IpAddr>,
         budget: &Arc<CaptureBudget>,
     ) -> Option<Self> {
         let host = authority.parse::<http::uri::Authority>().ok();
@@ -269,9 +269,9 @@ impl Access {
         };
         let request_uri = request.uri().path_and_query().map_or("/", |v| v.as_str());
         let mut fields = vec![
-            Field::new("remote_ip", V::String(peer.ip().to_string())),
-            Field::new("remote_port", V::String(peer.port().to_string())),
-            Field::new("client_ip", V::String(client.to_string())),
+            Field::new("remote_ip", V::RawString(peer.raw_host().into_owned())),
+            Field::new("remote_port", V::RawString(peer.raw_port().into_owned())),
+            Field::new("client_ip", V::String(client.map_or_else(String::new,|ip|ip.to_string()))),
             Field::new("proto", V::String(protocol.into())),
             Field::new(
                 "method",

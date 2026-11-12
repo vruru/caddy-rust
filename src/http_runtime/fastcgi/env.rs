@@ -5,7 +5,6 @@
 use std::{
     collections::BTreeMap,
     io,
-    net::SocketAddr,
     path::{Path, PathBuf},
 };
 
@@ -49,8 +48,8 @@ pub struct Request<'a> {
     pub host: &'a [u8],
     pub protocol: &'a str,
     pub software: &'a str,
-    pub remote: SocketAddr,
-    pub local: SocketAddr,
+    pub remote: crate::net_address::NetAddress,
+    pub local: crate::net_address::NetAddress,
     pub tls: Option<(&'a str, &'a str)>,
     pub authenticated_user: &'a [u8],
     pub remainder: &'a [u8],
@@ -138,9 +137,8 @@ pub fn build(
     }
     let secure = request.tls.is_some();
     let (host, port) = host_port(request.host);
-    let remote_ip = request.remote.ip().to_string();
-    let remote_port = request.remote.port().to_string();
-    let local_ip = request.local.ip().to_string();
+    let (remote_ip,remote_port) = request.remote.fastcgi_remote();
+    let local_ip = request.local.raw_host();
     let mut values: BTreeMap<String, Vec<u8>> = [
         ("AUTH_TYPE", &b""[..]),
         (
@@ -153,9 +151,9 @@ pub fn build(
         ("GATEWAY_INTERFACE", b"CGI/1.1"),
         ("PATH_INFO", info),
         ("QUERY_STRING", request.query),
-        ("REMOTE_ADDR", remote_ip.as_bytes()),
-        ("REMOTE_HOST", remote_ip.as_bytes()),
-        ("REMOTE_PORT", remote_port.as_bytes()),
+        ("REMOTE_ADDR", remote_ip.as_slice()),
+        ("REMOTE_HOST", remote_ip.as_slice()),
+        ("REMOTE_PORT", remote_port.as_slice()),
         ("REMOTE_IDENT", b""),
         ("REMOTE_USER", request.authenticated_user),
         ("REQUEST_SCHEME", if secure { b"https" } else { b"http" }),
@@ -168,7 +166,6 @@ pub fn build(
         ("REQUEST_URI", request.original_uri),
         ("SCRIPT_FILENAME", &script_file),
         ("SCRIPT_NAME", &script_name),
-        ("SERVER_ADDR", local_ip.as_bytes()),
         (
             "SERVER_PORT",
             port.filter(|p| !p.is_empty())
@@ -178,6 +175,11 @@ pub fn build(
     .into_iter()
     .map(|(name, value)| (name.to_owned(), value.to_vec()))
     .collect();
+    // CGI SERVER_ADDR names an IP, not a Unix address or an arbitrary host.
+    // Go ParseIP also rejects scoped IPv6; preserve that distinction here.
+    if std::str::from_utf8(&local_ip).is_ok_and(|host|host.parse::<std::net::IpAddr>().is_ok()){
+        values.insert("SERVER_ADDR".into(),local_ip.into_owned());
+    }
     if !info.is_empty() {
         values.insert("PATH_TRANSLATED".into(), sanitized_path(root, info));
     }

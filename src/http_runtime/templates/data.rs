@@ -9,17 +9,17 @@ pub(crate) struct RequestData {
     tls_snapshot:Option<Arc<crate::http_runtime::ConnectionSnapshot>>,
     tls_values:tls_values::Cache,
     pub uri:Uri,pub original_uri:Uri,pub request_uri:String,pub method:Method,pub original_method:Method,
-    pub form:Arc<super::forms::Form>,pub headers:HeaderMap,pub version:Version,pub host:String,pub remote:String,
-    pub remote_ip:String,pub client_ip:String,pub tls:bool,pub content_length:i64,pub placeholders:BTreeMap<String,String>,
+    pub form:Arc<super::forms::Form>,pub headers:HeaderMap,pub version:Version,pub host:String,pub remote:Vec<u8>,
+    pub remote_ip:Vec<u8>,pub client_ip:String,pub tls:bool,pub content_length:i64,pub placeholders:BTreeMap<String,Vec<u8>>,
 }
 impl RequestData {
     pub(crate) fn capture(ctx:&super::super::super::request::Context)->Result<Self,super::super::TemplateFailure>{
         let req=ctx.req();let mut placeholders=BTreeMap::new();
-        for name in ["http.shutting_down","http.time_until_shutdown","http.request.hostport","http.request.host","http.request.port","http.request.remote","http.request.remote.host","http.request.remote.port","http.request.local","http.request.local.host","http.request.local.port","http.request.client_ip","http.request.scheme","http.request.method","http.request.orig_method","http.request.uri","http.request.uri.path","http.request.uri.query","http.request.orig_uri","http.request.orig_uri.path","http.request.orig_uri.query","http.request.orig_uri.prefixed_query","http.request.proto","http.vars.root","http.error.status_code","http.error.message","http.error.id","http.error.trace"] {
-            if let Some(value)=ctx.lookup(name){placeholders.insert(name.into(),value);}
+        for name in ["http.shutting_down","http.time_until_shutdown","http.request.hostport","http.request.host","http.request.port","http.request.remote","http.request.remote.host","http.request.remote.port","http.request.local","http.request.local.host","http.request.local.port","http.request.client_ip","http.vars.client_ip","http.request.scheme","http.request.method","http.request.orig_method","http.request.uri","http.request.uri.path","http.request.uri.query","http.request.orig_uri","http.request.orig_uri.path","http.request.orig_uri.query","http.request.orig_uri.prefixed_query","http.request.proto","http.vars.root","http.error.status_code","http.error.message","http.error.id","http.error.trace"] {
+            if let Some(value)=ctx.lookup_bytes(name){placeholders.insert(name.into(),value);}
         }
-        for name in ctx.values.keys(){if let Some(value)=ctx.lookup(name){placeholders.insert(name.clone(),value);}}
-        for name in ctx.template_map_destinations(){if let Some(value)=ctx.lookup(name){placeholders.insert(name.to_owned(),value);}}
+        for name in ctx.values.keys(){if let Some(value)=ctx.lookup_bytes(name){placeholders.insert(name.clone(),value);}}
+        for name in ctx.template_map_destinations(){if let Some(value)=ctx.lookup_bytes(name){placeholders.insert(name.to_owned(),value);}}
         let bytes=placeholders.iter().try_fold(0usize,|n,(key,value)|n.checked_add(key.len()+value.len()+64));
         if !bytes.is_some_and(|n|n<=1<<20){return Err(super::super::TemplateFailure(http::StatusCode::INTERNAL_SERVER_ERROR));}
         let target=req.extensions().get::<super::super::virtual_request::VirtualTarget>();
@@ -30,7 +30,7 @@ impl RequestData {
         // Go's net/http parser promotes the wire Host header into Request.Host
         // and removes it from Request.Header; Hyper retains that wire field.
         let mut headers=req.headers().clone();headers.remove(header::HOST);
-        Ok(Self{tls_snapshot:req.extensions().get::<Arc<crate::http_runtime::ConnectionSnapshot>>().cloned(),tls_values:tls_values::cache(),dynamic:crate::http_runtime::placeholder_value::Dynamic::capture(ctx),uri,original_uri,request_uri,form,method:req.method().clone(),original_method:ctx.lookup("http.request.orig_method").and_then(|s|s.parse().ok()).unwrap_or(Method::GET),headers,version:req.version(),host:ctx.authority.clone(),remote:ctx.peer.to_string(),remote_ip:ctx.peer.ip().to_string(),client_ip:ctx.client_ip.to_string(),tls:ctx.tls,content_length:if target.is_some(){0}else{ctx.template_content_length()},placeholders})
+        Ok(Self{tls_snapshot:req.extensions().get::<Arc<crate::http_runtime::ConnectionSnapshot>>().cloned(),tls_values:tls_values::cache(),dynamic:crate::http_runtime::placeholder_value::Dynamic::capture(ctx),uri,original_uri,request_uri,form,method:req.method().clone(),original_method:ctx.lookup("http.request.orig_method").and_then(|s|s.parse().ok()).unwrap_or(Method::GET),headers,version:req.version(),host:ctx.authority.clone(),remote:ctx.peer.raw_text().into_owned(),remote_ip:ctx.peer.raw_host().into_owned(),client_ip:ctx.client_ip.map_or_else(String::new,|ip|ip.to_string()),tls:ctx.tls,content_length:if target.is_some(){0}else{ctx.template_content_length()},placeholders})
     }
     pub(super) fn placeholder(&self,name:&str,control:&Arc<super::Control>)->RenderResult<Value> {
         if let Some(value)=crate::http_config::helpers::global_lookup(name){control.reserve_host_bytes(value.len()+64)?;return Ok(string(value));}
@@ -39,7 +39,7 @@ impl RequestData {
             let value=match value{P::Null=>String::new(),P::Bool(v)=>v.to_string(),P::Duration(v)=>crate::duration::format(v),P::Double(v)=>v.to_string(),P::Unavailable(message)=>return Err(error(message)),_=>return Err(error("unexpected dynamic placeholder type"))};
             control.reserve_host_bytes(value.len()+64)?;return Ok(string(value));
         }
-        if let Some(value)=self.placeholders.get(name){control.reserve_host_bytes(value.len()+64)?;return Ok(string(value.as_str()));}
+        if let Some(value)=self.placeholders.get(name){control.reserve_host_bytes(value.len()+64)?;return Ok(Value::from_go_bytes(value.clone()));}
         if let Some(name)=name.strip_prefix("http.request.header."){
             let values=self.headers.get_all(name);let count=values.iter().count();
             let length=values.iter().try_fold(count.saturating_sub(1),|n,v|n.checked_add(v.as_bytes().len())).ok_or_else(||error("header placeholder size overflow"))?;
@@ -72,8 +72,9 @@ impl RequestData {
             return Ok(string(""));
         }
         arity(args,0,0)?;
+        if name=="RemoteIP"{return Ok(Value::from_go_bytes(self.remote_ip.clone()));}
         Ok(string(match name{
-            "RemoteIP"=>self.remote_ip.clone(),"ClientIP"=>self.client_ip.clone(),
+            "ClientIP"=>self.client_ip.clone(),
             "Host"=>{
                 if self.host.starts_with('['){self.host.rsplit_once("]:").map_or_else(||self.host.clone(),|(host,_)|host.trim_start_matches('[').into())}
                 else if self.host.bytes().filter(|byte|*byte==b':').count()==1{self.host.split_once(':').map_or_else(||self.host.clone(),|(host,_)|host.into())}
@@ -92,7 +93,7 @@ impl RequestData {
             ("Method".into(),string(method.as_str())),("URL".into(),url_value(uri,control)?),
             ("Header".into(),header_value(Arc::new(Mutex::new(headers.clone())),false)),
             ("Trailer".into(),header_value(Arc::new(Mutex::new(HeaderMap::new())),false)),
-            ("Host".into(),string(if original{""}else{&self.host})),("RemoteAddr".into(),string(self.remote.clone())),
+            ("Host".into(),string(if original{""}else{&self.host})),("RemoteAddr".into(),Value::from_go_bytes(self.remote.clone())),
             ("RequestURI".into(),string(request_uri.as_str())),("Proto".into(),string(proto)),
             ("ProtoMajor".into(),Value::Int(major)),("ProtoMinor".into(),Value::Int(minor)),
             ("ContentLength".into(),Value::Int64(if original{0}else{self.content_length})),

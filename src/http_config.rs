@@ -42,6 +42,7 @@ pub(crate) use header_alias::HeaderAliases;
 pub(crate) struct ServerConfig {
     pub(crate) access_logs: Option<AccessLogConfig>,
     pub(crate) header_aliases: HeaderAliases,
+    pub(crate) listener_stack:Arc<crate::http_runtime::listener_stack::Stack>,
     pub(crate) listen: Vec<SocketAddr>,
     pub(crate) routes: Vec<Route>,
     pub(crate) named_routes: std::collections::BTreeMap<String, Route>,
@@ -398,17 +399,20 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
     let tls_policies = crate::tls_policy::parse_policies(policies)?;
     let mut tls_wrapper = None;
     let mut redirects = Vec::new();
+    let mut listener_operations=Vec::new();
     if let Some(wrappers) = m.get("listener_wrappers").filter(|v| !v.is_null()) {
         let wrappers = wrappers
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("listener wrappers array required"))?;
+        ensure!(wrappers.len()<=64,"listener wrapper limit exceeded");
         for (index, value) in wrappers.iter().enumerate() {
             let normalized = crate::module_json::inline(value, "wrapper", false)?;
             let wrapper = object(&normalized, path)?;
             match wrapper.get("wrapper").and_then(Value::as_str) {
                 Some("tls") => {
                     deny_unknown(wrapper, &["wrapper"], path)?;
-                    ensure!(index != 0, "TLS listener wrapper cannot be first");
+                    // An explicit leading TLS marker has the same unambiguous
+                    // meaning as the implicit marker; accepting it is useful.
                     ensure!(tls_wrapper.is_none(), "duplicate TLS listener wrapper");
                     tls_wrapper = Some(index);
                 }
@@ -427,7 +431,9 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
                         .transpose()?
                         .unwrap_or(0);
                     redirects.push((index, maximum));
+                    listener_operations.push((index,crate::http_runtime::listener_stack::Operation::Redirect(maximum)));
                 }
+                Some("proxy_protocol")=>{listener_operations.push((index,crate::http_runtime::listener_stack::Operation::Proxy(crate::proxy_protocol::Config::parse(&normalized,path)?)));}
                 _ => return Err(unsupported("listener wrapper")),
             }
         }
@@ -554,6 +560,7 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
         expected("expected_dot_headers")?,
     )?;
     Ok(ServerConfig {
+        listener_stack:Arc::new(crate::http_runtime::listener_stack::Stack::ordered(listener_operations,tls_wrapper)),
         access_logs,
         header_aliases,
         listen,
@@ -1923,7 +1930,6 @@ fn parse_proxy(
             .transpose()?,
     })
 }
-use std::str::FromStr;
 
 fn pending_placeholders(value: &Value) -> Result<()> {
     pending_placeholders_depth(value, 0, false)

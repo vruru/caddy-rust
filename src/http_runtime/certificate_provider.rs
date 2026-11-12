@@ -36,7 +36,7 @@ pub(crate) struct CertificateHello {
     pub(crate) server_name: String,
     pub(crate) signatures: Vec<u16>,
     pub(crate) ciphers: Vec<u16>,
-    pub(crate) local_ip: std::net::IpAddr,
+    pub(crate) local_ip: Option<Vec<u8>>,
 }
 #[derive(Clone)]
 pub(crate) struct WarmSelection {

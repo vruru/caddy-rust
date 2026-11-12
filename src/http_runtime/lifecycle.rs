@@ -623,6 +623,15 @@ impl HttpRuntime {
                             "HTTP candidate conflicts with a challenge listener lease"
                         );
                     }
+                    // Validate every shared proof policy before changing any owner.
+                    for address in bindings.keys(){
+                        if control.leases.iter().any(|record|record.bindings.iter().any(|(key,_)|key==address)){
+                            let owner=control.pool.get(address).and_then(|slot|slot.owner.upgrade())
+                                .ok_or_else(||anyhow::anyhow!("challenge listener owner unavailable"))?;
+                            ensure!(*owner.proof.load().listener_stack==*servers[address].plan.listener_stack,
+                                "HTTP candidate changes wrappers used by a challenge listener lease");
+                        }
+                    }
                     let mut listeners = HashMap::with_capacity(bindings.len());
                     let mut addresses = Vec::with_capacity(bindings.len());
                     let mut launches = Vec::new();
@@ -637,7 +646,8 @@ impl HttpRuntime {
                             &mut launches,
                             &self.inner.connections,
                         )?;
-                        configure_proof(&listener, *kind, &proof_tls);
+                        let stack=servers[address].plan.listener_stack.clone();
+                        configure_proof(&listener, *kind, &proof_tls,Some(stack));
                         let capability = current
                             .servers
                             .get(address)
@@ -1046,8 +1056,11 @@ fn pin_pool(
     }
     Ok((pins, None))
 }
-fn configure_proof(owner: &ListenerControl, kind: ListenerKind, tls: &Arc<rustls::ServerConfig>) {
+fn configure_proof(owner: &ListenerControl, kind: ListenerKind, tls: &Arc<rustls::ServerConfig>, stack:Option<Arc<listener_stack::Stack>>) {
+    // A challenge lease reuses the candidate's transport, it must not reset it.
+    let listener_stack=stack.unwrap_or_else(||owner.proof.load().listener_stack.clone());
     owner.proof.store(Arc::new(ProofListener {
+        listener_stack,
         tls: (kind == ListenerKind::Tls).then(|| tls.clone()),
         cancel: owner.cancel.clone(),
     }));
@@ -1092,6 +1105,7 @@ fn own_socket(
         .map_err(|_| anyhow::anyhow!("HTTP listener address unavailable"))?;
     let cancel = CancellationToken::new();
     let proof = Arc::new(ArcSwap::from_pointee(ProofListener {
+        listener_stack:Arc::default(),
         tls: (kind == ListenerKind::Tls).then(|| tls.clone()),
         cancel: cancel.clone(),
     }));
@@ -1314,7 +1328,7 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
                                 modes.push((key, *kind));
                                 keys.push(key);
                             }
-                            configure_proof(&owner, *kind, &tls);
+                            configure_proof(&owner, *kind, &tls,None);
                             addresses.push(StagedAddress {
                                 declared: *address,
                                 actual: owner.actual,

@@ -1,5 +1,16 @@
 //! Handshake identity remains attached to its TLS connection; each new HTTP
 //! operation is admitted against the currently published route/TLS policy.
+use crate::net_address::NetAddress;
+
+// CertMagic selects the local host when SNI is absent. Unlike ACL parsing,
+// this lookup may use a bare IP or a DNS-shaped Unix address, and drops zones.
+fn local_certificate_name(local:&NetAddress)->String{
+    let raw=local.raw_host();
+    let host=raw.split(|byte|*byte==b'%').next().unwrap_or_default();
+    let Ok(host)=std::str::from_utf8(host)else{return String::new();};
+    host.parse::<std::net::IpAddr>().map(crate::tls_resolver::canonical_certificate_ip)
+        .unwrap_or_else(|_|host.to_owned())
+}
 use super::certificate_choice::{Choice, eligible_names};
 use super::*;
 use crate::leaf_guard::{LeafState, leaf_id};
@@ -158,7 +169,7 @@ impl ResolvesServerCert for PinnedProof {
 }
 async fn proof_event(inner:&Arc<Inner>,registration:Option<&crate::challenge::TlsRegistration>,
     app:Option<&Arc<crate::events::EventsApp>>,fields:&super::tls_events::HelloFields,
-    peer_local:(SocketAddr,SocketAddr),cancel:&CancellationToken)->Result<()> {
+    peer_local:(NetAddress,NetAddress),cancel:&CancellationToken)->Result<()> {
     let event_cancel=cancel.child_token();let _cancel_on_drop=event_cancel.clone().drop_guard();
     let future=super::tls_events::emit(app,fields,&inner.resources,
         (peer_local.0,peer_local.1,super::tls_events::Transport::Tcp),&event_cancel);
@@ -171,7 +182,7 @@ async fn proof_event(inner:&Arc<Inner>,registration:Option<&crate::challenge::Tl
     }else{future.await}
 }
 pub(super) async fn accept_proof<I>(inner:&Arc<Inner>,stream:I,config:Arc<rustls::ServerConfig>,
-    peer_local:(SocketAddr,SocketAddr),cancel:CancellationToken)->Result<()>
+    peer_local:(NetAddress,NetAddress),cancel:CancellationToken)->Result<()>
 where I:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin+Send+'static {
     let start=tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(),stream).await?;
     let hello=start.client_hello();let fields=super::tls_events::HelloFields::capture(&hello);
@@ -335,7 +346,7 @@ async fn server_for_hello(
     wire_sni: &str,
     alpn: &[&[u8]],
     schemes: &[SignatureScheme],
-    connection: (SocketAddr, SocketAddr, &super::tls_events::HelloFields),
+    connection: (NetAddress,NetAddress,&super::tls_events::HelloFields),
 ) -> Result<(
     Arc<ActiveServer>,
     usize,
@@ -358,10 +369,11 @@ async fn server_for_hello(
             .ok_or_else(|| anyhow::anyhow!("TLS listener retired"))?;
         let server_to_match = server.clone();
         let sni_to_match = wire_sni.to_owned();
+        let peer_to_match=peer.clone();let local_to_match=local.clone();
         let (policy_index, policy) = inner
             .resources
             .metadata
-            .run(move || server_to_match.policy(&sni_to_match, peer, local))
+            .run(move || server_to_match.policy(&sni_to_match, peer_to_match, local_to_match))
             .await
             .map_err(|_| anyhow::anyhow!("TLS policy matching worker unavailable"))?
             .ok_or_else(|| anyhow::anyhow!("no TLS connection policy matched"))?;
@@ -371,7 +383,7 @@ async fn server_for_hello(
         );
         if event_generation.as_ref().is_none_or(|g|!Arc::ptr_eq(g,&activity)) {
             super::tls_events::emit(server.events.as_ref(),event_fields,&inner.resources,
-                (peer,local,super::tls_events::Transport::Tcp),&activity.admission_closed).await?;
+                (peer.clone(),local.clone(),super::tls_events::Transport::Tcp),&activity.admission_closed).await?;
             event_generation=Some(activity.clone());
             if !same_business_view(&inner.current.load_full(),&address,&server,&activity){continue 'view;}
         }
@@ -447,7 +459,7 @@ async fn server_for_hello(
             (manual, fallback)
         };
         let typed = sni.is_empty() || sni.parse::<std::net::IpAddr>().is_ok();
-        let local_ip = crate::tls_resolver::canonical_certificate_ip(local.ip());
+        let local_ip = local_certificate_name(&local);
         let primary = if sni.is_empty() {
             local_ip.as_str()
         } else {
@@ -512,7 +524,7 @@ async fn server_for_hello(
                 origin: sni.to_owned(), subject: effective.clone(), force_lookup,
                 hello: Some(CertificateHello { server_name: event_fields.server_name.clone(),
                     signatures: event_fields.signature_schemes.clone().unwrap_or_default(),
-                    ciphers: event_fields.cipher_suites.clone(), local_ip: local.ip() }),
+                    ciphers: event_fields.cipher_suites.clone(), local_ip: local.host_port_bytes().filter(|(host,_)|!host.is_empty()).map(|(host,_)|host.into_owned()) }),
                 cached: cached_target,
                 selection: Some(WarmSelection { filter: resolver.certificate_selection.clone(),
                     schemes: schemes.to_vec(), version: None }),
@@ -578,7 +590,7 @@ pub(super) async fn accept<I>(
     address: SocketAddr,
     deadline: Option<tokio::time::Instant>,
     reply_http: bool,
-    peer_local: (SocketAddr, SocketAddr),
+    peer_local: (NetAddress, NetAddress),
 ) -> Result<AcceptedTls<http_redirect::ReplayIo<I>>>
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -597,7 +609,7 @@ where
     let raw_sni = hello.offered_server_name().unwrap_or_default().to_owned();
     let sni = crate::tls_policy::normalized_offered_name(&raw_sni)?;
     let ip_sni = sni.parse::<std::net::IpAddr>().is_ok();
-    let local_ip = crate::tls_resolver::canonical_certificate_ip(local.ip());
+    let local_ip = local_certificate_name(&local);
     let offered_protocols = hello
         .alpn()
         .map(|a| a.map(<[u8]>::to_vec).collect::<Vec<_>>())
@@ -626,10 +638,11 @@ where
             event_app=business.events.clone();
             let matching = business.clone();
             let proof_name = raw_sni.clone();
+            let peer_to_match=peer.clone();let local_to_match=local.clone();
             let (_, policy) = inner
                 .resources
                 .metadata
-                .run(move || matching.policy(&proof_name, peer, local))
+                .run(move || matching.policy(&proof_name, peer_to_match, local_to_match))
                 .await
                 .map_err(|_| anyhow::anyhow!("TLS proof policy worker unavailable"))?
                 .ok_or_else(|| anyhow::anyhow!("no TLS proof connection policy matched"))?;
@@ -647,7 +660,7 @@ where
         } else {
             proof_tls_config(inner.challenge_resolver.clone())?
         };
-        proof_event(inner,registration.as_ref(),event_app.as_ref(),&event_fields,(peer,local),&inner.stopped).await?;
+        proof_event(inner,registration.as_ref(),event_app.as_ref(),&event_fields,(peer.clone(),local.clone()),&inner.stopped).await?;
         let mut config=(*config).clone();
         config.cert_resolver=Arc::new(PinnedProof{registry:inner.registry.clone(),sni:sni.clone(),registration});
         let config=Arc::new(config);
@@ -669,7 +682,7 @@ where
     }
     connection_budget::classify(&admission, connection_budget::ConnectionClass::Business)?;
     let (server, policy_index, policy, acquired) = server_for_hello(
-        inner, address, &sni, &raw_sni, &protocols, &schemes, (peer,local,&event_fields),
+        inner, address, &sni, &raw_sni, &protocols, &schemes, (peer.clone(),local.clone(),&event_fields),
     )
     .await?;
     let resolver = &policy.resolver;
@@ -718,7 +731,7 @@ where
     // An omitted SNI uses a distinct session namespace bound to the actual
     // local address. It cannot borrow a ticket from a DNS-named handshake.
     let session_name: Arc<str> = if sni.is_empty() {
-        format!("no-sni:{local_ip}").into()
+        if local.socket().is_some(){format!("no-sni:{local_ip}").into()}else{format!("no-sni:{}:{}",local.network(),local.raw_text().iter().map(|byte|format!("{byte:02x}")).collect::<String>()).into()}
     } else if ip_sni {
         format!("ip-sni:{sni}").into()
     } else {

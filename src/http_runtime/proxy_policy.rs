@@ -10,7 +10,6 @@ use http_body_util::BodyExt;
 use sha2::Sha256;
 use std::{
     collections::HashMap,
-    net::IpAddr,
     pin::Pin,
     sync::{
         Arc, Mutex, Weak,
@@ -312,8 +311,8 @@ pub(super) struct SelectionInput<'a> {
     pub uri: &'a Uri,
     pub version: Version,
     pub headers: &'a HeaderMap,
-    pub peer_ip: IpAddr,
-    pub client_ip: IpAddr,
+    pub peer_ip: &'a [u8],
+    pub client_ip: &'a str,
     pub secure: bool,
 }
 
@@ -322,8 +321,8 @@ pub(super) struct OwnedSelectionInput {
     uri: Uri,
     version: Version,
     headers: HeaderMap,
-    peer_ip: IpAddr,
-    client_ip: IpAddr,
+    peer_ip: Vec<u8>,
+    client_ip: String,
     secure: bool,
 }
 impl SelectionInput<'_> {
@@ -333,8 +332,8 @@ impl SelectionInput<'_> {
             uri: self.uri.clone(),
             version: self.version,
             headers: self.headers.clone(),
-            peer_ip: self.peer_ip,
-            client_ip: self.client_ip,
+            peer_ip: self.peer_ip.to_owned(),
+            client_ip: self.client_ip.to_owned(),
             secure: self.secure,
         }
     }
@@ -346,8 +345,8 @@ impl OwnedSelectionInput {
             uri: &self.uri,
             version: self.version,
             headers: &self.headers,
-            peer_ip: self.peer_ip,
-            client_ip: self.client_ip,
+            peer_ip: &self.peer_ip,
+            client_ip: &self.client_ip,
             secure: self.secure,
         }
     }
@@ -604,8 +603,8 @@ impl Policy {
                 }
                 least(subset.into_iter(), true)
             }
-            Self::Ip => Ok(by_hash(pool, input.peer_ip.to_string().as_bytes())),
-            Self::ClientIp => Ok(by_hash(pool, input.client_ip.to_string().as_bytes())),
+            Self::Ip => Ok(by_hash(pool, input.peer_ip)),
+            Self::ClientIp => Ok(by_hash(pool, input.client_ip.as_bytes())),
             Self::Uri => {
                 if ((matches!(input.version, Version::HTTP_10 | Version::HTTP_11))
                     && input.uri.scheme().is_some())

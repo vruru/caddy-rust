@@ -144,6 +144,7 @@ mod incremental;
 #[path = "http_runtime/zstd_codec.rs"]
 mod zstd_codec;
 
+pub(crate) mod listener_stack;
 mod http_dial;
 mod http_dial_io;
 #[path = "http_runtime/rewrite_uri.rs"]
@@ -778,6 +779,7 @@ async fn prepare_servers(
                 trusted_strict: false,
                 client_ip_headers: vec!["X-Forwarded-For".into()],
                 read_header_timeout: Duration::from_secs(60),
+                listener_stack:Arc::new(listener_stack::Stack::default()),
                 read_idle_timeout: Duration::from_secs(60),
                 idle_timeout: Some(Duration::from_secs(300)),
                 protocols: vec!["h1".into(), "h2".into()],
@@ -812,6 +814,7 @@ fn plain_transport_compatible(old: &ServerConfig, next: &ServerConfig) -> bool {
     !old.tls
         && !next.tls
         && old.protocols == next.protocols
+        && old.listener_stack==next.listener_stack
         && old.read_header_timeout == next.read_header_timeout
 }
 fn dns_covers(pattern: &str, name: &str) -> bool {
@@ -859,6 +862,7 @@ fn certificate_names(chain: &[u8]) -> Result<Vec<String>> {
 /// never exposes the candidate routes. Mode is fixed when a connection accepts.
 #[derive(Clone)]
 struct ProofListener {
+    listener_stack:Arc<listener_stack::Stack>,
     tls: Option<Arc<rustls::ServerConfig>>,
     cancel: CancellationToken,
 }
@@ -949,15 +953,15 @@ async fn accept_loop(
         let eviction = stream.eviction_token();
         if let Some(server) = server {
             spawn_admitted(&inner, eviction, async move {
+                let (mut peer,mut local)=(crate::net_address::NetAddress::from(peer),crate::net_address::NetAddress::from(local));
+                let accepted_listener_stack=server.plan.listener_stack.clone();
                 let Some(deadline) =
                     tokio::time::Instant::now().checked_add(server.plan.read_header_timeout)
                 else {
                     return;
                 };
-                let stream = match http_redirect::prepare(
-                    stream,
-                    server.plan.redirect_before_tls,
-                    deadline,
+                let stream = match listener_stack::prepare(
+                    stream,&accepted_listener_stack.before,&mut peer,&mut local,deadline,
                     task_inner.stopped.child_token(),
                 )
                 .await
@@ -973,7 +977,7 @@ async fn accept_loop(
                         key,
                         Some(deadline),
                         server.plan.redirect_after_tls.is_none(),
-                        (peer, local),
+                        (peer.clone(), local.clone()),
                     );
                     let accepted = tokio::select! {
                         biased;
@@ -995,10 +999,8 @@ async fn accept_loop(
                     else {
                         return;
                     };
-                    let stream = match http_redirect::prepare(
-                        accepted.stream,
-                        server.plan.redirect_after_tls,
-                        deadline,
+                    let stream = match listener_stack::prepare(
+                        accepted.stream,&accepted_listener_stack.after,&mut peer,&mut local,deadline,
                         task_inner.stopped.child_token(),
                     )
                     .await
@@ -1009,9 +1011,10 @@ async fn accept_loop(
                     serve_connection(
                         task_inner,
                         TokioIo::new(stream),
-                        peer,
-                        local,
+                        peer.into(),
+                        local.into(),
                         ConnectionView {
+                            listener_stack:accepted_listener_stack,
                             key,
                             server: accepted.server,
                             admission,
@@ -1024,10 +1027,8 @@ async fn accept_loop(
                     )
                     .await;
                 } else {
-                    let stream = match http_redirect::prepare(
-                        stream,
-                        server.plan.redirect_after_tls,
-                        deadline,
+                    let stream = match listener_stack::prepare(
+                        stream,&accepted_listener_stack.after,&mut peer,&mut local,deadline,
                         task_inner.stopped.child_token(),
                     )
                     .await
@@ -1038,9 +1039,10 @@ async fn accept_loop(
                     serve_connection(
                         task_inner,
                         TokioIo::new(stream),
-                        peer,
-                        local,
+                        peer.into(),
+                        local.into(),
                         ConnectionView {
+                            listener_stack:accepted_listener_stack,
                             key,
                             server,
                             admission,
@@ -1062,6 +1064,11 @@ async fn accept_loop(
                 if proof.cancel.is_cancelled() {
                     return;
                 }
+                let (mut peer,mut local)=(crate::net_address::NetAddress::from(peer),crate::net_address::NetAddress::from(local));
+                let deadline=tokio::time::Instant::now()+Duration::from_secs(10);
+                let stream=match listener_stack::prepare(stream,&proof.listener_stack.before,&mut peer,&mut local,deadline,proof.cancel.child_token()).await{
+                    Ok(stream)=>stream,Err(_)=>return,
+                };
                 if let Some(tls) = proof.tls.clone() {
                     // Prefix classification is I/O, not TLS CPU work. The dedicated
                     // proof listener has no server read_header_timeout to inherit.
@@ -1073,7 +1080,7 @@ async fn accept_loop(
                             match result { Ok(Ok(stream)) => stream, _ => return }
                         }
                     };
-                    let handshake=connection_identity::accept_proof(&task_inner,stream,tls,(peer,local),proof.cancel.child_token());
+                    let handshake=connection_identity::accept_proof(&task_inner,stream,tls,(peer.into(),local.into()),proof.cancel.child_token());
                     tokio::select! {
                         biased;
                         _ = proof.cancel.cancelled() => {},
@@ -1082,8 +1089,10 @@ async fn accept_loop(
                     }
                     // ACME ALPN never speaks HTTP after its handshake.
                 } else {
-                    serve_proof_connection(task_inner, TokioIo::new(stream), proof.cancel.clone())
-                        .await;
+                    let stream=match listener_stack::prepare(stream,&proof.listener_stack.after,&mut peer,&mut local,deadline,proof.cancel.child_token()).await{
+                        Ok(stream)=>stream,Err(_)=>return,
+                    };
+                    serve_proof_connection(task_inner, TokioIo::new(stream), proof.cancel.clone()).await;
                 }
             });
         }
@@ -1126,6 +1135,7 @@ where
     }
 }
 struct ConnectionView {
+    listener_stack:Arc<listener_stack::Stack>,
     admission: std::sync::Weak<connection_budget::Admission>,
     key: SocketAddr,
     server: Arc<ActiveServer>,
@@ -1138,13 +1148,14 @@ struct ConnectionView {
 async fn serve_connection<I>(
     inner: Arc<Inner>,
     io: I,
-    peer: SocketAddr,
-    local: SocketAddr,
+    peer: crate::net_address::NetAddress,
+    local: crate::net_address::NetAddress,
     view: ConnectionView,
 ) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
     let ConnectionView {
+        listener_stack,
         key,
         server,
         negotiated_tls_h2,
@@ -1168,6 +1179,7 @@ async fn serve_connection<I>(
         let tls_log = tls_log.clone();
         let tls_snapshot = tls_snapshot.clone();
         let client_cert_cache = client_cert_cache.clone();
+        let peer=peer.clone();let local=local.clone();let listener_stack=listener_stack.clone();
         let admission = admission.clone();
         async move {
             // Count admission before confirming that this exact view is still
@@ -1202,7 +1214,7 @@ async fn serve_connection<I>(
                     .map(|entry| entry.binding.advertisement.clone());
                 break (Some(current), Some(business), alt_svc);
             };
-            let verdict = match (identity.as_ref(), current.as_ref()) {
+            let verdict = if current.as_ref().is_some_and(|current|current.plan.listener_stack!=listener_stack){TlsVerdict::Reject}else{match (identity.as_ref(), current.as_ref()) {
                 (Some(identity), Some(current)) => {
                     identity.verdict(current, negotiated_tls_h2 == Some(true))
                 }
@@ -1212,7 +1224,7 @@ async fn serve_connection<I>(
                     TlsVerdict::Serve
                 }
                 _ => TlsVerdict::Reject,
-            };
+            }};
             if verdict == TlsVerdict::Reject {
                 let mut response = simple(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable\n");
                 response.headers_mut().insert(
