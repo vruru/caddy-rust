@@ -294,29 +294,44 @@ impl PreparedResponse {
             let metrics=ctx.metrics.as_ref().map(|group|(group.clone(),group.retain_tunnel()));
             let hard_stop = business.generation().hard_stop.clone();
             let admission = self.lease.take().expect("HTTP upgrade lease");
+            // Capture before publishing the response head; the empty upgrade
+            // body must not end spans owned by this detached application actor.
+            let trace=ctx.trace_tunnel();
+            let count_data=ctx.req().version()==Version::HTTP_2;
             inner.upgrades.spawn(async move {
                 let _extended = setup.extended;
                 let _admission = admission;
                 let _hold_client = setup.client;
                 let _business = business;
                 let _metrics=metrics;
+                let mut trace_actor=super::tracing::TunnelActor::new(trace.clone());
                 let tunnel = async {
-                    if let (Ok(downstream), Ok(upstream)) = tokio::join!(downstream, setup.upstream)
-                    {
-                        let mut downstream = TokioIo::new(downstream);
-                        let mut upstream = TokioIo::new(upstream);
-                        let copy = tokio::io::copy_bidirectional(&mut downstream, &mut upstream);
-                        tokio::pin!(copy);
-                        if let Some(delay) = setup.close_delay {
-                            tokio::select! { _ = &mut copy => {}, _ = drain.cancelled() => {
-                                let _ = tokio::time::timeout(delay, copy).await;
-                            } }
-                        } else {
-                            let _ = copy.await;
+                    let(downstream,upstream)=tokio::join!(downstream,setup.upstream);
+                    let downstream=downstream.map_err(std::io::Error::other)?;
+                    let upstream=upstream.map_err(std::io::Error::other)?;
+                    let mut downstream=super::tracing::ObservedIo{
+                        inner:TokioIo::new(downstream),
+                        observation:if count_data{trace.clone()}else{None},
+                    };
+                    let mut upstream=TokioIo::new(upstream);
+                    let copy=tokio::io::copy_bidirectional(&mut downstream,&mut upstream);
+                    tokio::pin!(copy);
+                    let result=if let Some(delay)=setup.close_delay{
+                        tokio::select!{
+                            result=&mut copy=>result,
+                            _=drain.cancelled()=>match tokio::time::timeout(delay,copy).await{
+                                Ok(result)=>result,
+                                Err(error)=>Err(std::io::Error::new(std::io::ErrorKind::TimedOut,error)),
+                            },
                         }
-                    }
+                    }else{copy.await};
+                    result.map(|_|())
                 };
-                tokio::select! { biased; _ = hard_stop.cancelled() => {}, _ = tunnel => {} }
+                let result=tokio::select!{biased;
+                    _=hard_stop.cancelled()=>Err(std::io::Error::new(std::io::ErrorKind::Interrupted,"WebSocket generation stopped")),
+                    result=tunnel=>result,
+                };
+                if result.is_ok(){trace_actor.success();}
             });
             }
         }

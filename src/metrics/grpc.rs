@@ -154,6 +154,93 @@ impl Grpc {
         unreachable!("bounded retry loop returns on its final attempt")
     }
 
+pub(super) async fn export_traces(
+    &self,
+    data: &[opentelemetry_sdk::trace::SpanData],
+    resource: &opentelemetry_sdk::Resource,
+    credit: Arc<Credit>,
+) -> anyhow::Result<()> {
+    use opentelemetry_proto::tonic::collector::trace::v1::{
+        ExportTraceServiceRequest, trace_service_client::TraceServiceClient,
+    };
+    use opentelemetry_proto::transform::common::tonic::ResourceAttributesWithSchema;
+    use opentelemetry_proto::transform::trace::tonic::group_spans_by_resource_and_scope;
+    use prost::Message;
+    use tonic_types::StatusExt;
+    let owners = Arc::strong_count(&credit);
+    let mut delay = std::time::Duration::from_millis(100);
+    let mut cap = std::time::Duration::from_millis(1600);
+    for attempt in 0..4 {
+        let service = Service {
+            transport: self.transport.clone(),
+            credit: credit.clone(),
+        };
+        let mut client = TraceServiceClient::with_origin(service, self.origin.clone())
+            .max_encoding_message_size(32 << 20);
+        if self.gzip {
+            client = client
+                .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+                .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+        }
+        let message = ExportTraceServiceRequest {
+            resource_spans: group_spans_by_resource_and_scope(
+                data.to_vec(),
+                &ResourceAttributesWithSchema::from(resource),
+            ),
+        };
+        anyhow::ensure!(
+            message.encoded_len() <= 32 << 20,
+            "OTLP protobuf message exceeds 32 MiB"
+        );
+        let mut request = tonic::Request::new(message);
+        *request.metadata_mut() = self.headers.clone();
+        request.set_timeout(self.timeout);
+        let result = client.export(request).await;
+        drop(client);
+        let error = match result {
+            Ok(_) => return Ok(()),
+            Err(error) => error,
+        };
+        let hint = error.get_details_retry_info().and_then(|v| v.retry_delay);
+        let retry = match error.code() {
+            tonic::Code::ResourceExhausted => hint.is_some(),
+            tonic::Code::Unavailable
+            | tonic::Code::Cancelled
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Aborted
+            | tonic::Code::OutOfRange
+            | tonic::Code::DataLoss => true,
+            _ => false,
+        };
+        // A peer may finish the control response while its request DATA is
+        // still queued. Do not accumulate retries behind that real owner.
+        if !retry || attempt == 3 || Arc::strong_count(&credit) > owners {
+            return Err(error.into());
+        }
+        if let Some(hint) = hint {
+            let hint = hint.min(std::time::Duration::from_secs(30));
+            if hint > cap {
+                cap = std::time::Duration::from_secs(30);
+            }
+            delay = delay.max(hint);
+        }
+        let jitter = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64
+            % 101;
+        let sleep = delay
+            .saturating_add(std::time::Duration::from_millis(jitter))
+            .min(cap);
+        if sleep >= self.timeout.saturating_sub(credit.created.elapsed()) {
+            return Err(error.into());
+        }
+        tokio::time::sleep(sleep).await;
+        delay = delay.saturating_mul(2).min(cap);
+    }
+    unreachable!("bounded retry loop returns on its final attempt")
+}
+
     pub(super) async fn shutdown(&self) {
         self.transport.shutdown().await;
     }

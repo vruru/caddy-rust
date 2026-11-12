@@ -77,6 +77,7 @@ struct Shared {
     flags: AtomicU8,
     state: Mutex<State>,
     limits: InformationalLimits,
+    emit_interims: bool,
 }
 
 impl Shared {
@@ -129,6 +130,10 @@ impl InformationalSender {
         request.body_mut().take_informational()
     }
 
+    /// Whether the peer protocol permits informational heads. A HTTP/1.0
+    /// writer may still carry non-wire deadline metadata without sending 1xx.
+    pub fn allows_informational(&self)->bool{self.0.emit_interims}
+
     /// Bind an existing response scope before an automatic 100 response is
     /// demanded by the first request-body read. This writes no headers and
     /// starts no pending-output clock. Rebinding a different scope is rejected.
@@ -159,6 +164,8 @@ impl InformationalSender {
         {
             return Err(InformationalError(ErrorKind::InvalidStatus));
         }
+
+        if !self.0.emit_interims{return Ok(())}
 
         let limit = InformationalError(ErrorKind::Limit);
         let mut bytes = 48usize; // status line and HTTP/2 pseudo-header overhead
@@ -303,6 +310,7 @@ pub(crate) fn install(
     limits: InformationalLimits,
     recycled: Option<InformationalReceiver>,
 ) -> InformationalReceiver {
+    let emit_interims=request.version()!=http::Version::HTTP_10;
     if let Some(mut previous) = recycled {
         if let Some(shared) = Arc::get_mut(&mut previous.0) {
             // Only a closed, completely unreferenced H1 request can reuse
@@ -312,6 +320,7 @@ pub(crate) fn install(
                 flags: AtomicU8::new(0),
                 state: Mutex::new(State::default()),
                 limits,
+                emit_interims,
             };
             request
                 .body_mut()
@@ -323,6 +332,7 @@ pub(crate) fn install(
         flags: AtomicU8::new(0),
         state: Mutex::new(State::default()),
         limits,
+        emit_interims,
     });
     request
         .body_mut()

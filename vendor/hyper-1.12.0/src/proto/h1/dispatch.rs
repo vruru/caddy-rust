@@ -866,7 +866,7 @@ cfg_server! {
             *req.version_mut() = msg.version;
             *req.extensions_mut() = msg.extensions;
             let recycled = self.informational.take();
-            self.informational = if req.version() == http::Version::HTTP_11 {
+            self.informational = if matches!(req.version(),http::Version::HTTP_10|http::Version::HTTP_11) {
                 self.informational_limits
                     .map(|limits| crate::ext::install_informational(&mut req, limits, recycled))
             } else {

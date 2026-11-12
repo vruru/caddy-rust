@@ -10,6 +10,7 @@ pub(crate) struct RequestData {
     tls_values:tls_values::Cache,
     url_values:OnceLock<request_url::Cache>,
     url_origin:Option<Uri>,url_origin_form:bool,
+    h2_protocol:Option<Arc<str>>,
     pub uri:Uri,pub original_uri:Uri,pub request_uri:String,pub method:Method,pub original_method:Method,
     pub form:Arc<super::forms::Form>,pub headers:HeaderMap,pub version:Version,pub host:String,pub remote:Vec<u8>,
     pub remote_ip:Vec<u8>,pub client_ip:String,pub tls:bool,pub content_length:i64,pub placeholders:BTreeMap<String,(Vec<u8>,bool)>,
@@ -40,7 +41,15 @@ impl RequestData {
         // Go's net/http parser promotes the wire Host header into Request.Host
         // and removes it from Request.Header; Hyper retains that wire field.
         let mut headers=req.headers().clone();headers.remove(header::HOST);
-        Ok(Self{tls_snapshot:req.extensions().get::<Arc<crate::http_runtime::ConnectionSnapshot>>().cloned(),tls_values:tls_values::cache(),url_values:OnceLock::new(),dynamic:crate::http_runtime::placeholder_value::Dynamic::capture(ctx),url_origin,url_origin_form,uri,original_uri,request_uri,form,method:req.method().clone(),original_method:ctx.lookup("http.request.orig_method").and_then(|s|s.parse().ok()).unwrap_or(Method::GET),headers,version:req.version(),host:ctx.authority.clone(),remote:ctx.peer.raw_text().into_owned(),remote_ip:ctx.peer.raw_host().into_owned(),client_ip:ctx.client_ip.map_or_else(String::new,|ip|ip.to_string()),tls:ctx.tls,content_length:if target.is_some(){0}else{ctx.template_content_length()},placeholders})
+        // Hyper stores the validated HTTP/2 extended-CONNECT pseudo-field in
+        // an extension because HeaderMap correctly rejects pseudo-header names.
+        // Go's template header view exposes this one real field read-only.
+        let h2_protocol=if target.is_none()&&req.version()==Version::HTTP_2{
+            req.extensions().get::<hyper::ext::Protocol>().map(|p|Arc::<str>::from(p.as_str()))
+        }else{None};
+        if h2_protocol.as_ref().is_some_and(|p|p.len()>128*1024){return Err(super::super::TemplateFailure(http::StatusCode::INTERNAL_SERVER_ERROR));}
+
+        Ok(Self{tls_snapshot:req.extensions().get::<Arc<crate::http_runtime::ConnectionSnapshot>>().cloned(),tls_values:tls_values::cache(),url_values:OnceLock::new(),dynamic:crate::http_runtime::placeholder_value::Dynamic::capture(ctx),h2_protocol,url_origin,url_origin_form,uri,original_uri,request_uri,form,method:req.method().clone(),original_method:ctx.lookup("http.request.orig_method").and_then(|s|s.parse().ok()).unwrap_or(Method::GET),headers,version:req.version(),host:ctx.authority.clone(),remote:ctx.peer.raw_text().into_owned(),remote_ip:ctx.peer.raw_host().into_owned(),client_ip:ctx.client_ip.map_or_else(String::new,|ip|ip.to_string()),tls:ctx.tls,content_length:if target.is_some(){0}else{ctx.template_content_length()},placeholders})
     }
     pub(super) fn placeholder(&self,name:&str,control:&Arc<super::Control>)->RenderResult<Value> {
         if let Some(value)=crate::http_config::helpers::global_lookup(name){control.reserve_host_bytes(value.len()+64)?;return Ok(string(value));}
@@ -104,7 +113,7 @@ impl RequestData {
         let (major,minor,proto)=if original{(0,0,"")}else{match self.version{Version::HTTP_10=>(1,0,"HTTP/1.0"),Version::HTTP_2=>(2,0,"HTTP/2.0"),Version::HTTP_3=>(3,0,"HTTP/3.0"),_=>(1,1,"HTTP/1.1")}};
         let mut fields=Fields::from([
             ("Method".into(),string(method.as_str())),("URL".into(),request_url::cached(uri,self.url_origin.as_ref(),self.url_origin_form,control,url_cache,original)?),
-            ("Header".into(),header_value(Arc::new(Mutex::new(headers.clone())),false)),
+            ("Header".into(),header_with_protocol(Arc::new(Mutex::new(headers.clone())),false,if original{None}else{self.h2_protocol.clone()})),
             ("Trailer".into(),header_value(Arc::new(Mutex::new(HeaderMap::new())),false)),
             ("Host".into(),string(if original{""}else{&self.host})),("RemoteAddr".into(),Value::from_go_bytes(self.remote.clone())),
             ("RequestURI".into(),string(request_uri.as_str())),("Proto".into(),string(proto)),
@@ -137,19 +146,27 @@ pub(super) fn response_header(headers:Arc<Mutex<HeaderMap>>)->Value{
     let Value::Object(inner)=&wrapped else{return Value::Nil;};
     object(Fields::from([("Header".into(),header)]),inner.methods.clone())
 }
+struct HeaderData{headers:Arc<Mutex<HeaderMap>>,protocol:Option<Arc<str>>}
 pub(super) fn header_format_cost(value:&Value)->RenderResult<Option<usize>>{
     let Value::Object(object)=value else{return Ok(None);};
-    let Some(headers)=object.data.as_ref().and_then(|data|data.downcast_ref::<Mutex<HeaderMap>>())else{return Ok(None);};
-    let headers=lock(headers)?;let mut bytes=4096usize;
+    let Some(data)=object.data.as_ref().and_then(|data|data.downcast_ref::<HeaderData>())else{return Ok(None);};
+    let headers=lock(&data.headers)?;let mut bytes=4096usize+data.protocol.as_ref().map_or(0,|p|p.len()*4+512);
     for name in headers.keys(){bytes=bytes.checked_add(name.as_str().len()*4+512).ok_or_else(||error("header formatting size overflow"))?;for value in headers.get_all(name){bytes=bytes.checked_add(value.as_bytes().len()*4+256).ok_or_else(||error("header formatting size overflow"))?;}}
     Ok(Some(bytes))
 }
-pub(super) fn header_value(headers:Arc<Mutex<HeaderMap>>,writable:bool)->Value{
+pub(super) fn header_value(headers:Arc<Mutex<HeaderMap>>,writable:bool)->Value{header_with_protocol(headers,writable,None)}
+fn header_with_protocol(headers:Arc<Mutex<HeaderMap>>,writable:bool,protocol:Option<Arc<str>>)->Value{
     let mut methods=BTreeMap::<Arc<str>,ValueFunc>::new();
     let names=if writable{vec!["Get","Values","Set","Add","Del"]}else{vec!["Get","Values"]};
-    for name in names{let headers=headers.clone();methods.insert(name.into(),Arc::new(move|args|{
+    for name in names{let headers=headers.clone();let protocol=protocol.clone();methods.insert(name.into(),Arc::new(move|args|{
         arity(args,if name=="Set"||name=="Add"{2}else{1},if name=="Set"||name=="Add"{2}else{1})?;
-        let field=match HeaderName::from_bytes(text(args,0)?.as_bytes()){
+        let key=text(args,0)?;
+        if key==":protocol"{if let Some(protocol)=&protocol{return match name{
+            "Get"=>Ok(string(protocol.as_ref())),
+            "Values"=>Ok(Value::Slice(gotmpl::TypedSlice::values("[]string",Some(vec![string(protocol.as_ref())].into()))?)),
+            _=>Err(error("extended CONNECT protocol is read-only")),
+        }}}
+        let field=match HeaderName::from_bytes(key.as_bytes()){
             Ok(field)=>field,
             Err(_)if name=="Get"=>return Ok(string("")),
             Err(_)if name=="Values"=>return Ok(Value::Slice(gotmpl::TypedSlice::nil("[]string"))),
@@ -165,12 +182,12 @@ pub(super) fn header_value(headers:Arc<Mutex<HeaderMap>>,writable:bool)->Value{
             _=>Err(error("unknown header method")),
         }
     }));}
-    // Reuse the existing HeaderMap Arc as the preflight payload: no tag allocation.
-    let format_data=headers.clone();
+    let format_data=Arc::new(HeaderData{headers:headers.clone(),protocol:protocol.clone()});
     let snapshot=Arc::new(move||{
         let headers=lock(&headers)?;
         let mut fields=Fields::new();
         for name in headers.keys(){let values=headers.get_all(name).iter().map(|v|Value::from_go_bytes(v.as_bytes())).collect::<Vec<_>>();fields.insert(canonical(name.as_str()).into(),Value::Slice(gotmpl::TypedSlice::values("[]string",Some(values.into()))?));}
+        if let Some(protocol)=&protocol{fields.insert(":protocol".into(),Value::Slice(gotmpl::TypedSlice::values("[]string",Some(vec![string(protocol.as_ref())].into()))?));}
         Ok(gotmpl::GoMapSnapshot::Utf8(Arc::new(fields)))
     });
     Value::Object(Arc::new(Object{data:Some(format_data),fields:Fields::new(),methods,map_view:Some(MapView{is_nil:Arc::new(||false),type_name:"http.Header",snapshot,zero:Value::Slice(gotmpl::TypedSlice::nil("[]string"))}),..Object::default()}))

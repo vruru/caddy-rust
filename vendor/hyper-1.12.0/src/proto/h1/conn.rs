@@ -69,6 +69,8 @@ where
                 h1_header_read_timeout_fut: None,
                 #[cfg(feature = "server")]
                 h1_header_read_timeout_running: false,
+                #[cfg(feature="server")]
+                h1_request_read_started: None,
                 #[cfg(feature = "server")]
                 h1_idle_timeout: None,
                 #[cfg(feature = "server")]
@@ -294,6 +296,13 @@ where
             self.state.h1_idle_timeout_fut = None;
         }
 
+        #[cfg(feature="server")]
+        if T::is_server() && self.state.h1_request_read_started.is_none(){
+            let at=self.state.h1_initial_header_deadline.zip(self.state.h1_header_read_timeout)
+                .and_then(|(deadline,window)|deadline.checked_sub(window))
+                .unwrap_or_else(||self.state.timer.now());
+            self.state.h1_request_read_started=Some(at);
+        }
         #[cfg(feature = "server")]
         if !self.state.h1_header_read_timeout_running {
             if let Some(h1_header_read_timeout) = self.state.h1_header_read_timeout {
@@ -314,7 +323,8 @@ where
             }
         }
 
-        let msg = match self.io.parse::<T>(
+        #[allow(unused_mut)]
+        let mut msg = match self.io.parse::<T>(
             cx,
             ParseContext {
                 cached_headers: &mut self.state.cached_headers,
@@ -357,6 +367,10 @@ where
             self.state.h1_header_read_timeout_fut = None;
         }
 
+        #[cfg(feature="server")]
+        if T::is_server() {
+            if let Some(at)=self.state.h1_request_read_started.take(){msg.head.extensions.insert(crate::ext::RequestReadStarted(at));}
+        }
         // Note: don't deconstruct `msg` into local variables, it appears
         // the optimizer doesn't remove the extra copies.
 
@@ -1156,6 +1170,8 @@ struct State {
     h1_header_read_timeout_fut: Option<Pin<Box<dyn Sleep>>>,
     #[cfg(feature = "server")]
     h1_header_read_timeout_running: bool,
+    #[cfg(feature="server")]
+    h1_request_read_started: Option<Instant>,
     #[cfg(feature = "server")]
     h1_idle_timeout: Option<Option<Duration>>,
     #[cfg(feature = "server")]

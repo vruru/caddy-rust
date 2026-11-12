@@ -389,3 +389,10 @@ impl hyper::body::Body for Replay {
         hint
     }
 }
+
+pub(super) fn trace_fields(ctx:&mut Context,context:&opentelemetry::Context){
+ use opentelemetry::trace::TraceContextExt;
+ if ctx.access_start.is_none(){return}let span=context.span();let sc=span.span_context();if !sc.is_valid(){return}
+ ctx.log_fields.get_or_insert_with(Default::default);
+ push(ctx,"traceID",V::String(sc.trace_id().to_string()));push(ctx,"spanID",V::String(sc.span_id().to_string()));
+}

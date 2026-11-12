@@ -12,11 +12,11 @@ native-run = []
 
 [dependencies]
 native-write-policy = { path = "vendor/native-write-policy" }
-opentelemetry = { version = "=0.33.1", default-features = false, features = ["metrics"] }
-opentelemetry_sdk = { version = "=0.33.1", default-features = false, features = ["metrics", "experimental_metrics_custom_reader", "experimental_metrics_bound_instruments"] }
-opentelemetry-otlp = { version = "=0.33.1", default-features = false, features = ["metrics", "http-proto", "grpc-tonic", "gzip-http", "gzip-tonic", "tls-provider-agnostic", "tls-roots"] }
+opentelemetry = { version = "=0.33.1", default-features = false, features = ["metrics", "trace"] }
+opentelemetry_sdk = { version = "=0.33.1", default-features = false, features = ["trace", "metrics", "experimental_metrics_custom_reader", "experimental_metrics_bound_instruments"] }
+opentelemetry-otlp = { version = "=0.33.1", default-features = false, features = ["trace", "metrics", "http-proto", "grpc-tonic", "gzip-http", "gzip-tonic", "tls-provider-agnostic", "tls-roots"] }
 opentelemetry-http = { version = "=0.33.1", default-features = false }
-opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic", "metrics"] }
+opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic", "metrics", "trace"] }
 tonic = { version = "=0.14.9", default-features = false, features = ["codegen", "gzip"] }
 tonic-types = { version = "=0.14.9", default-features = false }
 prost = { version = "=0.14.5", default-features = false, features = ["std"] }

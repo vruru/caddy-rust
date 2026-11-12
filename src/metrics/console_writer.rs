@@ -102,6 +102,16 @@ impl Writer {
             .try_acquire_owned()
             .context("console writer occupied")
     }
+    /// A bounded caller may await the single physical stdout owner without
+    /// dropping a healthy batch merely because another exporter is writing.
+    /// The caller retains its batch credits and its original absolute deadline.
+    pub async fn admit_until(&self, deadline: tokio::time::Instant) -> Result<OwnedSemaphorePermit> {
+        let serial=SERIAL.get_or_init(||Arc::new(Semaphore::new(1))).clone();
+        tokio::select! { biased;
+            _=self.cancel.cancelled()=>anyhow::bail!("console exporter stopped"),
+            result=tokio::time::timeout_at(deadline,serial.acquire_owned())=>result.context("console admission deadline")?.context("console admission unavailable"),
+        }
+    }
     pub async fn send(&self, batch: Batch, timeout: Duration) -> Result<()> {
         ensure!(batch.bytes.len() <= MAX, "console output limit exceeded");
         let stop = self.cancel.child_token();

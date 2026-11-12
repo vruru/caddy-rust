@@ -392,6 +392,9 @@ impl Drop for Active {
         drop(credit);
     }
 }
+pub(super) fn native_client(transport: Arc<super::transport::Transport>, active: Arc<std::sync::Mutex<Option<Arc<super::transport::Credit>>>>) -> impl opentelemetry_http::HttpClient {
+    Client { transport, active, previous: Default::default() }
+}
 struct Client {
     transport: Arc<super::transport::Transport>,
     active: Arc<std::sync::Mutex<Option<Arc<super::transport::Credit>>>>,

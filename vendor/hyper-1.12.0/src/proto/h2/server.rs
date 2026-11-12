@@ -367,6 +367,7 @@ where
                             )
                         };
 
+                        req.extensions_mut().insert(crate::ext::RequestReadStarted(self.timer.now()));
                         if let Some(protocol) = req.extensions_mut().remove::<h2::ext::Protocol>() {
                             req.extensions_mut().insert(Protocol::from_inner(protocol));
                         }

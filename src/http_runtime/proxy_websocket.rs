@@ -32,21 +32,22 @@ impl Prepared {
     }
 }
 struct Hold {
+    trace: Option<Arc<super::super::tracing::Tunnel>>,
     _prepared: Arc<Prepared>,
     _client: HyperClient,
     _admission: Arc<super::super::proxy_policy::RequestLease>,
     _business: Arc<BusinessGuard>,
     _metrics: Option<(Arc<crate::metrics::observe::Group>,Option<crate::metrics::observe::Tunnel>)>,
 }
-// Keep the actual upload body and write half in one application owner. Their
-// destructors run before the retained session/admission owner on every path;
-// a separated task-local token does not establish that last-owner ordering.
+// One actual application owner, not a separated marker. Body and writer are
+// destroyed before the shared admission/observation owner on every exit path.
 struct UploadIo{
     body:Body,
     writer:tokio::io::WriteHalf<TokioIo<hyper::upgrade::Upgraded>>,
-    _hold:Arc<Hold>,
+    hold:Arc<Hold>,
 }
 impl UploadIo{
+    fn trace(&self)->Option<Arc<super::super::tracing::Tunnel>>{self.hold.trace.clone()}
     async fn copy(&mut self)->std::io::Result<()>{
         while let Some(frame)=self.body.frame().await{
             let frame=frame.map_err(std::io::Error::other)?;
@@ -118,6 +119,7 @@ pub(super) async fn h3_body(
     let upload = prepared.take_upload().ok_or_else(||anyhow::anyhow!("WebSocket upload already claimed"))?;
     let (reader,writer) = tokio::io::split(TokioIo::new(upstream));
     let hold = Arc::new(Hold{
+        trace:ctx.trace_tunnel(),
         _prepared:prepared,_client:client,_admission:admission,_business:ctx.business.clone(),
         _metrics:ctx.metrics.as_ref().map(|g|(g.clone(),g.retain_tunnel())),
     });
@@ -125,8 +127,9 @@ pub(super) async fn h3_body(
     let upload_cancel = cancel.clone();
     let hard_stop = ctx.business.generation().hard_stop.clone();
     let drain = ctx.drain.clone();
-    let mut upload_io=UploadIo{body:upload,writer,_hold:hold.clone()};
+    let mut upload_io=UploadIo{body:upload,writer,hold:hold.clone()};
     inner.upgrades.spawn(async move {
+        let mut trace_actor=super::super::tracing::TunnelActor::new(upload_io.trace());
         let copy=upload_io.copy();
         tokio::pin!(copy);
         let deadline = async {
@@ -139,7 +142,7 @@ pub(super) async fn h3_body(
             _=hard_stop.cancelled()=>upload_cancel.cancel(),
             _=upload_cancel.cancelled()=>{},
             _=deadline=>upload_cancel.cancel(),
-            result=&mut copy=>if result.is_err(){upload_cancel.cancel()},
+            result=&mut copy=>if result.is_err(){upload_cancel.cancel()}else{trace_actor.success()},
         }
     });
     Ok(Download{

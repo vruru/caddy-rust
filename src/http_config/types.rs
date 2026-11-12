@@ -80,6 +80,8 @@ pub(crate) struct HeaderOps {
 
 #[derive(Clone)]
 pub(crate) enum Handler {
+    Tracing(std::sync::Arc<crate::metrics::distributed_trace::config::Config>),
+    Timeouts(super::route_timeouts::RouteTimeouts),
     Metrics { disable_openmetrics: bool },
     Templates(std::sync::Arc<crate::http_runtime::templates::TemplatePlan>),
     StaticError {

@@ -20,6 +20,10 @@ pub(super) struct AdminSeries {
     _credit: OwnedSemaphorePermit,
 }
 pub struct Process {
+    pub(super) traces: Arc<super::distributed_trace::processor::Process>,
+    pub(super) trace_workspace: Arc<Semaphore>,
+    pub(super) trace_output: Arc<Semaphore>,
+    pub(super) trace_cpu: crate::http_runtime::resource_budget::BlockingBudget,
     pub(super) discarded_bodies: Arc<Semaphore>,
     pub(super) prom_servers: super::prometheus::Servers,
     pub(super) prom_listeners: Arc<Semaphore>,
@@ -38,6 +42,16 @@ pub struct Process {
     _fixed_credit: OwnedSemaphorePermit,
 }
 impl Process {
+    pub fn tracing_diagnostics(&self)->super::TracingDiagnostics{
+        super::TracingDiagnostics{
+            retained_source_bytes:self.traces.used(),
+            live_span_owners:self.traces.retained_spans(),
+            workspace_remaining_bytes:self.trace_workspace.available_permits(),
+            encoded_output_remaining_bytes:self.trace_output.available_permits(),
+            observations_dropped:self.traces.dropped.load(Ordering::Relaxed),
+            exports_failed:self.traces.errors.load(Ordering::Relaxed),
+        }
+    }
     pub fn diagnostics(&self) -> super::Diagnostics {
         let reserved = self
             .generation_headroom
@@ -117,6 +131,10 @@ impl Process {
             .try_acquire_many_owned(GENERATION_HEADROOM as u32)
             .expect("fresh generation headroom");
         Arc::new(Self {
+            traces: super::distributed_trace::processor::Process::new(),
+            trace_workspace: Arc::new(Semaphore::new(512<<20)),
+            trace_output: Arc::new(Semaphore::new(128<<20)),
+            trace_cpu: crate::http_runtime::resource_budget::BlockingBudget::new(cpu.clamp(1,4),32,std::time::Duration::from_secs(2)).expect("valid trace CPU lane"),
             discarded_bodies: Arc::new(Semaphore::new(cpu.clamp(1, 4))),
             prom_servers: Default::default(),
             prom_listeners: Arc::new(Semaphore::new(16)),

@@ -124,6 +124,10 @@ pub(crate) mod encode_body;
 mod query_match;
 #[path = "http_runtime/request.rs"]
 mod request;
+#[path = "http_runtime/read_deadline.rs"]
+mod read_deadline;
+#[path = "http_runtime/route_timeouts.rs"]
+mod route_timeouts;
 #[path="http_runtime/response_length.rs"]
 mod response_length;
 #[path="http_runtime/templates.rs"]
@@ -235,6 +239,7 @@ struct Inner {
     stopped: CancellationToken,
 }
 struct Generation {
+    tracing: Option<Arc<crate::metrics::distributed_trace::provider::Provider>>,
     metrics: Arc<crate::metrics::Registry>,
     id: u64,
     proxy_cleanup: Option<proxy_cleanup::Reservation>,
@@ -261,6 +266,7 @@ impl Generation {
 }
 #[derive(Clone)]
 struct ActiveServer {
+    tracing: Option<Arc<crate::metrics::distributed_trace::provider::Provider>>,
     metrics: Arc<crate::metrics::Registry>,
     events: Option<Arc<crate::events::EventsApp>>,
     logging: Option<Arc<crate::logging::Logging>>,
@@ -364,6 +370,7 @@ impl HttpRuntime {
             BusinessGeneration::new(0, crate::http_config::HttpShutdownPolicy::default());
         let metrics_process=crate::metrics::Process::new();
         let initial = Generation {
+            tracing: None,
             metrics: crate::metrics::Registry::initial(metrics_process.clone()),
             id: 0,
             proxy_cleanup: None,
@@ -570,7 +577,7 @@ async fn prepare_servers(
     challenges: &Arc<HotCertificateResolver>,
     material: ServingMaterial<'_>,
     resources: &Arc<resource_budget::Resources>,
-) -> Result<(HashMap<SocketAddr, Arc<ActiveServer>>, Vec<Vec<String>>, Arc<crate::metrics::Registry>)> {
+) -> Result<(HashMap<SocketAddr, Arc<ActiveServer>>, Vec<Vec<String>>, Arc<crate::metrics::Registry>, Option<Arc<crate::metrics::distributed_trace::provider::Provider>>)> {
     let ServingMaterial {
         manual,
         provider,
@@ -583,8 +590,12 @@ async fn prepare_servers(
     if config.metrics.is_some_and(|c|c.per_host&&!c.observe_catchall_hosts){
         for server in &config.servers{for route in &server.routes{for group in &route.matchers{for matcher in group{if let Matcher::Host(hosts)=matcher{for host in hosts{if !host.contains(['*','{']){allowed.push(host,process);tokio::task::consume_budget().await;}}}}}}}
     }
-    let process=process.clone();let metrics_config=config.metrics;let https=config.servers.iter().any(|s|s.tls);
-    let metrics=resources.metadata.run(move||{let allowed=allowed.build(&process);crate::metrics::Registry::prepare(process,metrics_config,allowed,https)}).await.map_err(|_|anyhow::anyhow!("metrics provisioning worker unavailable"))??;
+    let process=process.clone();let metrics_config=config.metrics;let https=config.servers.iter().any(|s|s.tls);let trace_required=tracing::needed(config);
+    let (metrics,tracing)=resources.metadata.run(move||{
+        let allowed=allowed.build(&process);let metrics=crate::metrics::Registry::prepare(process.clone(),metrics_config,allowed,https)?;
+        let tracing=if trace_required{Some(crate::metrics::distributed_trace::provider::Provider::prepare(process)?)}else{None};
+        Ok::<_,anyhow::Error>((metrics,tracing))
+    }).await.map_err(|_|anyhow::anyhow!("observability provisioning worker unavailable"))??;
     let standalone;
     let manual = if let Some(manual) = manual {
         ensure!(
@@ -701,6 +712,7 @@ async fn prepare_servers(
         .map_err(|_| anyhow::anyhow!("candidate proxy provisioning task failed"))??;
         for client in clients.values(){metrics.upstreams(client.metric_probes());}
         let active = ActiveServer {
+            tracing: tracing.clone(),
             metrics: metrics.clone(),
             events: config.events.clone(),
             logging: logging.cloned(),
@@ -770,6 +782,7 @@ async fn prepare_servers(
             output.insert(
                 address,
                 Arc::new(ActiveServer {
+                    tracing: tracing.clone(),
                     metrics: metrics.clone(),
                     events: config.events.clone(),
                     logging: logging.cloned(),
@@ -803,6 +816,7 @@ async fn prepare_servers(
                 read_header_timeout: Some(Duration::from_secs(60)),
                 listener_stack:Arc::new(listener_stack::Stack::default()),
                 read_idle_timeout: Duration::from_secs(60),
+                transfers: crate::http_config::server_transfers::ServerTransfers::default(),
                 idle_timeout: Some(Duration::from_secs(300)),
                 protocols: vec!["h1".into(), "h2".into()],
                 redirect_http: false,
@@ -814,6 +828,7 @@ async fn prepare_servers(
             output.insert(
                 address,
                 Arc::new(ActiveServer {
+                    tracing: tracing.clone(),
                     metrics: metrics.clone(),
                     events: config.events.clone(),
                     logging: logging.cloned(),
@@ -832,6 +847,7 @@ async fn prepare_servers(
         output,
         actual_managed.into_iter().map(|n| vec![n]).collect(),
         metrics,
+        tracing,
     ))
 }
 fn plain_transport_compatible(old: &ServerConfig, next: &ServerConfig) -> bool {
@@ -839,7 +855,7 @@ fn plain_transport_compatible(old: &ServerConfig, next: &ServerConfig) -> bool {
         && !next.tls
         && old.protocols == next.protocols
         && old.listener_stack==next.listener_stack
-        && old.read_header_timeout == next.read_header_timeout
+        && old.request_head_limit() == next.request_head_limit()
 }
 fn dns_covers(pattern: &str, name: &str) -> bool {
     if pattern.eq_ignore_ascii_case(name) {
@@ -979,7 +995,7 @@ async fn accept_loop(
             spawn_admitted(&inner, eviction, Some((cancel.clone(), admission.clone())), async move {
                 let (mut peer,mut local)=(crate::net_address::NetAddress::from(peer),crate::net_address::NetAddress::from(local));
                 let accepted_listener_stack=server.plan.listener_stack.clone();
-                let deadline = match server.plan.read_header_timeout {
+                let deadline = match server.plan.request_head_limit() {
                     Some(timeout) => match tokio::time::Instant::now().checked_add(timeout) {
                         Some(deadline) => Some(deadline),
                         None => return,
@@ -1020,7 +1036,7 @@ async fn accept_loop(
                         accepted.identity.server_name(),
                     )));
 
-                    let deadline = match server.plan.read_header_timeout {
+                    let deadline = match server.plan.request_head_limit() {
                         Some(timeout) => match tokio::time::Instant::now().checked_add(timeout) {
                             Some(deadline) => Some(deadline),
                             None => return,
@@ -1320,7 +1336,7 @@ async fn serve_connection<I>(
             }
             let activity = business.generation().clone();
             let close_after = verdict == TlsVerdict::ServeThenClose
-                || current.plan.read_header_timeout != accepted_server.plan.read_header_timeout
+                || current.plan.request_head_limit() != accepted_server.plan.request_head_limit()
                 || current.plan.idle_timeout != accepted_server.plan.idle_timeout;
             let request_h2 = request.version() == http::Version::HTTP_2;
             let metadata = match trailer_policy::prepare_request(&mut request) {
@@ -1400,7 +1416,7 @@ async fn serve_connection<I>(
     // ReadHeaderTimeout is an HTTP/1 head deadline, not an H2 idle deadline.
     let protocol_timeout = if negotiated_tls_h2 == Some(true) {
         Some(Duration::from_secs(10))
-    } else { server.plan.read_header_timeout };
+    } else { server.plan.request_head_limit() };
     if let Some(timeout) = protocol_timeout {
         builder.protocol_read_timeout(timeout, TokioTimer::new());
     }
@@ -1420,7 +1436,7 @@ async fn serve_connection<I>(
         .max_trailer_size(4096)
         .allow_obsolete_multiline_trailers(true)
         .timer(TokioTimer::new())
-        .header_read_timeout(server.plan.read_header_timeout)
+        .header_read_timeout(server.plan.request_head_limit())
         .idle_timeout(server.plan.idle_timeout);
     let allow_h2 = server
         .plan
@@ -1528,3 +1544,6 @@ mod proxy_dns_file;
 
 #[path="http_runtime/handler_trace.rs"]
 pub(crate) mod handler_trace;
+
+#[path="http_runtime/tracing.rs"]
+mod tracing;

@@ -970,3 +970,23 @@ for HTTP/3 source DATA), not remote acknowledgment or successful application
 consumption. Separately bounded QUIC transport/retransmission state is not
 represented as already-freed source payload or as a whole-process memory cap.
 These integrated paths still require the final combined release gates above.
+
+Tracing and transfer policies
+-----------------------------
+
+Native tracing is connected to committed provider generations, ordinary response
+bodies and actual detached upgrade owners. HTTP/protobuf, gRPC, optional gzip,
+TLS/mTLS and console export use independent bounded transport/work lanes.
+Telemetry pressure drops recording/export work without rejecting business
+requests. Stream cancellation records Error where the inspected reference can
+leave Unset. OTEL_SDK_DISABLED suppresses native export while propagation can
+continue. See docs/TRACING.md for configuration,
+resource bounds and reference differences.
+
+Server hard read/write deadlines and progress/rate controls are active in the
+normal runtime. Original HTTP/1 header/body epochs are preserved; HTTP/2 and
+HTTP/3 scopes remain per stream. Route error unwind restores prior clauses
+without erasing an outer server hard deadline. Requests and upgrade actors
+retain their concrete generation and allocation owners through reload and stop.
+See docs/TIMEOUTS.md for units, defaults and scope bounds. These paths do not
+waive any outstanding full-project acceptance gate.

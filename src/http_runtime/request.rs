@@ -21,6 +21,8 @@ struct LazyMap {
     defaults: Vec<serde_json::Value>,
 }
 pub(super) struct Context {
+    pub(super) trace_context: Option<opentelemetry::Context>,
+    pub(super) timeouts:Option<Box<super::route_timeouts::RequestTimeouts>>,
     pub(super) metrics: Option<Arc<crate::metrics::observe::Group>>,
     pub(super) request_started: std::time::Instant,
     pub(super) typed_vars: HashMap<String, Arc<serde_json::Value>>,
@@ -69,8 +71,14 @@ enum DeferredResponse {
     Encode(super::encode_response::ResponseEncoding),
     LogBody(usize),
     Metrics(Arc<crate::metrics::observe::Observation>),
+    Trace(Arc<super::tracing::Observation>),
 }
 impl Context {
+    pub(super) fn trace_tunnel(&self)->Option<Arc<super::tracing::Tunnel>>{
+        super::tracing::Tunnel::capture(self.deferred.iter().filter_map(|entry|match entry{
+            DeferredResponse::Trace(observation)=>Some(observation.clone()),_=>None,
+        }))
+    }
     // 保留 id：永不分配给配置 generation；类型按 BusinessGeneration::new 调整
     const PROBE_GENERATION_ID: u64 = u64::MAX;
 
@@ -104,7 +112,9 @@ impl Context {
         let request_content_length=request.headers().get(http::header::CONTENT_LENGTH).and_then(|v|v.to_str().ok()).and_then(|v|v.parse().ok()).unwrap_or(if original_framing.chunked || !request.body().is_end_stream(){-1}else{0});
         let zero = SocketAddr::from(([0, 0, 0, 0], 0));
         Ok(Context {
+            timeouts:None,
             metrics: None,
+            trace_context: None,
             request_started: std::time::Instant::now(),
             typed_vars: HashMap::new(),
             cel_body: None,
@@ -151,6 +161,14 @@ impl Context {
     }
     pub(super) fn template_map_destinations(&self)->impl Iterator<Item=&str> {self.maps.iter().flat_map(|map|map.destinations.iter().map(String::as_str))}
 
+    pub(super) fn bind_timeout_control(&mut self,control:hyper::ext::ResponseWriteControl)->Result<()> {
+        match self.informational.as_mut(){
+            Some(InformationalOutput::Http(sender))=>sender.bind_write_control(control)?,
+            Some(InformationalOutput::Quic(sender))=>sender.bind_write_control(control)?,
+            _=>{},
+        }
+        Ok(())
+    }
     pub fn req(&self) -> &Request<Body> {
         self.request
             .as_ref()
@@ -254,7 +272,7 @@ impl Context {
                 .map(|query| format!("?{query}"))
                 .unwrap_or_default(),
             "http.request.proto" => match req?.version() {
-                Version::HTTP_3 => "HTTP/3",
+                Version::HTTP_3 => "HTTP/3.0",
                 Version::HTTP_2 => "HTTP/2.0",
                 Version::HTTP_10 => "HTTP/1.0",
                 _ => "HTTP/1.1",
@@ -477,7 +495,6 @@ where
     let alt_svc = request.extensions().get::<super::h3::AltSvc>().cloned();
     let (parts, body) = request.into_parts();
     let body = super::trailer_policy::validate_incoming(body, &trailer_metadata);
-    let body = IdleBody::new(body, server.plan.read_idle_timeout);
     let body = if let Some(access) = &access {
         super::access_log::ReadCount {
             body,
@@ -488,6 +505,7 @@ where
         body.boxed_unsync()
     };
     let mut ctx = Context {
+        timeouts:None,
         metrics: crate::metrics::observe::Group::new(server.metrics.clone(),0),
         request_started: std::time::Instant::now(),
         typed_vars: HashMap::new(),
@@ -511,6 +529,7 @@ where
         business,
         original_uri,
         request_content_length,
+        trace_context: None,
         original_method,
         error_status: None,
         access_start: access.as_ref().map(|access| access.started_at()),
@@ -535,7 +554,11 @@ where
         maps: Vec::new(),
         probe: false,
     };
-    let result = if tls
+    let timeout_setup=super::route_timeouts::install_server(&mut ctx,&server.plan);
+    let result = if timeout_setup.is_err(){
+        ctx.close_after_response=true;
+        Err(budget_failure(&mut ctx,super::resource_budget::BudgetError::Overloaded))
+    } else if tls
         && server.plan.strict_sni_host
         && !strict_host_matches(&ctx.authority, sni.unwrap_or_default())
     {
@@ -544,6 +567,7 @@ where
     } else {
         routes(&server.plan.routes, &mut ctx, &inner, &server).await
     };
+    let result=if result.is_err() && ctx.timeouts.as_ref().is_some_and(|state|state.read_expired()){Err(failure(StatusCode::REQUEST_TIMEOUT))}else{result};
     let (mut response, explicit_headers) = match result {
         Ok(Flow::Response(response)) => (response, true),
         Ok(Flow::ImplicitResponse(response)) => (response, false),
@@ -596,6 +620,7 @@ where
         let response = simple(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error\n");
         return super::request_body::mark_response(response, ctx.await_h2_response_head);
     }
+    if ctx.timeouts.as_ref().is_some_and(|state|state.close_unread_h1()){ctx.close_after_response=true;}
     if ctx.close_after_response {
         headers.insert(http::header::CONNECTION, HeaderValue::from_static("close"));
     }
@@ -612,7 +637,7 @@ where
         *response.body_mut()=full(Bytes::new());
     }
     if is_head    {
-        if ctx.metrics.is_some() && response.extensions().get::<StaticHeadLength>().is_some(){
+        if (ctx.metrics.is_some()||response.extensions().get::<super::tracing::TracedResponse>().is_some()) && response.extensions().get::<StaticHeadLength>().is_some(){
             // Count the finite logical writes of a static HEAD representation,
             // including its selected codec, while sending no response body.
             while let Some(frame)=response.body_mut().frame().await{if frame.is_err(){break;}tokio::task::consume_budget().await;}
@@ -659,6 +684,9 @@ where
     let exact=response.body().size_hint().exact();let status=response.status();
     super::response_length::apply(response.headers_mut(),status,is_head,is_connect,exact);
     response = super::request_body::mark_response(response, ctx.await_h2_response_head);
+    if super::route_timeouts::attach(ctx.timeouts.as_deref(),&mut response,&ctx.resources.transfer_deadlines).is_err(){
+        return simple(StatusCode::SERVICE_UNAVAILABLE,"Response deadline budget unavailable\n");
+    }
     if let Some(access) = access.filter(|_| !ctx.skip_access) {
         return (*access).attach(
             response,
@@ -959,6 +987,27 @@ fn handlers<'a>(
                 && let Some(logging)=server.logging.as_deref()
                 && let Some(module)=traces.get(index) {module.emit(logging);}
             match handler {
+                Handler::Tracing(plan)=>{
+                    let Some(provider)=server.tracing.as_ref()else{continue};
+                    let entered=super::tracing::enter(ctx,provider,plan);
+                    let previous=ctx.trace_context.replace(entered.context.clone());
+                    log_append::trace_fields(ctx,&entered.context);
+                    ctx.deferred.push(DeferredResponse::Trace(entered.clone()));
+                    let after=Next::Handlers(&list[index+1..],traces.get(index+1..).unwrap_or_default(),next);
+                    let result=continue_chain(after,ctx,inner,server).await;
+                    super::tracing::attributes(ctx,&entered,plan);
+                    ctx.trace_context=previous;
+                    if let Err(error)=&result {entered.failed(error.downcast_ref::<HttpError>().map_or(500,|e|e.status.as_u16()));}
+                    return result;
+                }
+                Handler::Timeouts(plan)=>{
+                    let mark=super::route_timeouts::mark(ctx.timeouts.as_deref());
+                    if super::route_timeouts::install(ctx,plan).is_err(){ctx.close_after_response=true;return Err(budget_failure(ctx,super::resource_budget::BudgetError::Overloaded));}
+                    let after=Next::Handlers(&list[index+1..],traces.get(index+1..).unwrap_or_default(),next);
+                    let result=continue_chain(after,ctx,inner,server).await;
+                    if result.is_err() && super::route_timeouts::unwind(ctx,mark).is_err(){ctx.close_after_response=true;}
+                    return result;
+                }
                 Handler::Metrics{disable_openmetrics}=>{
                     let mut response=server.metrics.scrape(ctx.req().headers(),!*disable_openmetrics).await;
                     response.extensions_mut().insert(crate::metrics::discarded::PreparedEntity);
@@ -1160,6 +1209,7 @@ fn handlers<'a>(
                         Ok(Flow::Continue) => {}
                         Ok(flow) => return Ok(flow),
                         Err(error) if *errors_configured => {
+                            let error=if ctx.timeouts.as_ref().is_some_and(|state|state.read_expired()){failure(StatusCode::REQUEST_TIMEOUT)}else{error};
                             // Keep wrappers outside this subroute, while
                             // dropping the failed inner route's deferred work.
                             log_append::unwind(ctx, pending_logs, None).await;
@@ -1804,7 +1854,11 @@ pub(super) enum InformationalOutput {
 }
 
 pub(super) fn accepts_informational(ctx: &Context) -> bool {
-    ctx.informational.is_some()
+    match ctx.informational.as_ref(){
+        Some(InformationalOutput::Http(sender))=>sender.allows_informational(),
+        Some(InformationalOutput::Quic(_))=>true,
+        None=>false,
+    }
 }
 
 pub(super) async fn forward_informational(
@@ -1812,7 +1866,7 @@ pub(super) async fn forward_informational(
     status: StatusCode,
     fields: HeaderMap,
 ) -> Result<()> {
-    if ctx.informational.is_none() {
+    if !accepts_informational(ctx) {
         return Ok(());
     }
     let mut snapshot = ctx.immediate.clone();
@@ -1826,7 +1880,7 @@ pub(super) async fn forward_informational(
 }
 
 async fn emit_informational(ctx: &mut Context, status: StatusCode) -> Result<()> {
-    if ctx.informational.is_none() {
+    if !accepts_informational(ctx) {
         return Ok(());
     }
     write_informational(ctx, status, ctx.immediate.clone()).await
@@ -1837,6 +1891,7 @@ async fn write_informational(
     status: StatusCode,
     fields: HeaderMap,
 ) -> Result<()> {
+    if !accepts_informational(ctx){return Ok(())}
     let Some(sender) = &mut ctx.informational else {
         // In particular, RFC 9110 forbids a 1xx to an HTTP/1.0 client.
         // Continue the handler semantics without sending that head.
@@ -1847,6 +1902,7 @@ async fn write_informational(
     *response.headers_mut() = fields;
     // Interim responses use the same protocol field rules as final responses.
     super::response_length::apply(response.headers_mut(),status,false,false,None);
+    if let Some(control)=ctx.timeouts.as_deref().and_then(|state|state.control()){response.extensions_mut().insert(control);}
     let suppressed = match sender {
         InformationalOutput::Http(sender) => match sender.send(response).await {
             Ok(()) => false,
@@ -2076,74 +2132,6 @@ fn parse_forwarded_ip(raw: &str) -> Option<IpAddr> {
     raw.parse().ok()
 }
 
-struct IdleBody<B> {
-    inner: Pin<Box<B>>,
-    timer: Option<Pin<Box<tokio::time::Sleep>>>,
-    timeout: Duration,
-    failed: bool,
-}
-impl<B> IdleBody<B> {
-    fn new(inner: B, timeout: Duration) -> Self {
-        Self {
-            inner: Box::pin(inner),
-            timer: None,
-            timeout,
-            failed: false,
-        }
-    }
-}
-impl<B> hyper::body::Body for IdleBody<B>
-where
-    B: hyper::body::Body<Data = Bytes>,
-    B::Error: Into<BoxError>,
-{
-    type Data = Bytes;
-    type Error = BoxError;
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
-        if self.failed {
-            return std::task::Poll::Ready(None);
-        }
-        match self.inner.as_mut().poll_frame(cx) {
-            std::task::Poll::Ready(Some(frame)) => {
-                self.timer = None;
-                std::task::Poll::Ready(Some(frame.map_err(Into::into)))
-            }
-            std::task::Poll::Ready(None) => {
-                self.timer = None;
-                std::task::Poll::Ready(None)
-            }
-            std::task::Poll::Pending => {
-                if !self.timeout.is_zero() && self.timer.is_none() {
-                    self.timer = Some(Box::pin(tokio::time::sleep(self.timeout)));
-                }
-                if self
-                    .timer
-                    .as_mut()
-                    .is_some_and(|timer| timer.as_mut().poll(cx).is_ready())
-                {
-                    self.failed = true;
-                    std::task::Poll::Ready(Some(Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "request body idle timeout",
-                    )
-                    .into())))
-                } else {
-                    std::task::Poll::Pending
-                }
-            }
-        }
-    }
-    fn is_end_stream(&self) -> bool {
-        self.failed || self.inner.is_end_stream()
-    }
-    fn size_hint(&self) -> hyper::body::SizeHint {
-        self.inner.size_hint()
-    }
-}
-
 fn header_pattern(pattern: &str, value: &str) -> bool {
     header_value_pattern(&pattern.to_ascii_lowercase(), &value.to_ascii_lowercase())
 }
@@ -2158,7 +2146,7 @@ fn finalize_transforms<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         let status = response.status();
-        let observed_head=ctx.metrics.is_some() && ctx.req().method()==Method::HEAD && response.extensions().get::<StaticHeadLength>().is_some();
+        let observed_head=(ctx.metrics.is_some()||ctx.deferred.iter().any(|v|matches!(v,DeferredResponse::Trace(_)))) && ctx.req().method()==Method::HEAD && response.extensions().get::<StaticHeadLength>().is_some();
         let interim = response
             .extensions()
             .get::<StaticInterimStatus>()
@@ -2186,6 +2174,12 @@ fn finalize_transforms<'a>(
                 DeferredResponse::Encode(_) => {}
                 DeferredResponse::LogBody(index) => {
                     log_append::capture_response(ctx, *index, headers, &mut body, explicit).await;
+                }
+                DeferredResponse::Trace(observation)=>{
+                    observation.complete(status.as_u16());
+                    let normal_discard=ctx.req().method()==Method::HEAD||status.is_informational()||matches!(status,StatusCode::NO_CONTENT|StatusCode::NOT_MODIFIED);
+                    body=super::tracing::attach_body(body,observation.clone(),normal_discard);
+                    response.extensions_mut().insert(super::tracing::TracedResponse);
                 }
                 DeferredResponse::Metrics(observation)=>{
                     observation.complete(status.as_u16(),explicit);

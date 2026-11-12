@@ -164,6 +164,7 @@ impl RetiringBinding {
     }
 }
 struct RetirementOwner {
+    tracing: Option<Arc<crate::metrics::distributed_trace::provider::Provider>>,
     metrics: Arc<crate::metrics::Registry>,
     group: Arc<retirement::AdmissionGroup>,
     bindings: Vec<Arc<RetiringBinding>>,
@@ -218,7 +219,7 @@ async fn retire_generation(
     } else {
         activity.wait_idle().await;
     }
-    owner.metrics.stop_exporter().await;
+    stop_observability(&owner.metrics, owner.tracing.as_ref()).await;
     if let Some(control) = control.upgrade() {
         let removed = {
             let mut state = control.lock();
@@ -361,7 +362,7 @@ impl HttpStage {
             self.guard.armed = false;
             (previous, old_listeners)
         };
-        self.inner.current.load().metrics.activate();
+        { let current=self.inner.current.load();current.metrics.activate();if let Some(tracing)=&current.tracing{tracing.activate(current.servers.values().find_map(|server|server.logging.as_deref()));} }
         self.guard.control.changed.notify_waiters();
         previous.activity.superseded.cancel();
         drop(previous);
@@ -435,7 +436,7 @@ impl HttpRuntime {
         tokio::select! {
             biased;
             _ = self.inner.stopped.cancelled() => anyhow::bail!("HTTP runtime is stopping"),
-            result = prepared => result.map(|(_,names,_)|names)
+            result = prepared => result.map(|(_,names,_,_)|names)
         }
     }
     /// Compatibility wrapper for standalone callers. Integrated reloads supply
@@ -586,7 +587,7 @@ impl HttpRuntime {
             },
             &self.inner.resources,
         );
-        let (servers, managed_names, metrics) = tokio::select! {
+        let (servers, managed_names, metrics, tracing) = tokio::select! {
             biased;
             _ = guard.cancel.cancelled() => anyhow::bail!("HTTP candidate was stopped"),
             result = prepared => result?,
@@ -746,7 +747,7 @@ impl HttpRuntime {
                 bindings.push(binding);
             }
             (
-                Arc::new(RetirementOwner { metrics: current.metrics.clone(), group, bindings }),
+                Arc::new(RetirementOwner { tracing: current.tracing.clone(), metrics: current.metrics.clone(), group, bindings }),
                 retiring,
                 overridden,
             )
@@ -765,6 +766,7 @@ impl HttpRuntime {
         );
         let proxy_cleanup = self.inner.resources.proxy_cleanup.reserve(owners).await?;
         let next = Arc::new(Generation {
+            tracing,
             metrics,
             id: generation,
             activity: activity.clone(),
@@ -1009,7 +1011,7 @@ async fn stop_runtime(inner: Arc<Inner>, lifecycle: Arc<Lifecycle>, signal: Http
         }
     };
     tokio::join!(finish_admission, drain_current);
-    current.metrics.stop_exporter().await;
+    stop_observability(&current.metrics,current.tracing.as_ref()).await;
 }
 
 type Launch = (
@@ -1378,4 +1380,8 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
             }
         })
     }
+}
+
+async fn stop_observability(metrics:&crate::metrics::Registry,tracing:Option<&Arc<crate::metrics::distributed_trace::provider::Provider>>){
+ tokio::join!(metrics.stop_exporter(),async{if let Some(tracing)=tracing{tracing.stop().await;}});
 }

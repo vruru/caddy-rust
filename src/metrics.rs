@@ -39,3 +39,16 @@ pub struct Diagnostics {
 }
 
 pub(crate) const SERIES_LIMIT: usize = 2048;
+
+pub(crate) mod distributed_trace;
+
+/// Independent tracing admission snapshots; no payload, identity or endpoint is
+/// exposed, and these budgets are not a whole-process RSS guarantee.
+#[derive(Debug,serde::Serialize)]pub struct TracingDiagnostics{
+ pub retained_source_bytes:usize,
+ pub live_span_owners:usize,
+ pub workspace_remaining_bytes:usize,
+ pub encoded_output_remaining_bytes:usize,
+ pub observations_dropped:u64,
+ pub exports_failed:u64,
+}

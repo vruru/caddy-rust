@@ -6,6 +6,10 @@ pub(crate) mod helpers;
 pub(crate) mod proxy_ext;
 #[path = "http_config/types.rs"]
 pub(crate) mod types;
+#[path = "http_config/route_timeouts.rs"]
+pub(crate) mod route_timeouts;
+#[path = "http_config/server_transfers.rs"]
+pub(crate) mod server_transfers;
 use anyhow::{Result, ensure};
 use helpers::*;
 use serde_json::Value;
@@ -59,6 +63,7 @@ pub(crate) struct ServerConfig {
     pub(crate) client_ip_headers: Vec<String>,
     pub(crate) read_header_timeout: Option<Duration>,
     pub(crate) read_idle_timeout: Duration,
+    pub(crate) transfers: server_transfers::ServerTransfers,
     pub(crate) idle_timeout: Option<Duration>,
     pub(crate) protocols: Vec<String>,
     pub(crate) redirect_http: bool,
@@ -66,6 +71,13 @@ pub(crate) struct ServerConfig {
     pub(crate) skip_manage: Vec<String>,
     pub(crate) skip_redirect: Vec<String>,
     pub(crate) ignore_loaded_certificates: bool,
+}
+impl ServerConfig {
+    pub(crate) fn request_head_limit(&self)->Option<Duration>{
+        match(self.read_header_timeout,self.transfers.read_hard){
+            (Some(a),Some(b))=>Some(a.min(b)),(a,b)=>a.or(b),
+        }
+    }
 }
 #[derive(Clone)]
 pub(crate) struct AccessLogConfig {
@@ -376,6 +388,12 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
             "expected_underscore_headers",
             "expected_dot_headers",
             "read_header_timeout",
+            "read_timeout",
+            "write_timeout",
+            "write_idle_timeout",
+            "read_min_rate",
+            "write_min_rate",
+            "max_write_chunk",
             "read_idle_timeout",
             "idle_timeout",
             "logs",
@@ -623,6 +641,7 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
             .map(|v| strings(v, path))
             .transpose()?
             .unwrap_or_else(|| vec!["X-Forwarded-For".into()]),
+        transfers: server_transfers::parse(m,path)?,
         read_header_timeout: match m
             .get("read_header_timeout")
             .filter(|v| !v.is_null())
@@ -997,6 +1016,7 @@ fn parse_handler(
                 early: boolean(m.get("early").filter(|value| !value.is_null()), false, path)?,
             }))
         }
+        "tracing" => Handler::Tracing(std::sync::Arc::new(crate::metrics::distributed_trace::config::Config::parse(value)?)),
         "metrics" => {
             deny_unknown(m, &["handler","disable_openmetrics"], path)?;
             Handler::Metrics { disable_openmetrics: boolean(m.get("disable_openmetrics").filter(|v| !v.is_null()),false,path)? }
@@ -1078,6 +1098,7 @@ fn parse_handler(
             crate::http_runtime::templates::prepare_metadata()?;
             Handler::Templates(std::sync::Arc::new(crate::http_runtime::templates::TemplatePlan{root,mime_types,delimiters:[if delimiters[0].is_empty(){"{{".into()}else{delimiters[0].clone()},if delimiters[1].is_empty(){"}}".into()}else{delimiters[1].clone()}]}))
         }
+        "timeouts" => Handler::Timeouts(route_timeouts::parse(value,path)?),
         "encode" => Handler::Encode(std::sync::Arc::new(parse_encode(m, path)?)),
         "headers" => {
             deny_unknown(m, &["handler", "request", "response"], path)?;
