@@ -587,7 +587,7 @@ from the baseline's H1 CR/LF rewriting and invalid NUL emission; accepting a
 malformed response field is not treated as additional useful compatibility.
 
 
-Request URL templates now retain decoded Go-string bytes for Path/User/Host facts and expose Redacted and MarshalBinary alongside the existing read methods. RawPath, empty absolute paths, ForceQuery, IPv6 zones and numeric port text (including values greater than65535) are retained; request hosts use ordinary URL rules rather than X.509 SAN restrictions. This layer is read-only and does not claim Parse/JoinPath/ResolveReference/AppendBinary/UnmarshalBinary mutability. The shared HTTP Uri parser still rejects percent-encoded DNS host bytes which Go can accept in an absolute-form target; this remains a separate pre-factory transport gap. Other unrepresented request-target forms and full net/url standard-library compatibility remain pending.
+Request URL templates now retain decoded Go-string bytes for Path/User/Host facts and expose Redacted and MarshalBinary alongside the existing read methods. RawPath, empty absolute paths, ForceQuery, IPv6 zones and numeric port text (including values greater than65535) are retained; request hosts use ordinary URL rules rather than X.509 SAN restrictions. Mutable receiver operations and their ownership boundaries are described below. The shared HTTP Uri parser still rejects percent-encoded DNS host bytes which Go can accept in an absolute-form target; this remains a separate pre-factory transport gap. Other unrepresented request-target forms and full net/url standard-library compatibility remain pending.
 
 Construction and method outputs are prepaid on the existing request Control before temporary vectors, field maps and byte-slice outputs allocate, with cancellation/retired-owner checks. The factory retains only a weak Control backlink and owns its private URL facts; it does not modify authenticated TLS facts. This host prepayment does not establish full-engine heap coverage or replace the narrower refundable printf allocation scope.
 
@@ -758,3 +758,79 @@ fields are rejected before publication. A failed candidate retains the working
 configuration. Unknown/unprepared providers still fail explicitly. HTTP CA
 sources, TLS renegotiation and remaining issuer/PKIX behavior remain separate
 work; this addition does not claim complete TLS compatibility.
+
+
+Mutable template request URL views
+---------------------------------
+
+Within an admitted render graph, URL Parse/JoinPath/ResolveReference return
+new private views and UnmarshalBinary atomically replaces its receiver's facts.
+String, fmt.Stringer, JSON, query helpers and supported URI placeholders read
+that state. Current and original URL views stay separate. A first form parse
+observes the current query; parsed form values retain their cache. include
+shares its graph, while httpInclude captures an independent request. Transport
+URI/routing and authenticated TLS facts are not rewritten by these views.
+
+Addressable URL fields remain references across template variable assignment,
+and/or and with. Interface/function arguments resolve after all argument
+expressions finish; list and include arguments retain snapshots. Template dot
+can still carry a field reference. This new Value::Field ABI is registered only
+for the URL factory's string/bool/User fields. A closed host gate checks actual
+source identity and the same Weak<Control>, and 32 retained Arc identities bound
+resolution and detect cycles without allocator-address reuse mistakes. Owner
+retirement, cancellation, incompatible values and resource failure are errors.
+
+Object gains a guarded dynamic_stringer callback, ArgKind gains ByteSlice and
+GoPointer, and TypedSlice::from_list now returns Result. Existing Rust callers
+must propagate that result. Values constructors reject direct or nested retained
+field references before creating mutable backing, using a callback-free scan
+bounded to 16,384 nodes and depth32. Existing Arc snapshots release each cell
+lock before inspecting children. Map and scalar-only Values writes also reject
+references. This preserves the existing trusted-host boundary for opaque Rust
+captures rather than claiming that arbitrary captures are acyclic or prepaid.
+
+AppendBinary preserves byte backing/view aliases when capacity permits, and
+uses Go byte-slice growth when a new backing is required. Nil []byte, non-nil
+empty slices and typed nil non-byte slices stay distinct. URL has Stringer,
+not a fabricated fmt.Formatter. The older generic formatter's non-v struct
+reflection remains an explicit gap for verbs such as d/f/t; the optional HTML
+feature also retains its separately recorded baseline build errors. These
+remaining paths are not implied complete by successful URL method cases.
+
+URL host allocation/work is conservatively prepaid from the same Control;
+this does not expand refundable printf coverage to every allocation family or
+promise a whole-engine heap/RSS cap. Online results retain their real Tree until
+the last response owner or worker retires. Future field reads fail after render
+completion. Arbitrary raw host Value escape is outside that owner contract.
+The existing raw-query form UTF-8 materialization limitation, HTTP request-target
+userinfo rejection and percent-host HTTP parser gap remain separate boundaries.
+
+
+HTTP/3 automatic continuation and early control binding
+------------------------------------------------------
+
+On the first actual read of a nonempty or unknown request body with
+Expect:100-continue, the native H3 driver sends and acknowledges100 before
+allowing body reads to proceed. Unread and known-empty bodies do not trigger
+an automatic head. Explicit and automatic100 for the same exchange are
+suppressed after the first acknowledged continuation; unrelated streams
+continue independently. This is a verified extension: the pinned Go H3
+implementation does not generate that automatic continuation.
+
+A concrete shared Flow carries first-read demand and optional write-control
+metadata through the existing request task. It adds no per-frame task or
+unbounded queue. Prebinding emits no head and starts no pending-write idle
+clock; the same actual control governs informational and final output. Waker
+clone, wake, replacement destruction and retained-control destruction occur
+outside the Flow mutex. An independent process-wide2MiB metadata quota prepays
+1024bytes per admitted Flow before allocation. A full quota rejects only a new
+request stream with H3_REQUEST_REJECTED; existing owners retain their credits
+until their actual last reference retires. Other protocol, task, header,
+payload and Quinn allocations keep their separate ownership boundaries.
+
+Template request URLs also distinguish transport provenance: H2/H3 pseudo-field
+reconstruction does not expose an artificial scheme/authority in the ordinary
+server URL. Request.Host retains the independently validated authority. H1
+absolute-form targets, CONNECT authority-form and virtual include targets keep
+their own representations. Server/route timeout activation and the remaining
+full release gates are tracked independently.

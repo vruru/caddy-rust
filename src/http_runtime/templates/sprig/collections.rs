@@ -248,7 +248,7 @@ fn check_budget(count: usize) -> gotmpl::Result<()> {
 fn typed_nil_list()->V{V::Slice(TypedSlice::nil("[]interface {}"))}
 fn finish_list(mut values:Vec<V>,cap:usize,nil:bool)->R{
     check_budget(cap)?;let len=values.len();if nil&&len==0{return Ok(typed_nil_list());}
-    values.resize_with(cap,||V::Nil);Ok(V::Slice(TypedSlice::from_list(values.into()).with_len(len)?))
+    values.resize_with(cap,||V::Nil);Ok(V::Slice(TypedSlice::from_list(values.into())?.with_len(len)?))
 }
 fn go_append(s:&[V],item:V)->R{
     let len=s.len()+1;let cap=gotmpl::go_slice_capacity(s.len(),len,16,true).ok_or_else(||err("slice capacity overflow"))?;check_budget(cap)?;
@@ -465,7 +465,7 @@ fn call(name: &str, a: &[V], context: &MapContext) -> R {
                         .ok_or_else(|| err("chunk index out of range"))?;
                     row.push(v);
                 }
-                rows.push(V::Slice(TypedSlice::from_list(row.into())));
+                rows.push(V::Slice(TypedSlice::from_list(row.into())?));
             }
             Ok(V::Slice(TypedSlice::values(
                 "[][]interface {}",
@@ -570,7 +570,7 @@ fn call(name: &str, a: &[V], context: &MapContext) -> R {
                             );
                         }
                     }
-                    Ok(V::Slice(TypedSlice::from_list(out.into())))
+                    Ok(V::Slice(TypedSlice::from_list(out.into())?))
                 }
                 "append" | "prepend" => {
                     arity(a, 2, 2)?;
@@ -601,7 +601,7 @@ fn call(name: &str, a: &[V], context: &MapContext) -> R {
                                 .ok_or_else(|| err("index out of range in reverse"))?,
                         );
                     }
-                    Ok(V::Slice(TypedSlice::from_list(out.into())))
+                    Ok(V::Slice(TypedSlice::from_list(out.into())?))
                 }
                 "compact" => {
                     arity(a, 1, 1)?;

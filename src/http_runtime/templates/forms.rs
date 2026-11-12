@@ -9,11 +9,13 @@ pub(crate) struct Form {
     method:String,query:String,content_type:String,state:Mutex<State>,
     sender:OnceLock<mpsc::UnboundedSender<ReadRequest>>,
     control:OnceLock<Weak<Control>>,
+    query_source:OnceLock<Arc<dyn Fn()->RenderResult<Vec<u8>>+Send+Sync>>,
 }
 pub(crate) struct ReadRequest {pub reply:oneshot::Sender<RenderResult<BodyRead>>}
 pub(crate) enum BodyRead {Bytes(Vec<u8>),Io(String),TooLarge}
 impl Form {
-    pub(crate) fn new(method:&str,query:&str,content_type:&str)->Arc<Self>{Arc::new(Self{method:method.into(),query:query.into(),content_type:content_type.into(),state:Mutex::new(State::default()),sender:OnceLock::new(),control:OnceLock::new()})}
+    pub(crate) fn new(method:&str,query:&str,content_type:&str)->Arc<Self>{Arc::new(Self{method:method.into(),query:query.into(),content_type:content_type.into(),state:Mutex::new(State::default()),sender:OnceLock::new(),control:OnceLock::new(),query_source:OnceLock::new()})}
+    pub(super) fn set_query_source(&self,source:Arc<dyn Fn()->RenderResult<Vec<u8>>+Send+Sync>){let _=self.query_source.set(source);}
     pub(super) fn set_control(&self,control:Arc<Control>){let _=self.control.set(Arc::downgrade(&control));}
     pub(crate) fn attach(&self)->RenderResult<mpsc::UnboundedReceiver<ReadRequest>>{
         let(tx,rx)=mpsc::unbounded_channel();self.sender.set(tx).map_err(|_|error("template body owner was already attached"))?;Ok(rx)
@@ -47,7 +49,7 @@ impl Form {
         }
         if state.form.is_none(){
             if let Some(control)=self.control.get().and_then(Weak::upgrade).as_ref(){control.reserve_host_bytes(state.post.as_ref().map_or(0,|values|values.len().saturating_mul(96)))?;}
-            let mut form=state.post.as_ref().map(|values|values.as_ref().clone()).unwrap_or_default();let(query,query_error)=parse_query(&self.query,self.control.get().and_then(Weak::upgrade).as_ref())?;
+            let mut form=state.post.as_ref().map(|values|values.as_ref().clone()).unwrap_or_default();let current=self.query_source.get().map(|source|source()).transpose()?;let raw=match &current{Some(raw)=>std::str::from_utf8(raw).map_err(|_|error("form query contains unrepresentable byte string"))?,None=>self.query.as_str()};let(query,query_error)=parse_query(raw,self.control.get().and_then(Weak::upgrade).as_ref())?;
             if failure.is_none(){failure=query_error;}append_values(&mut form,query)?;state.form=Some(Arc::new(form));
         }
         Ok(failure)

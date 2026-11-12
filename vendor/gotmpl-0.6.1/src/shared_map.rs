@@ -219,6 +219,7 @@ impl MapCell {
             .checked_sub(32)
             .ok_or_else(|| error("map value byte limit exceeded"))?;
         match value {
+            Value::Field(_)=>return Err(error("map storage rejects retained field references")),
             Value::ByteString(s) => {
                 *bytes = bytes
                     .checked_sub(s.as_bytes().len())

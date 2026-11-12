@@ -11,6 +11,7 @@ use tokio::{sync::Semaphore, task::JoinSet, time::Instant};
 
 mod hello;
 mod write_control;
+mod continue_flow;
 mod sessions;
 pub(super) mod stream;
 pub(super) type Pool = HashMap<SocketAddr, Weak<Binding>>;
@@ -937,9 +938,15 @@ async fn serve_connection(
                     request.extensions_mut().insert(metadata);
                     request.extensions_mut().insert(snapshot);
                     request.extensions_mut().insert(client_cert_cache);
-                    let Ok((request,wire))=stream::start(request,wire) else{return;};
+                    let Some((interim, receiver)) = stream::interim_channel() else {
+                        let mut rejected = wire;
+                        rejected.stop_stream(::h3::error::Code::H3_REQUEST_REJECTED);
+                        rejected.stop_sending(::h3::error::Code::H3_REQUEST_REJECTED);
+                        return;
+                    };
+                    let Ok((mut request,wire))=stream::start(request,wire) else{return;};
+                    request.body_mut().attach_interim(&interim);
                     let task=async move {
-                        let (interim, receiver) = stream::interim_channel();
                         let response = request::handle_business(runtime,server,request,request::RequestOrigin { peer:crate::net_address::NetAddress::udp(canonical(peer.peer)), local:crate::net_address::NetAddress::udp(canonical(peer.local)), tls:true, sni:sni.as_deref() },business.clone(),Some(request::InformationalOutput::Quic(interim)));
                         let _=stream::drive(wire,receiver,response,head,quic_for_stream).await;
                         drop(business);

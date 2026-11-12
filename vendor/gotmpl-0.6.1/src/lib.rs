@@ -47,6 +47,8 @@ pub use go_string::{GoBytes,GoKey,GoMapSnapshot,GoMapKeyRef,GoMapIter,decode_go_
 pub mod parse;
 pub(crate) mod value;
 mod signature;
+mod field_reference;
+pub use field_reference::{FieldKind,FieldSource,FieldReference};
 pub use signature::{ArgKind,Signature};
 #[cfg(feature = "std")]
 mod shared_map;

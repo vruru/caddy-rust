@@ -215,7 +215,7 @@ pub fn builtins() -> BTreeMap<String, ValueFunc> {
                     let end = parse_slice_index(&args[2])?;
                     let max = parse_slice_index(&args[3])?;
                     if start<0||end<0||max<0{return Err(TemplateError::Exec("slice: index out of range".into()));}
-                    let slice=match v{Value::List(v)=>crate::TypedSlice::from_list(v.clone()),Value::Slice(s)=>s.clone(),_=>return Err(TemplateError::Exec("slice: cannot 3-index slice this type".into()))};
+                    let slice=match v{Value::List(v)=>crate::TypedSlice::from_list(v.clone())?,Value::Slice(s)=>s.clone(),_=>return Err(TemplateError::Exec("slice: cannot 3-index slice this type".into()))};
                     Ok(Value::Slice(slice.reslice3(start as usize,end as usize,max as usize)?))
                 }
                 #[allow(

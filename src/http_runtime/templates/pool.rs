@@ -127,7 +127,7 @@ impl Binding {
   // This is the closed Frame function/factory set. User template/JSON values
   // cannot construct Objects/NamedTypes and CustomFuncs is nil. Public scopes
   // default to rejecting opaque callback formatting paths.
-  let host:gotmpl::FormatHostGuard=Arc::new(move|value|{weak.upgrade().ok_or_else(||gotmpl::TemplateError::Exec("formatter host owner retired".into()))?.check()?;super::render::formatting_host_cost(value)});
+  let host:gotmpl::FormatHostGuard=Arc::new(move|value|{let control=weak.upgrade().ok_or_else(||gotmpl::TemplateError::Exec("formatter host owner retired".into()))?;control.check()?;super::render::formatting_host_cost(value,&control)});
   let owner=gotmpl::FormatterScope::new(meter,Some(host))?;
   let unused=tree.formatter_scope.set(owner);drop(unused);
   tree.formatter_scope.get().map(|owner|owner.scope()).ok_or_else(||gotmpl::TemplateError::Exec("formatter scope unavailable".into()))

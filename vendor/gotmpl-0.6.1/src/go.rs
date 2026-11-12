@@ -473,7 +473,7 @@ fn sprintf_into(out: &mut dyn FormatBuffer, fmt_str: &[u8], args: &[Value]) -> R
             if i > 0 {
                 out.push_str(", ");
             }
-            write_bad_arg(out, v);
+            write_bad_arg(out, v,false)?;
         }
         out.push(')');
     }
@@ -485,6 +485,7 @@ fn format_value(out:&mut dyn FormatBuffer,arg:&Value,verb:char,spec:FmtSpec,dept
     format_value_inner(out,arg,verb,spec,depth,false)
 }
 fn format_value_inner(out:&mut dyn FormatBuffer,arg:&Value,verb:char,mut spec:FmtSpec,depth:usize,erroring:bool)->Result<()>{
+    if matches!(arg,Value::Field(_)){let resolved=arg.resolve_field_with(|value|out.host(value))?;return format_value_inner(out,&resolved,verb,spec,depth,erroring);}
     out.check()?;if depth>32{return Err(TemplateError::Exec("formatted value exceeds nesting limit".into()));}
     if erroring && verb=='v' {
         // badVerb prints the underlying value with the original flags; it
@@ -508,6 +509,13 @@ fn format_value_inner(out:&mut dyn FormatBuffer,arg:&Value,verb:char,mut spec:Fm
         let _host_guard=out.host(arg)?;let formatted=formatter(object,verb,&spec)?;
         let bytes=formatted.as_go_bytes().ok_or_else(||TemplateError::Exec("host formatter must return string".into()))?;
         crate::go_write::GoWrite::write_bytes(out,bytes)?;return out.check();
+    }
+    if !erroring && (matches!(verb,'s'|'q'|'x'|'X')||(verb=='v'&&!spec.hash)) && let Value::Object(object)=arg && let Some(stringer)=object.dynamic_stringer {
+        let _guard=out.host(arg)?;let text=stringer(object)?;
+        let bytes=text.as_go_bytes().ok_or_else(||TemplateError::Exec("host Stringer must return a Go string".into()))?;
+        let start=out.len();let mut unpadded=spec;unpadded.width=None;
+        format_bytes_value(out,bytes,if verb=='v'{'s'}else{verb},&unpadded)?;
+        pad_error_text(out,start,&spec);return out.check();
     }
     if depth>0&&matches!(arg,Value::Nil|Value::NilError){out.push_str(if verb=='v'&&spec.hash&&!erroring{"interface {}(nil)"}else{"<nil>"});return out.check();}
     if !erroring && (matches!(verb,'s'|'q'|'x'|'X') || (verb=='v'&&!spec.hash)) && let Value::Slice(slice)=arg {
@@ -533,8 +541,11 @@ fn format_value_inner(out:&mut dyn FormatBuffer,arg:&Value,verb:char,mut spec:Fm
         if let Some(values)=arg.as_sequence(){
             if matches!(verb,'s'|'q'|'x'|'X'){if let Some(bytes)=values.visible_bytes(){return format_bytes_value(out,&bytes,verb,&spec);}}
             let sharp=verb=='v'&&spec.hash&&!erroring;
-            if sharp && values.is_nil(){out.push_str(values.go_type());out.push_str("(nil)");return out.check();}
-            if sharp{out.push_str(values.go_type());out.push('{');}else{out.push('[');}
+            // fmt's direct []byte type switch uses the alias spelling, while
+            // nested reflection and %T retain []uint8 (Go fmt.printArg).
+            let sequence_type=if depth==0&&matches!(arg,Value::Slice(slice)if slice.named_type().is_none()&&matches!(slice.go_type(),"[]uint8"|"[]byte")){"[]byte"}else{values.go_type()};
+            if sharp && values.is_nil(){out.push_str(sequence_type);out.push_str("(nil)");return out.check();}
+            if sharp{out.push_str(sequence_type);out.push('{');}else{out.push('[');}
             for(index,value)in values.iter().enumerate(){out.check()?;if index>0{out.push_str(if sharp{", "}else{" "});}format_value_inner(out,&value,verb,spec,depth+1,erroring)?;}
             out.push(if sharp{'}'}else{']'});return out.check();
         }
@@ -567,14 +578,14 @@ fn format_value_inner(out:&mut dyn FormatBuffer,arg:&Value,verb:char,mut spec:Fm
                 else{out.push_str("<nil>");}
                 return out.check();
             }
-            if let Some(fields)=&object.field_order {
-                let pointer=object.go_type.is_some_and(|ty|ty.starts_with('*'));
-                if pointer && depth>0 {
+            let pointer=object.go_type.is_some_and(|ty|ty.starts_with('*'));
+            if pointer && depth>0 {
                     let address=object.pointer_identity.unwrap_or(object.as_ref() as *const crate::Object as usize);
                     if spec.hash {let _=write!(out,"({})(0x{address:x})",object.go_type.unwrap());}
                     else{let _=write!(out,"0x{address:x}");}
                     return out.check();
-                }
+            }
+            if let Some(fields)=&object.field_order {
                 if pointer{out.push('&');}
                 if spec.hash&&!erroring{out.push_str(object.go_type.ok_or_else(||TemplateError::Exec("host struct has no Go type".into()))?.trim_start_matches('*'));}
                 out.push('{');
@@ -595,7 +606,7 @@ fn format_value_inner(out:&mut dyn FormatBuffer,arg:&Value,verb:char,mut spec:Fm
             'T' => out.push_str(match arg {Value::Nil|Value::NilError=>"<nil>",Value::List(_)=>"[]interface {}",Value::Map(_)=>"map[string]interface {}",#[cfg(feature="std")]Value::SharedMap(_)=>"map[string]interface {}",#[cfg(feature="std")]Value::GenericMap(_)=>"map[interface {}]interface {}",value=>value.type_name()}),
             's' => {
                 if let Some(bytes)=arg.as_go_bytes(){out.push_bytes(truncate_runes(bytes,spec.precision));spec.pad_in_place(out,start,false);}
-                else{write_bad_verb(out,verb,arg);}
+                else{write_bad_verb(out,verb,arg)?;}
             },
             'd' => match arg {
                 // Match Uint before the as_int() path: a u64 above i64::MAX
@@ -609,7 +620,7 @@ fn format_value_inner(out:&mut dyn FormatBuffer,arg:&Value,verb:char,mut spec:Fm
                         spec.write_signed(out, n);
                         spec.pad_in_place(out, start, true);
                     }
-                    None => write_bad_verb(out, verb, arg),
+                    None => write_bad_verb(out, verb, arg)?,
                 },
             },
             'f' | 'F' => match match arg { Value::Float(f)=>Some(*f),_=>None } {
@@ -626,7 +637,7 @@ fn format_value_inner(out:&mut dyn FormatBuffer,arg:&Value,verb:char,mut spec:Fm
                     if spec.hash&&prec==0{out.push('.');}
                     spec.pad_in_place(out, start, true);
                 }
-                None => write_bad_verb(out, verb, arg),
+                None => write_bad_verb(out, verb, arg)?,
             },
             'e' | 'E' => match match arg { Value::Float(f)=>Some(*f),_=>None } {
                 Some(f) => {
@@ -638,7 +649,7 @@ fn format_value_inner(out:&mut dyn FormatBuffer,arg:&Value,verb:char,mut spec:Fm
                     apply_float_sign_in_place(out, start, f, &spec);
                     spec.pad_in_place(out, start, true);
                 }
-                None => write_bad_verb(out, verb, arg),
+                None => write_bad_verb(out, verb, arg)?,
             },
             'g' | 'G' => match match arg { Value::Float(f)=>Some(*f),_=>None } {
                 Some(f) => {
@@ -654,7 +665,7 @@ fn format_value_inner(out:&mut dyn FormatBuffer,arg:&Value,verb:char,mut spec:Fm
                     apply_float_sign_in_place(out, start, f, &spec);
                     spec.pad_in_place(out, start, true);
                 }
-                None => write_bad_verb(out, verb, arg),
+                None => write_bad_verb(out, verb, arg)?,
             },
             'v' => {
                 if let Value::Float(value)=arg{write_g_default(out,*value,false);apply_float_sign_in_place(out,start,*value,&spec);spec.pad_in_place(out,start,true);}
@@ -691,7 +702,7 @@ fn format_value_inner(out:&mut dyn FormatBuffer,arg:&Value,verb:char,mut spec:Fm
                         }
                         spec.pad_in_place(out, start, false);
                     }
-                    None => write_bad_verb(out, verb, arg),
+                    None => write_bad_verb(out, verb, arg)?,
                 }
             }
             'q' => match arg {
@@ -707,14 +718,14 @@ fn format_value_inner(out:&mut dyn FormatBuffer,arg:&Value,verb:char,mut spec:Fm
                     let rune=arg.as_go_integer().and_then(|n|u32::try_from(n).ok()).and_then(char::from_u32).unwrap_or('\u{fffd}');
                     let mut buffer=[0u8;4];quote_with_delimiter(out,rune.encode_utf8(&mut buffer).as_bytes(),spec.plus,'\'');spec.pad_in_place(out,start,false);
                 }
-                _ => write_bad_verb(out, verb, arg),
+                _ => write_bad_verb(out, verb, arg)?,
             },
             't' => match arg {
                 Value::Bool(b) => {
                     out.push_str(if *b { "true" } else { "false" });
                     spec.pad_in_place(out, start, false);
                 }
-                _ => write_bad_verb(out, verb, arg),
+                _ => write_bad_verb(out, verb, arg)?,
             },
             'x' | 'X' | 'o' | 'O' | 'b' => match arg {
                 Value::Float(value)if !matches!(verb,'o'|'O')=>write_float_binary_hex(out,*value,verb,&spec),
@@ -736,7 +747,7 @@ fn format_value_inner(out:&mut dyn FormatBuffer,arg:&Value,verb:char,mut spec:Fm
                         // only space-pad the overall field here.
                         spec.pad_in_place(out, start, false);
                     }
-                    None => write_bad_verb(out, verb, arg),
+                    None => write_bad_verb(out, verb, arg)?,
                 },
             },
             'c' => match arg.as_go_integer() {
@@ -744,9 +755,9 @@ fn format_value_inner(out:&mut dyn FormatBuffer,arg:&Value,verb:char,mut spec:Fm
                     Some(c) => out.push(c),
                     None => out.push('\u{FFFD}'),
                 }if spec.zero&&!spec.left_align{if let Some(width)=spec.width{insert_repeated(out,start,'0',width.saturating_sub(1));}}else{spec.pad_in_place(out,start,false);}},
-                None => write_bad_verb(out, verb, arg),
+                None => write_bad_verb(out, verb, arg)?,
             },
-            _ => write_bad_verb(out, verb, arg),
+            _ => write_bad_verb(out, verb, arg)?,
         }
     out.check()
 }
@@ -826,26 +837,29 @@ fn format_pointer(out:&mut dyn FormatBuffer,arg:&Value,mut spec:FmtSpec,depth:us
 /// Emit Go's `%!verb(type=value)` marker for a type-mismatched or unknown verb.
 ///
 /// Nil is a special case: Go emits `%!verb(<nil>)` without the `nil=` prefix.
-fn write_bad_verb(out: &mut dyn FormatBuffer, verb: char, arg: &Value) {
+fn write_bad_verb(out: &mut dyn FormatBuffer, verb: char, arg: &Value)->Result<()> {
     out.push_str("%!");
     out.push(verb);
     out.push('(');
-    write_bad_arg(out, arg);
+    write_bad_arg(out, arg,true)?;
     out.push(')');
+    out.check()
 }
 
 /// Emit the `type=value` (or bare `<nil>`) form used inside `%!verb(...)`
 /// and `%!(EXTRA …)` markers.
-fn write_bad_arg(out: &mut dyn FormatBuffer, arg: &Value) {
+fn write_bad_arg(out: &mut dyn FormatBuffer, arg: &Value,erroring:bool)->Result<()> {
     if matches!(arg, Value::Nil) {
         out.push_str("<nil>");
-        return;
+        return Ok(());
     }
-    let _ = write!(out, "{}=", arg.type_name());
+    out.push_str(arg.type_name());out.push('=');
     match arg {
         value if value.as_go_bytes().is_some()=>out.push_bytes(value.as_go_bytes().unwrap_or_default()),
-        other=>{let _=crate::go_write::write_value(out,other,0);}
+        Value::Object(object)if erroring&&object.dynamic_stringer.is_some()=>{format_value_inner(out,arg,'v',FmtSpec::default(),0,true)?;}
+        other=>{crate::go_write::write_value(out,other,0)?;}
     }
+    out.check()
 }
 
 /// `%x` / `%X` on strings: hex-encode each byte into `out`.

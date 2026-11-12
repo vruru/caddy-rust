@@ -2,44 +2,56 @@
 use super::{Fields,RenderResult,arity,error,lock,string,text};
 use gotmpl::{MapView,Object,Value,ValueFunc};
 use http::{HeaderMap,HeaderName,HeaderValue,Method,Uri,Version,header};
-use std::{collections::BTreeMap,path::Path,sync::{Arc,Mutex}};
+use std::{collections::BTreeMap,path::Path,sync::{Arc,Mutex,OnceLock}};
 #[derive(Clone)]
 pub(crate) struct RequestData {
     dynamic:crate::http_runtime::placeholder_value::Dynamic,
     tls_snapshot:Option<Arc<crate::http_runtime::ConnectionSnapshot>>,
     tls_values:tls_values::Cache,
+    url_values:OnceLock<request_url::Cache>,
     pub uri:Uri,pub original_uri:Uri,pub request_uri:String,pub method:Method,pub original_method:Method,
     pub form:Arc<super::forms::Form>,pub headers:HeaderMap,pub version:Version,pub host:String,pub remote:Vec<u8>,
-    pub remote_ip:Vec<u8>,pub client_ip:String,pub tls:bool,pub content_length:i64,pub placeholders:BTreeMap<String,Vec<u8>>,
+    pub remote_ip:Vec<u8>,pub client_ip:String,pub tls:bool,pub content_length:i64,pub placeholders:BTreeMap<String,(Vec<u8>,bool)>,
+}
+// H2/H3 reconstruct an absolute Uri from separate pseudo-fields. Go's
+// server URL still contains the origin-form path/query; Request.Host remains
+// the independent authority. H1 absolute targets and virtual includes retain
+// their own provenance. CONNECT retains its authority-form URL.
+fn captured_uri(uri:&Uri,version:Version,method:&Method)->Result<Uri,super::super::TemplateFailure>{
+    if !matches!(version,Version::HTTP_2|Version::HTTP_3)||method==Method::CONNECT{return Ok(uri.clone());}
+    let mut parts=uri.clone().into_parts();parts.scheme=None;parts.authority=None;
+    if parts.path_and_query.is_none(){parts.path_and_query=Some(http::uri::PathAndQuery::from_static("/"));}
+    Uri::from_parts(parts).map_err(|_|super::super::TemplateFailure(http::StatusCode::BAD_REQUEST))
 }
 impl RequestData {
     pub(crate) fn capture(ctx:&super::super::super::request::Context)->Result<Self,super::super::TemplateFailure>{
         let req=ctx.req();let mut placeholders=BTreeMap::new();
         for name in ["http.shutting_down","http.time_until_shutdown","http.request.hostport","http.request.host","http.request.port","http.request.remote","http.request.remote.host","http.request.remote.port","http.request.local","http.request.local.host","http.request.local.port","http.request.client_ip","http.vars.client_ip","http.request.scheme","http.request.method","http.request.orig_method","http.request.uri","http.request.uri.path","http.request.uri.query","http.request.orig_uri","http.request.orig_uri.path","http.request.orig_uri.query","http.request.orig_uri.prefixed_query","http.request.proto","http.vars.root","http.error.status_code","http.error.message","http.error.id","http.error.trace"] {
-            if let Some(value)=ctx.lookup_bytes(name){placeholders.insert(name.into(),value);}
+            if let Some(value)=ctx.lookup_bytes(name){placeholders.insert(name.into(),(value,false));}
         }
-        for name in ctx.values.keys(){if let Some(value)=ctx.lookup_bytes(name){placeholders.insert(name.clone(),value);}}
-        for name in ctx.template_map_destinations(){if let Some(value)=ctx.lookup_bytes(name){placeholders.insert(name.to_owned(),value);}}
-        let bytes=placeholders.iter().try_fold(0usize,|n,(key,value)|n.checked_add(key.len()+value.len()+64));
+        for name in ctx.values.keys(){if let Some(value)=ctx.lookup_bytes(name){placeholders.insert(name.clone(),(value,true));}}
+        for name in ctx.template_map_destinations(){if let Some(value)=ctx.lookup_bytes(name){placeholders.insert(name.to_owned(),(value,true));}}
+        let bytes=placeholders.iter().try_fold(0usize,|n,(key,value)|n.checked_add(key.len()+value.0.len()+64));
         if !bytes.is_some_and(|n|n<=1<<20){return Err(super::super::TemplateFailure(http::StatusCode::INTERNAL_SERVER_ERROR));}
         let target=req.extensions().get::<super::super::virtual_request::VirtualTarget>();
-        let uri=target.map_or_else(||req.uri().clone(),|target|target.uri.clone());
-        let original_uri=target.map_or_else(||ctx.original_uri.clone(),|target|target.uri.clone());
+        let uri=match target{Some(target)=>target.uri.clone(),None=>captured_uri(req.uri(),req.version(),req.method())?};
+        let original_uri=match target{Some(target)=>target.uri.clone(),None=>captured_uri(&ctx.original_uri,req.version(),ctx.template_original_method())?};
         let request_uri=if target.is_some(){String::new()}else{ctx.original_uri.path_and_query().map_or("/",|v|v.as_str()).to_owned()};
         let form=super::forms::Form::new(req.method().as_str(),uri.query().unwrap_or_default(),req.headers().get(header::CONTENT_TYPE).and_then(|v|v.to_str().ok()).unwrap_or_default());
         // Go's net/http parser promotes the wire Host header into Request.Host
         // and removes it from Request.Header; Hyper retains that wire field.
         let mut headers=req.headers().clone();headers.remove(header::HOST);
-        Ok(Self{tls_snapshot:req.extensions().get::<Arc<crate::http_runtime::ConnectionSnapshot>>().cloned(),tls_values:tls_values::cache(),dynamic:crate::http_runtime::placeholder_value::Dynamic::capture(ctx),uri,original_uri,request_uri,form,method:req.method().clone(),original_method:ctx.lookup("http.request.orig_method").and_then(|s|s.parse().ok()).unwrap_or(Method::GET),headers,version:req.version(),host:ctx.authority.clone(),remote:ctx.peer.raw_text().into_owned(),remote_ip:ctx.peer.raw_host().into_owned(),client_ip:ctx.client_ip.map_or_else(String::new,|ip|ip.to_string()),tls:ctx.tls,content_length:if target.is_some(){0}else{ctx.template_content_length()},placeholders})
+        Ok(Self{tls_snapshot:req.extensions().get::<Arc<crate::http_runtime::ConnectionSnapshot>>().cloned(),tls_values:tls_values::cache(),url_values:OnceLock::new(),dynamic:crate::http_runtime::placeholder_value::Dynamic::capture(ctx),uri,original_uri,request_uri,form,method:req.method().clone(),original_method:ctx.lookup("http.request.orig_method").and_then(|s|s.parse().ok()).unwrap_or(Method::GET),headers,version:req.version(),host:ctx.authority.clone(),remote:ctx.peer.raw_text().into_owned(),remote_ip:ctx.peer.raw_host().into_owned(),client_ip:ctx.client_ip.map_or_else(String::new,|ip|ip.to_string()),tls:ctx.tls,content_length:if target.is_some(){0}else{ctx.template_content_length()},placeholders})
     }
     pub(super) fn placeholder(&self,name:&str,control:&Arc<super::Control>)->RenderResult<Value> {
         if let Some(value)=crate::http_config::helpers::global_lookup(name){control.reserve_host_bytes(value.len()+64)?;return Ok(string(value));}
+        if !self.placeholders.get(name).is_some_and(|(_,explicit)|*explicit){if let Some(cache)=self.url_values.get(){if let Some(value)=request_url::placeholder(cache,control,name)?{return Ok(value);}}}
         if let Some(value)=self.dynamic.get(name){
             use crate::http_runtime::placeholder_value::Value as P;
             let value=match value{P::Null=>String::new(),P::Bool(v)=>v.to_string(),P::Duration(v)=>crate::duration::format(v),P::Double(v)=>v.to_string(),P::Unavailable(message)=>return Err(error(message)),_=>return Err(error("unexpected dynamic placeholder type"))};
             control.reserve_host_bytes(value.len()+64)?;return Ok(string(value));
         }
-        if let Some(value)=self.placeholders.get(name){control.reserve_host_bytes(value.len()+64)?;return Ok(Value::from_go_bytes(value.clone()));}
+        if let Some((value,_))=self.placeholders.get(name){control.reserve_host_bytes(value.len()+64)?;return Ok(Value::from_go_bytes(value.clone()));}
         if let Some(name)=name.strip_prefix("http.request.header."){
             let values=self.headers.get_all(name);let count=values.iter().count();
             let length=values.iter().try_fold(count.saturating_sub(1),|n,v|n.checked_add(v.as_bytes().len())).ok_or_else(||error("header placeholder size overflow"))?;
@@ -85,12 +97,14 @@ impl RequestData {
     }
     pub(super) fn value(&self,original:bool,control:&Arc<super::Control>)->RenderResult<Value>{
         let uri=if original{&self.original_uri}else{&self.uri};
+        if self.url_values.get().is_none(){let prepared=request_url::cache(control)?;let _=self.url_values.set(prepared);}
+        let url_cache=self.url_values.get().ok_or_else(||error("request URL cache missing"))?;
         let method=if original{&self.original_method}else{&self.method};
         let headers=if original{HeaderMap::new()}else{self.headers.clone()};
         let request_uri=&self.request_uri;
         let (major,minor,proto)=if original{(0,0,"")}else{match self.version{Version::HTTP_10=>(1,0,"HTTP/1.0"),Version::HTTP_2=>(2,0,"HTTP/2.0"),Version::HTTP_3=>(3,0,"HTTP/3.0"),_=>(1,1,"HTTP/1.1")}};
         let mut fields=Fields::from([
-            ("Method".into(),string(method.as_str())),("URL".into(),url_value(uri,control)?),
+            ("Method".into(),string(method.as_str())),("URL".into(),request_url::cached(uri,control,url_cache,original)?),
             ("Header".into(),header_value(Arc::new(Mutex::new(headers.clone())),false)),
             ("Trailer".into(),header_value(Arc::new(Mutex::new(HeaderMap::new())),false)),
             ("Host".into(),string(if original{""}else{&self.host})),("RemoteAddr".into(),Value::from_go_bytes(self.remote.clone())),
@@ -104,6 +118,7 @@ impl RequestData {
         fields.insert("Response".into(),nil_pointer("*http.Response",&["Status","StatusCode","Proto","ProtoMajor","ProtoMinor","Header","Body","ContentLength","TransferEncoding","Close","Uncompressed","Trailer","Request","TLS"]));
         fields.insert("Pattern".into(),string(""));
         fields.insert("TLS".into(),tls_values::value(self.tls_snapshot.clone(),&self.tls_values,control,original||!self.tls)?);
+        if !original{self.form.set_query_source(request_url::query_source(url_cache,control)?);}
         let mut methods=if original{BTreeMap::new()}else{self.form.methods()};let mut method_signatures=if original{BTreeMap::new()}else{super::forms::Form::signatures()};
         if !original{
             for(name,field)in [("UserAgent",header::USER_AGENT),("Referer",header::REFERER)]{let headers=headers.clone();methods.insert(name.into(),Arc::new(move|args:&[Value]|{arity(args,0,0)?;Ok(string(headers.get(&field).and_then(|v|v.to_str().ok()).unwrap_or_default()))}));}
@@ -162,7 +177,6 @@ pub(super) fn header_value(headers:Arc<Mutex<HeaderMap>>,writable:bool)->Value{
     Value::Object(Arc::new(Object{data:Some(format_data),fields:Fields::new(),methods,map_view:Some(MapView{is_nil:Arc::new(||false),type_name:"http.Header",snapshot,zero:Value::Slice(gotmpl::TypedSlice::nil("[]string"))}),..Object::default()}))
 }
 #[path="request_url.rs"]mod request_url;
-fn url_value(uri:&Uri,control:&Arc<super::Control>)->RenderResult<Value>{request_url::value(uri,control)}
 fn escape_path(input:&str,slash:bool)->String{let mut out=String::new();for byte in input.bytes(){if byte.is_ascii_alphanumeric()||b"-_.~:@&=+$".contains(&byte)||(slash&&byte==b'/'){out.push(byte as char);}else{out.push_str(&format!("%{byte:02X}"));}}out}
 pub(super) fn path_escape(input:&str)->String{escape_path(input,false)}
 pub(super) fn strip_html(input:&str)->String{let mut out=String::new();let mut depth=0usize;let mut quote='\0';for ch in input.chars(){match ch{
@@ -392,3 +406,5 @@ fn query_escape_bytes(output: &mut Vec<u8>, value: &[u8]) {
         }
     }
 }
+
+pub(super)fn field_reference_cost(value:&Value,control:&Arc<super::Control>)->RenderResult<Option<usize>>{request_url::field_reference_cost(value,control)}

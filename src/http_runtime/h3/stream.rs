@@ -6,6 +6,8 @@ use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Ve
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, SizeHint};
 use std::error::Error;
+use std::sync::Arc;
+use super::continue_flow::{Flow, Event as FlowEvent};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
@@ -75,9 +77,20 @@ pub struct Incoming {
     stream: Option<Receiving>,
     phase: Phase,
     remaining: Option<u64>,
+    expect_continue: bool,
+    continue_flow: Option<Arc<Flow>>,
 }
 
+impl Drop for Incoming {
+    fn drop(&mut self) {
+        if let Some(flow) = self.continue_flow.take() { flow.retire_reader(); }
+    }
+}
 impl Incoming {
+    pub fn attach_interim(&mut self, writer: &InterimWriter) {
+        writer.flow.set_expected(self.expect_continue && self.remaining != Some(0));
+        self.continue_flow = Some(writer.flow.clone());
+    }
     fn fail(&mut self, error: Failure) -> Poll<Option<Result<Frame<Bytes>, Failure>>> {
         self.phase = Phase::Done;
         // h3-quinn moves the native receive stream into the pending read
@@ -96,6 +109,11 @@ impl Body for Incoming {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Failure>>> {
         if matches!(self.phase, Phase::Data) {
+            if let Some(flow) = self.continue_flow.as_ref() {
+                if let Err(message) = ready!(flow.poll_continue(cx)) {
+                    return self.fail(malformed(message));
+                }
+            }
             // Convert the opaque Buf while the recv stream is mutably borrowed.
             let polled = ready!(
                 self.stream
@@ -119,6 +137,7 @@ impl Body for Incoming {
                         return self.fail(malformed("HTTP/3 data ended before content-length"));
                     }
                     self.phase = Phase::Trailers;
+                    if let Some(flow) = self.continue_flow.as_ref() { flow.retire_reader(); }
                 }
                 Err(error) => return self.fail(Box::new(error)),
             }
@@ -170,6 +189,7 @@ pub fn start(
     }
     let (mut parts, _) = request.into_parts();
     parts.version = Version::HTTP_3;
+    let expect_continue = parts.headers.get(header::EXPECT).is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"100-continue"));
     Ok((
         Request::from_parts(
             parts,
@@ -177,6 +197,8 @@ pub fn start(
                 stream: Some(recv),
                 phase: Phase::Data,
                 remaining: length?,
+                expect_continue,
+                continue_flow: None,
             },
         ),
         send,
@@ -186,6 +208,7 @@ pub fn start(
 /// One in-flight informational frame per request. The handler continues only
 /// after its own stream accepted the frame; unrelated streams are independent.
 pub struct InterimWriter {
+    flow: Arc<Flow>,
     sender: tokio::sync::mpsc::Sender<Interim>,
     count: usize,
     bytes: usize,
@@ -196,19 +219,30 @@ pub struct Interim {
     acknowledged: tokio::sync::oneshot::Sender<bool>,
 }
 
-pub fn interim_channel() -> (InterimWriter, tokio::sync::mpsc::Receiver<Interim>) {
+pub struct InterimReceiver {
+    receiver: tokio::sync::mpsc::Receiver<Interim>,
+    flow: Arc<Flow>,
+}
+impl Drop for InterimReceiver {
+    fn drop(&mut self) { self.flow.close(); }
+}
+
+/// Admission precedes all new Flow allocation. Exhaustion rejects only the
+/// new request stream; existing readers and drivers retain their real credit.
+pub fn interim_channel() -> Option<(InterimWriter, InterimReceiver)> {
+    let flow = Flow::new()?;
     let (sender, receiver) = tokio::sync::mpsc::channel(1);
-    (
-        InterimWriter {
-            sender,
-            count: 0,
-            bytes: 0,
-        },
-        receiver,
-    )
+    Some((
+        InterimWriter { flow: flow.clone(), sender, count: 0, bytes: 0 },
+        InterimReceiver { receiver, flow },
+    ))
 }
 
 impl InterimWriter {
+    /// Metadata only: no informational count, IO boundary, or payload credit.
+    pub fn bind_write_control(&mut self, control: hyper::ext::ResponseWriteControl) -> anyhow::Result<()> {
+        self.flow.bind(control).map_err(anyhow::Error::msg)
+    }
     pub async fn send(&mut self, mut response: Response<()>) -> anyhow::Result<bool> {
         anyhow::ensure!(
             response.status().is_informational()
@@ -266,7 +300,7 @@ fn bind_writer(
 
 pub async fn drive<B>(
     mut stream: Sending,
-    mut interim: tokio::sync::mpsc::Receiver<Interim>,
+    mut interim: InterimReceiver,
     response: impl std::future::Future<Output = Response<B>>,
     head: bool,
     connection: quinn::Connection,
@@ -274,23 +308,48 @@ pub async fn drive<B>(
 where
     B: Body<Data = Bytes, Error = Failure> + Unpin,
 {
-    enum Event<B>{Interim(Option<Interim>),Final(Response<B>)}
+    enum Event<B>{Flow(FlowEvent),Interim(Option<Interim>),Final(Response<B>)}
     tokio::pin!(response);
     let id=quinn::StreamId::from(quinn::VarInt::from_u64(stream.send_id().into_inner())?);
     let mut writer:Option<super::write_control::Writer>=None;
     let mut open = true;
+    let flow = interim.flow.clone();
+    let mut final_response = None;
     loop {
-        let next=async{tokio::select! {
-            biased;
-            next=interim.recv(),if open=>Event::Interim(next),
-            response=&mut response=>Event::Final(response),
-        }};
+        let next = std::future::poll_fn(|cx| {
+            if let Poll::Ready(event) = flow.poll_event(cx) { return Poll::Ready(Event::Flow(event)); }
+            if open && let Poll::Ready(head) = interim.receiver.poll_recv(cx) { return Poll::Ready(Event::Interim(head)); }
+            if final_response.is_none() && let Poll::Ready(response) = response.as_mut().poll(cx) { final_response = Some(response); }
+            // Binding, first-read demand, or a detached explicit interim may
+            // have appeared while polling the application in this same turn.
+            if let Poll::Ready(event) = flow.poll_event(cx) { return Poll::Ready(Event::Flow(event)); }
+            if open && let Poll::Ready(head) = interim.receiver.poll_recv(cx) { return Poll::Ready(Event::Interim(head)); }
+            final_response.take().map_or(Poll::Pending, |response| Poll::Ready(Event::Final(response)))
+        });
         let event=if let Some(writer)=&mut writer{writer.action(next).await?}else{next.await};
         match event {
+            Event::Flow(FlowEvent::Bind(control)) => {
+                if let Err(error) = bind_writer(&mut writer,Some(control),&connection,id) {
+                    stream.stop_stream(Code::H3_REQUEST_CANCELLED);
+                    return Err(error);
+                }
+            },
+            Event::Flow(FlowEvent::Continue) => {
+                let response = Response::builder().status(StatusCode::CONTINUE).body(())?;
+                if let Some(writer) = &mut writer {
+                    writer.begin_wire()?;
+                    writer.action(stream.send_response(response)).await??;
+                    writer.seal_wire(false)?;
+                    writer.boundary().await?;
+                } else { stream.send_response(response).await?; }
+                flow.continued();
+            }
             Event::Interim(Some(Interim{mut response,acknowledged})) if !acknowledged.is_closed()=>{
                 let control=response.extensions_mut().remove::<hyper::ext::ResponseWriteControl>();
                 bind_writer(&mut writer,control,&connection,id)?;
-                let suppressed=if let Some(writer)=&mut writer {
+                let is_continue = response.status() == StatusCode::CONTINUE;
+                let duplicate = is_continue && flow.is_continued();
+                let suppressed=if duplicate { false } else if let Some(writer)=&mut writer {
                     writer.begin_wire()?;
                     match writer.action(stream.send_response(response)).await? {
                         Ok(())=>{writer.seal_wire(false)?;writer.boundary().await?;false},
@@ -302,6 +361,7 @@ where
                     Err(h3::error::StreamError::HeaderTooBig{..})=>true,
                     Err(error)=>return Err(error.into()),
                 }};
+                if is_continue && !suppressed && !duplicate { flow.continued(); }
                 let _=acknowledged.send(suppressed);
             },
             Event::Interim(Some(_))=>{},

@@ -41,6 +41,7 @@ impl serde::Serialize for JsonValue<'_>{
             for(key,value)in snapshot.iter(){object.serialize_entry(&go_utf8_text(key.as_bytes()),&JsonValue(value,self.1+1))?;}return object.end();
         }
         match self.0{
+            V::Field(_)=>{let value=self.0.resolve_field().map_err(S::Error::custom)?;JsonValue(&value,self.1+1).serialize(serializer)},
             V::GenericMap(map)=>{
                 let snapshot=map.snapshot().map_err(S::Error::custom)?;
                 let account=map.budget_account();

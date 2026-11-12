@@ -12,12 +12,28 @@ impl GoWrite for VecSink<'_>{fn write_bytes(&mut self,bytes:&[u8])->fmt::Result{
 /// This printer is shared by raw actions and Sprint. It never builds an
 /// unbounded intermediate String, including for nested maps and lists.
 pub(crate) fn write_value<W:GoWrite+?Sized>(writer:&mut W,value:&Value,depth:usize)->Result<()>{
+    if matches!(value,Value::Field(_)){let resolved=value.resolve_field_with(|value|writer.host(value))?;return write_value(writer,&resolved,depth);}
     if depth>32{return Err(TemplateError::Exec("template printed value exceeds nesting limit".into()));}
     let _slice_host=if matches!(value,Value::Slice(slice)if slice.named_type().is_some_and(|kind|kind.stringer.is_some())){writer.host(value)?}else{None};
     if let Value::Slice(slice)=value && let Some(display)=slice.string_value()? {
         return write_value(writer,&display,depth+1);
     }
     if let Some(bytes)=value.as_go_bytes(){writer.write_bytes(bytes)?;return Ok(());}
+    if let Value::Object(object)=value {
+            if let Some(formatter)=object.formatter {
+                let _host_guard=writer.host(value)?;
+                let formatted=formatter(object,'v',&crate::HostFormat::default())?;
+                writer.write_bytes(formatted.as_go_bytes().ok_or_else(||TemplateError::Exec("host formatter must return string".into()))?)?;
+                return Ok(());
+            }
+
+            if let Some(stringer)=object.dynamic_stringer {
+                let _host_guard=writer.host(value)?;
+                let text=stringer(object)?;
+                writer.write_bytes(text.as_go_bytes().ok_or_else(||TemplateError::Exec("host Stringer must return a Go string".into()))?)?;
+                return Ok(());
+            }
+    }
     #[cfg(feature="std")] if let Value::GenericMap(map)=value{
         writer.write_str("map[")?;for(index,(key,value))in map.snapshot()?.iter().enumerate(){if index>0{writer.write_str(" ")?;}write_value(writer,key,depth+1)?;writer.write_str(":")?;write_value(writer,value,depth+1)?;}writer.write_str("]")?;return Ok(());
     }
@@ -31,13 +47,6 @@ pub(crate) fn write_value<W:GoWrite+?Sized>(writer:&mut W,value:&Value,depth:usi
         Value::Slice(slice)=>{writer.write_str("[")?;for(index,value)in slice.iter().enumerate(){if index>0{writer.write_str(" ")?;}write_value(writer,&value,depth+1)?;}writer.write_str("]")?;}
         Value::List(values)=>{writer.write_str("[")?;for(index,value)in values.iter().enumerate(){if index>0{writer.write_str(" ")?;}write_value(writer,value,depth+1)?;}writer.write_str("]")?;}
         Value::Object(object)=>{
-            if let Some(formatter)=object.formatter {
-                let _host_guard=writer.host(value)?;
-                let formatted=formatter(object,'v',&crate::HostFormat::default())?;
-                writer.write_bytes(formatted.as_go_bytes().ok_or_else(||TemplateError::Exec("host formatter must return string".into()))?)?;
-                return Ok(());
-            }
-
             let _nil_guard=if object.nil_pointer.is_some()&&object.display.is_none(){writer.host(value)?}else{None};
             if let Some(display)=&object.display{writer.write_str(display)?;}
             else if object.is_nil_pointer(){writer.write_str("<nil>")?;}

@@ -203,11 +203,19 @@ struct OutputWriter<'a, W> {
     remaining: Option<usize>,
     charge: Option<crate::ExecutionCharge>,
     error: Option<TemplateError>,
+    #[cfg(feature="std")]
+    formatter_scope:Option<alloc::sync::Arc<crate::FormatterScope>>,
 }
 impl<W: GoWrite> Write for OutputWriter<'_, W> {
     fn write_str(&mut self,text:&str)->core::fmt::Result{self.write_bytes(text.as_bytes())}
 }
 impl<W:GoWrite> GoWrite for OutputWriter<'_,W>{
+    fn host(&self,value:&Value)->Result<Option<crate::ByteLease>>{
+        #[cfg(feature="std")]
+        if let Some(scope)=&self.formatter_scope{return scope.host(value);}
+        self.inner.host(value)
+    }
+
     fn write_bytes(&mut self,text:&[u8])->core::fmt::Result{
         if let Some(left) = &mut self.remaining {
             let Some(next) = left.checked_sub(text.len()) else {
@@ -391,6 +399,7 @@ impl<'a> Executor<'a> {
             remaining: self.execution_charge.as_ref().map(|_| self.output_limit),
             charge: self.execution_charge.clone(),
             error: None,
+            #[cfg(feature="std")]formatter_scope:self.formatter_scope.clone(),
         };
         let result = self.walk(&mut output, tree, dot).map_err(|sig| match sig {
             ExecSignal::Err(e) => *e,
@@ -459,7 +468,7 @@ impl<'a> Executor<'a> {
         self.vars.push();
         let result = depth_ok.and_then(|()| match self.eval_pipeline(dot, &branch.pipe) {
             Ok(val) => {
-                if val.is_truthy() {
+                if self.observe(&val)?.is_truthy() {
                     self.walk(w, &branch.body, dot)
                 } else if let Some(ref else_body) = branch.else_body {
                     self.walk(w, else_body, dot)
@@ -485,7 +494,7 @@ impl<'a> Executor<'a> {
         self.vars.push();
         let result = depth_ok.and_then(|()| match self.eval_pipeline(dot, &branch.pipe) {
             Ok(val) => {
-                if val.is_truthy() {
+                if self.observe(&val)?.is_truthy() {
                     self.walk(w, &branch.body, &val)
                 } else if let Some(ref else_body) = branch.else_body {
                     self.walk(w, else_body, dot)
@@ -524,6 +533,7 @@ impl<'a> Executor<'a> {
         // decl-free evaluator so pipe.decl names do not leak into the outer
         // scope or get pre-bound to the pipeline's final value.
         let val = self.eval_pipeline_value(dot, &branch.pipe)?;
+        let val = self.observe(&val)?;
         if let Some(map)=val.map_snapshot()?{
             if map.is_empty(){if let Some(body)=&branch.else_body{self.walk(w,body,dot)?;}}
             else{range_loop!(self,w,branch,map.iter().map(|(key,value)|(key.to_value(),value.clone())));}
@@ -812,10 +822,10 @@ impl<'a> Executor<'a> {
 
         for expr in arg_exprs {
             let val = self.eval_expr(dot, expr)?;
-            if is_and && !val.is_truthy() {
+            if is_and && !self.observe(&val)?.is_truthy() {
                 return Ok(val);
             }
-            if !is_and && val.is_truthy() {
+            if !is_and && self.observe(&val)?.is_truthy() {
                 return Ok(val);
             }
             last = val;
@@ -823,10 +833,10 @@ impl<'a> Executor<'a> {
 
         // Handle piped value (becomes last argument)
         if let Some(piped_val) = piped {
-            if is_and && !piped_val.is_truthy() {
+            if is_and && !self.observe(&piped_val)?.is_truthy() {
                 return Ok(piped_val);
             }
-            if !is_and && piped_val.is_truthy() {
+            if !is_and && self.observe(&piped_val)?.is_truthy() {
                 return Ok(piped_val);
             }
             last = piped_val;
@@ -864,22 +874,27 @@ impl<'a> Executor<'a> {
         for (index,expr) in arg_exprs.iter().enumerate() {
             self.charge(1)?;
             let kind=signature.map_or(crate::ArgKind::Any,|signature|signature.kind(index));
-            let value=match kind.constant(expr)? {Some(value)=>value,None=>{let value=self.eval_expr(dot,expr)?;kind.validate(&value)?;value}};
-            args.push(if matches!(kind,crate::ArgKind::Any)&&matches!(value,Value::NilError){Value::Nil}else{value});
+            let value=match kind.constant(expr)? {Some(value)=>value,None=>self.eval_expr(dot,expr)?};
+            kind.validate(&value)?;args.push(value);
         }
 
         // Piped value becomes the last argument (Go convention)
         if let Some(piped_val) = piped {
             if let Some(signature)=signature{signature.kind(args.len()).validate(&piped_val)?;}
-            args.push(if signature.is_none_or(|s|matches!(s.kind(args.len()),crate::ArgKind::Any))&&matches!(piped_val,Value::NilError){Value::Nil}else{piped_val});
+            args.push(piped_val);
         }
 
+        for (index,value) in args.iter_mut().enumerate(){
+            let kind=signature.map_or(crate::ArgKind::Any,|s|s.kind(index));
+            *value=self.observe(value)?;kind.validate(value)?;
+            if matches!(kind,crate::ArgKind::Any)&&matches!(value,Value::NilError){*value=Value::Nil;}
+        }
         Ok(args)
     }
 
     fn select_method(&self, value: Value, fields: &[SmolStr]) -> ExecResult<Option<(BoundMethod,Option<crate::Signature>)>> {
         let Some((last, prefix)) = fields.split_last() else { return Ok(None) };
-        let value = self.walk_fields(value, prefix)?;
+        let value = self.observe(&self.walk_fields(value, prefix)?)?;
         Ok(match value {
             Value::Object(object) => {
                 object.validate_lazy()?;
@@ -911,6 +926,7 @@ impl<'a> Executor<'a> {
     /// Access a field on a value, respecting missingkey option.
     fn field_access(&self, val: &Value, name: &str) -> ExecResult<Value> {
         self.charge(1)?;
+        let resolved=self.observe(val)?;let val=&resolved;
         if let Value::Object(object)=val{object.validate_lazy()?;}
         if let Value::Object(object)=val&&let Some(method)=object.method(name){
             return match method{
@@ -972,6 +988,14 @@ impl<'a> Executor<'a> {
             ))
             .into()),
         }
+    }
+
+    fn observe(&self,value:&Value)->ExecResult<Value>{
+        value.resolve_field_with(|value|{
+            if let Some(charge)=&self.execution_charge{charge(1)?;}
+            #[cfg(feature="std")]if let Some(scope)=&self.formatter_scope{return scope.host(value);}
+            let _=value;Ok(None::<crate::ByteLease>)
+        }).map_err(Into::into)
     }
 
     fn charge(&self, units: usize) -> ExecResult<()> {
@@ -1079,6 +1103,7 @@ fn measure_value(value: &Value, remaining: &mut usize, nodes:&mut usize, depth: 
     #[cfg(feature="std")]
     let _host_guard=if let Some(scope)=context.scope{if matches!(value,Value::Object(object)if object.map_view.is_some()||(!object.lazy_fields&&object.dynamic_fields.is_some()&&!object.fields.is_empty())){scope.host(value)?}else{None}}else{None};
     match value {
+        Value::Field(reference)=>{*remaining=remaining.checked_sub(core::mem::size_of::<crate::FieldReference>()+reference.name().len()+32).ok_or_else(limit)?;},
         Value::ByteString(bytes)=>*remaining=remaining.checked_sub(bytes.as_bytes().len()).ok_or_else(limit)?,
         Value::String(text) => *remaining = remaining.checked_sub(text.len()).ok_or_else(limit)?,
         Value::Slice(slice)=>{if let Some(values)=slice.retained_values(){for value in values.iter(){measure_value(value,remaining,nodes,depth+1,context)?;}}else{*remaining=remaining.checked_sub(slice.retained_len()).ok_or_else(limit)?;}},

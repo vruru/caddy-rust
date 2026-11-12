@@ -77,6 +77,8 @@ pub type ValueFunc = Arc<dyn Fn(&[Value]) -> Result<Value> + Send + Sync>;
 /// - `Map` → `map[k1:v1 k2:v2]`
 /// - `Function` → `<func>`
 pub enum Value {
+    /// Addressable closed-host field; variable assignment retains this lvalue.
+    Field(Arc<crate::FieldReference>),
     /// The nil value, represents absence of data.
     Nil,
     /// Nil error interface returned as a single Go method result.
@@ -210,6 +212,10 @@ pub struct Object {
     /// Go fmt.Formatter hook. The host admits allocation/work before entering
     /// this callback; output must be a Go string and includes its own padding.
     pub formatter:Option<fn(&Object,char,&crate::HostFormat)->Result<Value>>,
+    /// Dynamic Go fmt.Stringer. The callback must prepay its own allocation
+    /// and work before returning a Go string. Scoped formatters additionally
+    /// admit the host before calling it; %T, %p and bad-verb diagnostics do not.
+    pub dynamic_stringer:Option<fn(&Object)->Result<Value>>,
     pub display: Option<Arc<str>>,
     pub go_type: Option<&'static str>,
     pub field_order:Option<Arc<[Arc<str>]>>,
@@ -235,7 +241,7 @@ impl Object {
         self.host_type.and_then(|host|host.methods.iter().find(|method|method.name==name)).map(MethodRef::Static)
     }
     pub(crate) fn validate_lazy(&self)->Result<()>{
-        if self.lazy_fields&&(self.map_view.is_some()||self.json.is_some()||self.json_dynamic.is_some()||self.display.is_some()||self.nil_pointer.is_some()||self.field_charge.is_none()||self.fields.values().any(|value|!matches!(value,Value::Nil))){return Err(crate::TemplateError::Exec("invalid lazy host object".into()));}Ok(())
+        if self.lazy_fields&&(self.map_view.is_some()||self.json.is_some()||self.json_dynamic.is_some()||self.display.is_some()||self.dynamic_stringer.is_some()||self.nil_pointer.is_some()||self.field_charge.is_none()||self.fields.values().any(|value|!matches!(value,Value::Nil))){return Err(crate::TemplateError::Exec("invalid lazy host object".into()));}Ok(())
     }
     pub fn is_nil_pointer(&self)->bool{self.nil_pointer.as_ref().is_some_and(|is_nil|is_nil())}
     pub fn field_value(&self,name:&str)->Result<Option<Value>>{
@@ -255,6 +261,7 @@ impl Object {
 impl Clone for Value {
     fn clone(&self) -> Self {
         match self {
+            Value::Field(reference)=>Value::Field(reference.clone()),
             Value::Nil => Value::Nil,
             Value::NilError=>Value::NilError,
             Value::Bool(b) => Value::Bool(*b),
@@ -288,6 +295,7 @@ impl Clone for Value {
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Value::Field(reference)=>f.debug_tuple("Field").field(&reference.name()).field(&reference.kind()).finish(),
             Value::Nil => write!(f, "Nil"),
             Value::NilError=>write!(f,"NilError"),
             Value::Bool(b) => write!(f, "Bool({b:?})"),
@@ -350,6 +358,7 @@ impl Value {
     /// See the [type-level docs](Value) for the full truthiness table.
     pub fn is_truthy(&self) -> bool {
         match self {
+            Value::Field(_)=>self.resolve_field().is_ok_and(|value|value.is_truthy()),
             Value::Nil|Value::NilError => false,
             Value::Bool(b) => *b,
             Value::Int(n) | Value::Int64(n) | Value::NamedInt64(n,_) => *n != 0,
@@ -498,6 +507,7 @@ impl Value {
     /// Returns a short type name for use in error messages.
     pub fn type_name(&self) -> &'static str {
         match self {
+            Value::Field(reference)=>reference.kind().type_name(),
             Value::Nil => "nil",
             Value::NilError=>"error",
             Value::Bool(_) => "bool",
@@ -581,7 +591,7 @@ impl Value {
             Ok((start as usize, end as usize))
         }
         match self {
-            Value::List(v)=>{let(s,e)=resolve("slice",start,end,v.len())?;Ok(Value::Slice(crate::TypedSlice::from_list(v.clone()).reslice(s,e)?))},
+            Value::List(v)=>{let(s,e)=resolve("slice",start,end,v.len())?;Ok(Value::Slice(crate::TypedSlice::from_list(v.clone())?.reslice(s,e)?))},
             Value::Slice(v)=>{let default_end=end.unwrap_or(v.len()as i64);let(s,e)=resolve("slice",start,Some(default_end),v.cap())?;Ok(Value::Slice(v.reslice(s,e)?))},
             Value::String(_) | Value::ByteString(_) => {
                 let bytes=self.as_go_bytes().ok_or_else(||crate::TemplateError::Exec("expected Go string".into()))?;
@@ -668,6 +678,7 @@ impl Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Value::Field(_)=>self.resolve_field().map_err(|_|fmt::Error)?.fmt(f),
             Value::Nil|Value::NilError => write!(f, "<nil>"),
             Value::Bool(b) => write!(f, "{b}"),
             Value::Int(n) | Value::Int64(n) => write!(f, "{n}"),
@@ -717,6 +728,10 @@ impl fmt::Display for Value {
             Value::Function(_) => write!(f, "<func>"),
             Value::Object(object) => {
                 if object.lazy_fields{return Err(fmt::Error);}
+                if let Some(stringer)=object.dynamic_stringer {
+                    let value=stringer(object).map_err(|_|fmt::Error)?;
+                    return f.write_str(core::str::from_utf8(value.as_go_bytes().ok_or(fmt::Error)?).map_err(|_|fmt::Error)?);
+                }
                 if let Some(display)=&object.display { return write!(f,"{display}"); }
                 if object.is_nil_pointer(){return write!(f,"<nil>");}
                 if let Some(view)=&object.map_view {

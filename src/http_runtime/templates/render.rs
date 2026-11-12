@@ -24,7 +24,7 @@ use gotmpl::{MapContext,MissingKey,Object,Template,TemplateError,Value,ValueFunc
 use http::{HeaderMap,StatusCode,header};
 use std::{collections::BTreeMap,io::Read,path::{Component,Path,PathBuf},sync::{Arc,Mutex,atomic::{AtomicU16,AtomicUsize,Ordering}},time::{Duration,Instant}};
 use tokio_util::sync::CancellationToken;
-pub(super) fn formatting_host_cost(value:&Value)->RenderResult<usize>{Ok(data::header_format_cost(value)?.unwrap_or(0))}
+pub(super) fn formatting_host_cost(value:&Value,control:&Arc<Control>)->RenderResult<usize>{if let Some(cost)=data::field_reference_cost(value,control)?{return Ok(cost);}Ok(data::header_format_cost(value)?.unwrap_or(0))}
 type Fields=BTreeMap<Arc<str>,Value>;
 type RenderResult<T>=gotmpl::Result<T>;
 pub(super) type VirtualInclude=Arc<dyn Fn(&str,Arc<Control>)->RenderResult<Vec<u8>>+Send+Sync>;
@@ -236,7 +236,7 @@ impl Frame {
             "include"=>{
                 arity(args,1,usize::MAX)?;let name=text(args,0)?;let input=self.read(name)?;
                 self.control.charge_bytes(args.len().checked_mul(std::mem::size_of::<Value>()).and_then(|n|n.checked_add(128)).ok_or_else(||error("template arguments overflow"))?)?;
-                let child=Self::new(self.plan.clone(),self.root.clone(),self.request.clone(),self.headers.clone(),self.control.clone(),gotmpl::TypedSlice::from_list(args[1..].to_vec().into()),self.depth+1,self.virtual_include.clone(),Fields::new())?;
+                let child=Self::new(self.plan.clone(),self.root.clone(),self.request.clone(),self.headers.clone(),self.control.clone(),gotmpl::TypedSlice::from_list(args[1..].to_vec().into())?,self.depth+1,self.virtual_include.clone(),Fields::new())?;
                 Ok(Value::from_go_bytes(child.render(name,input)?))
             }
             "import"=>{

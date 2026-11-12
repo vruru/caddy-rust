@@ -184,6 +184,7 @@ impl TypedSlice {
         let elem = go_type
             .strip_prefix("[]")
             .ok_or_else(|| TemplateError::Exec("invalid typed slice".into()))?;
+        if let Some(values)=&data{crate::field_reference::check_storage_fields(values)?;}
         let n = data.as_ref().map_or(0, |d| d.len());
         if let Some(vals) = &data {
             for v in vals.iter() {
@@ -211,6 +212,10 @@ impl TypedSlice {
         Self::bytes(data).with_named_bytes(kind)
     }
 
+    pub(crate) fn byte_parameter_compatible(&self)->bool {
+        (self.go_type=="[]uint8"||self.go_type=="[]byte"||self.named.is_some_and(|kind|kind.element=="uint8"))&&!matches!(self.storage.as_ref(),Some(SliceData::Values(_)))
+    }
+
     /// Change only a byte-slice type descriptor. The actual backing cell,
     /// window/capacity and original budget gate remain shared and unchanged.
     pub fn with_named_bytes(mut self, kind: &'static SliceType) -> Result<Self> {
@@ -224,14 +229,28 @@ impl TypedSlice {
     /// Assign a byte slice to its unnamed Go type without copying its backing.
     /// Offset, length, capacity and the original request budget remain intact.
     pub fn into_plain_bytes(mut self) -> Result<Self> {
-        let byte_type = self.go_type == "[]uint8" || self.go_type == "[]byte"
-            || self.named.is_some_and(|kind| kind.element == "uint8");
-        if !byte_type || matches!(self.storage.as_ref(), Some(SliceData::Values(_))) {
+        if !self.byte_parameter_compatible() {
             return Err(TemplateError::Exec("invalid byte slice assignment".into()));
         }
         self.go_type = "[]uint8";
         self.named = None;
         Ok(self)
+    }
+
+    /// Capacity of a Go1.27 byte append, including noscan allocation-class
+    /// rounding. This calculation allocates no backing and grants no writes;
+    /// the caller must prepay the returned capacity before any allocation.
+    /// Go Authors' runtime/slice.go/msize.go behavior (BSD-3-Clause).
+    pub fn byte_append_capacity(&self, additional:usize)->Result<usize>{
+        if !self.byte_parameter_compatible(){return Err(TemplateError::Exec("expected byte slice".into()));}
+        let length=self.len.checked_add(additional).filter(|n|*n<=isize::MAX as usize).ok_or_else(||TemplateError::Exec("byte append length overflow".into()))?;
+        if length<=self.cap{return Ok(self.cap);}
+        let double=self.cap.checked_mul(2).filter(|n|*n<=isize::MAX as usize);
+        let mut capacity=match double{Some(double)if length>double=>length,Some(double)if self.cap<256=>double,Some(_)=>self.cap,None=>length};
+        if self.cap>=256&&double.is_some()&&length<=double.unwrap(){while capacity<length{capacity=match capacity.checked_add(768).map(|n|n>>2).and_then(|step|capacity.checked_add(step)).filter(|n|*n<=isize::MAX as usize){Some(n)=>n,None=>length};}}
+        const CLASSES:&[usize]=&[0,8,16,24,32,48,64,80,96,112,128,144,160,176,192,208,224,240,256,288,320,352,384,416,448,480,512,576,640,704,768,896,1024,1152,1280,1408,1536,1792,2048,2304,2688,3072,3200,3456,4096,4864,5376,6144,6528,6784,6912,8192,9472,9728,10240,10880,12288,13568,14336,16384,18432,19072,20480,21760,24576,27264,28672,32768];
+        let capacity=if capacity<=32760{CLASSES.iter().copied().find(|size|*size>=capacity).ok_or_else(||TemplateError::Exec("byte size class missing".into()))?}else{capacity.checked_add(8191).map(|n|n&!8191).ok_or_else(||TemplateError::Exec("byte append capacity overflow".into()))?};
+        if capacity>isize::MAX as usize{return Err(TemplateError::Exec("byte append capacity overflow".into()));}Ok(capacity)
     }
 
     /// Full byte backing size, including portions outside this view. Does not
@@ -330,6 +349,7 @@ impl TypedSlice {
         if data.as_ref().is_some_and(|values| values.iter().any(|v| !canonical_elem_ok(v, kind.element))) {
             return Err(TemplateError::Exec("invalid named slice element".into()));
         }
+        if let Some(values)=&data{crate::field_reference::check_storage_fields(values)?;}
         let n = data.as_ref().map_or(0, |values| values.len());
         #[cfg(feature = "std")]
         let storage = data.map(|d| SliceData::Values(Arc::new(Mutex::new(d))));
@@ -362,13 +382,16 @@ impl TypedSlice {
         }).transpose()
     }
 
-    pub fn from_list(data: Arc<[Value]>) -> Self {
+    /// Input backing must already be prepaid. The bounded structural scan rejects
+    /// retained field lvalues; resolve them at an Interface boundary first.
+    pub fn from_list(data: Arc<[Value]>) -> Result<Self> {
+        crate::field_reference::check_storage_fields(&data)?;
         let n = data.len();
         #[cfg(feature = "std")]
         let storage = SliceData::Values(Arc::new(Mutex::new(data)));
         #[cfg(not(feature = "std"))]
         let storage = SliceData::Values(data);
-        TypedSlice {
+        Ok(TypedSlice {
             go_type: "[]interface {}",
             named: None,
             host_budget: None,
@@ -376,7 +399,7 @@ impl TypedSlice {
             start: 0,
             len: n,
             cap: n,
-        }
+        })
     }
 
     pub fn with_len(mut self, n: usize) -> Result<Self> {

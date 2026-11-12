@@ -109,6 +109,7 @@ impl GenericMapCell {
         if depth>32{return Err(error("generic map graph nesting limit exceeded"));}
         self.account.charge_work(1)?;
         match value{
+            Value::Field(_)=>return Err(error("map storage rejects retained field references")),
             Value::GenericMap(map)=>{
                 if std::ptr::eq(self,map.as_ref()){return Err(error("cyclic template map is not supported"));}
                 if !Arc::ptr_eq(&self.graph,&map.graph){return Err(error("mutable template maps belong to different renders"));}

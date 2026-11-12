@@ -145,6 +145,7 @@ impl Context {
             probe: true,
         })
     }
+    pub(super) fn template_original_method(&self)->&Method {&self.original_method}
     pub(super) fn template_content_length(&self)->i64 {
         self.req().extensions().get::<super::request_body::Replacement>().map_or(self.request_content_length,|replacement|replacement.length as i64)
     }
