@@ -38,7 +38,6 @@ pub struct Headers {
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct HeadersFlag(u8);
 
-#[derive(Eq, PartialEq)]
 pub struct PushPromise {
     /// The ID of the stream with which this frame is associated.
     stream_id: StreamId,
@@ -51,6 +50,8 @@ pub struct PushPromise {
 
     /// The associated flags
     flags: PushPromiseFlag,
+    receipt: Option<crate::data_receipt::QueuedDataOwner>,
+    source_owner: Option<crate::data_receipt::SourceDataOwner>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -381,7 +382,22 @@ pub enum PushPromiseHeaderError {
     NotSafeAndCacheable,
 }
 
+impl PartialEq for PushPromise {
+    fn eq(&self, other: &Self) -> bool {
+        self.stream_id == other.stream_id && self.promised_id == other.promised_id
+            && self.header_block == other.header_block && self.flags == other.flags
+    }
+}
+impl Eq for PushPromise {}
 impl PushPromise {
+    pub(crate) fn set_receipt(&mut self, receipt: crate::data_receipt::QueuedDataOwner,
+        source: crate::data_receipt::SourceDataOwner) {
+        self.receipt = Some(receipt); self.source_owner = Some(source);
+    }
+    pub(crate) fn take_receipt(&mut self) -> Option<crate::data_receipt::QueuedDataOwner> {
+        self.receipt.take()
+    }
+
     pub fn new(
         stream_id: StreamId,
         promised_id: StreamId,
@@ -398,6 +414,8 @@ impl PushPromise {
             },
             promised_id,
             stream_id,
+            receipt: None,
+            source_owner: None,
         }
     }
 
@@ -489,6 +507,8 @@ impl PushPromise {
             },
             promised_id,
             stream_id: head.stream_id(),
+            receipt: None,
+            source_owner: None,
         };
         Ok((frame, src))
     }

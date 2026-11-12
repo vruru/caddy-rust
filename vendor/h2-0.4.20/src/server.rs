@@ -1343,6 +1343,18 @@ impl<B: Buf> SendResponse<B> {
             .map_err(Into::into)
     }
 
+    /// Enqueue a push promise with concrete metadata ownership and local
+    /// PUSH_PROMISE/CONTINUATION completion. The receipt observes local output,
+    /// not peer acceptance. Dropping it does not refund a queued frame's credit.
+    pub fn push_request_observed(
+        &mut self, request: Request<()>, credit: bytes::Bytes,
+        deadline: Option<crate::ext::DataWritePolicy>,
+    ) -> Result<(SendPushedResponse<B>, crate::ext::DataWriteReceipt<B>), crate::Error> {
+        self.inner.send_push_promise_observed(request, credit, deadline)
+            .map(|(inner, receipt)| (SendPushedResponse { inner: SendResponse { inner } }, receipt))
+            .map_err(Into::into)
+    }
+
     /// Send a stream reset to the peer.
     ///
     /// This essentially cancels the stream, including any inbound or outbound
@@ -1413,6 +1425,15 @@ impl<B: Buf> SendPushedResponse<B> {
         end_of_stream: bool,
     ) -> Result<SendStream<B>, crate::Error> {
         self.inner.send_response(response, end_of_stream)
+    }
+
+    /// Observed response HEADERS on this promised stream; the normal per-stream
+    /// DATA/flush ownership API is then available on the returned send stream.
+    pub fn send_response_observed_with_policy(
+        &mut self, response: Response<()>, end_of_stream: bool,
+        credit: Option<bytes::Bytes>, deadline: Option<crate::ext::DataWritePolicy>,
+    ) -> Result<(SendStream<B>, crate::ext::DataWriteReceipt<B>), crate::Error> {
+        self.inner.send_response_observed_with_policy(response, end_of_stream, credit, deadline)
     }
 
     /// Send a stream reset to the peer.

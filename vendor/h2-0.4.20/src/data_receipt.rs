@@ -314,6 +314,7 @@ pub struct DataWriteSnapshot {
 /// refund retained DATA until the connection driver drains actual owners.
 pub struct DataWriteReceipt<B: Buf> {
     sender: StreamRef<B>,
+    cancel_on_drop: bool,
     state: Option<Arc<State>>,
     relay: Arc<Relay>,
 }
@@ -355,6 +356,7 @@ impl<B: Buf> DataWriteReceipt<B> {
         Some((
             Self {
                 sender,
+                cancel_on_drop: true,
                 state: Some(state.clone()),
                 relay,
             },
@@ -364,6 +366,13 @@ impl<B: Buf> DataWriteReceipt<B> {
             },
             SourceDataOwner { state },
         ))
+    }
+    // A PUSH_PROMISE is written on its parent but cancellation belongs to the
+    // promised child. No parent reset is allowed during failed reservation.
+    pub(crate) fn defer_cancellation(&mut self) { self.cancel_on_drop = false; }
+    pub(crate) fn bind_cancellation(&mut self, sender: StreamRef<B>) {
+        self.sender = sender;
+        self.cancel_on_drop = true;
     }
     /// Returns the currently known physical progress without waiting.
     pub fn snapshot(&self) -> DataWriteSnapshot {
@@ -389,7 +398,7 @@ impl<B: Buf> Drop for DataWriteReceipt<B> {
     fn drop(&mut self) {
         let state = self.state.take().expect("live receipt");
         let queue = state.queue.clone();
-        if !state.snapshot().wire_complete {
+        if self.cancel_on_drop && !state.snapshot().wire_complete {
             self.sender.send_reset(crate::Reason::CANCEL);
         }
         drop(state); // real last Arc can enqueue its retained bundle here

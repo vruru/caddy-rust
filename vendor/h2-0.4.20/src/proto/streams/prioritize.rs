@@ -916,6 +916,8 @@ impl Prioritize {
                 }
             } else if let Frame::Headers(frame) = &mut frame {
                 frame.take_receipt().map(|owner| owner.last(0))
+            } else if let Frame::PushPromise(frame) = &mut frame {
+                frame.take_receipt().map(|owner| owner.last(0))
             } else {
                 None
             };

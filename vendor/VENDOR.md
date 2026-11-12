@@ -153,6 +153,16 @@ conflicting Content-Length fields, and truncated ordinary GET responses still
 fail their own stream without resetting a valid parent response. This client
 correctness fix does not by itself implement the native HTTP/2 push handler.
 
+The opt-in h2 promise-observation API retains concrete caller metadata through
+PUSH_PROMISE/CONTINUATION encoding and actual local flush. Its cancellation
+target is the promised child, although the promise frame belongs to its parent.
+A failed reservation does not reset the parent. Request validation precedes
+child-table allocation, so rejected methods do not leave unreachable reserved
+streams. The existing bounded retirement table retains its first allocation
+credit until the real connection owner retires. These are transport building
+blocks; the native route-level push handler remains a separate implementation
+and acceptance gate.
+
 ## Explicit outgoing SSL transport
 
 `native-ssl-tls` is first-party Apache-2.0 functional source. It uses the complete

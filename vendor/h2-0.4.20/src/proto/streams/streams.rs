@@ -1505,7 +1505,36 @@ impl<B> StreamRef<B> {
 
     pub fn send_push_promise(
         &mut self,
+        request: Request<()>,
+    ) -> Result<StreamRef<B>, UserError> {
+        self.send_push_promise_with_receipt(request, None)
+    }
+    pub fn send_push_promise_observed(
+        &mut self,
+        request: Request<()>,
+        credit: bytes::Bytes,
+        deadline: Option<crate::ext::DataWritePolicy>,
+    ) -> Result<(StreamRef<B>, crate::ext::DataWriteReceipt<B>), UserError>
+    where B: Buf,
+    {
+        let queue = self.send_buffer.data_receipts
+            .get_or_init(|| crate::data_receipt::DeferredData::new(Some(credit.clone()))).clone();
+        let (mut receipt, owner, source) = crate::ext::DataWriteReceipt::new(
+            self.clone(), bytes::Bytes::new(), Some(credit), queue.clone(), deadline,
+        ).ok_or(UserError::Rejected)?;
+        receipt.defer_cancellation();
+        let result = self.send_push_promise_with_receipt(request, Some((owner, source)));
+        // No stream/send-buffer lock is held while foreign source owners retire.
+        queue.drain();
+        result.map(|stream| {
+            receipt.bind_cancellation(stream.clone());
+            (stream, receipt)
+        })
+    }
+    fn send_push_promise_with_receipt(
+        &mut self,
         mut request: Request<()>,
+        receipt: Option<(crate::data_receipt::QueuedDataOwner, crate::data_receipt::SourceDataOwner)>,
     ) -> Result<StreamRef<B>, UserError> {
         // Clear before taking lock, incase extensions contain a StreamRef.
         request.extensions_mut().clear();
@@ -1517,6 +1546,11 @@ impl<B> StreamRef<B> {
 
         let actions = &mut me.actions;
         let promised_id = actions.send.reserve_local()?;
+        // Validate the request before allocating a child stream. A malformed
+        // target must not leave an unreachable reserved stream in the table.
+        let parent_id = me.store.resolve(self.opaque.key).id;
+        let mut frame = crate::server::Peer::convert_push_message(parent_id, promised_id, request)?;
+        if let Some((owner, source)) = receipt { frame.set_receipt(owner, source); }
 
         let child_key = {
             let mut child_stream = me.store.insert(
@@ -1534,8 +1568,6 @@ impl<B> StreamRef<B> {
 
         let pushed = {
             let mut stream = me.store.resolve(self.opaque.key);
-
-            let frame = crate::server::Peer::convert_push_message(stream.id, promised_id, request)?;
 
             actions
                 .send
