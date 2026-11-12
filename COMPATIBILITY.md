@@ -677,8 +677,8 @@ Rust library callers gain `AcmeIssuerConfig::account_key` with type
 field. This is a Rust source interface extension, not a cross-language plugin
 ABI. Signing-key/control input residency is distinct from certificate-chain
 payload pools; this feature does not claim a whole-process heap or RSS bound.
-`test_ca`, the independent ZeroSSL API issuer, DNS solver/resolver/ECH options,
-and client-auth HTTP CA providers remain explicitly unfinished.
+`test_ca`, the independent ZeroSSL API issuer and DNS solver/resolver/ECH
+options remain explicitly unfinished. HTTP CA sources are described below.
 
 Controlled HTTP/2 informational output
 ------------------------------------
@@ -740,7 +740,7 @@ explicit limits. Actual input and transformation scratch retain their shared
 credits until the real worker releases them. Prepared trust output then enters
 the existing configuration ownership boundary; this is not a whole-process RSS
 bound. System-root scanning propagates resource exhaustion instead of silently
-skipping a valid root. HTTP CA providers remain separate integration work.
+skipping a valid root. HTTP providers are described below.
 
 
 Reverse-proxy TLS trust-provider consumers
@@ -755,9 +755,8 @@ Active upstream health checks use that prepared transport; handshakes perform no
 CA-provider I/O. An explicitly empty pool trusts no roots, and cannot silently
 fall back to system trust or a previous generation. Conflicting legacy root-CA
 fields are rejected before publication. A failed candidate retains the working
-configuration. Unknown/unprepared providers still fail explicitly. HTTP CA
-sources, TLS renegotiation and remaining issuer/PKIX behavior remain separate
-work; this addition does not claim complete TLS compatibility.
+configuration. Unknown/unprepared providers still fail explicitly. TLS renegotiation and
+remaining issuer/PKIX behavior remain separate work; this addition does not claim complete TLS compatibility.
 
 
 Mutable template request URL views
@@ -863,3 +862,36 @@ last-result/Tree lifetime remain in force. Static layouts do not establish a
 whole-engine heap cap or cover arbitrary opaque Rust captures. Host values
 without their real reflection/GoStringer representation remain explicit gaps
 rather than being replaced with a Stringer fallback for unsupported reflection.
+
+
+Configuration-time HTTP CA sources
+----------------------------------
+
+HTTP CA modules now perform configuration-time HTTP(S) GETs for both server
+client authentication and the typed upstream CA consumers above. Successful
+2xx PEM bodies ignore non-certificate blocks; gzip, URL Basic authentication,
+HTTP proxy environment settings and bounded redirects are supported. Relative
+URL references preserve configured userinfo, while absolute redirects without
+userinfo do not inherit those URL credentials, including across ports on the
+same host. Explicit HTTP endpoints are allowed; HTTPS redirects cannot downgrade
+to HTTP. HTTPS fetch trust can itself use the supported CA modules, including
+nested HTTP, PKI and storage sources. Custom server names and handshake deadlines
+apply only to origin TLS, preserving the dial/CONNECT target, HTTP Host and an
+HTTPS proxy's own TLS name. This retains correct Native behavior where the
+pinned Go implementation drops the configured server name and does not wire
+its handshake timeout.
+
+Four HTTP CA network slots and existing external byte credits are shared across
+generations. Each body reserves input credit before network allocation and
+output credit before conversion; general certificate scratch is borrowed only
+inside bounded CPU decoding, never across network waits. Limits include 4 MiB
+raw and inflated bodies, 16 MiB each of aggregate raw/decoded/DER data, 4096
+certificates, 256 endpoints/logical GETs, depth eight, ten requests per redirect
+chain, a 30-second fetch deadline and a 120-second preparation deadline.
+Independent endpoints progress concurrently and preserve configured order.
+Failure or cancellation cancels and drains started sibling work through the
+owned service task before returning. A failed candidate keeps the old site;
+handshakes and health probes use the published pool without source I/O.
+Persistent prepared trust retains its existing output accounting boundary;
+these temporary credits are not a whole-process/RSS limit. Rustls TLS
+renegotiation `once` and `freely` remain explicitly unsupported.

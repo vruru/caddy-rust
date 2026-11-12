@@ -167,6 +167,10 @@ struct Config {
     certs_verification: bool,
     #[cfg(feature = "__tls")]
     tls_sni: bool,
+    #[cfg(feature = "__rustls")]
+    tls_server_name_override: Option<String>,
+    #[cfg(feature = "__rustls")]
+    tls_handshake_timeout: Option<Duration>,
     connect_timeout: Option<Duration>,
     connection_verbose: bool,
     pool_idle_timeout: Option<Duration>,
@@ -296,6 +300,10 @@ impl ClientBuilder {
                 certs_verification: true,
                 #[cfg(feature = "__tls")]
                 tls_sni: true,
+                #[cfg(feature = "__rustls")]
+                tls_server_name_override: None,
+                #[cfg(feature = "__rustls")]
+                tls_handshake_timeout: None,
                 connect_timeout: None,
                 connection_verbose: false,
                 pool_idle_timeout: Some(Duration::from_secs(90)),
@@ -914,6 +922,11 @@ impl ClientBuilder {
             )
         };
 
+        #[cfg(feature="__rustls")]
+        connector_builder.set_origin_tls_options(
+            config.tls_server_name_override.map(rustls_pki_types::ServerName::try_from).transpose().map_err(crate::error::builder)?,
+            config.tls_handshake_timeout,
+        ).map_err(crate::error::builder)?;
         connector_builder.set_timeout(config.connect_timeout);
         connector_builder.set_verbose(config.connection_verbose);
         connector_builder.set_keepalive(config.tcp_keepalive);
@@ -2024,6 +2037,19 @@ impl ClientBuilder {
         self
     }
 
+    /// Override origin SNI and certificate-name verification without changing
+    /// the request URL, Host, proxy CONNECT destination, or proxy TLS name.
+    /// Native Caddy CA-loader extension; unset preserves upstream behavior.
+    #[cfg(feature="__rustls")]
+    pub fn tls_server_name_override(mut self,name:impl Into<String>)->ClientBuilder {
+        self.config.tls_server_name_override=Some(name.into());self
+    }
+    /// Bound the origin TLS handshake after the underlying stream connects.
+    /// Dial/proxy setup and complete-response deadlines remain independent.
+    #[cfg(feature="__rustls")]
+    pub fn tls_handshake_timeout(mut self,timeout:Duration)->ClientBuilder {
+        self.config.tls_handshake_timeout=Some(timeout);self
+    }
     /// Controls the use of TLS server name indication.
     ///
     /// Defaults to `true`.
@@ -2891,6 +2917,8 @@ impl Config {
             }
 
             f.field("tls_sni", &self.tls_sni);
+            #[cfg(feature="__rustls")]
+            {f.field("tls_server_name_override",&self.tls_server_name_override.is_some());f.field("tls_handshake_timeout",&self.tls_handshake_timeout);}
 
             f.field("tls_info", &self.tls_info);
         }

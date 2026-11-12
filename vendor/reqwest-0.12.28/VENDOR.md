@@ -12,5 +12,14 @@ authoritative for scheme and authority; replacing the path does not change
 proxy selection, the network destination, TLS verification, or timeout
 behavior. CONNECT is rejected before dialing. Ordinary requests keep the original implementation and semantics.
 
-Only `src/async_impl/client.rs` and `src/redirect.rs` differ from the
-distribution's runtime source.
+The asynchronous `ClientBuilder` also has opt-in Rustls methods
+`tls_server_name_override` and `tls_handshake_timeout`. These configure only
+origin SNI/name verification and the origin TLS handshake deadline. The URL,
+HTTP Host, dial target, HTTP proxy CONNECT target and HTTPS proxy's own TLS name
+remain unchanged. They apply to direct TCP/Unix, CONNECT and SOCKS connections;
+an unset override retains the upstream connector path. Selecting another TLS
+backend with origin overrides returns a builder error rather than ignoring them.
+Dial, proxy setup and whole-request deadlines remain independent.
+
+Only `src/async_impl/client.rs`, `src/connect.rs` and `src/redirect.rs` differ from
+the distribution's runtime source.

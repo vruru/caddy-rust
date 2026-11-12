@@ -394,6 +394,8 @@ where {
                 http,
                 tls,
                 tls_proxy,
+                origin_server_name: None,
+                origin_handshake_timeout: None,
             },
             proxies,
             verbose: verbose::OFF,
@@ -410,6 +412,16 @@ where {
         }
     }
 
+    #[cfg(feature="__rustls")]
+    #[allow(unreachable_patterns)]
+    pub(crate) fn set_origin_tls_options(&mut self,name:Option<rustls_pki_types::ServerName<'static>>,timeout:Option<Duration>)->Result<(),BoxError>{
+        let requested=name.is_some()||timeout.is_some();
+        match &mut self.inner {
+            Inner::RustlsTls{origin_server_name,origin_handshake_timeout,..}=>{*origin_server_name=name;*origin_handshake_timeout=timeout;Ok(())},
+            _ if !requested=>Ok(()),
+            _=>Err("origin TLS overrides require the Rustls backend".into()),
+        }
+    }
     pub(crate) fn set_timeout(&mut self, timeout: Option<Duration>) {
         self.timeout = timeout;
     }
@@ -505,6 +517,16 @@ pub(crate) struct ConnectorService {
     windows_named_pipe: Option<Arc<std::ffi::OsStr>>,
 }
 
+#[cfg(feature="__rustls")]
+fn origin_name(name:&Option<rustls_pki_types::ServerName<'static>>,host:&str)->Result<rustls_pki_types::ServerName<'static>,BoxError>{
+    match name{Some(value)=>Ok(value.clone()),None=>rustls_pki_types::ServerName::try_from(host.to_owned()).map_err(|_|"Invalid Server Name".into())}
+}
+#[cfg(feature="__rustls")]
+async fn origin_handshake<T,F>(deadline:Option<Duration>,future:F)->Result<T,BoxError>
+where F:std::future::Future<Output=std::io::Result<T>> {
+    match deadline{Some(deadline)=>Ok(tokio::time::timeout(deadline,future).await.map_err(|_|std::io::Error::new(std::io::ErrorKind::TimedOut,"origin TLS handshake timed out"))??),None=>Ok(future.await?)}
+}
+
 #[derive(Clone)]
 enum Inner {
     #[cfg(not(feature = "__tls"))]
@@ -516,6 +538,8 @@ enum Inner {
         http: HttpConnector,
         tls: Arc<rustls::ClientConfig>,
         tls_proxy: Arc<rustls::ClientConfig>,
+        origin_server_name: Option<rustls_pki_types::ServerName<'static>>,
+        origin_handshake_timeout: Option<Duration>,
     },
 }
 
@@ -563,7 +587,7 @@ impl ConnectorService {
                 }
             }
             #[cfg(feature = "__rustls")]
-            Inner::RustlsTls { http, tls, .. } => {
+            Inner::RustlsTls { http, tls, origin_server_name, origin_handshake_timeout, .. } => {
                 if dst.scheme() == Some(&Scheme::HTTPS) {
                     use std::convert::TryFrom;
                     use tokio_rustls::TlsConnector as RustlsConnector;
@@ -573,12 +597,8 @@ impl ConnectorService {
                     let conn = socks::connect(proxy, dst, dns, &self.resolver, http).await?;
                     let conn = TokioIo::new(conn);
                     let conn = TokioIo::new(conn);
-                    let server_name =
-                        rustls_pki_types::ServerName::try_from(host.as_str().to_owned())
-                            .map_err(|_| "Invalid Server Name")?;
-                    let io = RustlsConnector::from(tls)
-                        .connect(server_name, conn)
-                        .await?;
+                    let server_name = origin_name(origin_server_name, &host)?;
+                    let io = origin_handshake(*origin_handshake_timeout,RustlsConnector::from(tls).connect(server_name,conn)).await?;
                     let io = TokioIo::new(io);
                     return Ok(Conn {
                         inner: self.verbose.wrap(RustlsTlsConn { inner: io }),
@@ -661,7 +681,7 @@ impl ConnectorService {
                 }
             }
             #[cfg(feature = "__rustls")]
-            Inner::RustlsTls { http, tls, .. } => {
+            Inner::RustlsTls { http, tls, origin_server_name, origin_handshake_timeout, .. } => {
                 let mut http = http.clone();
 
                 // Disable Nagle's algorithm for TLS handshake
@@ -671,6 +691,15 @@ impl ConnectorService {
                     http.set_nodelay(true);
                 }
 
+                if dst.scheme()==Some(&Scheme::HTTPS)&&(origin_server_name.is_some()||origin_handshake_timeout.is_some()){
+                    let host=dst.host().ok_or("no host in url")?.to_owned();
+                    let io=http.call(dst).await?;
+                    let name=origin_name(&origin_server_name,&host)?;
+                    let io=origin_handshake(origin_handshake_timeout,tokio_rustls::TlsConnector::from(tls.clone()).connect(name,TokioIo::new(io))).await?;
+                    let stream=TokioIo::new(io);
+                    if !self.nodelay{let(io,_)=stream.inner().get_ref();io.inner().inner().set_nodelay(false)?;}
+                    return Ok(Conn{inner:self.verbose.wrap(RustlsTlsConn{inner:stream}),is_proxy,tls_info:self.tls_info});
+                }
                 let mut http = hyper_rustls::HttpsConnector::from((http, tls.clone()));
                 let io = http.call(dst).await?;
 
@@ -759,7 +788,13 @@ impl ConnectorService {
                 }
             }
             #[cfg(feature = "__rustls")]
-            Inner::RustlsTls { tls, .. } => {
+            Inner::RustlsTls { tls, origin_server_name, origin_handshake_timeout, .. } => {
+                if dst.scheme()==Some(&Scheme::HTTPS)&&(origin_server_name.is_some()||origin_handshake_timeout.is_some()){
+                    let host=dst.host().ok_or("no host in url")?.to_owned();let mut svc=svc;
+                    let io=svc.call(dst).await?;let name=origin_name(&origin_server_name,&host)?;
+                    let io=origin_handshake(origin_handshake_timeout,tokio_rustls::TlsConnector::from(tls.clone()).connect(name,TokioIo::new(io))).await?;
+                    return Ok(Conn{inner:self.verbose.wrap(RustlsTlsConn{inner:TokioIo::new(io)}),is_proxy,tls_info:self.tls_info});
+                }
                 let mut http = hyper_rustls::HttpsConnector::from((svc, tls.clone()));
                 let io = http.call(dst).await?;
 
@@ -842,6 +877,8 @@ impl ConnectorService {
                 http,
                 tls,
                 tls_proxy,
+                origin_server_name,
+                origin_handshake_timeout,
             } => {
                 if dst.scheme() == Some(&Scheme::HTTPS) {
                     use rustls_pki_types::ServerName;
@@ -869,11 +906,8 @@ impl ConnectorService {
                     // and we know this is definitely HTTPS.
                     let tunneled = tunnel.call(dst.clone()).await?;
                     let host = dst.host().ok_or("no host in url")?.to_string();
-                    let server_name = ServerName::try_from(host.as_str().to_owned())
-                        .map_err(|_| "Invalid Server Name")?;
-                    let io = RustlsConnector::from(tls.clone())
-                        .connect(server_name, TokioIo::new(tunneled))
-                        .await?;
+                    let server_name=origin_name(origin_server_name,&host)?;
+                    let io=origin_handshake(*origin_handshake_timeout,RustlsConnector::from(tls.clone()).connect(server_name,TokioIo::new(tunneled))).await?;
 
                     return Ok(Conn {
                         inner: self.verbose.wrap(RustlsTlsConn {

@@ -220,7 +220,8 @@ fn provider_roots(raw:&serde_json::Value,depth:usize,budget:&mut u64,count:&mut 
     }
     Ok(())
 }
-fn provision(tls: &ProxyTls, enable_http2: bool) -> Result<ClientConfig> {
+fn provision(tls:&ProxyTls,enable_http2:bool)->Result<ClientConfig>{provision_inner(tls,enable_http2,false)}
+fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool) -> Result<ClientConfig> {
     ensure!(
         tls.client_certificate_file.is_some() == tls.client_certificate_key_file.is_some(),
         "client_certificate_file and client_certificate_key_file must be set together"
@@ -271,7 +272,7 @@ fn provision(tls: &ProxyTls, enable_http2: bool) -> Result<ClientConfig> {
         }
     }
     ensure!(
-        tls.ca.is_some() || tls.insecure_skip_verify || !roots.is_empty(),
+        allow_empty_default || tls.ca.is_some() || tls.insecure_skip_verify || !roots.is_empty(),
         "upstream trust roots unavailable"
     );
     let provider = crate::crypto::provider();
@@ -468,4 +469,11 @@ impl Service<Uri> for FixedDialConnector {
             }
         })
     }
+}
+
+/// Real configuration-time HTTP CA-fetch trust uses the same prepared client
+/// TLS policy as proxy traffic, with no client identity or per-port exception.
+pub(crate) fn ca_source_client_tls(ca:Option<serde_json::Value>,insecure:bool)->Result<ClientConfig>{
+    let options=ProxyTls{ca,except_ports:Vec::new(),server_name:None,insecure_skip_verify:insecure,root_ca_pem_files:Vec::new(),root_ca_pool:Vec::new(),client_certificate_file:None,client_certificate_key_file:None,handshake_timeout:None};
+    provision_inner(&options,true,true)
 }

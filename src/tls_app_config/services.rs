@@ -37,6 +37,8 @@ mod ca_pools;
 mod ca_consumers;
 #[path = "services/storage_pools.rs"]
 mod storage_pools;
+#[path = "services/http_pools.rs"]
+mod http_pools;
 #[path = "services/capacity.rs"]
 mod capacity;
 #[path = "services/group.rs"]

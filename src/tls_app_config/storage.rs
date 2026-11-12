@@ -44,6 +44,9 @@ pub struct CertificateResources {
     pub(super) revoked: Notify,
     /// Bytes reserved before receiving/parsing manager material, shared across reloads.
     pub(super) external_bytes: Arc<Semaphore>,
+    /// HTTP CA preparation network admission, shared across all generations.
+    #[cfg(feature = "native-run")]
+    pub(super) ca_fetch: Arc<Semaphore>,
 }
 impl CertificateResources {
     pub fn new() -> Result<Self> {
@@ -71,6 +74,8 @@ impl CertificateResources {
             io: Arc::new(Semaphore::new(8)),
             revoked: Notify::new(),
             external_bytes: Arc::new(Semaphore::new(256 * 1024 * 1024)),
+            #[cfg(feature = "native-run")]
+            ca_fetch: Arc::new(Semaphore::new(4)),
         })
     }
     pub(super) async fn store(

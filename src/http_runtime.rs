@@ -157,6 +157,7 @@ pub(crate) mod timeout_io;
 mod trailer_policy;
 #[path = "http_runtime/upstream_tls.rs"]
 mod upstream_tls;
+pub(crate) use upstream_tls::ca_source_client_tls;
 pub(crate) mod metrics_client;
 pub use upstream_tls::NativeTrustDiagnostics;
 

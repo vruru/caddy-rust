@@ -79,7 +79,7 @@ where
     Ok(())
 }
 
-pub(super) fn each(
+pub(super) fn each_root(
     config: &PreparedConfig,
     f: &mut impl FnMut(&Value) -> Result<()>,
 ) -> Result<()> {
@@ -163,7 +163,7 @@ where
     Ok(())
 }
 
-pub(super) fn each_mut(
+pub(super) fn each_root_mut(
     config: &mut PreparedConfig,
     f: &mut impl FnMut(&mut Value) -> Result<()>,
 ) -> Result<()> {
@@ -172,4 +172,71 @@ pub(super) fn each_mut(
         visit_server_mut(server, f)?;
     }
     Ok(())
+}
+
+fn module_children(
+    value: &Value,
+    depth: usize,
+    f: &mut impl FnMut(&Value) -> Result<()>,
+) -> Result<()> {
+    anyhow::ensure!(depth < 8, "CA module nesting too deep");
+    match value.get("provider").and_then(Value::as_str) {
+        Some("combined") => {
+            if let Some(sources) = value.get("sources").and_then(Value::as_array) {
+                for source in sources {
+                    module_children(source, depth + 1, f)?;
+                }
+            }
+        }
+        Some("http") => {
+            if let Some(ca) = value.get("tls").and_then(|v| v.get("ca")) {
+                f(ca)?;
+                module_children(ca, depth + 1, f)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+fn module_children_mut(
+    value: &mut Value,
+    depth: usize,
+    f: &mut impl FnMut(&mut Value) -> Result<()>,
+) -> Result<()> {
+    anyhow::ensure!(depth < 8, "CA module nesting too deep");
+    match value.get("provider").and_then(Value::as_str) {
+        Some("combined") => {
+            if let Some(sources) = value.get_mut("sources").and_then(Value::as_array_mut) {
+                for source in sources {
+                    module_children_mut(source, depth + 1, f)?;
+                }
+            }
+        }
+        Some("http") => {
+            if let Some(ca) = value.get_mut("tls").and_then(|v| v.get_mut("ca")) {
+                f(ca)?;
+                module_children_mut(ca, depth + 1, f)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+pub(super) fn each(
+    config: &PreparedConfig,
+    f: &mut impl FnMut(&Value) -> Result<()>,
+) -> Result<()> {
+    each_root(config, &mut |value| {
+        f(value)?;
+        module_children(value, 0, f)
+    })
+}
+pub(super) fn each_mut(
+    config: &mut PreparedConfig,
+    f: &mut impl FnMut(&mut Value) -> Result<()>,
+) -> Result<()> {
+    each_root_mut(config, &mut |value| {
+        f(value)?;
+        module_children_mut(value, 0, f)
+    })
 }

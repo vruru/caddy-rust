@@ -125,7 +125,7 @@ fn at<'a>(mut value: &'a mut Value, path: &[usize]) -> Result<&'a mut Value> {
 }
 impl CertificateServices {
     #[cfg(feature = "native-run")]
-    pub(crate) async fn prepare_client_pools(
+    pub(super) async fn prepare_storage_pools(
         self: &Arc<Self>,
         config: crate::http_config::PreparedConfig,
         cancel: CancellationToken,
