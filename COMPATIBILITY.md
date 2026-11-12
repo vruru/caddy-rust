@@ -913,3 +913,14 @@ component constructor supports relative and empty rewrite paths without widening
 the normal wire request-target parser. Other rewrite modifiers and fragment
 projection are separate compatibility work; controlled CONNECT body/upgrade
 acceptance is not established by these URL changes.
+
+Reverse-proxy HTTP transport `tls.curves` now selects real outgoing key exchange
+groups through the same mapping as incoming TLS policies: X25519, P-256,
+P-384, P-521 and X25519MLKEM768. It applies to every typed proxy consumer and
+active health checks, including Caddyfile `tls_curves`. Native preserves the
+configured first-occurrence order and removes duplicates; the pinned Go TLS
+implementation instead reorders its allowed set by its own preferences. This
+Native ordering enhancement is retained. Empty/null fields retain the current
+provider defaults. Invalid groups or invalid field types reject the candidate
+and keep the old working site. The outgoing default group profile remains a
+separate compatibility item; this stage covers explicit curve configuration.

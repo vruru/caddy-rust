@@ -55,14 +55,7 @@ impl ConnectionPolicy {
         {
             let mut selected = Vec::new();
             for name in names {
-                let group: &'static dyn rustls::crypto::SupportedKxGroup = match name.as_str() {
-                    "x25519" => rustls::crypto::ring::kx_group::X25519,
-                    "secp256r1" => rustls::crypto::ring::kx_group::SECP256R1,
-                    "secp384r1" => rustls::crypto::ring::kx_group::SECP384R1,
-                    "x25519mlkem768" => rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
-                    "secp521r1" => &Secp521r1,
-                    _ => anyhow::bail!("unsupported TLS key exchange group"),
-                };
+                let group = key_exchange_group(name)?;
                 if !selected.iter().any(
                     |existing: &&'static dyn rustls::crypto::SupportedKxGroup| {
                         existing.name() == group.name()
@@ -207,4 +200,16 @@ impl ActiveKeyExchange for Secp521r1Exchange {
     fn pub_key(&self) -> &[u8] {
         self.public.as_ref()
     }
+}
+
+/// Shared group mapping; callers preserve configured order and deduplicate.
+pub(crate) fn key_exchange_group(name: &str) -> Result<&'static dyn SupportedKxGroup> {
+    Ok(match name {
+        "x25519" => rustls::crypto::ring::kx_group::X25519,
+        "secp256r1" => rustls::crypto::ring::kx_group::SECP256R1,
+        "secp384r1" => rustls::crypto::ring::kx_group::SECP384R1,
+        "x25519mlkem768" => rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+        "secp521r1" => &Secp521r1,
+        _ => anyhow::bail!("unsupported TLS key exchange group"),
+    })
 }

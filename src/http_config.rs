@@ -1826,6 +1826,7 @@ fn parse_proxy(
                     t,
                     &[
                         "server_name",
+                        "curves",
                         "insecure_skip_verify",
                         "root_ca_pem_files",
                         "root_ca_pool",
@@ -1846,6 +1847,7 @@ fn parse_proxy(
                 }
                 tls = Some(ProxyTls {
                     ca,
+                    curves: t.get("curves").filter(|v|!v.is_null()).map(|v|strings(v,path)).transpose()?.unwrap_or_default(),
                     except_ports: t
                         .get("except_ports")
                         .map(|v| strings(v, path))

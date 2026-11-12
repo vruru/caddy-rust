@@ -4,6 +4,7 @@ mod client_auth;
 pub(crate) use client_auth::{source_certificates,source_inline};
 mod client_paths;
 mod provision;
+pub(crate) use provision::key_exchange_group;
 
 use std::collections::BTreeMap;
 use std::fmt;
