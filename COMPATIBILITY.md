@@ -719,7 +719,8 @@ scratch uses the existing shared pool and is released by the actual CPU
 worker. Persistent prepared configuration/trust outputs retain their existing
 control/output ownership boundary; this is not a whole-process heap bound.
 A failed reload keeps the previous working TLS configuration. This entry
-covers server client-authentication pools; HTTP CA providers remain a separate gap; upstream consumers are described below.
+covers server client-authentication pools; upstream consumers and HTTP CA
+providers are described below.
 
 
 Server client-authentication storage CA sources
