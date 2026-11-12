@@ -96,6 +96,12 @@ fn failed(category: &'static str) -> AdminError {
 /// Keep the public category stable while recording the bounded internal cause.
 /// Storage errors omit payloads/paths; do not discard their diagnostic chain.
 fn storage_preparation_failed(logging:&Logging,error:&anyhow::Error)->AdminError {
+    certificate_preparation_failed(logging,error,"certificate storage preparation failed","certificate_storage_preparation_failed")
+}
+fn client_pool_preparation_failed(logging:&Logging,error:&anyhow::Error)->AdminError {
+    certificate_preparation_failed(logging,error,"client trust pool preparation failed","client_trust_pool_preparation_failed")
+}
+fn certificate_preparation_failed(logging:&Logging,error:&anyhow::Error,message:&str,category:&'static str)->AdminError {
     struct Limited(String);
     impl std::fmt::Write for Limited {
         fn write_str(&mut self,text:&str)->std::fmt::Result {
@@ -107,11 +113,11 @@ fn storage_preparation_failed(logging:&Logging,error:&anyhow::Error)->AdminError
     }
     let mut cause=Limited(String::with_capacity(4096));
     let _=std::fmt::write(&mut cause,format_args!("{error:#}"));
-    if let Ok(mut event)=Event::new(Origin::Module{module_id:"tls".into()},"tls",Level::Error,"certificate storage preparation failed") {
+    if let Ok(mut event)=Event::new(Origin::Module{module_id:"tls".into()},"tls",Level::Error,message) {
         event.fields.push(Field::new("error",FieldValue::String(cause.0)));
         let _=logging.try_emit(event);
     }
-    failed("certificate_storage_preparation_failed")
+    failed(category)
 }
 fn stopping() -> AdminError {
     AdminError::new(503, "backend_stopping")
@@ -174,7 +180,7 @@ impl NativeBackend {
         if root.phase.load(Ordering::Acquire) != RUNNING {
             return Err(stopping());
         }
-        let prepared = root.offload(move || prepare(raw)).await?;
+        let mut prepared = root.offload(move || prepare(raw)).await?;
         let raw_events = prepared.events;
         let registry = root.events_registry.clone();
         let events = root.offload(move || crate::events::EventsApp::prepare(&raw_events, &registry, Default::default()).map_err(|_| failed("invalid_events_application"))).await?;
@@ -216,6 +222,8 @@ impl NativeBackend {
             events.set_logging(logging.clone());
             services.prepare(root.candidates.child_token()).await
                 .map_err(|error|storage_preparation_failed(&logging,&error))?;
+            prepared.http=services.prepare_client_pools(prepared.http,root.candidates.child_token()).await
+                .map_err(|error|client_pool_preparation_failed(&logging,&error))?;
             drop(logging);
             let manual = services
                 .manual_certificates()
@@ -390,6 +398,8 @@ impl Root {
             events.set_logging(logging.clone());
             services.prepare(self.candidates.child_token()).await
                 .map_err(|error|storage_preparation_failed(&logging,&error))?;
+            prepared.http=services.prepare_client_pools(prepared.http,self.candidates.child_token()).await
+                .map_err(|error|client_pool_preparation_failed(&logging,&error))?;
             // Manual loading is Provision-time; configured subscriptions become
             // active only when the app starts, before business acquisition.
             events.start().map_err(|_| failed("events_start_failed"))?;

@@ -678,7 +678,7 @@ field. This is a Rust source interface extension, not a cross-language plugin
 ABI. Signing-key/control input residency is distinct from certificate-chain
 payload pools; this feature does not claim a whole-process heap or RSS bound.
 `test_ca`, the independent ZeroSSL API issuer, DNS solver/resolver/ECH options,
-and client-auth PKI/storage/HTTP CA providers remain explicitly unfinished.
+and client-auth storage/HTTP CA providers remain explicitly unfinished.
 
 Controlled HTTP/2 informational output
 ------------------------------------
@@ -698,3 +698,26 @@ Replacing route clauses between acknowledged boundaries requires the same pool,
 no pending output and no final payload progress, preserving all outer clauses.
 Controlled HTTP/2 CONNECT tunnel handoff remains an explicit unsupported path.
 Route/server timeout configuration remains a development integration gate.
+
+
+Server client-authentication CA pools now resolve native `pki_root` and
+`pki_intermediate` providers, including nested `combined` sources, during the
+tracked configuration preparation transaction. They reuse the current
+generation's native PKI authorities and storage; no CA lookup or I/O occurs
+in a handshake. `pki_root` exports the single root certificate, while
+`pki_intermediate` exports the complete configured intermediate chain. The
+raw published/admin configuration retains its original provider definitions.
+The existing client-certificate modes, proof-of-possession checks and PKIX
+path validation still apply to the resolved anchors.
+
+The PKI app must be configured or already provisioned by the generation's
+internal issuer. The local authority may then be provisioned lazily, and an
+unknown non-local authority fails preparation. Independent authorities use
+at most four concurrent provisioning futures. Provider nesting, authority
+references and prepared trust material are bounded; short transformation
+scratch uses the existing shared pool and is released by the actual CPU
+worker. Persistent prepared configuration/trust outputs retain their existing
+control/output ownership boundary; this is not a whole-process heap bound.
+A failed reload keeps the previous working TLS configuration. This entry
+covers server client-authentication pools; other consumers of CA providers,
+and the storage/HTTP client-authentication providers, remain separate gaps.
