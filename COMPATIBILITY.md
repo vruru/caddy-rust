@@ -287,3 +287,41 @@ forwarding headers. Native removes X-Forwarded-For/Host/Proto in that case,
 instead of inventing a source IP or forwarding unauthenticated assertions. An
 explicit leading TLS marker is also accepted: it has the same valid meaning as
 the implicit marker, despite the pinned baseline rejecting the redundant form.
+
+### Numerical zero after noncanonical integer decoding
+
+The integer byte codecs retain Go's observable raw sign and partial scanner state for Gob and formatting roundtrips. Numerical methods treat a decoded negative-zero representation as integer zero. Comparisons return equality with zero; zero is representable as uint64; sqrt, shifts and bit operations compute their ordinary zero results instead of propagating Go's internal-sign underflow/panic defects. Arithmetic results are canonical, while copying may preserve raw sign for encoding fidelity. A zero exponent is evaluated as zero even if its raw codec sign was negative, so modular exponentiation does not incorrectly require an inverse.
+
+These are intentional correctness repairs, independently checked with integer arithmetic and modular-power/square oracles. Actual Go error/result bytes remain recorded as known differences, not counted as matching behavior. The repairs affect template-private number state and do not modify authenticated TLS snapshots or trust facts.
+
+### Integer codecs, modular roots and primality
+
+Template-private integers support Gob/text/JSON decoding, byte-faithful codec
+round trips and modular square roots. Decoder failures preserve the observable
+partial scanner state where the Go API does so; JSON `null` leaves an existing
+integer unchanged. Modular roots use bounded Jacobi, exponentiation and
+Tonelli–Shanks steps rather than an uninterruptible search. This does not add
+the entire Go `math/big` API or complete shared `Bits`/`SetBits` backing semantics.
+
+`ProbablyPrime` uses the Go-compatible deterministic Miller–Rabin base sequence
+and extra-strong Lucas test. Its local seeded RNG is used only to reproduce
+those primality bases, never for keys, salts or security tokens. Odd operands
+are limited to 65,536 bits. Each modular multiply/reduction prepays work from
+the existing one-million-unit render allowance, at 2,048 conceptual 64-bit
+limb products per unit; linear work and RNG setup are charged separately.
+Absurd round counts fail before computation. The existing 30-second deadline
+and allocation allowance remain in force. These are explicit resource bounds,
+not a hard CPU-time or whole-process RSS guarantee.
+
+Primality computation uses a separate admission stage, bounded by the actual
+available CPU count up to eight concurrent jobs. It validates arguments and
+render ownership before admission, rejects overload without waiting, and
+temporarily returns the ordinary template CPU permit while computing on the
+same renderer thread. Only that overloaded request receives 503. Normal
+continuation fairly reacquires ordinary capacity outside state locks. Memory,
+request-tree admission and worker ownership remain held until the actual
+worker exits; cancellation, completed trees and shutdown stop continuation.
+The control backlink is weak and a foreign or unbound worker cannot bypass
+admission. This revision isolates `ProbablyPrime`; other arithmetic retains
+its previous execution stage and work fees. It adds no production CPU quota
+or affinity and does not change the runtime's use of available CPUs.

@@ -2,6 +2,8 @@
 // Used under the BSD 3-Clause license in THIRD-PARTY-NOTICES.
 //! Owned advanced arithmetic. All inputs are staged before any receiver change.
 use super::*;
+#[path = "x509_values_modsqrt.rs"]
+pub(super) mod modular;
 fn abs(x: BigInt) -> BigInt {
     if x.sign() == Sign::Minus { -x } else { x }
 }
@@ -23,7 +25,7 @@ fn target(v: &Value) -> RenderResult<Option<Arc<Integer>>> {
     };
     Ok(Some(shared_payload(o)?))
 }
-fn peak(f: &Factory, bits: u64) -> RenderResult<()> {
+pub(super) fn peak(f: &Factory, bits: u64) -> RenderResult<()> {
     let n = usize::try_from(bits.div_ceil(8)).map_err(|_| error("big.Int size overflow"))?;
     f.reserve(
         n.checked_mul(64)
@@ -31,7 +33,7 @@ fn peak(f: &Factory, bits: u64) -> RenderResult<()> {
             .ok_or_else(|| error("big.Int peak overflow"))?,
     )
 }
-fn step(f: &Factory, bits: u64) -> RenderResult<()> {
+pub(super) fn step(f: &Factory, bits: u64) -> RenderResult<()> {
     let l = usize::try_from(bits.div_ceil(64))
         .map_err(|_| error("big.Int work overflow"))?
         .max(1);
@@ -50,6 +52,7 @@ fn write(d: &Integer, n: BigInt) -> RenderResult<()> {
         .epoch
         .checked_add(1)
         .ok_or_else(|| error("big.Int epoch overflow"))?;
+    s.negative_zero = false;
     s.number = n;
     s.epoch = e;
     Ok(())
@@ -79,6 +82,7 @@ fn write_all(writes: Vec<(Arc<Integer>, BigInt)>) -> RenderResult<()> {
         })
         .collect::<RenderResult<Vec<_>>>()?;
     for ((state, value), epoch) in guards.iter_mut().zip(values).zip(epochs) {
+        state.negative_zero = false;
         state.number = value;
         state.epoch = epoch;
     }
@@ -92,6 +96,7 @@ fn nil(f: &Arc<Factory>) -> RenderResult<Value> {
         data: Some(Arc::new(Integer {
             number: Mutex::new(State {
                 number: BigInt::from(0),
+                negative_zero: false,
                 epoch: 0,
             }),
             owner: Arc::downgrade(f),
@@ -217,6 +222,14 @@ pub(super) fn invoke(o: &Object, name: &str, args: &[Value]) -> RenderResult<Val
                 }
                 r
             }
+        }
+        "ModSqrt" => {
+            let x = stage(&f, &args[0])?;
+            let p = stage(&f, &args[1])?;
+            let Some(r) = modular::compute(&f, x, p)? else {
+                return nil(&f);
+            };
+            r
         }
         "ModInverse" => {
             let g = stage(&f, &args[0])?;

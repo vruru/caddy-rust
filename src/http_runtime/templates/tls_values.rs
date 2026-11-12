@@ -50,6 +50,7 @@ impl Factory {
     pub(super) fn reserve(&self, bytes: usize) -> RenderResult<()> {
         self.owner()?.reserve_host_bytes(bytes)
     }
+    pub(super) fn numeric(&self)->RenderResult<crate::http_runtime::templates::pool::NumericGuard>{self.owner()?.numeric()}
     pub(super) fn work(&self, units: usize) -> RenderResult<()> {
         self.owner()?.charge(units)
     }

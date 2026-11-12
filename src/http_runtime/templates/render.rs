@@ -27,6 +27,7 @@ type RenderResult<T>=gotmpl::Result<T>;
 pub(super) type VirtualInclude=Arc<dyn Fn(&str,Arc<Control>)->RenderResult<Vec<u8>>+Send+Sync>;
 pub(crate) struct Control {
     pub cancel:CancellationToken,
+    worker:std::sync::OnceLock<super::pool::Binding>,
     deadline:Instant,
     work:AtomicUsize,
     source:AtomicUsize,
@@ -40,11 +41,20 @@ pub(crate) struct Control {
 }
 fn error(message:impl Into<String>)->TemplateError{TemplateError::Exec(message.into())}
 impl Control {
-    pub(crate) fn new(cancel:CancellationToken)->Arc<Self>{Arc::new(Self{cancel,deadline:Instant::now()+Duration::from_secs(30),work:AtomicUsize::new(1_000_000),source:AtomicUsize::new(4<<20),allocation:AtomicUsize::new(64<<20),allocation_limit:64<<20,files:AtomicUsize::new(256),http_calls:AtomicUsize::new(64),status:AtomicU16::new(0),maps:MapContext::new(),value_limit:1<<20,output_limit:1<<20})}
+    pub(crate) fn new(cancel:CancellationToken)->Arc<Self>{Arc::new(Self{cancel,worker:std::sync::OnceLock::new(),deadline:Instant::now()+Duration::from_secs(30),work:AtomicUsize::new(1_000_000),source:AtomicUsize::new(4<<20),allocation:AtomicUsize::new(64<<20),allocation_limit:64<<20,files:AtomicUsize::new(256),http_calls:AtomicUsize::new(64),status:AtomicU16::new(0),maps:MapContext::new(),value_limit:1<<20,output_limit:1<<20})}
     /// The browse caller already owns its existing 32 MiB listing work permit.
     /// Charge host graph construction here before allocating nodes/strings.
     pub(crate) fn for_browse(cancel:CancellationToken)->Arc<Self>{
-        Arc::new(Self{cancel,deadline:Instant::now()+Duration::from_secs(30),work:AtomicUsize::new(1_000_000),source:AtomicUsize::new(4<<20),allocation:AtomicUsize::new(32<<20),allocation_limit:32<<20,files:AtomicUsize::new(256),http_calls:AtomicUsize::new(64),status:AtomicU16::new(0),maps:MapContext::new(),value_limit:8<<20,output_limit:8<<20})
+        Arc::new(Self{cancel,worker:std::sync::OnceLock::new(),deadline:Instant::now()+Duration::from_secs(30),work:AtomicUsize::new(1_000_000),source:AtomicUsize::new(4<<20),allocation:AtomicUsize::new(32<<20),allocation_limit:32<<20,files:AtomicUsize::new(256),http_calls:AtomicUsize::new(64),status:AtomicU16::new(0),maps:MapContext::new(),value_limit:8<<20,output_limit:8<<20})
+    }
+    pub(super) fn bind_worker(&self,binding:super::pool::Binding)->Result<(),crate::http_runtime::resource_budget::BudgetError>{self.worker.set(binding).map_err(|_|crate::http_runtime::resource_budget::BudgetError::WorkerFailed)}
+    pub(super) fn numeric(&self)->RenderResult<super::pool::NumericGuard>{
+        self.check()?;
+        let binding=self.worker.get().ok_or_else(||error(super::pool::NumericError::Unbound.message()))?;
+        super::pool::NumericGuard::enter(binding).map_err(|failure|{
+            if matches!(failure,super::pool::NumericError::Overloaded|super::pool::NumericError::AlreadyActive){let _=self.status.compare_exchange(0,503,Ordering::AcqRel,Ordering::Acquire);}
+            error(failure.message())
+        })
     }
     pub(crate) fn reserve_host_bytes(&self,bytes:usize)->RenderResult<()>{self.charge_bytes(bytes)}
     /// Bridge to the same pool; no secondary allowance is created. Adapter
@@ -62,7 +72,7 @@ impl Control {
 
     fn take(counter:&AtomicUsize,units:usize)->RenderResult<()> {counter.try_update(Ordering::AcqRel,Ordering::Acquire,|n|n.checked_sub(units)).map(|_|()).map_err(|_|error("template aggregate budget exhausted"))}
     pub(super) fn deadline(&self)->Instant{self.deadline}
-    pub(super) fn check(&self)->RenderResult<()> {if self.cancel.is_cancelled()||Instant::now()>self.deadline{Err(error("template execution cancelled or timed out"))}else{Ok(())}}
+    pub(super) fn check(&self)->RenderResult<()> {if self.cancel.is_cancelled()||self.worker.get().is_some_and(super::pool::Binding::stopped)||Instant::now()>self.deadline{Err(error("template execution cancelled or timed out"))}else{Ok(())}}
     pub(super) fn charge(&self,units:usize)->RenderResult<()> {self.check()?;Self::take(&self.work,units)}
     fn source(&self,length:usize)->RenderResult<()> {self.charge(1+length.div_ceil(64))?;Self::take(&self.source,length)?;Self::take(&self.allocation,length.checked_mul(32).ok_or_else(||error("template source overflow"))?)}
     pub(super) fn charge_bytes(&self,length:usize)->RenderResult<()> {self.check()?;Self::take(&self.allocation,length)}

@@ -4,6 +4,10 @@
 mod advanced;
 #[path = "x509_values_arithmetic.rs"]
 mod arithmetic;
+#[path = "x509_values_codecs.rs"]
+mod codecs;
+#[path = "x509_values_prime.rs"]
+mod prime;
 use super::{Factory, RenderResult, arity, error};
 use bigdecimal::num_bigint::{BigInt, Sign};
 use gotmpl::{ArgKind, HostFormat, HostMethod, HostType, Object, Signature, Value};
@@ -12,6 +16,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex, Weak},
 };
 struct State {
+    negative_zero: bool,
     number: BigInt,
     epoch: u64,
 }
@@ -22,6 +27,41 @@ pub(super) struct Integer {
 static INT_ARG: Signature = Signature::from_static(&[ArgKind::Int], None);
 static BIG_TYPE: HostType = HostType {
     methods: &[
+        HostMethod {
+            name: "ProbablyPrime",
+            invoke: prime::invoke,
+            signature: Some(&INT_ARG),
+        },
+        HostMethod {
+            name: "ModSqrt",
+            invoke: |o, a| advanced::invoke(o, "ModSqrt", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "GobEncode",
+            invoke: |o, a| codecs::invoke(o, "GobEncode", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "GobDecode",
+            invoke: |o, a| codecs::invoke(o, "GobDecode", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "AppendText",
+            invoke: |o, a| codecs::invoke(o, "AppendText", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "UnmarshalText",
+            invoke: |o, a| codecs::invoke(o, "UnmarshalText", a),
+            signature: None,
+        },
+        HostMethod {
+            name: "UnmarshalJSON",
+            invoke: |o, a| codecs::invoke(o, "UnmarshalJSON", a),
+            signature: None,
+        },
         HostMethod {
             name: "Exp",
             invoke: |o, a| advanced::invoke(o, "Exp", a),
@@ -307,7 +347,11 @@ pub(super) fn integer(factory: &Arc<Factory>, bytes: &[u8], signed: bool) -> Ren
         BigInt::from_bytes_be(Sign::Plus, bytes)
     };
     let data = Arc::new(Integer {
-        number: Mutex::new(State { number, epoch: 0 }),
+        number: Mutex::new(State {
+            number,
+            epoch: 0,
+            negative_zero: false,
+        }),
         owner: Arc::downgrade(factory),
     });
     let id = Arc::as_ptr(&data) as usize;
@@ -525,7 +569,7 @@ fn format_integer(o: &Object, verb: char, f: &HostFormat) -> RenderResult<Value>
 
     let data = payload(o)?;
     let factory = owner(data)?;
-    let current = read_number(data, &factory)?;
+    let (current, negative_zero) = snapshot_number(data, &factory)?;
     let n = &current;
     let bits = n.bits() as usize;
     let maximum = bits.max(f.width.unwrap_or(0)).max(f.precision.unwrap_or(0));
@@ -559,7 +603,7 @@ fn format_integer(o: &Object, verb: char, f: &HostFormat) -> RenderResult<Value>
     if f.precision == Some(0) && n.sign() == Sign::NoSign {
         return Ok(Value::String("".into()));
     }
-    let sign = if n.sign() == Sign::Minus {
+    let sign = if n.sign() == Sign::Minus || negative_zero {
         "-"
     } else if f.plus {
         "+"
@@ -791,6 +835,9 @@ pub(super) fn insecure_algorithm(value: i64) -> Value {
 }
 
 fn read_number(data: &Integer, factory: &Arc<Factory>) -> RenderResult<BigInt> {
+    Ok(snapshot_number(data, factory)?.0)
+}
+fn snapshot_number(data: &Integer, factory: &Arc<Factory>) -> RenderResult<(BigInt, bool)> {
     for _ in 0..8 {
         let (bits, epoch) = {
             let state = data
@@ -815,7 +862,7 @@ fn read_number(data: &Integer, factory: &Arc<Factory>) -> RenderResult<BigInt> {
         if state.epoch != epoch {
             continue;
         }
-        return Ok(state.number.clone());
+        return Ok((state.number.clone(), state.negative_zero));
     }
     Err(error("concurrent big.Int change limit exceeded"))
 }
@@ -899,6 +946,7 @@ fn mutate(object: &Object, name: &str, args: &[Value]) -> RenderResult<Value> {
         _ => 2,
     };
     arity(args, count, count)?;
+    let mut result_negative_zero = false;
     let result = match name {
         "SetInt64" => {
             let Value::Int64(n) = args[0] else {
@@ -931,7 +979,10 @@ fn mutate(object: &Object, name: &str, args: &[Value]) -> RenderResult<Value> {
             let Value::Object(input) = &args[0] else {
                 return Err(error("expected *big.Int"));
             };
-            let x = read_number(payload(input)?, &factory)?;
+            let (x, x_negative_zero) = snapshot_number(payload(input)?, &factory)?;
+            if name == "Set" {
+                result_negative_zero = x_negative_zero
+            }
             let unary = matches!(name, "Set" | "Abs" | "Neg" | "Not" | "Sqrt");
             let mut scalar = 0u64;
             let y = if unary {
@@ -1024,6 +1075,7 @@ fn mutate(object: &Object, name: &str, args: &[Value]) -> RenderResult<Value> {
             .epoch
             .checked_add(1)
             .ok_or_else(|| error("big.Int epoch overflow"))?;
+        state.negative_zero = result_negative_zero;
         state.number = result;
         state.epoch = next;
     }
