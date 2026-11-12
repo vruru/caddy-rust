@@ -240,6 +240,7 @@ impl AcmeWire {
         if let Some(proxy)=&options.network_proxy {proxy.validate()?;}
         let client = crate::cert_cpu::run(cpu.clone(),cancel.clone(),move || {
         let mut builder = reqwest::Client::builder()
+            .tls_crypto_provider(crate::crypto::client_provider())
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(options.request_timeout)

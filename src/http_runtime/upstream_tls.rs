@@ -276,7 +276,7 @@ fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool)
         "upstream trust roots unavailable"
     );
     let provider = if tls.curves.is_empty() {
-        crate::crypto::provider()
+        crate::crypto::client_provider()
     } else {
         let mut provider = (*crate::crypto::provider()).clone();
         let mut groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = Vec::new();

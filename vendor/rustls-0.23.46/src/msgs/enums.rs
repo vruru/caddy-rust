@@ -254,6 +254,7 @@ enum_builder! {
         MLKEM768 => 0x0201,
         MLKEM1024 => 0x0202,
         secp256r1MLKEM768 => 0x11eb,
+        secp384r1MLKEM1024 => 0x11ed,
         X25519MLKEM768 => 0x11ec,
     }
 }

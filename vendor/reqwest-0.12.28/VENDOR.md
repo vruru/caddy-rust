@@ -23,3 +23,9 @@ Dial, proxy setup and whole-request deadlines remain independent.
 
 Only `src/async_impl/client.rs`, `src/connect.rs` and `src/redirect.rs` differ from
 the distribution's runtime source.
+
+The optional `ClientBuilder::tls_crypto_provider` selects a provider for a newly
+built Rustls client without installing a process-wide default. Combining it
+with another backend or preconfigured TLS is rejected. Unset behavior is the
+upstream provider selection. Native outgoing HTTP clients opt into their
+client-only profile while incoming server/QUIC defaults remain independent.

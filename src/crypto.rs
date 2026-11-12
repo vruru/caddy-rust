@@ -62,6 +62,22 @@ pub fn provider() -> Arc<CryptoProvider> {
     PROVIDER.clone()
 }
 
+// Outgoing TLS follows the pinned Go client's complete default group set.
+// Keep the server/QUIC provider and process-wide default above unchanged.
+static CLIENT_PROVIDER: LazyLock<Arc<CryptoProvider>> = LazyLock::new(|| {
+    use rustls::crypto::{aws_lc_rs::kx_group as pq, ring::kx_group as classical};
+    let mut provider = (**PROVIDER).clone();
+    provider.kx_groups = vec![
+        pq::X25519MLKEM768, pq::SECP256R1MLKEM768, pq::SECP384R1MLKEM1024,
+        classical::X25519, classical::SECP256R1, classical::SECP384R1,
+        crate::tls_policy::key_exchange_group("secp521r1").expect("known P-521 group"),
+    ];
+    Arc::new(provider)
+});
+/// Default provider for outgoing clients, independent of server/QUIC defaults.
+/// Does not install or replace a process-wide provider.
+pub fn client_provider() -> Arc<CryptoProvider> { CLIENT_PROVIDER.clone() }
+
 /// Prepare the generic-hash view only for TLS1.2 certificate use. The ordinary
 /// key provider remains curve-bound, so CSR/CA signing algorithm labels and
 /// non-TLS consumers retain their existing native-hash behavior.

@@ -186,7 +186,7 @@ async fn fetch_http(
             let proxy = super::permission::external_proxy(&url)?;
             let mut roots = rustls::RootCertStore::empty();
             let _ = roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
-            let mut tls = rustls::ClientConfig::builder_with_provider(crate::crypto::provider())
+            let mut tls = rustls::ClientConfig::builder_with_provider(crate::crypto::client_provider())
                 .with_safe_default_protocol_versions()?
                 .with_root_certificates(roots)
                 .with_no_client_auth();

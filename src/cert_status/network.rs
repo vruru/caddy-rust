@@ -26,6 +26,7 @@ impl OcspTransport {
             "OCSP timeout out of range"
         );
         let mut builder = Client::builder()
+            .tls_crypto_provider(crate::crypto::client_provider())
             .connect_timeout(timeout.min(Duration::from_secs(10)))
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none());

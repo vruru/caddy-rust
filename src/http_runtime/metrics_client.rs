@@ -94,7 +94,7 @@ fn tls(
     } else {
         super::upstream_tls::native_roots().clone()
     };
-    let builder = rustls::ClientConfig::builder_with_provider(crate::crypto::provider())
+    let builder = rustls::ClientConfig::builder_with_provider(crate::crypto::client_provider())
         .with_safe_default_protocol_versions()?
         .with_root_certificates(roots);
     let mut config = if let Some((cert, key)) = identity {

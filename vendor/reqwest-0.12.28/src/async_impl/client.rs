@@ -168,6 +168,8 @@ struct Config {
     #[cfg(feature = "__tls")]
     tls_sni: bool,
     #[cfg(feature = "__rustls")]
+    tls_crypto_provider: Option<Arc<rustls::crypto::CryptoProvider>>,
+    #[cfg(feature = "__rustls")]
     tls_server_name_override: Option<String>,
     #[cfg(feature = "__rustls")]
     tls_handshake_timeout: Option<Duration>,
@@ -301,6 +303,8 @@ impl ClientBuilder {
                 #[cfg(feature = "__tls")]
                 tls_sni: true,
                 #[cfg(feature = "__rustls")]
+                tls_crypto_provider: None,
+                #[cfg(feature = "__rustls")]
                 tls_server_name_override: None,
                 #[cfg(feature = "__rustls")]
                 tls_handshake_timeout: None,
@@ -421,6 +425,11 @@ impl ClientBuilder {
 
         if let Some(err) = config.error {
             return Err(err);
+        }
+
+        #[cfg(feature = "__rustls")]
+        if config.tls_crypto_provider.is_some() && !matches!(&config.tls, TlsBackend::Rustls) {
+            return Err(crate::error::builder("explicit crypto provider requires builder-created Rustls TLS"));
         }
 
         let mut proxies = config.proxies;
@@ -768,8 +777,8 @@ impl ClientBuilder {
 
                     // Allow user to have installed a runtime default.
                     // If not, we use ring.
-                    let provider = rustls::crypto::CryptoProvider::get_default()
-                        .map(|arc| arc.clone())
+                    let provider = config.tls_crypto_provider.clone()
+                        .or_else(||rustls::crypto::CryptoProvider::get_default().cloned())
                         .unwrap_or_else(|| {
                             #[cfg(not(feature = "__rustls-ring"))]
                             panic!("No provider set");
@@ -2034,6 +2043,15 @@ impl ClientBuilder {
     )]
     pub fn danger_accept_invalid_certs(mut self, accept_invalid_certs: bool) -> ClientBuilder {
         self.config.certs_verification = !accept_invalid_certs;
+        self
+    }
+
+    /// Select the provider for a client built by this Rustls builder, without
+    /// installing a process default. Other TLS backends/preconfigured TLS are
+    /// rejected when combined with this option. Native Caddy local extension.
+    #[cfg(feature = "__rustls")]
+    pub fn tls_crypto_provider(mut self, provider: Arc<rustls::crypto::CryptoProvider>) -> ClientBuilder {
+        self.config.tls_crypto_provider = Some(provider);
         self
     }
 

@@ -119,7 +119,7 @@ their configuration and behavior require native implementations.
 Known development gaps still include remaining listener/address combinations,
 distributed tracing, the ACME server handler, push and timeout
 handlers and remaining template receiver methods,
-TLS 1.0/1.1, full Go PKIX edge semantics and remaining issuer/trust-loader
+TLS 1.2 CBC suites, client renegotiation, full Go PKIX edge semantics and remaining issuer/trust-loader
 capabilities. This list is not a claim that all other field combinations are
 fully verified. The 135-module baseline is an inventory, not a support registry.
 
@@ -924,3 +924,24 @@ Native ordering enhancement is retained. Empty/null fields retain the current
 provider defaults. Invalid groups or invalid field types reject the candidate
 and keep the old working site. The outgoing default group profile remains a
 separate compatibility item; this stage covers explicit curve configuration.
+
+
+Default outgoing TLS groups
+---------------------------
+
+Outgoing TLS clients use an independent provider with the pinned Go default
+groups: X25519MLKEM768, P256MLKEM768, P384MLKEM1024, X25519, P-256, P-384 and
+P-521. Incoming Rustls and QUIC defaults remain unchanged; explicitly configured
+upstream groups preserve their first-occurrence order. P384MLKEM1024 reuses the
+existing AWS-LC components and hybrid exchange layout with RFC 10024 wire sizes.
+The same outgoing profile covers configured upstreams, HTTPS CA sources and
+other native HTTP clients, without replacing the process-wide server provider.
+Real independent single-group peers, strict HTTP traffic, public ClientHello
+facts and shared-client issuance/trust regressions cover this behavior.
+
+The pinned baseline only recognizes TLS1.2/TLS1.3 as server protocols. Legacy
+TLS1.0/TLS1.1 names fall back to modern defaults and do not enable those wire
+versions; they are not an unimplemented baseline feature. TLS1.2 CBC suites,
+client renegotiation once/freely, automated client certificates and remaining
+issuer features remain separate unfinished work. PKI KeyPair formats other
+than empty/pem_file are likewise not implemented by the pinned baseline.

@@ -38,6 +38,20 @@ pub static SECP256R1MLKEM768: &dyn SupportedKxGroup = &hybrid::Hybrid {
     },
 };
 
+/// P-384/ML-KEM-1024 hybrid using the existing validated component exchanges.
+/// Wire sizes and component ordering follow RFC 10024 sections 4 and 7.
+pub static SECP384R1MLKEM1024: &dyn SupportedKxGroup = &hybrid::Hybrid {
+    classical: kx_group::SECP384R1,
+    post_quantum: MLKEM1024,
+    name: NamedGroup::secp384r1MLKEM1024,
+    layout: hybrid::Layout {
+        classical_share_len: 97,
+        post_quantum_client_share_len: 1568,
+        post_quantum_server_share_len: 1568,
+        post_quantum_first: false,
+    },
+};
+
 /// This is the [MLKEM] key encapsulation mechanism in NIST with security category 3.
 ///
 /// [MLKEM]: https://datatracker.ietf.org/doc/draft-ietf-tls-mlkem

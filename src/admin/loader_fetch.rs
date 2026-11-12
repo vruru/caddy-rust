@@ -58,7 +58,7 @@ fn tls(
     tls: Option<&LoaderTls>,
     identity: Option<Arc<dyn rustls::client::ResolvesClientCert>>,
 ) -> Result<ClientConfig, AdminError> {
-    let provider = crate::crypto::provider();
+    let provider = crate::crypto::client_provider();
     let mut roots = RootCertStore::empty();
     if let Some(tls) = tls.filter(|t| !t.root_ca_pem_files.is_empty()) {
         for path in &tls.root_ca_pem_files {

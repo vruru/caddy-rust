@@ -211,7 +211,7 @@ fn permission_client(cache: &Mutex<Option<CachedClient>>, url: &Url) -> Result<r
     }
     let mut trust = rustls::RootCertStore::empty();
     let _ = trust.add_parsable_certificates(roots);
-    let mut tls = rustls::ClientConfig::builder_with_provider(crate::crypto::provider())
+    let mut tls = rustls::ClientConfig::builder_with_provider(crate::crypto::client_provider())
         .with_safe_default_protocol_versions()
         .map_err(|_| PermissionFailure::Transport)?
         .with_root_certificates(trust)

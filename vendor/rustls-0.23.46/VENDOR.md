@@ -22,3 +22,10 @@ Application resolvers must distinguish preselection (`None`) from the real
 handshake (`Some`). Protocol-specific signatures may be authorized only against
 the real negotiated version. The accessor does not itself implement legacy
 signers, certificate selection, certificate validation or application policy.
+
+The AWS-LC provider exposes SecP384r1MLKEM1024 using its existing P-384 and
+ML-KEM-1024 implementations and generic hybrid combiner. The group codepoint
+and classical-first share/secret layout follow RFC 10024. This adds the group
+to ALL_KX_GROUPS but does not change DEFAULT_KX_GROUPS. Native outgoing client
+profiles select the complete pinned-Go capability set independently of server
+and QUIC defaults.
