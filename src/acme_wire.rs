@@ -5,6 +5,8 @@
 #[path = "acme_wire/signer.rs"]
 mod signer;
 mod network_proxy;
+mod order_parameters;
+pub use order_parameters::OrderParameters;
 pub use network_proxy::NetworkProxy;
 pub use signer::{AccountSigner, KeyType};
 
@@ -62,6 +64,10 @@ pub struct Identifier {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Order {
     pub status: String,
+    #[serde(default)]
+    pub profile: String,
+    #[serde(default, rename = "notAfter")]
+    pub not_after: Option<String>,
     #[serde(default)]
     pub expires: Option<String>,
     pub identifiers: Vec<Identifier>,
@@ -580,8 +586,18 @@ impl AccountSession {
         identifiers: &[Identifier],
         cancel: &CancellationToken,
     ) -> Result<Option<String>> {
+        self.reconcile_order_with_parameters(identifiers, &OrderParameters::default(), cancel).await
+    }
+
+    pub async fn reconcile_order_with_parameters(
+        &self,
+        identifiers: &[Identifier],
+        parameters: &OrderParameters,
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>> {
+        parameters.validate()?;
         let account: Resource<Value> = self
-            .resource(&self.location, Some(&json!({})), cancel)
+            .resource(&self.location, None, cancel)
             .await?;
         ensure!(
             account.value["status"] == "valid",
@@ -635,7 +651,7 @@ impl AccountSession {
                     .collect::<Vec<_>>();
                 actual.sort();
                 actual.dedup();
-                if actual == expected {
+                if actual == expected && parameters.matches_observation(&order) {
                     return Ok(Some(url.to_owned()));
                 }
             }
@@ -684,11 +700,36 @@ impl AccountSession {
         replaces: Option<&str>,
         cancel: &CancellationToken,
     ) -> Result<Resource<Order>> {
+        self.new_order_with_parameters(identifiers, replaces, &OrderParameters::default(), cancel).await
+    }
+
+    /// Validate explicit profiles against this directory before recording an
+    /// irreversible order intent. An empty profile requests the CA default.
+    pub fn validate_order_parameters(&self, parameters: &OrderParameters) -> Result<()> {
+        parameters.validate()?;
+        if !parameters.profile.is_empty() {
+            ensure!(self.wire.directory().meta.get("profiles")
+                .and_then(Value::as_object)
+                .is_some_and(|profiles| profiles.contains_key(&parameters.profile)),
+                "ACME directory does not advertise the requested profile");
+        }
+        Ok(())
+    }
+
+    pub async fn new_order_with_parameters(
+        &self,
+        identifiers: &[Identifier],
+        replaces: Option<&str>,
+        parameters: &OrderParameters,
+        cancel: &CancellationToken,
+    ) -> Result<Resource<Order>> {
+        self.validate_order_parameters(parameters)?;
         ensure!(
             !identifiers.is_empty() && identifiers.len() <= 100,
             "invalid ACME identifier count"
         );
         let mut payload = json!({"identifiers":identifiers});
+        parameters.write_payload(&mut payload);
         if let Some(replaces) = replaces {
             payload["replaces"] = json!(replaces);
         }

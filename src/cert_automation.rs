@@ -82,6 +82,8 @@ pub struct AcmeIssuerConfig {
     pub email: String,
     pub account_key_type: KeyType,
     pub leaf_key_type: KeyType,
+    pub certificate_lifetime_ns: i64,
+    pub profile: String,
     pub challenge_types: Vec<ChallengeType>,
     pub terms_of_service_agreed: bool,
     pub eab: Option<ExternalAccountBinding>,
@@ -100,6 +102,8 @@ impl AcmeIssuerConfig {
             email: String::new(),
             account_key_type: KeyType::P256,
             leaf_key_type: KeyType::P256,
+            certificate_lifetime_ns: 0,
+            profile: String::new(),
             challenge_types: vec![ChallengeType::Http01, ChallengeType::TlsAlpn01],
             terms_of_service_agreed: true,
             eab: None,
@@ -338,6 +342,8 @@ impl AutomationResources {
         hash.update(ino.to_be_bytes());
         frame(&mut hash, config.wire.directory.as_bytes());
         frame(&mut hash, config.email.as_bytes());
+        frame(&mut hash, config.profile.as_bytes());
+        hash.update(config.certificate_lifetime_ns.to_be_bytes());
         frame(
             &mut hash,
             &serde_json::to_vec(&(
@@ -425,6 +431,10 @@ struct Job {
     #[serde(default)]
     reuse_private_keys: bool,
     #[serde(default)]
+    certificate_lifetime_ns: i64,
+    #[serde(default)]
+    profile: String,
+    #[serde(default)]
     attempt_id: String,
     #[serde(default)]
     abandoned: bool,
@@ -433,6 +443,8 @@ struct Job {
     private_key_pem: String,
     #[serde(default)]
     initial_key_hash: Option<String>,
+    #[serde(default)]
+    requested_not_after: Option<String>,
     #[serde(default)]
     order_url: Option<String>,
     #[serde(default)]
@@ -466,9 +478,32 @@ struct Reservation {
     must_staple: bool,
     #[serde(default)]
     reuse_private_keys: bool,
+    #[serde(default)]
+    certificate_lifetime_ns: i64,
+    #[serde(default)]
+    profile: String,
     job_id: String,
     active: bool,
 }
+// Reservation activity is derived from the persisted phase. Treat inconsistent
+// markers as corruption; an inactive marker must never hide a live order.
+fn validate_reservation_job(marker: &Reservation, job: &Job) -> Result<()> {
+    ensure!(job.version == 1 && job.names == marker.names
+        && job.directory == marker.directory && job.account_location == marker.account_location
+        && job.config_email == marker.config_email && job.leaf_key_type == marker.leaf_key_type
+        && job.must_staple == marker.must_staple && job.reuse_private_keys == marker.reuse_private_keys
+        && job.certificate_lifetime_ns == marker.certificate_lifetime_ns && job.profile == marker.profile,
+        "active ACME checkpoint identity changed");
+    ensure!(marker.active == !["prepared", "stored"].contains(&job.phase.as_str()),
+        "ACME reservation activity disagrees with its checkpoint phase");
+    ensure!(job.phase != "prepared" || job.order_url.is_none(),
+        "prepared ACME checkpoint retains an order URL");
+    crate::acme_wire::OrderParameters {profile:job.profile.clone(),not_after:job.requested_not_after.clone()}.validate()?;
+    ensure!(job.certificate_lifetime_ns == 0 || job.phase == "prepared" || job.requested_not_after.is_some(),
+        "active ACME checkpoint lost requested expiry");
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 struct Attempt {
     version: u8,
@@ -653,6 +688,7 @@ impl CertificateManager {
                 "ACME challenge configuration outside bounds"
             );
             issuer_key(&issuer.wire.directory)?;
+            ensure!(issuer.profile.len() <= 1024, "ACME profile exceeds bounds");
         }
         ensure!(
             options.max_concurrent == resources.max_concurrent
@@ -1348,6 +1384,10 @@ impl CertificateManager {
                 && marker.directory == issuer.config.wire.directory,
             "issuer ACME reservation scope changed"
         );
+        let job: Job = serde_json::from_value(self.inner.store.journal_load(&marker.job_id).await?
+            .ok_or_else(|| anyhow!("issuer ACME order checkpoint missing"))?)
+            .map_err(|_| anyhow!("invalid issuer ACME checkpoint"))?;
+        validate_reservation_job(&marker, &job)?;
         if !marker.active {
             return Ok(None);
         }
@@ -1355,7 +1395,9 @@ impl CertificateManager {
             marker.config_email == issuer.config.email
                 && marker.leaf_key_type == issuer.config.leaf_key_type
                 && marker.must_staple == self.inner.must_staple
-                && marker.reuse_private_keys == self.inner.reuse_private_keys,
+                && marker.reuse_private_keys == self.inner.reuse_private_keys
+                && marker.certificate_lifetime_ns == issuer.config.certificate_lifetime_ns
+                && marker.profile == issuer.config.profile,
             "active issuer configuration changed; restore it or explicitly resolve that issuer order"
         );
         Ok(Some(marker))
@@ -1392,7 +1434,8 @@ impl CertificateManager {
         let marker: Reservation = serde_json::from_value(value)
             .map_err(|_| anyhow!("invalid issuer ACME reservation"))?;
         ensure!(
-            marker.version == 1 && marker.names == names,
+            marker.version == 1 && marker.names == names
+                && marker.directory == issuer_state.config.wire.directory,
             "active ACME reservation scope changed"
         );
         let mut job: Job = serde_json::from_value(
@@ -1403,18 +1446,9 @@ impl CertificateManager {
                 .ok_or_else(|| anyhow!("active ACME order checkpoint missing"))?,
         )
         .map_err(|_| anyhow!("invalid active ACME checkpoint"))?;
-        ensure!(
-            job.version == 1
-                && job.names == names
-                && job.directory == marker.directory
-                && job.account_location == marker.account_location
-                && job.config_email == marker.config_email
-                && job.leaf_key_type == marker.leaf_key_type
-                && job.must_staple == marker.must_staple
-                && job.reuse_private_keys == marker.reuse_private_keys,
-            "active ACME checkpoint identity changed"
-        );
+        validate_reservation_job(&marker, &job)?;
         self.validate_job_renewal_scope(&job).await?;
+        if marker.active {
         ensure!(
             self.inner
                 .issuers
@@ -1422,12 +1456,14 @@ impl CertificateManager {
                 .any(|i| i.config.wire.directory == marker.directory
                     && i.config.email == marker.config_email
                     && i.config.leaf_key_type == marker.leaf_key_type
+                    && i.config.certificate_lifetime_ns == marker.certificate_lifetime_ns
+                    && i.config.profile == marker.profile
                     && marker.must_staple == self.inner.must_staple
                     && marker.reuse_private_keys == self.inner.reuse_private_keys),
             "active ACME issuer configuration changed; restore it or explicitly resolve the order"
         );
+        }
         if job.phase == "prepared" {
-            self.save_job(&marker.job_id, &job, lease).await?;
             return Ok(None);
         }
         let issuer = issuer_key(&marker.directory)?;
@@ -2285,6 +2321,10 @@ impl CertificateManager {
         if self.inner.must_staple || self.inner.reuse_private_keys {
             order_identity.push_str(&format!("\0csr-v2:{}:{}",self.inner.must_staple,self.inner.reuse_private_keys));
         }
+        if issuer.config.certificate_lifetime_ns != 0 || !issuer.config.profile.is_empty() {
+            order_identity.push_str(&format!("\0order-parameters-v1:{}:{}:{}",issuer.config.certificate_lifetime_ns,
+                issuer.config.profile.len(),issuer.config.profile));
+        }
         let computed_id=digest(order_identity.as_bytes());
         let id = reservation.map(|r| r.job_id.clone()).unwrap_or(computed_id);
         let mut _job_key_reservation: Option<Arc<crate::key_compromise::KeyState>>=None;
@@ -2299,7 +2339,9 @@ impl CertificateManager {
                     && job.config_email == issuer.config.email
                     && job.leaf_key_type == issuer.config.leaf_key_type
                     && job.must_staple == self.inner.must_staple
-                    && job.reuse_private_keys == self.inner.reuse_private_keys,
+                    && job.reuse_private_keys == self.inner.reuse_private_keys
+                    && job.certificate_lifetime_ns == issuer.config.certificate_lifetime_ns
+                    && job.profile == issuer.config.profile,
                 "ACME order checkpoint identity changed"
             );
             job
@@ -2322,6 +2364,9 @@ impl CertificateManager {
                 leaf_key_type: issuer.config.leaf_key_type,
                 must_staple:self.inner.must_staple,
                 reuse_private_keys:self.inner.reuse_private_keys,
+                certificate_lifetime_ns:issuer.config.certificate_lifetime_ns,
+                profile:issuer.config.profile.clone(),
+                requested_not_after:None,
                 attempt_id: attempt_id.to_owned(),
                 abandoned: false,
                 phase: "prepared".to_owned(),
@@ -2443,7 +2488,8 @@ impl CertificateManager {
                     value: name.clone(),
                 })
                 .collect::<Vec<_>>();
-            match account.reconcile_order(&identifiers, cancel).await {
+            let parameters = crate::acme_wire::OrderParameters {profile:job.profile.clone(),not_after:job.requested_not_after.clone()};
+            match account.reconcile_order_with_parameters(&identifiers, &parameters, cancel).await {
                 Ok(Some(url)) => {
                     job.order_url = Some(url);
                     job.phase = "order_recovered".to_owned();
@@ -2453,6 +2499,18 @@ impl CertificateManager {
             }
         }
         if job.order_url.is_none() {
+            // Capture this absolute date once, before the durable intent and
+            // POST. Unknown outcomes retain it through restart/reconciliation.
+            let not_after = if job.certificate_lifetime_ns == 0 { None } else {
+                let date = time::OffsetDateTime::now_utc()
+                    .checked_add(time::Duration::nanoseconds(job.certificate_lifetime_ns))
+                    .ok_or_else(|| anyhow!("ACME requested certificate lifetime overflows"))?
+                    .replace_nanosecond(0)?;
+                Some(date.format(&time::format_description::well_known::Rfc3339)?)
+            };
+            let parameters = crate::acme_wire::OrderParameters {profile:job.profile.clone(),not_after};
+            account.validate_order_parameters(&parameters)?;
+            job.requested_not_after = parameters.not_after.clone();
             job.phase = "new_order_intent".to_owned();
             self.save_job(&id, &job, lease).await?;
             let identifiers = issuance_names
@@ -2463,13 +2521,14 @@ impl CertificateManager {
                 })
                 .collect::<Vec<_>>();
             let result = account
-                .new_order(
+                .new_order_with_parameters(
                     &identifiers,
                     if job.replaces_disabled {
                         None
                     } else {
                         replaces
                     },
+                    &parameters,
                     cancel,
                 )
                 .await;
@@ -2492,7 +2551,7 @@ impl CertificateManager {
                             // Retry without `replaces` once, retaining key/CSR.
                             job.phase = "new_order_intent".to_owned();
                             self.save_job(&id, &job, lease).await?;
-                            match account.new_order(&identifiers, None, cancel).await {
+                            match account.new_order_with_parameters(&identifiers, None, &parameters, cancel).await {
                                 Ok(order) => order,
                                 Err(error) => {
                                     if error.downcast_ref::<ProtocolError>().is_some_and(|p| {
@@ -2655,6 +2714,8 @@ impl CertificateManager {
                 leaf_key_type: job.leaf_key_type,
                 must_staple:job.must_staple,
                 reuse_private_keys:job.reuse_private_keys,
+                certificate_lifetime_ns:job.certificate_lifetime_ns,
+                profile:job.profile.clone(),
                 job_id: id.to_owned(),
                 active,
             };

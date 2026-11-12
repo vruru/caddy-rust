@@ -63,7 +63,6 @@ fn acme(value: &Value, path: &str) -> Result<Issuer> {
     config.email = object.string("email")?.into();
     for (field, feature) in [
         ("test_ca", "acme_test_ca_retry"),
-        ("profile", "acme_profile"),
         ("account_key", "configured_acme_account_key"),
     ] {
         if !object.string(field)?.is_empty() {
@@ -91,11 +90,10 @@ fn acme(value: &Value, path: &str) -> Result<Issuer> {
         return Err(ConfigError::invalid(object.at("acme_timeout")));
     }
     let timeout = (timeout > 0).then(|| Duration::from_nanos(timeout as u64));
-    if object.duration_ns("certificate_lifetime")? != 0 {
-        return Err(ConfigError::unsupported(
-            object.at("certificate_lifetime"),
-            "acme_requested_lifetime",
-        ));
+    config.certificate_lifetime_ns = object.duration_ns("certificate_lifetime")?;
+    config.profile = object.string("profile")?.into();
+    if config.profile.len() > 1024 {
+        return Err(ConfigError::invalid(object.at("profile")));
     }
     if let Some(chains) = object.value("preferred_chains") {
         let chains = Object::new(

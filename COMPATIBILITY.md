@@ -193,3 +193,25 @@ An ACME issuer supports `network_proxy` modules `{"from":"url","url":"http://pro
 Explicit proxy policy remains effective when the HTTP app fills in ACME challenge defaults. Caddy 2.11.7 can lose its already-loaded proxy module during that second provisioning; Native preserves the configured policy. Native also makes `none` actually disable environment proxies instead of copying the upstream nil-callback fallback. These are deliberate repairs, rather than removal of the proxy capability.
 
 Proxy URL global placeholders are resolved once, on the existing bounded CPU lane, when each independent ACME HTTP client is constructed. Business-request placeholders have no ACME request context. The expanded URL must retain a valid host; errors cannot silently select a direct connection. URLs are limited to 64 KiB, shared across cloned issuer configurations, and credentials are not included in proxy validation diagnostics. Existing ACME request/body limits, CA concurrency budgets, storage leases, certificate/key revocation gates and generation cancellation continue to apply. Proxy routing covers account, order, authorization, certificate and ARI requests, plus the same client's automatic ZeroSSL EAB request; it does not replace the separate OCSP transport policy.
+
+
+ACME requested validity and profiles
+-----------------------------------
+
+ACME issuers apply `certificate_lifetime` as a signed nanosecond offset from
+order creation time. Zero omits the requested expiry; nonzero values become an
+absolute RFC 3339 `notAfter`, truncated to whole seconds. A CA remains free to
+adjust requested validity. Invalid or expired issued material is not published.
+Explicit `profile` values are literal strings and must be advertised by the CA
+before a new order is sent; the empty value selects the CA default. Profile
+names are bounded to 1024 UTF-8 bytes.
+
+The absolute expiry, profile, key and CSR are retained in the durable order
+checkpoint. Unknown new-order outcomes are reconciled with authenticated
+POST-as-GET and require matching explicit profile/expiry observations; absence
+or a mismatch never authorizes a second order. Known order URLs continue with
+the original request parameters. Changing an active issuer policy leaves its
+order blocked until the original parameters are restored or the order is
+explicitly resolved. A definitively rejected prepared request and a completed
+stored certificate do not lock future requests to obsolete parameters. This
+preserves existing lease, scope, publication-CAS and compromised-key checks.
