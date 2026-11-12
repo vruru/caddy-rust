@@ -1067,3 +1067,34 @@ pub(super) fn current(value: &Value) -> RenderResult<BigInt> {
     let factory = owner(data)?;
     read_number(data, &factory)
 }
+
+// Go crypto public-key equality compares unsigned magnitudes in constant time.
+pub(super) fn public_magnitude_equal(a: &Value, b: &Value) -> RenderResult<bool> {
+    let Value::Object(ao) = a else {
+        return Err(error("expected *big.Int"));
+    };
+    let Value::Object(bo) = b else {
+        return Err(error("expected *big.Int"));
+    };
+    let data = payload(ao)?;
+    let factory = owner(data)?;
+    let an = read_number(data, &factory)?;
+    let bn = read_number(payload(bo)?, &factory)?;
+    let n = usize::try_from(an.bits().max(bn.bits()).div_ceil(8))
+        .map_err(|_| error("integer equality size overflow"))?;
+    factory.reserve(
+        n.checked_mul(8)
+            .and_then(|n| n.checked_add(1024))
+            .ok_or_else(|| error("integer equality budget overflow"))?,
+    )?;
+    factory.work(n.div_ceil(8) + 1)?;
+    if an.bits().div_ceil(8) != bn.bits().div_ceil(8) {
+        return Ok(false);
+    }
+    let a = an.to_bytes_be().1;
+    let b = bn.to_bytes_be().1;
+    if a.len() != b.len() {
+        return Ok(false);
+    }
+    Ok(openssl::memcmp::eq(&a, &b))
+}

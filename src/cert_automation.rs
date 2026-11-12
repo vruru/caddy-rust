@@ -95,6 +95,7 @@ impl AcmeIssuerConfig {
                 trusted_ca_origins: Vec::new(),
                 allow_insecure_loopback: false,
                 request_timeout: Duration::from_secs(30),
+                network_proxy:None,
             },
             email: String::new(),
             account_key_type: KeyType::P256,
@@ -350,6 +351,11 @@ impl AutomationResources {
             u8::from(config.wire.allow_insecure_loopback),
         ]);
         hash.update(config.wire.request_timeout.as_nanos().to_be_bytes());
+        match &config.wire.network_proxy {
+            None=>frame(&mut hash,b"environment"),
+            Some(proxy)=>{let(kind,value)=proxy.fingerprint();frame(&mut hash,kind);frame(&mut hash,value);}
+        }
+
         hash.update((config.wire.extra_ca_pem.len() as u64).to_be_bytes());
         for root in &config.wire.extra_ca_pem {
             frame(&mut hash, root);

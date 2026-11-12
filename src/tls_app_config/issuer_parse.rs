@@ -113,11 +113,20 @@ fn acme(value: &Value, path: &str) -> Result<Issuer> {
             ));
         }
     }
-    if object.value("network_proxy").is_some() {
-        return Err(ConfigError::unsupported(
-            object.at("network_proxy"),
-            "acme_network_proxy_module",
-        ));
+    if let Some(proxy)=object.raw_value("network_proxy") {
+        let path=object.at("network_proxy");
+        let normalized=crate::module_json::inline(proxy,"from",false).map_err(|_|ConfigError::invalid(path.clone()))?;
+        let proxy=normalized.as_ref();
+        let parsed=match discriminator(proxy,"from",&path)? {
+            "none"=>{Object::new(Some(proxy),ObjectKind::ProxyNone,&path)?;crate::acme_wire::NetworkProxy::Direct},
+            "url"=>{
+                let proxy=Object::new(Some(proxy),ObjectKind::ProxyUrl,&path)?;
+                crate::acme_wire::NetworkProxy::Url(proxy.string("url")?.into())
+            },
+            _=>return Err(ConfigError::unsupported(pointer(&path,"from"),"acme_network_proxy_module")),
+        };
+        parsed.validate().map_err(|_|ConfigError::invalid(path))?;
+        config.wire.network_proxy=Some(parsed);
     }
     let roots = object
         .strings("trusted_roots_pem_files")?

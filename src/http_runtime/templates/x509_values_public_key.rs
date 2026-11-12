@@ -48,8 +48,7 @@ pub(super) fn equal(
     match which {
         1 => Ok(
             field(own, "E")?.as_int() == field(&other.fields, "E")?.as_int()
-                && numbers::current(field(own, "N")?)?
-                    == numbers::current(field(&other.fields, "N")?)?,
+                && numbers::public_magnitude_equal(field(own, "N")?, field(&other.fields, "N")?)?,
         ),
         3 => {
             let curve = |fields: &BTreeMap<Arc<str>, Value>| -> RenderResult<Option<usize>> {
@@ -59,10 +58,8 @@ pub(super) fn equal(
                 Ok(curve.pointer_identity)
             };
             Ok(curve(own)? == curve(&other.fields)?
-                && numbers::current(field(own, "X")?)?
-                    == numbers::current(field(&other.fields, "X")?)?
-                && numbers::current(field(own, "Y")?)?
-                    == numbers::current(field(&other.fields, "Y")?)?)
+                && numbers::public_magnitude_equal(field(own, "X")?, field(&other.fields, "X")?)?
+                && numbers::public_magnitude_equal(field(own, "Y")?, field(&other.fields, "Y")?)?)
         }
         _ => Ok(original.der == data.der),
     }

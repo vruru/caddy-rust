@@ -4,6 +4,8 @@
 
 #[path = "acme_wire/signer.rs"]
 mod signer;
+mod network_proxy;
+pub use network_proxy::NetworkProxy;
 pub use signer::{AccountSigner, KeyType};
 
 use anyhow::{Result, anyhow, bail, ensure};
@@ -30,6 +32,8 @@ pub struct WireOptions {
     /// Test-only plaintext transport is restricted to literal loopback IPs.
     pub allow_insecure_loopback: bool,
     pub request_timeout: Duration,
+    /// None preserves environment proxies; Direct explicitly disables them.
+    pub network_proxy:Option<NetworkProxy>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -211,12 +215,14 @@ impl AcmeWire {
             trusted.insert(url.origin().ascii_serialization());
         }
         validate_url(&directory_url, &trusted, options.allow_insecure_loopback)?;
+        if let Some(proxy)=&options.network_proxy {proxy.validate()?;}
         let client = crate::cert_cpu::run(cpu.clone(),cancel.clone(),move || {
         let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(options.request_timeout)
             .user_agent("Caddy-Rust-ACME/0.1");
+        if let Some(proxy)=options.network_proxy {builder=proxy.apply(builder)?;}
         for pem in options.extra_ca_pem {
             ensure!(pem.len() <= 1024 * 1024, "ACME trust root exceeds bounds");
             builder = builder.add_root_certificate(
