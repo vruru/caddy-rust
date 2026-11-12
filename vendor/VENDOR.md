@@ -143,3 +143,12 @@ Native WebSocket session admission has a 64 MiB metadata pool with 256 KiB reser
 The HTTP/3 application upload keeps its actual request body and write half in
 one owner whose session hold is dropped last. Cancellation does not refund that
 admission while the captured upload IO can still exist.
+
+## Promised HEAD responses
+
+The h2 receiver marks a validated promised HEAD request with the same body
+semantics as a locally initiated HEAD. Content-Length describes its selected
+representation and does not require response DATA. Nonempty HEAD DATA,
+conflicting Content-Length fields, and truncated ordinary GET responses still
+fail their own stream without resetting a valid parent response. This client
+correctness fix does not by itself implement the native HTTP/2 push handler.

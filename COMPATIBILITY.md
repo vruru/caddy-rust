@@ -117,8 +117,7 @@ accepting their module name. Go plugins have no cross-language binary ABI;
 their configuration and behavior require native implementations.
 
 Known development gaps still include remaining listener/address combinations,
-distributed tracing, the ACME server handler, push and timeout
-handlers and remaining template receiver methods,
+the ACME server handler, HTTP/2 push and remaining template receiver methods,
 TLS 1.2 CBC suites, client renegotiation, full Go PKIX edge semantics and remaining issuer/trust-loader
 capabilities. This list is not a claim that all other field combinations are
 fully verified. The 135-module baseline is an inventory, not a support registry.

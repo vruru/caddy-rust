@@ -866,6 +866,13 @@ impl Recv {
             return Err(Error::library_reset(promised_id, Reason::PROTOCOL_ERROR));
         }
 
+        // A promised HEAD has the same response-body semantics as a locally
+        // initiated HEAD. Its Content-Length describes the selected GET
+        // representation, not DATA that this stream must receive.
+        if req.method() == http::Method::HEAD {
+            stream.content_length = super::stream::ContentLength::Head;
+        }
+
         use super::peer::PollMessage::*;
         stream
             .pending_recv
