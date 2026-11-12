@@ -47,6 +47,18 @@ impl PathAndQuery {
         Self::from_shared_bounded(Bytes::copy_from_slice(raw), MAX_EXPLICIT_ORIGIN_FORM, true)
     }
 
+    /// Explicit native rewrite component, not a request-target parser. Go's
+    /// URL.Path may be relative and contain a colon in its first segment.
+    /// Keep those bytes as path data without interpreting a new scheme/host.
+    /// The caller has already encoded the path and validated the independent
+    /// connection authority. Ordinary public URI parsers remain strict.
+    pub fn from_native_rewrite_path_query(src: String) -> Result<Self, InvalidUri> {
+        let scanned = scan_path_and_query_mode(src.as_bytes(), MAX_EXPLICIT_ORIGIN_FORM, true)?;
+        if scanned.fragment.is_some() { return Err(ErrorKind::FragmentNotAllowed.into()); }
+        Ok(Self { data: ByteStr::from_utf8(Bytes::from(src)).map_err(|_|ErrorKind::InvalidUriChar)?,
+            query: scanned.query, implicit_slash: false })
+    }
+
     fn from_shared_bounded(
         mut src: Bytes,
         limit: usize,
@@ -533,6 +545,10 @@ fn check_origin_form_bounds(bytes: &[u8]) -> Result<(), InvalidUri> {
 }
 
 const fn scan_path_and_query(bytes: &[u8], limit: usize) -> Result<Scanned, ErrorKind> {
+    scan_path_and_query_mode(bytes, limit, false)
+}
+
+const fn scan_path_and_query_mode(bytes: &[u8], limit: usize, relative: bool) -> Result<Scanned, ErrorKind> {
     debug_assert!(limit < u32::MAX as usize);
     let mut i = 0;
     let mut query = NONE;
@@ -541,6 +557,7 @@ const fn scan_path_and_query(bytes: &[u8], limit: usize) -> Result<Scanned, Erro
     let mut is_maybe_not_utf8 = false;
 
     if bytes.is_empty() {
+        if relative { return Ok(Scanned { query, fragment, is_maybe_not_utf8: false }); }
         return Err(ErrorKind::Empty);
     }
 
@@ -556,7 +573,7 @@ const fn scan_path_and_query(bytes: &[u8], limit: usize) -> Result<Scanned, Erro
         });
     }
 
-    if !matches!(bytes[0], b'/' | b'?' | b'#') {
+    if !relative && !matches!(bytes[0], b'/' | b'?' | b'#') {
         return Err(ErrorKind::PathDoesNotStartWithSlash);
     }
 

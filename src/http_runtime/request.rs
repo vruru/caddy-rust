@@ -1184,6 +1184,11 @@ fn handlers<'a>(
                         let method = ctx.expand(method)?.to_uppercase().parse::<Method>()?;
                         *ctx.req_mut().method_mut() = method;
                     }
+                    if uri.as_ref().is_none_or(|value| value.is_empty())
+                        && strip_path_prefix.is_none() && strip_path_suffix.is_none()
+                    {
+                        continue;
+                    }
                     let mut target = ctx
                         .req()
                         .uri()
@@ -1217,7 +1222,7 @@ fn handlers<'a>(
                         if !path.starts_with('/') {
                             path.insert(0, '/');
                         }
-                        target = path;
+                        target = String::from_utf8(super::http_redirect::url::template_encode_path_bytes(path.as_bytes()))?;
                         if let Some(query) = query {
                             target.push('?');
                             target.push_str(&query);
@@ -1227,12 +1232,12 @@ fn handlers<'a>(
                         !target.contains(['\r', '\n', '\0']),
                         "invalid rewritten request URI"
                     );
-                    let url = url::Url::parse(&format!("http://rewrite.invalid{target}"))?;
-                    let target = match url.query() {
-                        Some(q) => format!("{}?{q}", url.path()),
-                        None => url.path().to_owned(),
-                    };
-                    *ctx.req_mut().uri_mut() = target.parse()?;
+                    // Construct a path/query component explicitly. Parsing this as a
+                    // full URI would reinterpret a colon in the first path segment
+                    // as a scheme and would lose an original absolute target's host.
+                    let mut parts = http::uri::Parts::default();
+                    parts.path_and_query = Some(http::uri::PathAndQuery::from_native_rewrite_path_query(target)?);
+                    *ctx.req_mut().uri_mut() = Uri::from_parts(parts)?;
                 }
                 Handler::Vars(vars) => {
                     for (name, value) in vars {

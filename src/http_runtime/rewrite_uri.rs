@@ -39,7 +39,7 @@ pub(super) fn rewrite_uri(
         .map_or((before_fragment, None), |(path, query)| (path, Some(query)));
     let mut query = raw_query.map(str::to_owned);
     let path = if raw_path.is_empty() {
-        current.path().to_owned()
+        current.path_and_query().map_or("",|value|value.raw_path()).to_owned()
     } else {
         let escaped = escape_path_placeholders(raw_path, current, &lookup)?;
         let expanded = replace(&escaped, true, &lookup)?;
@@ -56,6 +56,15 @@ pub(super) fn rewrite_uri(
             expanded.to_owned()
         }
     };
+    // A URI setter changes URL.Path, not Scheme/Host. Decode its supplied
+    // path once then use Go's EscapedPath encoding, without cleaning dots or
+    // treating a literal "https://..." path as a new absolute URI. An invalid
+    // escape is retained as literal text, as the Go setter does.
+    let path = if raw_path.is_empty() { path } else {
+        let bytes = super::http_redirect::url::template_decode_bytes(path.as_bytes())
+            .unwrap_or_else(|_|path.as_bytes().to_vec());
+        String::from_utf8(super::http_redirect::url::template_encode_path_bytes(&bytes))?
+    };
     let query = if let Some(query) = query {
         Some(build_query_string(&query, &lookup)?)
     } else {
@@ -71,7 +80,7 @@ pub(super) fn rewrite_uri(
 }
 
 fn get_path_and_query(uri: &Uri) -> String {
-    let path = uri.path();
+    let path = uri.path_and_query().map_or("",|value|value.raw_path());
     if let Some(q) = uri.query() {
         format!("{}?{}", path, q)
     } else {

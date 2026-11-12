@@ -9,20 +9,16 @@ pub(crate) struct RequestData {
     tls_snapshot:Option<Arc<crate::http_runtime::ConnectionSnapshot>>,
     tls_values:tls_values::Cache,
     url_values:OnceLock<request_url::Cache>,
+    url_origin:Option<Uri>,url_origin_form:bool,
     pub uri:Uri,pub original_uri:Uri,pub request_uri:String,pub method:Method,pub original_method:Method,
     pub form:Arc<super::forms::Form>,pub headers:HeaderMap,pub version:Version,pub host:String,pub remote:Vec<u8>,
     pub remote_ip:Vec<u8>,pub client_ip:String,pub tls:bool,pub content_length:i64,pub placeholders:BTreeMap<String,(Vec<u8>,bool)>,
 }
-// H2/H3 reconstruct an absolute Uri from separate pseudo-fields. Go's
-// server URL still contains the origin-form path/query; Request.Host remains
-// the independent authority. H1 absolute targets and virtual includes retain
-// their own provenance. CONNECT retains its authority-form URL.
-fn captured_uri(uri:&Uri,version:Version,method:&Method)->Result<Uri,super::super::TemplateFailure>{
-    if !matches!(version,Version::HTTP_2|Version::HTTP_3)||method==Method::CONNECT{return Ok(uri.clone());}
-    let mut parts=uri.clone().into_parts();parts.scheme=None;parts.authority=None;
-    if parts.path_and_query.is_none(){parts.path_and_query=Some(http::uri::PathAndQuery::from_static("/"));}
-    Uri::from_parts(parts).map_err(|_|super::super::TemplateFailure(http::StatusCode::BAD_REQUEST))
-}
+// Mechanical H2/H3 URIs contain pseudo-field scheme/authority even though
+// Go exposes an origin-form URL, including extended CONNECT. Derive the
+// logical URL authority from the actual original transport target, not a
+// rewritten method or operator-overridable placeholder. Rewrites change the
+// path/query while the original scheme/authority remain independent facts.
 impl RequestData {
     pub(crate) fn capture(ctx:&super::super::super::request::Context)->Result<Self,super::super::TemplateFailure>{
         let req=ctx.req();let mut placeholders=BTreeMap::new();
@@ -34,14 +30,17 @@ impl RequestData {
         let bytes=placeholders.iter().try_fold(0usize,|n,(key,value)|n.checked_add(key.len()+value.0.len()+64));
         if !bytes.is_some_and(|n|n<=1<<20){return Err(super::super::TemplateFailure(http::StatusCode::INTERNAL_SERVER_ERROR));}
         let target=req.extensions().get::<super::super::virtual_request::VirtualTarget>();
-        let uri=match target{Some(target)=>target.uri.clone(),None=>captured_uri(req.uri(),req.version(),req.method())?};
-        let original_uri=match target{Some(target)=>target.uri.clone(),None=>captured_uri(&ctx.original_uri,req.version(),ctx.template_original_method())?};
+        let uri=target.map_or_else(||req.uri().clone(),|target|target.uri.clone());
+        let original_uri=target.map_or_else(||ctx.original_uri.clone(),|target|target.uri.clone());
+        let url_origin=target.is_none().then(||ctx.original_uri.clone());
+        let url_origin_form=matches!(req.version(),Version::HTTP_2|Version::HTTP_3)
+            &&(ctx.template_original_method()!=Method::CONNECT||ctx.original_uri.path_and_query().is_some());
         let request_uri=if target.is_some(){String::new()}else{ctx.original_uri.path_and_query().map_or("/",|v|v.as_str()).to_owned()};
         let form=super::forms::Form::new(req.method().as_str(),uri.query().unwrap_or_default(),req.headers().get(header::CONTENT_TYPE).and_then(|v|v.to_str().ok()).unwrap_or_default());
         // Go's net/http parser promotes the wire Host header into Request.Host
         // and removes it from Request.Header; Hyper retains that wire field.
         let mut headers=req.headers().clone();headers.remove(header::HOST);
-        Ok(Self{tls_snapshot:req.extensions().get::<Arc<crate::http_runtime::ConnectionSnapshot>>().cloned(),tls_values:tls_values::cache(),url_values:OnceLock::new(),dynamic:crate::http_runtime::placeholder_value::Dynamic::capture(ctx),uri,original_uri,request_uri,form,method:req.method().clone(),original_method:ctx.lookup("http.request.orig_method").and_then(|s|s.parse().ok()).unwrap_or(Method::GET),headers,version:req.version(),host:ctx.authority.clone(),remote:ctx.peer.raw_text().into_owned(),remote_ip:ctx.peer.raw_host().into_owned(),client_ip:ctx.client_ip.map_or_else(String::new,|ip|ip.to_string()),tls:ctx.tls,content_length:if target.is_some(){0}else{ctx.template_content_length()},placeholders})
+        Ok(Self{tls_snapshot:req.extensions().get::<Arc<crate::http_runtime::ConnectionSnapshot>>().cloned(),tls_values:tls_values::cache(),url_values:OnceLock::new(),dynamic:crate::http_runtime::placeholder_value::Dynamic::capture(ctx),url_origin,url_origin_form,uri,original_uri,request_uri,form,method:req.method().clone(),original_method:ctx.lookup("http.request.orig_method").and_then(|s|s.parse().ok()).unwrap_or(Method::GET),headers,version:req.version(),host:ctx.authority.clone(),remote:ctx.peer.raw_text().into_owned(),remote_ip:ctx.peer.raw_host().into_owned(),client_ip:ctx.client_ip.map_or_else(String::new,|ip|ip.to_string()),tls:ctx.tls,content_length:if target.is_some(){0}else{ctx.template_content_length()},placeholders})
     }
     pub(super) fn placeholder(&self,name:&str,control:&Arc<super::Control>)->RenderResult<Value> {
         if let Some(value)=crate::http_config::helpers::global_lookup(name){control.reserve_host_bytes(value.len()+64)?;return Ok(string(value));}
@@ -104,7 +103,7 @@ impl RequestData {
         let request_uri=&self.request_uri;
         let (major,minor,proto)=if original{(0,0,"")}else{match self.version{Version::HTTP_10=>(1,0,"HTTP/1.0"),Version::HTTP_2=>(2,0,"HTTP/2.0"),Version::HTTP_3=>(3,0,"HTTP/3.0"),_=>(1,1,"HTTP/1.1")}};
         let mut fields=Fields::from([
-            ("Method".into(),string(method.as_str())),("URL".into(),request_url::cached(uri,control,url_cache,original)?),
+            ("Method".into(),string(method.as_str())),("URL".into(),request_url::cached(uri,self.url_origin.as_ref(),self.url_origin_form,control,url_cache,original)?),
             ("Header".into(),header_value(Arc::new(Mutex::new(headers.clone())),false)),
             ("Trailer".into(),header_value(Arc::new(Mutex::new(HeaderMap::new())),false)),
             ("Host".into(),string(if original{""}else{&self.host})),("RemoteAddr".into(),Value::from_go_bytes(self.remote.clone())),

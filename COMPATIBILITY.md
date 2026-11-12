@@ -896,3 +896,20 @@ handshakes and health probes use the published pool without source I/O.
 Persistent prepared trust retains its existing output accounting boundary;
 these temporary credits are not a whole-process/RSS limit. Rustls TLS
 renegotiation `once` and `freely` remain explicitly unsupported.
+
+### Native request URL provenance and rewrite path components
+
+Template URL projections retain scheme and host from the actual original
+transport target, independently of later method and path rewrites. HTTP/2 and
+HTTP/3 pseudo-field authorities remain Request.Host facts; origin-form requests
+and extended CONNECT expose an origin-form URL. Authority-form CONNECT retains
+its separate URL authority. Virtual template requests retain their own target.
+
+A method-only rewrite no longer changes the path. URI setters update a path and
+query component without interpreting a literal scheme-looking path as a new
+origin, or cleaning dot segments with a generic URL parser. Percent escapes are
+decoded and re-encoded using the Go setter's path behavior. An explicit bounded
+component constructor supports relative and empty rewrite paths without widening
+the normal wire request-target parser. Other rewrite modifiers and fragment
+projection are separate compatibility work; controlled CONNECT body/upgrade
+acceptance is not established by these URL changes.
