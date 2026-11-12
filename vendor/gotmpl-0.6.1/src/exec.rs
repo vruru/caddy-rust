@@ -1139,6 +1139,7 @@ fn measure_value(value: &Value, remaining: &mut usize, nodes:&mut usize, depth: 
             object.validate_lazy()?;
             *remaining=remaining.checked_sub(object.data_bytes).ok_or_else(limit)?;
             if let Some(json)=&object.json{let bytes=match json{Ok(bytes)|Err(bytes)=>bytes};*remaining=remaining.checked_sub(bytes.len()).ok_or_else(limit)?;}
+            if let Some(fields)=&object.reflected_fields{for(name,value)in fields.iter(){*remaining=remaining.checked_sub(name.len()+core::mem::size_of::<(Arc<str>,Value)>()).ok_or_else(limit)?;measure_value(value,remaining,nodes,depth+1,context)?;}}
             if let Some(order)=&object.field_order{for name in order.iter(){*remaining=remaining.checked_sub(name.len()+32).ok_or_else(limit)?;}}
             if let Some(fields)=&object.json_fields{for field in fields.iter(){*remaining=remaining.checked_sub(field.name.len()+field.source.len()+32).ok_or_else(limit)?;}}
             if let Some(display)=&object.display{*remaining=remaining.checked_sub(display.len()).ok_or_else(limit)?;}

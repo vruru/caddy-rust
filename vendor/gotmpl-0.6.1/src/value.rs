@@ -219,6 +219,10 @@ pub struct Object {
     pub display: Option<Arc<str>>,
     pub go_type: Option<&'static str>,
     pub field_order:Option<Arc<[Arc<str>]>>,
+    /// Immutable reflection layout for fmt only, including actual private Go
+    /// fields. Never participates in template field lookup or JSON export.
+    /// The producer must prepay both the layout and its owned values.
+    pub reflected_fields:Option<Arc<[(Arc<str>,Value)]>>,
     pub json:Option<core::result::Result<Arc<str>,Arc<str>>>,
     /// Current host JSON representation. The host charges allocation and work
     /// before generating a Go string; serialization validates the returned JSON.
@@ -241,7 +245,7 @@ impl Object {
         self.host_type.and_then(|host|host.methods.iter().find(|method|method.name==name)).map(MethodRef::Static)
     }
     pub(crate) fn validate_lazy(&self)->Result<()>{
-        if self.lazy_fields&&(self.map_view.is_some()||self.json.is_some()||self.json_dynamic.is_some()||self.display.is_some()||self.dynamic_stringer.is_some()||self.nil_pointer.is_some()||self.field_charge.is_none()||self.fields.values().any(|value|!matches!(value,Value::Nil))){return Err(crate::TemplateError::Exec("invalid lazy host object".into()));}Ok(())
+        if self.lazy_fields&&(self.map_view.is_some()||self.json.is_some()||self.json_dynamic.is_some()||self.display.is_some()||self.dynamic_stringer.is_some()||self.reflected_fields.is_some()||self.nil_pointer.is_some()||self.field_charge.is_none()||self.fields.values().any(|value|!matches!(value,Value::Nil))){return Err(crate::TemplateError::Exec("invalid lazy host object".into()));}Ok(())
     }
     pub fn is_nil_pointer(&self)->bool{self.nil_pointer.as_ref().is_some_and(|is_nil|is_nil())}
     pub fn field_value(&self,name:&str)->Result<Option<Value>>{

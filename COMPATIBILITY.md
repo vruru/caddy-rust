@@ -792,10 +792,13 @@ captures rather than claiming that arbitrary captures are acyclic or prepaid.
 AppendBinary preserves byte backing/view aliases when capacity permits, and
 uses Go byte-slice growth when a new backing is required. Nil []byte, non-nil
 empty slices and typed nil non-byte slices stay distinct. URL has Stringer,
-not a fabricated fmt.Formatter. The older generic formatter's non-v struct
-reflection remains an explicit gap for verbs such as d/f/t; the optional HTML
-feature also retains its separately recorded baseline build errors. These
-remaining paths are not implied complete by successful URL method cases.
+not a fabricated fmt.Formatter. Struct formatting with an actual supplied
+layout now recurses with the original verb and flags. Userinfo supplies an
+immutable formatter-only layout of its real private fields; this does not make
+those fields accessible to template field lookup or JSON. The optional HTML
+feature retains its separately recorded baseline build errors. GoStringer and
+private layouts which have not been provided for other host types, including
+time.Time/time.Location, remain separate gaps.
 
 URL host allocation/work is conservatively prepaid from the same Control;
 this does not expand refundable printf coverage to every allocation family or
@@ -834,3 +837,29 @@ server URL. Request.Host retains the independently validated authority. H1
 absolute-form targets, CONNECT authority-form and virtual include targets keep
 their own representations. Server/route timeout activation and the remaining
 full release gates are tracked independently.
+
+
+Formatter reflection and static layouts
+---------------------------------------
+
+Object.reflected_fields is a producer-prepaid immutable layout for formatting,
+separate from public fields and JSON. Its strong values and names participate
+in execution measurement and bounded structural/graph checks; collection
+constructors and writes cannot hide field references or a self-reference in
+this layout. The current Userinfo layout contains only its actual immutable
+username, password and passwordSet scalars. Formatting can reveal that private
+password just as Go does; String/Redacted and JSON retain their own rules.
+Other TLS/BigInt factories are not given invented private layouts.
+
+Static, dynamic and named Stringers preserve width, precision and zero padding;
+T/p/sharp-v and bad-verb reflection do not call Stringer. Bad-verb diagnostics
+format the underlying value with the original flags, and decimal/default integer
+precision and boolean zero padding follow Go. Reflected pointers use their
+actual native pointee identity. Addresses vary across processes and engines;
+no portable address literal is promised. Native output bytes remain intact.
+
+The existing scoped printf account, callback admission, work/cancellation and
+last-result/Tree lifetime remain in force. Static layouts do not establish a
+whole-engine heap cap or cover arbitrary opaque Rust captures. Host values
+without their real reflection/GoStringer representation remain explicit gaps
+rather than being replaced with a Stringer fallback for unsupported reflection.

@@ -122,6 +122,11 @@ fn user_value(user: Option<&Arc<User>>, weak: &Weak<Control>) -> RenderResult<Va
     Ok(Value::Object(Arc::new(Object {
         methods,
         display: Some(display.into()),
+        reflected_fields:user.map(|user|Arc::from([
+            (Arc::from("username"),Value::from_go_bytes(user.username.as_slice())),
+            (Arc::from("password"),Value::from_go_bytes(user.password.as_deref().unwrap_or_default())),
+            (Arc::from("passwordSet"),Value::Bool(user.password.is_some())),
+        ])),
         go_type: Some("*url.Userinfo"),
         nil_pointer: user
             .is_none()

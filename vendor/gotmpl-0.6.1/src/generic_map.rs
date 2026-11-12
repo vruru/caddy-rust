@@ -122,7 +122,7 @@ impl GenericMapCell {
             Value::List(items)=>for item in items.iter(){self.inspect(item,depth+1)?;},
             Value::Slice(slice)=>if let Some(items)=slice.retained_values(){for item in items.iter(){self.inspect(item,depth+1)?;}},
             Value::Map(items)=>for item in items.values(){self.inspect(item,depth+1)?;},
-            Value::Object(object)=>for item in object.fields.values(){self.inspect(item,depth+1)?;},
+            Value::Object(object)=>{if let Some(fields)=&object.reflected_fields{for(_,item)in fields.iter(){self.inspect(item,depth+1)?;}}for item in object.fields.values(){self.inspect(item,depth+1)?;}},
             _=>{}
         }Ok(())
     }

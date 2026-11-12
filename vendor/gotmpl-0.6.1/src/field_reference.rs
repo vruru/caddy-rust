@@ -59,7 +59,7 @@ pub(crate) fn check_storage_fields(values:&[Value])->Result<()> {
    Value::SharedMap(map)=>{let snapshot=map.snapshot_go()?;for value in snapshot.values(){visit(value,depth+1,nodes)?;}},
    #[cfg(feature="std")]
    Value::GenericMap(map)=>{let snapshot=map.snapshot()?;for(key,value)in snapshot.iter(){visit(key,depth+1,nodes)?;visit(value,depth+1,nodes)?;}},
-   Value::Object(object)=>for value in object.fields.values(){visit(value,depth+1,nodes)?;},
+   Value::Object(object)=>{if let Some(fields)=&object.reflected_fields{for(_,value)in fields.iter(){visit(value,depth+1,nodes)?;}}for value in object.fields.values(){visit(value,depth+1,nodes)?;}},
    _=>{}
   }Ok(())
  }

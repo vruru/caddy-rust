@@ -264,6 +264,7 @@ impl MapCell {
                 }
             }
             Value::Object(object) => {
+                if let Some(fields)=&object.reflected_fields{for(name,value)in fields.iter(){*bytes=bytes.checked_sub(name.len().saturating_add(core::mem::size_of::<(Arc<str>,Value)>())).ok_or_else(||error("map value byte limit exceeded"))?;self.inspect(value,depth+1,nodes,bytes)?;}}
                 for value in object.fields.values() {
                     self.inspect(value, depth + 1, nodes, bytes)?;
                 }

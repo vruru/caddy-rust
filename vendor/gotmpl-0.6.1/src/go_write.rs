@@ -14,6 +14,7 @@ impl GoWrite for VecSink<'_>{fn write_bytes(&mut self,bytes:&[u8])->fmt::Result{
 pub(crate) fn write_value<W:GoWrite+?Sized>(writer:&mut W,value:&Value,depth:usize)->Result<()>{
     if matches!(value,Value::Field(_)){let resolved=value.resolve_field_with(|value|writer.host(value))?;return write_value(writer,&resolved,depth);}
     if depth>32{return Err(TemplateError::Exec("template printed value exceeds nesting limit".into()));}
+    if let Value::Object(object)=value{object.validate_lazy()?;}
     let _slice_host=if matches!(value,Value::Slice(slice)if slice.named_type().is_some_and(|kind|kind.stringer.is_some())){writer.host(value)?}else{None};
     if let Value::Slice(slice)=value && let Some(display)=slice.string_value()? {
         return write_value(writer,&display,depth+1);
