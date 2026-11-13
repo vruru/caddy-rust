@@ -19,6 +19,12 @@ static ranges and conditions, request/response middleware and matchers, logging
 and handler trace. Templates, Goldmark and CEL have differential coverage, but
 remaining host methods and field combinations are not claimed complete.
 
+The HTTP Host matcher removes request-authority IPv6 brackets before matching
+literal or wildcard patterns, as the reference does, with or without an explicit
+port. Brackets in a configured pattern remain literal. This corrects a route
+miss after successful IPv6 TLS; it does not change certificate selection, TLS
+verification, strict-SNI checks or request-placeholder formatting.
+
 TLS 1.2/1.3, manual and managed material, automatic HTTP redirects, local PKI,
 on-demand permission checks, HTTP-01/TLS-ALPN-01 issuance, renewal/ARI and OCSP
 are connected to the native lifecycle. HTTP and Tailscale external managers

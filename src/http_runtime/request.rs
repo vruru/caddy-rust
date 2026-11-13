@@ -1903,6 +1903,10 @@ pub(super) fn hostname(authority: &str) -> String {
         .unwrap_or_else(|_| authority.trim_end_matches('.').to_ascii_lowercase())
 }
 fn host_match(pattern: &str, host: &str) -> bool {
+    // Authority::host() retains IPv6 brackets. Caddy's Host matcher removes
+    // them after splitting the request authority; matcher patterns stay literal.
+    let host = host.strip_prefix('[').unwrap_or(host);
+    let host = host.strip_suffix(']').unwrap_or(host);
     let p = pattern.trim_end_matches('.').split('.').collect::<Vec<_>>();
     let h = host.trim_end_matches('.').split('.').collect::<Vec<_>>();
     p.len() == h.len()
