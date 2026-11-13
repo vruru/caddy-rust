@@ -853,6 +853,7 @@ async fn worker(weak: Weak<Inner>, mut receiver: mpsc::Receiver<Job>) {
                 if let Ok(mut admission) = inner.admission.lock() {
                     *admission = Admission::Closed;
                 }
+                crate::process_notify::send(crate::process_notify::State::Stopping).await;
                 let _ = job.reply.send(Ok(false));
                 let backend = inner.backend.clone();
                 tokio::spawn(async move {
@@ -882,10 +883,17 @@ async fn worker(weak: Weak<Inner>, mut receiver: mpsc::Receiver<Job>) {
                 });
             }
             Work::Change(change) => {
+                crate::process_notify::send(crate::process_notify::State::Reloading).await;
                 let result = std::panic::AssertUnwindSafe(apply(&inner, change))
                     .catch_unwind()
                     .await
                     .unwrap_or_else(|_| Err(AdminError::new(500, "admin_internal_error")));
+                if result.is_err() {
+                    crate::process_notify::send(crate::process_notify::State::ReloadFailed).await;
+                }
+                if inner.check_readable().is_ok() {
+                    crate::process_notify::send(crate::process_notify::State::Ready).await;
+                }
                 match result {
                     Ok(Applied {
                         changed,

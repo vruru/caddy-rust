@@ -72,6 +72,7 @@ struct Source {
 }
 
 fn run(parsed: args::Flags) -> Result<i32> {
+    caddy_compat_native::process_notify::initialize();
     let pingback = nonempty(parsed.text("pingback"));
     ensure!(
         pingback.is_none() || nonempty(parsed.text("config")) != Some(OsStr::new("-")),
@@ -238,6 +239,7 @@ async fn supervise(root: Arc<NativeBackend>, setup: RunSetup) -> Result<i32> {
             .map(|s| (cwd, s.path.clone(), s.adapter.clone())),
     )?;
     let mut stops = controller.stop_events();
+    caddy_compat_native::process_notify::send(caddy_compat_native::process_notify::State::Reloading).await;
     let startup = controller.start();
     tokio::pin!(startup);
     loop {
@@ -252,6 +254,7 @@ async fn supervise(root: Arc<NativeBackend>, setup: RunSetup) -> Result<i32> {
             },
             result=&mut startup=>{
                 if let Err(error)=result {
+                    caddy_compat_native::process_notify::send(caddy_compat_native::process_notify::State::ReloadFailed).await;
                     let (_,_) = tokio::join!(controller.shutdown(),root.stop(StopMode::Force));
                     return Err(error.into());
                 }
@@ -271,6 +274,7 @@ async fn supervise(root: Arc<NativeBackend>, setup: RunSetup) -> Result<i32> {
             bail!("failed to report native startup readiness");
         }
     }
+    caddy_compat_native::process_notify::send(caddy_compat_native::process_notify::State::Ready).await;
     eprintln!("run event=serving_initial_configuration");
     let cancel = CancellationToken::new();
     let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(1);
@@ -329,6 +333,7 @@ async fn drain(
     signals: &mut Signals,
     mut interrupted: bool,
 ) -> Result<i32> {
+    caddy_compat_native::process_notify::send(caddy_compat_native::process_notify::State::Stopping).await;
     let owned = async {
         let (admin, application) = tokio::join!(controller.shutdown(), root.stop_unbounded());
         admin?;
@@ -350,6 +355,7 @@ async fn drain(
 }
 
 async fn force(controller: &AdminController) -> Result<i32> {
+    caddy_compat_native::process_notify::send(caddy_compat_native::process_notify::State::Stopping).await;
     if controller.force_shutdown().await.is_err() {
         eprintln!("run event=forced_shutdown_incomplete");
     }

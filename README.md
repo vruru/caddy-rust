@@ -6,6 +6,7 @@
 
 The project currently covers a specific subset of functionalities:
 *   **CLI**: `fmt`, `adapt`, `validate`, `run`, `start`, `reload`, `stop`, `hash-password` (bcrypt and Argon2id), and recovery with `run --resume`.
+*   **Process Lifecycle**: Linux `Type=notify` readiness/reload/stop datagrams, bounded notification delivery, Unix signal handling and graceful drain.
 *   **HTTP/Admin**: Transactional endpoints, Host/origin/remote authorization, conditional configurations, and ETag support.
 *   **Transports**: H1, H2, and H3 streaming uploads and downloads, range-conditional responses, compression, reverse proxying (including FastCGI and WebSocket), and load balancing with dynamic upstream health checks.
 *   **TLS & Certificates**: TLS 1.2/1.3, managed and manual certificate support, on-demand ACME (HTTP-01, TLS-ALPN-01), local PKI, OCSP, session tickets, external certificate retrieval (HTTP, Tailscale), generation-scoped Must-Staple requests and private-key reuse.
@@ -33,6 +34,7 @@ cargo build --locked --release --features native-run
 
 For compatibility details, refer to:
 *   `COMPATIBILITY.md`
+*   `docs/PROCESS-NOTIFY.md`
 *   `docs/ACME-SERVER.md`
 *   `docs/SESSION-TICKETS.md`
 *   `docs/METRICS.md`
