@@ -47,7 +47,7 @@ impl OcspScope {
         let mut receiver = self.0.manager.subscribe();
         let resources = service.context.resources.clone();
         let cancel = self.0.cancel.clone();
-        self.0.tasks.spawn(service.tasks.track_future(async move {loop {tokio::select! {biased;
+        let watcher=self.0.tasks.track_future(service.tasks.track_future(async move {loop {tokio::select! {biased;
             _=cancel.cancelled()=>break,
             event=receiver.recv()=>match event {
                 Ok(event)=>if event.status.is_some_and(|status|status.state==OcspState::Revoked){resources.revoked.notify_waiters();},
@@ -59,7 +59,7 @@ impl OcspScope {
         let cancel = self.0.cancel.clone();
         let events = service.events.clone();
         let names = self.0.names.clone();
-        self.0.tasks.spawn(service.tasks.track_future(async move {
+        let runner=self.0.tasks.track_future(service.tasks.track_future(async move {
             let result = std::panic::AssertUnwindSafe(manager.run(cancel.clone()))
                 .catch_unwind()
                 .await;
@@ -73,6 +73,8 @@ impl OcspScope {
         }));
         drop(started);
         drop(_parent);
+        tokio::spawn(watcher);
+        tokio::spawn(runner);
         self.0.tasks.close();
         Ok(())
     }

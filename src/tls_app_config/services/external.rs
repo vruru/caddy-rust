@@ -97,9 +97,10 @@ impl CertificateServices {
                 // have joined. It does not own the connection lease itself.
                 let charge=external.reservation.clone();let resources=this.context.resources.clone();
                 let runner_cancel=lifetime.clone();
+                let task={
                 let _admission=this.admission.lock().map_err(|_|anyhow!("certificate service admission unavailable"))?;
                 ensure!(!*_admission && !this.context.cancel.is_cancelled(),"certificate services stopped");
-                this.tasks.spawn(async move {
+                this.tasks.track_future(async move {
                     let _charge=charge;
                     let mut events=manager.subscribe();
                     let running=manager.run(runner_cancel);
@@ -114,7 +115,9 @@ impl CertificateServices {
                         }
                     }}
                     resources.revoked.notify_waiters();
-                });
+                })
+                };
+                tokio::spawn(task);
             }
             ensure!(!cancel.is_cancelled(),"external certificate acquisition cancelled");
             Ok(Some(AcquiredCertificate{subject,receipt,slot,external:Some(external)}))

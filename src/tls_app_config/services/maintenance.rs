@@ -232,11 +232,12 @@ impl CertificateServices {
         *started = true;
         let this = self.clone();
         let worker = group.clone();
-        group.tasks.spawn(self.tasks.track_future(async move {
+        let task=group.tasks.track_future(self.tasks.track_future(async move {
             this.run_group(worker).await;
         }));
         drop(started);
         drop(_admission);
+        tokio::spawn(task);
         group.tasks.close();
         Ok(())
     }

@@ -413,6 +413,7 @@ impl CertificateServices {
         let TicketRuntime::Rotating { owner, .. } = tickets else {
             return Ok(None);
         };
+        let (task,activate) = {
         let _admission = self
             .admission
             .lock()
@@ -424,22 +425,26 @@ impl CertificateServices {
         );
         let owner = owner.clone();
         let (activate, signal) = oneshot::channel();
-        self.tasks.spawn(async move {
+        let task=self.tasks.track_future(async move {
             tokio::select! { biased;
                 _=token.cancelled()=>{},
                 ready=signal=>{ if ready.is_ok() { owner.run(generation, token).await; } },
             }
         });
+        (task,activate)
+        };
+        tokio::spawn(task);
         Ok(Some(activate))
     }
 
     /// All fallible preparation/ensure work precedes this synchronous signal.
     /// Repeated calls are harmless; a dropped sender never activates maintenance.
     pub fn activate(&self) {
-        let signal = {
+        let (signal,prune) = {
             let closed = self.admission.lock().unwrap_or_else(|e| e.into_inner());
             if *closed || self.context.cancel.is_cancelled() { return; }
             let signal = self.activate.lock().unwrap_or_else(|e|e.into_inner()).take();
+            let mut prune=None;
             if signal.is_some() {
                 if let Some(epoch) = self.cache_epoch.get() {
                     let cache = self.context.resources.resident_cache.clone();
@@ -447,16 +452,17 @@ impl CertificateServices {
                     let old = cache.activate(epoch.clone());
                     let cpu = self.context.resources.cpu.clone();
                     let cancel = self.context.cancel.clone();
-                    self.tasks.spawn(async move {
+                    prune=Some(self.tasks.track_future(async move {
                         let _ = super::loaders::blocking(cpu, cancel, move || {
                             cache.prune(&epoch)?; drop(old); Ok(())
                         }).await;
-                    });
+                    }));
                 }
                 self.on_demand.active.store(true, Ordering::Release);
             }
-            signal
+            (signal,prune)
         };
+        if let Some(task)=prune {tokio::spawn(task);}
         // oneshot delivery may synchronously re-enter this service.
         if let Some(signal) = signal { let _ = signal.send(()); }
     }
@@ -558,7 +564,7 @@ impl CertificateServices {
         + 'static,
     ) -> Result<T> {
         let (sender, mut receiver) = oneshot::channel();
-        let token = {
+        let (token,task) = {
             let _admission = self
                 .admission
                 .lock()
@@ -570,12 +576,15 @@ impl CertificateServices {
             let token = self.context.cancel.child_token();
             let this = self.clone();
             let operation_token = token.clone();
-            self.tasks.spawn(async move {
+            let task=self.tasks.track_future(async move {
                 let result = work(this, operation_token).await;
                 let _ = sender.send(result);
             });
-            token
+            (token,task)
         };
+        // Tracking is admitted under the fence; runtime-side synchronous drop
+        // and payload destruction happen only after the gate is released.
+        tokio::spawn(task);
         let guard = token.clone().drop_guard();
         let result = tokio::select! {
             biased;

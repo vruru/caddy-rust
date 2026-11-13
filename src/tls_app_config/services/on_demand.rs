@@ -1481,6 +1481,7 @@ impl CertificateServices {
         selection: Option<crate::http_runtime::WarmSelection>,
     ) -> Result<(Arc<Flight>, bool)> {
         let mut previous_owner:Option<(Arc<Flight>,bool)>=None;
+        let mut admitted_task=None;
         let result=(|| {
         let _admission = self
             .admission
@@ -1560,7 +1561,7 @@ impl CertificateServices {
         let prior = predecessor.map(|p| p.quiet.clone());
         let this = self.clone();
         let worker = flight.clone();
-        self.tasks.spawn(async move {
+        admitted_task=Some(self.tasks.track_future(async move {
             use super::super::resident_cache::CacheChanged;
             let timeout = if matches!(action, Action::Maintenance) {
                 Duration::from_secs(300)
@@ -1668,9 +1669,10 @@ impl CertificateServices {
                     worker.selection.clone(),
                 );
             }
-        });
+        }));
         Ok((flight, true))
         })();
+        if let Some(task)=admitted_task {tokio::spawn(task);}
         if let Some((previous,stale))=previous_owner {
             if stale { previous.cancel.cancel(); }
             drop(previous);
