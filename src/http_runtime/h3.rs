@@ -51,6 +51,7 @@ pub(super) struct AltSvc(pub(super) HeaderValue);
 
 pub(super) struct Binding {
     pub(super) actual: SocketAddr,
+    only_v6: bool,
     pub(super) advertisement: AltSvc,
     _endpoint: Endpoint,
     accept_stop: CancellationToken,
@@ -134,14 +135,16 @@ pub(super) fn stage(
             .find(|address| address.declared == key)
             .map(|a| a.actual);
         let wanted = tcp_actual.unwrap_or(key);
+        let only_v6=server.plan.listen_v6_only.contains(&key);
         let binding = if let Some(binding) = pool.get(&key).and_then(Weak::upgrade) {
+            ensure!(binding.only_v6==only_v6,"HTTP/3 listener IPv6-only mode changed across reload");
             ensure!(
                 wanted.port() == 0 || wanted == binding.actual,
                 "HTTP/3 listener address changed across reload"
             );
             binding
         } else {
-            let socket = udp_socket(wanted)?;
+            let socket = udp_socket(wanted,only_v6)?;
             let endpoint = Endpoint::new(
                 quinn::EndpointConfig::default(),
                 Some(initial_config(crypto.clone(), &transport, scope)?),
@@ -151,6 +154,7 @@ pub(super) fn stage(
             let actual = endpoint.local_addr()?;
             let binding = Arc::new(Binding {
                 actual,
+                only_v6,
                 advertisement: AltSvc(HeaderValue::from_str(&format!(
                     "h3=\":{}\"; ma=2592000",
                     actual.port()
@@ -185,7 +189,7 @@ pub(super) fn stage(
     Ok(listeners)
 }
 
-fn udp_socket(address: SocketAddr) -> std::io::Result<UdpSocket> {
+fn udp_socket(address: SocketAddr, only_v6: bool) -> std::io::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let socket = Socket::new(
         Domain::for_address(address),
@@ -193,7 +197,7 @@ fn udp_socket(address: SocketAddr) -> std::io::Result<UdpSocket> {
         Some(Protocol::UDP),
     )?;
     if let SocketAddr::V6(address) = address {
-        socket.set_only_v6(!address.ip().is_unspecified())?;
+        socket.set_only_v6(only_v6 || !address.ip().is_unspecified())?;
     }
     socket.set_nonblocking(true)?;
     socket.bind(&address.into())?;

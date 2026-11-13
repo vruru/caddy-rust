@@ -46,6 +46,7 @@ impl Drop for ListenerControl {
 struct PoolSlot {
     owner: Weak<ListenerControl>,
     actual: SocketAddr,
+    only_v6: bool,
     cancel: CancellationToken,
     finished: CancellationToken,
 }
@@ -655,6 +656,10 @@ impl HttpRuntime {
                     }
                     // Validate every shared proof policy before changing any owner.
                     for address in bindings.keys(){
+                        if let Some(slot)=control.pool.get(address) {
+                            ensure!(slot.only_v6==servers[address].plan.listen_v6_only.contains(address),
+                                "HTTP listener IPv6-only mode changed across reload");
+                        }
                         if control.leases.iter().any(|record|record.bindings.iter().any(|(key,_)|key==address)){
                             let owner=control.pool.get(address).and_then(|slot|slot.owner.upgrade())
                                 .ok_or_else(||anyhow::anyhow!("challenge listener owner unavailable"))?;
@@ -671,6 +676,7 @@ impl HttpRuntime {
                             &mut control,
                             *address,
                             *kind,
+                            Some(servers[address].plan.listen_v6_only.contains(address)),
                             &proof_tls,
                             false,
                             &mut launches,
@@ -1065,11 +1071,12 @@ fn prune_pool(control: &mut Control) {
         .pool
         .retain(|_, slot| slot.owner.strong_count() != 0 || !slot.finished.is_cancelled());
 }
-fn covers(bound: SocketAddr, requested: SocketAddr) -> bool {
+fn covers(bound: SocketAddr, requested: SocketAddr, only_v6: bool) -> bool {
     bound == requested
         || bound.port() == requested.port()
             && bound.ip().is_unspecified()
-            && (bound.is_ipv6() || requested.is_ipv4())
+            && (bound.is_ipv6() && (!only_v6 || requested.is_ipv6())
+                || bound.is_ipv4() && requested.is_ipv4())
 }
 fn pool_key(control: &Control, address: SocketAddr, coverage: bool) -> Option<SocketAddr> {
     if control.pool.contains_key(&address) {
@@ -1079,7 +1086,7 @@ fn pool_key(control: &Control, address: SocketAddr, coverage: bool) -> Option<So
         control
             .pool
             .iter()
-            .find_map(|(key, slot)| covers(slot.actual, address).then_some(*key))
+            .find_map(|(key, slot)| covers(slot.actual, address, slot.only_v6).then_some(*key))
     } else {
         None
     }
@@ -1119,12 +1126,15 @@ fn own_socket(
     control: &mut Control,
     address: SocketAddr,
     kind: ListenerKind,
+    only_v6: Option<bool>,
     tls: &Arc<rustls::ServerConfig>,
     coverage: bool,
     launches: &mut Vec<Launch>,
     connections: &Arc<connection_budget::Budgets>,
 ) -> Result<(Arc<ListenerControl>, bool)> {
     if let Some(key) = pool_key(control, address, coverage) {
+        ensure!(only_v6.is_none_or(|mode|mode==control.pool[&key].only_v6),
+            "HTTP listener IPv6-only mode changed across reload");
         ensure!(
             !control.pool[&key].finished.is_cancelled(),
             "shared HTTP listener closed unexpectedly"
@@ -1135,13 +1145,14 @@ fn own_socket(
             .ok_or_else(|| anyhow::anyhow!("listener closing after admission"))?;
         return Ok((owner, true));
     }
+    let only_v6=only_v6.unwrap_or(false);
     ensure!(
         !control.pool.values().any(|slot| address.port() != 0
-            && (covers(slot.actual, address) || covers(address, slot.actual))),
+            && (covers(slot.actual, address, slot.only_v6) || covers(address, slot.actual, only_v6))),
         "HTTP listener binding scope overlaps an existing shared listener"
     );
     let socket =
-        bind_listener(address).map_err(|_| anyhow::anyhow!("HTTP listener bind failed"))?;
+        bind_listener(address,only_v6).map_err(|_| anyhow::anyhow!("HTTP listener bind failed"))?;
     let finished = CancellationToken::new();
     let admission = connections.listener();
     let socket = ListenerSocket {
@@ -1170,6 +1181,7 @@ fn own_socket(
         PoolSlot {
             owner: Arc::downgrade(&owner),
             actual,
+            only_v6,
             cancel: cancel.clone(),
             finished,
         },
@@ -1282,6 +1294,28 @@ fn requested_bindings(
     );
     Ok(bindings)
 }
+// An existing tcp6 wildcard cannot accept IPv4 proof traffic. Retain that
+// exact listener and lease a separate IPv4 socket rather than treating its
+// SocketAddr as a dual-stack capability. Recompute under the pool fence after
+// waiting for a closing descriptor, before creating or modifying any owner.
+fn proof_bindings(control:&Control,requests:&[(SocketAddr,ListenerKind)])->Result<Vec<(SocketAddr,ListenerKind)>> {
+    let mut bindings:Vec<(SocketAddr,ListenerKind)>=Vec::with_capacity(requests.len()*2);
+    let mut add=|address,kind|->Result<()> {
+        if let Some((_,previous))=bindings.iter().find(|(bound,_)|*bound==address) {
+            ensure!(*previous==kind,"challenge protocols conflict on one address");
+        } else {bindings.push((address,kind));}
+        Ok(())
+    };
+    for &(address,kind) in requests {
+        if address.is_ipv6() && address.ip().is_unspecified()
+            && control.pool.values().any(|slot|slot.actual==address&&slot.only_v6) {
+            let ipv4=SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(),address.port());
+            add(ipv4,kind)?;
+        }
+        add(address,kind)?;
+    }
+    Ok(bindings)
+}
 impl ChallengeListenerProvider for RuntimeChallengeProvider {
     fn acquire(
         &self,
@@ -1291,14 +1325,14 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
         let weak_inner = self.inner.clone();
         let weak_control = self.control.clone();
         Box::pin(async move {
-            let bindings = requested_bindings(requests)?;
+            let requested = requested_bindings(requests)?;
             let inner = weak_inner
                 .upgrade()
                 .ok_or_else(|| anyhow::anyhow!("HTTP runtime unavailable"))?;
             let control = weak_control
                 .upgrade()
                 .ok_or_else(|| anyhow::anyhow!("HTTP runtime unavailable"))?;
-            if bindings.iter().any(|(_, kind)| *kind == ListenerKind::Tls) {
+            if requested.iter().any(|(_, kind)| *kind == ListenerKind::Tls) {
                 ensure_tls_executor(&inner).await?;
             }
             let tls = proof_tls_config(inner.challenge_resolver.clone())?;
@@ -1318,6 +1352,7 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
                         "challenge listener lease capacity exceeded"
                     );
                     prune_pool(&mut state);
+                    let bindings=proof_bindings(&state,&requested)?;
                     let (_pins, closing) =
                         pin_pool(&state, bindings.iter().map(|(a, _)| *a), true)?;
                     if let Some(finished) = closing {
@@ -1360,6 +1395,7 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
                                 &mut state,
                                 *address,
                                 *kind,
+                                None,
                                 &tls,
                                 true,
                                 &mut launches,

@@ -56,6 +56,7 @@ pub(crate) struct ServerConfig {
     pub(crate) header_aliases: HeaderAliases,
     pub(crate) listener_stack:Arc<crate::http_runtime::listener_stack::Stack>,
     pub(crate) listen: Vec<SocketAddr>,
+    pub(crate) listen_v6_only: std::collections::HashSet<SocketAddr>,
     pub(crate) routes: Vec<Route>,
     pub(crate) named_routes: std::collections::BTreeMap<String, Route>,
     pub(crate) errors: Vec<Route>,
@@ -414,9 +415,10 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
         .map(|value| access_logs(value, path))
         .transpose()?;
     let mut listen = Vec::new();
+    let mut listen_v6_only = std::collections::HashSet::new();
     for raw in strings(required(m, "listen")?, path)? {
         let raw = helpers::replace(&raw, true, helpers::global_lookup)?;
-        listeners::append(&raw,&mut listen)?;
+        listeners::append(&raw,&mut listen,&mut listen_v6_only)?;
     }
     ensure!(
         !listen.is_empty() && listen.len() <= 1024,
@@ -594,6 +596,7 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
         access_logs,
         header_aliases,
         listen,
+        listen_v6_only,
         routes,
         named_routes: m
             .get("named_routes")

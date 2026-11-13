@@ -1223,3 +1223,21 @@ errors, including duplicate route references; it does not skip invalid inputs
 or substitute successful configuration parsing for actual ACME execution.
 Cancellation does not release CPU capacity while an accepted worker still owns
 its configuration. Route traversal cooperatively yields between handlers.
+
+Numeric TCP address families
+----------------------------
+
+Numeric `tcp4/` and `tcp6/` listener addresses retain their kernel address-family
+semantics, including wildcard and inclusive port ranges. TCP4 normalizes IPv4
+mapped literals and the unspecified IPv6 wildcard to IPv4; TCP6 rejects IPv4
+and mapped literals and sets IPv6-only on both TCP and HTTP/3 UDP sockets.
+Unqualified TCP keeps its existing dual-stack wildcard behavior. IPv6 scope IDs
+and duplicate/ephemeral declaration behavior are retained.
+
+Shared-socket ownership includes IPv6-only mode. A reload cannot silently reuse
+a descriptor with a different mode; the candidate is refused with the existing
+generation intact. An IPv6-only wildcard does not count as an IPv4 challenge
+capability. A default dual-family challenge lease reuses the actual IPv6
+listener and acquires a separate IPv4 listener, retaining/releasing each real
+descriptor independently, including listeners initially bound with port zero.
+This addition does not claim hostname, Unix or file-descriptor HTTP listeners.

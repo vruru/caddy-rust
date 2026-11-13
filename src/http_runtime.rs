@@ -632,7 +632,7 @@ async fn prepare_servers(
     let mut retained_client_auth_bytes = 0usize;
     let mut actual_managed = std::collections::BTreeSet::new();
     let mut redirect_domains = automatic_redirects::Domains::default();
-    let mut output = HashMap::new();
+    let mut output:HashMap<SocketAddr,Arc<ActiveServer>> = HashMap::new();
     resources.proxy_hosts.prune();
     for server in &config.servers {
         // One generation owns one manual resolver. Tags are per-server
@@ -742,6 +742,10 @@ async fn prepare_servers(
             clients: Arc::new(clients),
         };
         for addr in &server.listen {
+            if let Some(previous)=output.get(addr) {
+                ensure!(previous.plan.listen_v6_only.contains(addr)==server.listen_v6_only.contains(addr),
+                    "HTTP listener address has conflicting IPv6-only modes");
+            }
             output.insert(*addr, Arc::new(active.clone()));
         }
     }
@@ -825,6 +829,7 @@ async fn prepare_servers(
                 named_routes: Default::default(),
                 header_aliases: Default::default(),
                 listen: vec![address],
+                listen_v6_only: Default::default(),
                 routes,
                 errors: Vec::new(),
                 tls: false,
@@ -920,7 +925,7 @@ fn dns_covers(pattern: &str, name: &str) -> bool {
             .is_some_and(|(_, rest)| rest.eq_ignore_ascii_case(suffix))
     })
 }
-fn bind_listener(address: SocketAddr) -> Result<TcpListener> {
+fn bind_listener(address: SocketAddr, only_v6: bool) -> Result<TcpListener> {
     let domain = if address.is_ipv6() {
         socket2::Domain::IPV6
     } else {
@@ -928,8 +933,8 @@ fn bind_listener(address: SocketAddr) -> Result<TcpListener> {
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
     socket.set_reuse_address(true)?;
-    if address.is_ipv6() && address.ip().is_unspecified() {
-        socket.set_only_v6(false)?;
+    if address.is_ipv6() && (only_v6 || address.ip().is_unspecified()) {
+        socket.set_only_v6(only_v6)?;
     }
     socket.set_nonblocking(true)?;
     socket.bind(&address.into())?;
