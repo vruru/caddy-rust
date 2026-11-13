@@ -292,9 +292,12 @@ impl CertificateManager {
                 }
                 let network=self.net_permit(issuer,&cancel).await?;
                 let setup=async {
-                    let wire=issuer.wire.get_or_try_init(||AcmeWire::connect_with_client_tls_scope(
-                        issuer.config.wire.clone(),self.inner.local.clone(),self.inner.chain_memory.clone(),
-                        #[cfg(feature="native-run")] self.inner.outgoing_tls.clone(),&cancel)).await?;
+                    let wire=issuer.wire.get_or_try_init(||async {
+                        AcmeWire::connect_with_client_tls_scope(
+                            issuer.config.wire.clone(),self.inner.local.clone(),self.inner.chain_memory.clone(),
+                            #[cfg(feature="native-run")] self.inner.outgoing_tls.clone(),&cancel)
+                            .await?.with_issuer_values_credit(self.inner.issuer_values_credit.clone())
+                    }).await?;
                     let marker=self.read_reservation(&names,issuer).await?;
                     let session=self.account(issuer,wire,marker.as_ref().map(|m|m.account_location.as_str()),&cancel).await?;
                     Ok::<_,anyhow::Error>((session,marker))
