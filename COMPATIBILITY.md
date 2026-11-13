@@ -1817,3 +1817,19 @@ change the trace SDK queue-full/closed on_end boundary, impose a whole-RSS bound
 or establish untested platform DNS retirement. Explicit shutdown retains stack
 credit through actual OS join; no-runtime abandonment makes the narrower
 business-data/function-exit claim documented in METRICS.md.
+
+
+Threaded runtime startup failure
+--------------------------------
+
+The vendored Tokio threaded builder now owns its scheduler and blocking pool
+before launching workers. An OS thread-creation error closes that scheduler,
+reclaims unstarted cores and joins already started workers before returning the
+original error. A locked blocking pool with no worker retires queued tasks
+outside its mutex. This repairs a panic/unwind shutdown hang without lowering
+the automatically selected CPU count or changing public spawn_blocking behavior.
+Actual Linux partial/first-worker failure, recovery in the same process and
+shutdown while thread pressure remains held have isolated acceptance, alongside
+normal macOS and Linux TLS/reload regression. This
+is not a claim of recovery from arbitrary allocator failure or full production
+acceptance; see vendor/tokio-1.54.1/PATCH-NOTES.md.

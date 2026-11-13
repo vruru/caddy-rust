@@ -112,6 +112,7 @@ p224={version="0.13.2",features=["ecdsa"]}
 openssl = { version = "=0.10.82", features = ["vendored"] }
 
 [patch.crates-io]
+tokio = { path = "vendor/tokio-1.54.1" }
 h3 = { path = "vendor/h3-0.0.8" }
 urlpattern = { path = "vendor/urlpattern-0.6.0" }
 h2 = { path = "vendor/h2-0.4.20" }
