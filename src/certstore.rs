@@ -446,45 +446,43 @@ impl FsStore {
             data.dev != state.dev || data.ino != state.ino,
             "storage roots must be distinct"
         );
-        let id = match state.exclusive("store-id.json", 0o600)? {
-            Some(mut file) => {
-                let id = io::random_id()?;
-                let identity = StoreIdentity {
-                    version: 1,
-                    id: id.clone(),
-                    data_dev: data.dev,
-                    data_ino: data.ino,
-                };
-                file.write_all(&serde_json::to_vec(&identity)?)
-                    .map_err(|_| anyhow!("store identity write failed"))?;
-                file.sync_all()
-                    .map_err(|_| anyhow!("store identity synchronization failed"))?;
+        let parse_identity = |bytes: &[u8]| -> Result<String> {
+            ensure!(!bytes.is_empty(), "store identity initialization incomplete");
+            let identity: StoreIdentity = serde_json::from_slice(bytes)
+                .map_err(|_| anyhow!("invalid store identity"))?;
+            ensure!(
+                identity.version == 1
+                    && is_hex(&identity.id, 32)
+                    && identity.data_dev == data.dev
+                    && identity.data_ino == data.ino,
+                "store identity does not match storage root; explicit state migration required"
+            );
+            Ok(identity.id)
+        };
+        let id = if let Some(bytes) = state.load("store-id.json", true)? {
+            let id = parse_identity(&bytes)?;
+            // A competitor may have renamed its complete JSON but not yet
+            // synchronized this directory. This opener owns its durability too.
+            rustix::fs::fsync(state.fd.as_ref())
+                .map_err(|_| anyhow!("store identity directory synchronization failed"))?;
+            id
+        } else {
+            let id = io::random_id()?;
+            let identity = StoreIdentity {
+                version: 1,
+                id: id.clone(),
+                data_dev: data.dev,
+                data_ino: data.ino,
+            };
+            // The public name is missing until a fully written, fsynced JSON
+            // inode wins the no-replace rename. A competitor can finish while
+            // this candidate is still preparing its own private temporary file.
+            if state.store_new("store-id.json", &serde_json::to_vec(&identity)?)? {
                 id
-            }
-            None => {
-                let mut parsed = None;
-                for _ in 0..8 {
-                    if let Some(bytes) = state.load("store-id.json", true)?
-                        && !bytes.is_empty()
-                    {
-                        parsed = Some(
-                            serde_json::from_slice::<StoreIdentity>(&bytes)
-                                .map_err(|_| anyhow!("invalid store identity"))?,
-                        );
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                }
-                let identity =
-                    parsed.ok_or_else(|| anyhow!("store identity initialization incomplete"))?;
-                ensure!(
-                    identity.version == 1
-                        && is_hex(&identity.id, 32)
-                        && identity.data_dev == data.dev
-                        && identity.data_ino == data.ino,
-                    "store identity does not match storage root; explicit state migration required"
-                );
-                identity.id
+            } else {
+                let bytes = state.load("store-id.json", true)?
+                    .ok_or_else(|| anyhow!("store identity unavailable"))?;
+                parse_identity(&bytes)?
             }
         };
         Ok(Self {

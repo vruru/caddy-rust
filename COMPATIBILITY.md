@@ -78,6 +78,18 @@ cancellation must not release an I/O gate while a detached writer can still
 publish. A failed certificate or configuration candidate preserves its working
 predecessor.
 
+Concurrent certificate-store openers publish the private store identity only
+after writing and synchronizing its complete JSON to a private temporary inode.
+A no-replace rename selects one identity; losing openers remove only their own
+temporary file and strictly read the winner. Existing identities are validated
+without rewriting them, and each successful opener synchronizes the state
+directory before returning. This repairs the former empty-file publication
+window without serializing independent stores or weakening snapshot, ownership,
+link-count or storage-root checks. Malformed or incomplete existing identities
+still fail rather than being repaired; directory synchronization errors remain
+errors. Ordinary single-key updates retain atomic replacement semantics. These
+ordering checks do not establish power-loss behavior on every filesystem.
+
 HTTP acceptance includes simultaneous uploads/downloads, slow readers and
 upstreams, stream backpressure, ranges and conditional responses, interrupted
 transfers, retries of non-idempotent bodies, HTTP-version/trailer behavior,

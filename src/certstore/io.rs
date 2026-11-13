@@ -409,6 +409,16 @@ impl Root {
     }
 
     pub fn store(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        self.store_atomic(key, bytes, false).map(|_| ())
+    }
+
+    /// Publish a complete, synchronized value without replacing an existing
+    /// inode. A losing publisher removes only its own temporary file.
+    pub fn store_new(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+        self.store_atomic(key, bytes, true)
+    }
+
+    fn store_atomic(&self, key: &str, bytes: &[u8], no_replace: bool) -> Result<bool> {
         ensure!(bytes.len() <= MAX_FILE, "storage value size limit exceeded");
         let (parent, name) = self
             .parent(key, true)?
@@ -430,22 +440,42 @@ impl Root {
             Mode::from_raw_mode(0o600),
         )
         .map_err(|_| anyhow!("temporary storage file creation failed"))?;
-        let operation = || -> Result<()> {
+        let operation = || -> Result<bool> {
             let mut file = File::from(fd);
             file.write_all(bytes)
                 .map_err(|_| anyhow!("storage write failed"))?;
             file.sync_all()
                 .map_err(|_| anyhow!("storage file synchronization failed"))?;
-            fs::renameat(&parent, &temp, &parent, &name)
-                .map_err(|_| anyhow!("storage atomic replacement failed"))?;
+            if no_replace {
+                match fs::renameat_with(&parent, &temp, &parent, &name, fs::RenameFlags::NOREPLACE) {
+                    Ok(()) => {}
+                    Err(rustix::io::Errno::EXIST) => return Ok(false),
+                    Err(_) => bail!("storage no-replace publication failed"),
+                }
+            } else {
+                fs::renameat(&parent, &temp, &parent, &name)
+                    .map_err(|_| anyhow!("storage atomic replacement failed"))?;
+            }
             fs::fsync(&parent).map_err(|_| anyhow!("storage directory synchronization failed"))?;
-            Ok(())
+            Ok(true)
         };
-        let outcome = operation();
-        if outcome.is_err() {
-            let _ = fs::unlinkat(&parent, &temp, AtFlags::empty());
+        match operation() {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                match fs::unlinkat(&parent, &temp, AtFlags::empty()) {
+                    Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+                    Err(_) => bail!("storage temporary cleanup failed"),
+                }
+                fs::fsync(&parent).map_err(|_| anyhow!("storage directory synchronization failed"))?;
+                Ok(false)
+            }
+            Err(error) => {
+                // Preserve the operation's first failure even if cleanup fails.
+                // Successful publication already removed temp; NOENT is benign.
+                let _ = fs::unlinkat(&parent, &temp, AtFlags::empty());
+                Err(error)
+            }
         }
-        outcome
     }
 
     pub fn delete(&self, key: &str) -> Result<()> {
