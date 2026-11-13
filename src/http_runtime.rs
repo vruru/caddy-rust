@@ -1028,8 +1028,7 @@ async fn accept_loop(
             .business(&key)
             .map(|(server, _)| server)
             .filter(|server| h3::tcp_enabled(server));
-        let canonical =
-            |address: SocketAddr| SocketAddr::new(address.ip().to_canonical(), address.port());
+        let canonical = crate::net_address::canonical_socket;
         let peer = canonical(peer);
         let local = canonical(stream.local_addr().unwrap_or(key));
         let _ = stream.set_nodelay(true);

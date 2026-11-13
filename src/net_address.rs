@@ -6,6 +6,25 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
 };
+
+/// Canonicalize only IPv4-mapped addresses. Rebuilding a real IPv6 endpoint
+/// from its IP and port would discard its interface scope and flow information.
+pub(crate) fn canonical_socket(address: SocketAddr) -> SocketAddr {
+    match address {
+        SocketAddr::V6(value) => value.ip().to_ipv4_mapped()
+            .map_or(address, |ip| SocketAddr::new(ip.into(), value.port())),
+        SocketAddr::V4(_) => address,
+    }
+}
+
+fn socket_host(address: SocketAddr) -> String {
+    match canonical_socket(address) {
+        SocketAddr::V6(value) if value.scope_id() != 0 => {
+            format!("{}%{}", value.ip(), value.scope_id())
+        }
+        address => address.ip().to_string(),
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetAddress {
     Socket { address: SocketAddr, datagram: bool },
@@ -41,8 +60,7 @@ impl NetAddress {
     pub fn text(&self) -> Cow<'_, str> {
         match self {
             Self::Socket { address, .. } => {
-                let ip = address.ip().to_canonical();
-                Cow::Owned(SocketAddr::new(ip, address.port()).to_string())
+                Cow::Owned(canonical_socket(*address).to_string())
             }
             Self::Unix { path, .. } => String::from_utf8_lossy(path),
         }
@@ -56,7 +74,7 @@ impl NetAddress {
     pub fn host_port_bytes(&self) -> Option<(Cow<'_, [u8]>, Cow<'_, [u8]>)> {
         match self {
             Self::Socket { address, .. } => Some((
-                Cow::Owned(address.ip().to_canonical().to_string().into_bytes()),
+                Cow::Owned(socket_host(*address).into_bytes()),
                 Cow::Owned(address.port().to_string().into_bytes()),
             )),
             Self::Unix { path, .. } => {

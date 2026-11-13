@@ -819,7 +819,7 @@ impl Peer {
     }
 }
 fn canonical(address: SocketAddr) -> SocketAddr {
-    SocketAddr::new(address.ip().to_canonical(), address.port())
+    crate::net_address::canonical_socket(address)
 }
 
 struct QuicIdentity {
