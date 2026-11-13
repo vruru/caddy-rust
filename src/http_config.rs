@@ -2,6 +2,8 @@
 //! before activation. The raw configuration may contain secrets; do not Debug it.
 #[path = "http_config/listeners.rs"]
 mod listeners;
+mod header_ops;
+pub(crate) mod header_compile;
 #[path = "http_config/helpers.rs"]
 pub(crate) mod helpers;
 #[path = "http_config/proxy_ext.rs"]
@@ -1018,7 +1020,7 @@ fn parse_handler(
                     resources.push(PushResource{method:optional_handler_string(resource,"method",&rp)?,target:optional_handler_string(resource,"target",&rp)?});
                 }
             }
-            let headers=m.get("headers").filter(|v|!v.is_null()).map(|v|parse_header_ops(v,path,false)).transpose()?.unwrap_or_default();
+            let headers=m.get("headers").filter(|v|!v.is_null()).map(|v|parse_header_ops(v,path,false,regex_remaining)).transpose()?.unwrap_or_default();
             Handler::Push(std::sync::Arc::new(PushConfig{resources,headers}))
         }
         "tracing" => Handler::Tracing(std::sync::Arc::new(crate::metrics::distributed_trace::config::Config::parse(value)?)),
@@ -1109,13 +1111,14 @@ fn parse_handler(
             deny_unknown(m, &["handler", "request", "response"], path)?;
             let request = m
                 .get("request")
-                .map(|v| parse_header_ops(v, path, false))
+                .filter(|v|!v.is_null())
+                .map(|v| parse_header_ops(v, path, false,regex_remaining))
                 .transpose()?
                 .unwrap_or_default();
-            let (response, deferred) = if let Some(v) = m.get("response") {
+            let (response, deferred) = if let Some(v) = m.get("response").filter(|v|!v.is_null()) {
                 (
-                    parse_header_ops(v, path, true)?,
-                    boolean(object(v, path)?.get("deferred"), false, path)?,
+                    parse_header_ops(v, path, true,regex_remaining)?,
+                    boolean(object(v, path)?.get("deferred").filter(|v|!v.is_null()), false, path)?,
                 )
             } else {
                 (HeaderOps::default(), false)
@@ -1580,47 +1583,8 @@ fn parse_response_matcher(value: &Value, path: &str) -> Result<ResponseMatcher> 
     })
 }
 
-fn parse_header_ops(value: &Value, path: &str, response: bool) -> Result<HeaderOps> {
-    let m = object(value, path)?;
-    deny_unknown(
-        m,
-        if response {
-            &["set", "add", "delete", "deferred", "require"]
-        } else {
-            &["set", "add", "delete"]
-        },
-        path,
-    )?;
-    let delete = m
-        .get("delete")
-        .map(|v| strings(v, path))
-        .transpose()?
-        .unwrap_or_default();
-    for name in &delete {
-        ensure!(
-            !name.contains(['\r', '\n', '\0']),
-            "invalid configured header deletion"
-        );
-    }
-    Ok(HeaderOps {
-        set: m
-            .get("set")
-            .map(|v| parse_header_values(v, path))
-            .transpose()?
-            .unwrap_or_default(),
-        add: m
-            .get("add")
-            .map(|v| parse_header_values(v, path))
-            .transpose()?
-            .unwrap_or_default(),
-        delete,
-        require: m
-            .get("require")
-            .filter(|v| !v.is_null())
-            .map(|v| parse_response_matcher(v, path))
-            .transpose()?,
-    })
-}
+fn parse_header_ops(value:&Value,path:&str,response:bool,remaining:&mut usize)->Result<HeaderOps>{header_ops::parse(value,path,response,remaining)}
+
 fn parse_proxy(
     m: &serde_json::Map<String, Value>,
     path: &str,
@@ -1933,14 +1897,14 @@ fn parse_proxy(
     if let Some(v) = m.get("headers") {
         let h = object(v, path)?;
         deny_unknown(h, &["request", "response"], path)?;
-        if let Some(v) = h.get("request") {
-            request_headers = parse_header_ops(v, path, false)?;
+        if let Some(v) = h.get("request").filter(|v|!v.is_null()) {
+            request_headers = parse_header_ops(v, path, false,regex_remaining)?;
         }
-        if let Some(v) = h.get("response") {
-            response_headers = parse_header_ops(v, path, true)?;
+        if let Some(v) = h.get("response").filter(|v|!v.is_null()) {
+            response_headers = parse_header_ops(v, path, true,regex_remaining)?;
             // Proxy headers are applied on the received upstream response;
             // its deferred flag does not wrap a downstream writer in Caddy.
-            boolean(object(v, path)?.get("deferred"), false, path)?;
+            boolean(object(v, path)?.get("deferred").filter(|v|!v.is_null()), false, path)?;
         }
     }
     Ok(ProxyConfig {

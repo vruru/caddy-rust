@@ -1598,3 +1598,6 @@ pub(crate) mod handler_trace;
 
 #[path="http_runtime/tracing.rs"]
 mod tracing;
+
+#[path="http_runtime/headers_replace.rs"]
+mod headers_replace;

@@ -1091,8 +1091,9 @@ allocation. These bounds do not establish a whole-process memory ceiling.
 Native explicit/Link push and its bounded protocol ownership are documented in
 `docs/PUSH.md`. Combined acceptance includes actual parent completion/reset,
 interim heads, target/header behavior, backpressure and old/new generation
-separation through reload. Shared HeaderOps replacement and the other release
-gates remain tracked work; accepting a handler name is not full compatibility.
+separation through reload. Shared HeaderOps replacement is described in
+[HEADERS.md](docs/HEADERS.md). Remaining replacer/provider scheduling and other
+release gates stay separate; accepting a handler name is not full compatibility.
 
 
 Native ACME server

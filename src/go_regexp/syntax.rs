@@ -62,6 +62,8 @@ struct Node {
 pub(super) struct Translated {
     pub pattern: String,
     pub names: Vec<Option<Box<str>>>,
+    pub native_nodes:usize,
+    pub native_ranges:usize,
 }
 struct Parser<'a> {
     rest: &'a str,
@@ -372,10 +374,20 @@ impl<'a> Parser<'a> {
         }
         ensure!(self.frames.len() == 1, "missing regexp closing parenthesis");
         let root = self.frames.pop().expect("root");
+        // Retain only scalar shape facts for callers that prepay native AST/HIR.
+        // Branches can be empty, so they are counted independently of arena nodes.
+        let mut native_nodes=self.arena.len().saturating_add(root.branches.len());
+        let mut native_ranges=0usize;
+        for node in &self.arena{match &node.kind{
+            Kind::Group(frame)=>native_nodes=native_nodes.saturating_add(frame.branches.len()),
+            Kind::Class(ranges)=>native_ranges=native_ranges.saturating_add(ranges.len()),
+            _=>{},
+        }}
         let pattern = render(root, &self.arena, self.limit.min(MAX_TRANSLATED))?;
         Ok(Translated {
             pattern,
             names: self.names,
+            native_nodes,native_ranges,
         })
     }
 }

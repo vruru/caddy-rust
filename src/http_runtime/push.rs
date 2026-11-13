@@ -19,7 +19,8 @@ fn header_bytes(fields:&HeaderMap)->Option<usize>{
     fields.iter().try_fold(0usize,|n,(name,value)|n.checked_add(name.as_str().len())?.checked_add(value.len())?.checked_add(32)).filter(|n|*n<=65536)
 }
 impl LinkPlan{
- pub(super) fn new(ctx:&Context,config:&PushConfig,inner:&Arc<Inner>,server:&Arc<ActiveServer>)->Result<Option<Arc<Self>>>{
+ pub(super) fn new<'a>(ctx:&'a Context,config:&'a PushConfig,inner:&Arc<Inner>,server:&Arc<ActiveServer>)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<Option<Arc<Self>>>>+Send+'a>>{
+    let prepared=(||->Result<Option<(Self,super::headers_replace::Prepared<'a>)>>{
     let Some(push)=ctx.req().extensions().get::<ServerPush>()else{return Ok(None)};
     if ctx.req().headers().contains_key("caddy-push"){return Ok(None)}
     // Fixed bounded retained head/queue scratch. Prepay before copying fields;
@@ -35,8 +36,14 @@ impl LinkPlan{
     }
     super::request::apply_push_headers(&mut headers,&config.headers,ctx)?;
     anyhow::ensure!(header_bytes(&headers).is_some(),"pushed request headers exceed limit");
-    Ok(Some(Arc::new(Self{headers,push:push.clone(),inner:inner.clone(),server:server.clone(),peer:ctx.peer.clone(),local:ctx.local.clone(),tls:ctx.tls,sni:ctx.push_sni.clone(),business:ctx.business.clone(),
-        snapshot:ctx.req().extensions().get::<Arc<ConnectionSnapshot>>().cloned(),facts:ctx.req().extensions().get::<Arc<client_cert_facts::Cache>>().cloned(),details:ctx.req().extensions().get::<fastcgi::TlsDetails>().cloned(),access_tls:ctx.req().extensions().get::<Arc<access_log::Tls>>().cloned(),_credit:Bytes::from_owner(credit)})))
+    let replacement=super::headers_replace::prepare_owned(&config.headers,ctx,super::headers_replace::Scope::Original)?;
+    Ok(Some((Self{headers,push:push.clone(),inner:inner.clone(),server:server.clone(),peer:ctx.peer.clone(),local:ctx.local.clone(),tls:ctx.tls,sni:ctx.push_sni.clone(),business:ctx.business.clone(),
+        snapshot:ctx.req().extensions().get::<Arc<ConnectionSnapshot>>().cloned(),facts:ctx.req().extensions().get::<Arc<client_cert_facts::Cache>>().cloned(),details:ctx.req().extensions().get::<fastcgi::TlsDetails>().cloned(),access_tls:ctx.req().extensions().get::<Arc<access_log::Tls>>().cloned(),_credit:Bytes::from_owner(credit)},replacement)))
+    })();
+    Box::pin(async move{let Some((mut plan,replacement))=prepared? else{return Ok(None)};
+        super::headers_replace::apply_owned(&mut plan.headers,&config.headers,replacement,Some(65536)).await?;
+        Ok(Some(Arc::new(plan)))
+    })
  }
  pub(super) fn dispatch_bytes<'a>(&'a self,target:&'a [u8],method:&'a str,authority:&'a str)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<()>>+Send+'a>>{
     Box::pin(async move{

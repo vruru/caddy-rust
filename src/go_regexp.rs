@@ -46,6 +46,10 @@ impl fmt::Display for OperationError {
 }
 impl std::error::Error for OperationError {}
 
+/// Scalar facts from the already-bounded Go syntax translation. No native
+/// parser allocation has occurred when a preflight callback sees these values.
+#[derive(Clone,Copy)]
+pub(crate) struct NativeCompileSize{pub bytes:usize,pub nodes:usize,pub ranges:usize,pub captures:usize}
 /// Compile-time allocation and runtime match data stay on the native side.
 pub(crate) struct GoRegexp {
     native: meta::Regex,
@@ -58,9 +62,15 @@ pub(crate) struct GoRegexp {
 }
 impl GoRegexp {
     pub(crate) fn compile(pattern: &str, memory_limit: usize) -> Result<Self> {
+        Self::compile_preflight(pattern,memory_limit,|_|Ok(()))
+    }
+    /// Admit translated syntax before the native AST/HIR and engine allocate.
+    /// Existing callers retain their original compiler through `compile`.
+    pub(crate) fn compile_preflight(pattern:&str,memory_limit:usize,before_native:impl FnOnce(NativeCompileSize)->Result<()>)->Result<Self>{
         let limit = memory_limit.min(MAX_PATTERN_MEMORY);
         ensure!(limit >= 1024, "regexp compile memory limit too small");
-        let syntax::Translated { pattern, names } = syntax::translate(pattern, limit)?;
+        let syntax::Translated { pattern, names, native_nodes, native_ranges } = syntax::translate(pattern, limit)?;
+        before_native(NativeCompileSize{bytes:pattern.len(),nodes:native_nodes,ranges:native_ranges,captures:names.len()})?;
         let hir = regex_syntax::ParserBuilder::new()
             .utf8(true)
             .nest_limit(3_100)

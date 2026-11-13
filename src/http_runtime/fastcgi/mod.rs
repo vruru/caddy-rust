@@ -692,7 +692,7 @@ pub(super) async fn serve(
     let headers = if probe {
         headers
     } else {
-        proxy::proxy_headers(ctx, config, headers, false, true, None)?
+        proxy::proxy_headers(ctx, config, headers, false, true, None).await?
     };
     let target_permit = ctx
         .resources

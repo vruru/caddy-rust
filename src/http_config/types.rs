@@ -73,12 +73,21 @@ pub(crate) struct ResponseHeaderFilter {
     pub(crate) exclude: std::collections::HashSet<String>,
 }
 
+#[derive(Clone,Default)]
+pub(crate) struct HeaderReplacement {
+    pub(crate) search:String,
+    pub(crate) search_regexp:String,
+    pub(crate) replace:String,
+    pub(crate) regex:Option<std::sync::Arc<crate::go_regexp::GoRegexp>>,
+}
 #[derive(Clone, Default)]
 pub(crate) struct HeaderOps {
     pub(crate) require: Option<ResponseMatcher>,
     pub(crate) set: Vec<(String, Vec<String>)>,
     pub(crate) add: Vec<(String, Vec<String>)>,
     pub(crate) delete: Vec<String>,
+    pub(crate) replace:std::sync::Arc<[(String,std::sync::Arc<[HeaderReplacement]>) ]>,
+    pub(crate) replace_keys:std::sync::Arc<[String]>,
 }
 
 #[derive(Clone)]

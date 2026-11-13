@@ -30,8 +30,8 @@ rejected. The copied header allowlist and recursion marker follow the reference;
 configured header operations apply afterward. No implicit cookie or authorization
 copy is added.
 
-This implementation shares the existing header-operation compiler. Remaining
-header-operation fields are explicit compatibility work; unknown operations
+This implementation shares HeaderOps compilation and literal/regular-expression
+replacement with ordinary and proxy headers; see `HEADERS.md`. Unknown operations
 are rejected at configuration preparation rather than silently ignored.
 Resource limits are implementation safety bounds, not a process RSS promise.
 Full combined certificate, lifecycle and production acceptance remains required.

@@ -217,6 +217,7 @@ impl<F> RetainedBlockingJob<F> {
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ResourceDiagnostics {
     pub rewrite_uri_bytes:usize,
+    pub header_replacement_bytes:usize,
     pub tls_event_metadata_bytes:usize,
     pub client_certificate_metadata_bytes: usize,
     pub proxy_health_events_coalesced: u64,
@@ -247,6 +248,7 @@ pub struct ResourceDiagnostics {
 
 pub(crate) struct Resources {
     pub(super) rewrite_bytes: native_write_policy::Pool,
+    pub header_replacements:native_write_policy::Pool,
     pub(super) transfer_deadlines: native_write_policy::Pool,
     pub(crate) ssl_verify:Arc<native_ssl_tls::VerificationScope>,
     pub(super) proxy_health_events_coalesced: Arc<AtomicU64>,
@@ -439,6 +441,7 @@ impl Resources {
             )?,
             rewrite_bytes: native_write_policy::Pool::new(128<<20),
             request_regexp,
+            header_replacements:native_write_policy::Pool::new(128<<20),
             directory_listing,
             directory_listing_bytes: Arc::new(Semaphore::new(
                 super::browse::LISTING_BYTES_UNITS as usize,
@@ -542,6 +545,7 @@ impl Resources {
             proxy_passive_dropped: self.proxy_hosts.dropped_failures(),
             proxy_dns_background_rejected: self.proxy_dns.rejected_background_spawns(),
             request_regexp: self.request_regexp.snapshot(),
+            header_replacement_bytes:self.header_replacements.used(),
             directory_listing: self.directory_listing.snapshot(),
         }
     }

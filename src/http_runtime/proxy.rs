@@ -1,3 +1,4 @@
+use std::pin::Pin;
 use super::proxy_policy::{HostRegistry, PreparedSelection, SelectionInput};
 use super::request::{Context, apply_headers, apply_response_headers};
 use super::upstream_tls::{FixedDialConnector, PreparedTransport};
@@ -117,7 +118,8 @@ pub(super) fn prepare_clients(
                     prepare_clients(errors, output, hosts, dns, logging_available, ssl_verify)?;
                 }
                 Handler::Intercept(response) => {
-                    prepare_response_clients(response, output, hosts, dns, logging_available, ssl_verify)?;
+                    prepare_response_clients(response, output, hosts, dns, logging_available, ssl_verify,
+                    )?;
                 }
                 Handler::FileServer { .. } => {
                     super::mime::initialize();
@@ -273,21 +275,27 @@ impl PreparedResponse {
                 "upstream upgrade protocol mismatch"
             );
             if setup.extended.is_some() {
-                let expected=setup.expected_accept.as_ref().ok_or_else(||anyhow::anyhow!("missing extended WebSocket attempt challenge"))?;
+                let expected=setup.expected_accept.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("missing extended WebSocket attempt challenge")
+                })?;
                 websocket::validate_accept(self.response.headers(),expected)?;
                 *self.response.status_mut()=StatusCode::OK;
-                for name in [http::header::UPGRADE,http::header::CONNECTION,http::header::SEC_WEBSOCKET_ACCEPT] {self.response.headers_mut().remove(name);}
+                for name in [http::header::UPGRADE,http::header::CONNECTION,http::header::SEC_WEBSOCKET_ACCEPT,
+                ] {self.response.headers_mut().remove(name);}
             }
             if ctx.req().version()==Version::HTTP_2 {
                 if let Some(prepared)=&setup.extended {
-                    self.response.extensions_mut().insert(websocket::write_allocation(prepared,&ctx.resources.transfer_deadlines));
+                    self.response.extensions_mut().insert(websocket::write_allocation(prepared,&ctx.resources.transfer_deadlines,
+                        ));
                 }
             }
             if ctx.req().version()==Version::HTTP_3 {
                 let prepared=setup.extended.ok_or_else(||anyhow::anyhow!("HTTP/3 upgrade requires extended CONNECT"))?;
                 *self.response.body_mut()=websocket::h3_body(setup.upstream,prepared.clone(),ctx,inner,setup.client,
-                    self.lease.take().expect("HTTP upgrade lease"),setup.close_delay).await?;
-                self.response.extensions_mut().insert(websocket::write_allocation(&prepared,&ctx.resources.transfer_deadlines));
+                    self.lease.take().expect("HTTP upgrade lease"),setup.close_delay,
+                ).await?;
+                self.response.extensions_mut().insert(websocket::write_allocation(&prepared,&ctx.resources.transfer_deadlines,
+                    ));
             } else {
             let downstream = setup
                 .downstream
@@ -413,7 +421,7 @@ impl PreparedResponse {
             ctx.immediate
                 .append(http::header::VIA, HeaderValue::from_static(via));
             let status = self.response.status().as_u16();
-            apply_response_headers(self.response.headers_mut(), status, &self.headers, ctx)?;
+            apply_response_headers(self.response.headers_mut(), status, &self.headers, ctx).await?;
         }
         *self.response.version_mut() = ctx.req().version();
         // A copied or intercepted response may move just its body. Keep
@@ -752,7 +760,8 @@ async fn serve_once(
     };
     let hostport=unix_path.unwrap_or(&uri_hostport).to_owned();
     for (key, value) in [
-        ("address", format!("{}/{hostport}",if unix_path.is_some(){"unix"}else{family.name()})),
+        ("address", format!("{}/{hostport}",if unix_path.is_some(){"unix"}else{family.name()}),
+        ),
         ("hostport", hostport.clone()),
         ("host", unix_path.unwrap_or(host).to_owned()),
         ("port", port),
@@ -795,7 +804,8 @@ async fn serve_once(
                 } else {
                     Some(ServerName::try_from(super::http_dial::tls_host(&name).to_owned()).map_err(|_| {
                         anyhow::anyhow!("invalid expanded upstream TLS server name")
-                    })?)
+                    })?,
+                    )
                 }
             }
             None => None,
@@ -811,13 +821,17 @@ async fn serve_once(
         use base64::Engine;
         let mut key = [0u8;16];
         getrandom::fill(&mut key).map_err(|_|anyhow::anyhow!("WebSocket key entropy unavailable"))?;
-        outgoing.insert(http::header::CONNECTION,HeaderValue::from_static("Upgrade"));
+        outgoing.insert(http::header::CONNECTION,HeaderValue::from_static("Upgrade"),
+        );
         outgoing.insert(http::header::UPGRADE,HeaderValue::from_static("websocket"));
-        outgoing.insert("sec-websocket-key",HeaderValue::from_str(&base64::engine::general_purpose::STANDARD.encode(key))?);
+        outgoing.insert("sec-websocket-key",HeaderValue::from_str(&base64::engine::general_purpose::STANDARD.encode(key))?,
+        );
         outgoing.remove(http::header::CONTENT_LENGTH);
         outgoing.remove(http::header::TRANSFER_ENCODING);
     }
-    let mut headers = proxy_headers(ctx, config, outgoing, is_upgrade, false, unix_host.as_deref())?;
+    let mut headers = proxy_headers(ctx, config, outgoing, is_upgrade, false, unix_host.as_deref(),
+    )
+    .await?;
     trailer_metadata.write_upstream_declaration(&mut headers);
     if rewrite.is_some_and(|r|r.omit_body){headers.remove(http::header::CONTENT_LENGTH);headers.remove(http::header::TRANSFER_ENCODING);headers.remove(http::header::TRAILER);}
     let replacement = ctx
@@ -1221,14 +1235,15 @@ impl std::fmt::Display for DownstreamFailure {
     }
 }
 
-pub(super) fn proxy_headers(
-    ctx: &Context,
-    config: &ProxyConfig,
+pub(super) fn proxy_headers<'a>(
+    ctx: &'a Context,
+    config: &'a ProxyConfig,
     mut headers: HeaderMap,
     is_upgrade: bool,
     fastcgi: bool,
     http_host_override: Option<&str>,
-) -> Result<HeaderMap> {
+) -> Pin<Box<dyn std::future::Future<Output = Result<HeaderMap>> + Send + 'a>> {
+    let prepared = (|| -> Result<_> {
     let original_host = ctx.authority.clone();
     let old_xff = if ctx.trusted {
         headers
@@ -1257,8 +1272,10 @@ pub(super) fn proxy_headers(
         if !old_xff.is_empty(){xff.extend_from_slice(old_xff.as_bytes());xff.extend_from_slice(b", ");}
         xff.extend_from_slice(peer_host);
         headers.insert("x-forwarded-for",HeaderValue::from_bytes(&xff)?);
-        headers.insert("x-forwarded-host",forwarded_host.unwrap_or(HeaderValue::from_str(&original_host)?));
-        headers.insert("x-forwarded-proto",forwarded_proto.unwrap_or(HeaderValue::from_static(if ctx.tls{"https"}else{"http"})));
+        headers.insert("x-forwarded-host",forwarded_host.unwrap_or(HeaderValue::from_str(&original_host)?),
+            );
+        headers.insert("x-forwarded-proto",forwarded_proto.unwrap_or(HeaderValue::from_static(if ctx.tls{"https"}else{"http"})),
+            );
     } else {
         // An absent or unparseable peer host cannot authenticate supplied
         // forwarding headers. Never substitute the physical proxy's IP.
@@ -1273,7 +1290,8 @@ pub(super) fn proxy_headers(
         && config.tls.is_some()
         && let Some(hostport) = ctx.lookup("http.reverse_proxy.upstream.hostport")
     {
-        headers.insert(http::header::HOST, HeaderValue::from_str(http_host_override.unwrap_or(&hostport))?);
+        headers.insert(http::header::HOST, HeaderValue::from_str(http_host_override.unwrap_or(&hostport))?,
+            );
     }
     if fastcgi {
         let via = match ctx.req().version() {
@@ -1288,11 +1306,23 @@ pub(super) fn proxy_headers(
         }
     }
     apply_headers(&mut headers, &config.request_headers, ctx)?;
-    if !fastcgi && let Some(host) = headers.get(http::header::HOST).and_then(|v| v.to_str().ok())
+        Ok(headers)
+    })();
+    let snapshot = super::headers_replace::prepare_owned(
+        &config.request_headers,
+        ctx,
+        super::headers_replace::Scope::Original,
+    );
+    Box::pin(async move {
+        let mut headers = prepared?;
+        super::headers_replace::apply_owned(&mut headers, &config.request_headers, snapshot?, None)
+            .await?;
+        if !fastcgi && let Some(host) = headers.get(http::header::HOST).and_then(|v| v.to_str().ok())
         && let std::borrow::Cow::Owned(host) = super::http_dial::wire_host(host) {
         headers.insert(http::header::HOST, HeaderValue::from_str(&host)?);
     }
     Ok(headers)
+    })
 }
 
 pub(super) fn header_has_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool {
@@ -1482,7 +1512,8 @@ pub(super) async fn prepare_health(
             {
                 continue;
             }
-            prepared.push((client.clone(), server.logging.clone(), server.events.clone()));
+            prepared.push((client.clone(), server.logging.clone(), server.events.clone(),
+            ));
             anyhow::ensure!(
                 prepared.len() <= super::proxy_health::MAX_SCHEDULERS,
                 "active health schedulers exceed per-configuration limit {}",
