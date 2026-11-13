@@ -1162,3 +1162,14 @@ grace deadline still forces blocked requests to stop. Resource retirement does
 not substitute an artificial timeout for a configured unlimited drain.
 Explicit force shutdown and runtime drop close cancellation-bearing resources
 immediately, independently of whether the caller subsequently waits for joins.
+
+Local PKI admission and shutdown
+-------------------------------
+
+Local CA work is registered under a closed-state fence before it is submitted
+to its executor. Cancellation notifications, tracker-close notifications and
+executor-side payload destruction run outside that fence, including shutdown
+and maintenance-future cancellation. Already accepted work keeps its task and
+queue ownership until the actual worker or payload has retired; abandoning a
+caller does not release capacity early. No trust installation or issuance
+authorization is added by this lifecycle change.

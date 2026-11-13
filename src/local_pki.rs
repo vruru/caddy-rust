@@ -171,7 +171,16 @@ struct Shared {
     tasks: TaskTracker,
     closed: CancellationToken,
     running: AtomicBool,
-    admission: Mutex<()>,
+    admission: Mutex<bool>,
+}
+impl Shared {
+    fn close(&self) {
+        // Publish the fence atomically with task registration. Wakers and
+        // payload destructors may re-enter admission, so run them unlocked.
+        *self.admission.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.closed.cancel();
+        self.tasks.close();
+    }
 }
 struct Authority {
     config: CaConfig,
@@ -286,7 +295,7 @@ impl LocalPki {
                 tasks: TaskTracker::new(),
                 closed: CancellationToken::new(),
                 running: AtomicBool::new(false),
-                admission: Mutex::new(()),
+                admission: Mutex::new(false),
             }),
             authorities: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -385,14 +394,16 @@ impl LocalPki {
         waiting: CancellationToken,
         operation: impl Future<Output = Result<T>> + Send + 'static,
     ) -> Result<T> {
-        let task = {
-            let _admission = self
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| anyhow!("PKI executor unavailable"))?;
+        let tracked = {
+            let admission = self
                 .shared
                 .admission
                 .lock()
                 .map_err(|_| anyhow!("PKI admission unavailable"))?;
             ensure!(
-                !self.shared.closed.is_cancelled() && !waiting.is_cancelled(),
+                !*admission && !waiting.is_cancelled(),
                 "PKI stopped or caller already cancelled"
             );
             let pending = self
@@ -401,11 +412,12 @@ impl LocalPki {
                 .clone()
                 .try_acquire_owned()
                 .map_err(|_| anyhow!("PKI work queue full"))?;
-            self.shared.tasks.spawn(async move {
+            self.shared.tasks.track_future(async move {
                 let _pending = pending;
                 operation.await
             })
         };
+        let task = handle.spawn(tracked);
         tokio::select! { _ = waiting.cancelled() => Err(anyhow!("PKI caller stopped waiting; accepted work remains supervised")),
         result = task => result.map_err(|_|anyhow!("PKI accepted worker failed"))? }
     }
@@ -490,15 +502,7 @@ impl LocalPki {
         }
     }
     pub async fn shutdown(&self) -> Result<()> {
-        {
-            let _guard = self
-                .shared
-                .admission
-                .lock()
-                .map_err(|_| anyhow!("PKI admission unavailable"))?;
-            self.shared.closed.cancel();
-            self.shared.tasks.close();
-        }
+        self.shared.close();
         tokio::time::timeout(Duration::from_secs(45), self.shared.tasks.wait())
             .await
             .map_err(|_| {
@@ -540,8 +544,12 @@ impl LocalPki {
                 }
                 let owner = self.shared.closed.child_token();
                 let installer = installer.clone();
-                let _admission=self.shared.admission.lock().map_err(|_|anyhow!("PKI admission unavailable"))?;
-                if !self.shared.closed.is_cancelled() {jobs.push(self.shared.tasks.spawn(async move { authority.maintain(owner, installer).await }));}
+                let handle=tokio::runtime::Handle::try_current().map_err(|_|anyhow!("PKI executor unavailable"))?;
+                let tracked={
+                    let admission=self.shared.admission.lock().map_err(|_|anyhow!("PKI admission unavailable"))?;
+                    if !*admission {Some(self.shared.tasks.track_future(async move { authority.maintain(owner, installer).await }))}else{None}
+                };
+                if let Some(tracked)=tracked {jobs.push(handle.spawn(tracked));}
             }
             tokio::select! {
                 _ = cancel.cancelled()=>break,
@@ -573,13 +581,7 @@ impl LocalPki {
 struct RunGuard(Arc<Shared>);
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        self.0.closed.cancel();
-        let _admission = self
-            .0
-            .admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.0.tasks.close();
+        self.0.close();
     }
 }
 
