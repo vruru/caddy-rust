@@ -2,7 +2,7 @@ use crate::net_address::NetAddress;
 use super::*;
 #[path = "log_append.rs"]
 mod log_append;
-use crate::http_config::{helpers::replace, types::*};
+use crate::http_config::types::*;
 use base64::Engine;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Uri, Version};
 use hyper::body::Body as _;
@@ -220,10 +220,10 @@ impl Context {
             .expect("request is consumed only by terminal proxy")
     }
     pub fn expand(&self, s: &str) -> Result<String> {
-        replace(s, true, |name| self.lookup(name))
+        self.lookup_view().expand_primitive_text(s,true,false)
     }
     pub fn expand_bytes(&self,s:&str)->Result<Vec<u8>>{
-        crate::http_config::helpers::replace_bytes(s,true,|name|self.lookup_bytes(name))
+        self.lookup_view().expand_primitive_bytes(s,true)
     }
     pub(super) fn lookup_view(&self)->ReplacerView<'_>{ReplacerView::new(self)}
     pub fn lookup_bytes(&self,name:&str)->Option<Vec<u8>>{self.lookup_view().lookup_bytes(name)}

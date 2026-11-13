@@ -1530,7 +1530,7 @@ impl Leaf {
     }
 
     async fn plan_resolved(self:&Arc<Self>,view:super::request::ReplacerView<'_>)->Result<Plan>{
-        if view.map_plans().is_empty(){return self.plan(&|text|crate::http_config::helpers::replace(text,true,|name|view.lookup(name)))}
+        if view.map_plans().is_empty(){return self.plan(&|text|view.expand_primitive_text(text,true,false))}
         let _preparation=view.pool().reserve(8192)?;
         let mut inputs=Vec::with_capacity(3);
         match &self.kind {

@@ -1947,7 +1947,7 @@ fn pending_placeholders_depth(value: &Value, depth: usize, typed_expression: boo
                 {
                     let key = &s[i + 1..end];
                     if key.starts_with("file.")
-                        || (!typed_expression && key.starts_with("http.request.tls."))
+                        || (!typed_expression && key.starts_with("http.request.tls.") && helpers::TlsScalar::from_name(key).is_none())
                         || (key.starts_with("http.reverse_proxy.")
                             && !matches!(
                                 key,

@@ -84,6 +84,55 @@ pub(crate) fn is_global(name: &str) -> bool {
                 | "time.now.unix_ms"
         )
 }
+/// Scalar formatting is shared by typed and ordinary replacers. ALPN remains
+/// bytes here; only the existing typed String projection uses lossy UTF-8.
+pub(super) enum TlsScalarValue<'a> {
+    Empty,
+    Bool(bool),
+    Text(std::borrow::Cow<'a, [u8]>),
+}
+impl TlsScalarValue<'_> {
+    pub(super) fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Empty => Vec::new(),
+            Self::Bool(value) => if value { b"true".to_vec() } else { b"false".to_vec() },
+            Self::Text(value) => value.into_owned(),
+        }
+    }
+    fn into_typed(self) -> Value {
+        match self {
+            Self::Empty => Value::Null,
+            Self::Bool(value) => Value::Bool(value),
+            Self::Text(value) => Value::String(String::from_utf8_lossy(&value).into_owned()),
+        }
+    }
+}
+pub(super) fn tls_scalar<'a>(
+    scalar: crate::http_config::helpers::TlsScalar,
+    tls: bool,
+    snapshot: Option<&'a Arc<ConnectionSnapshot>>,
+) -> anyhow::Result<TlsScalarValue<'a>> {
+    use crate::http_config::helpers::TlsScalar as S;
+    use std::borrow::Cow;
+    if !tls { return Ok(TlsScalarValue::Empty); }
+    let snapshot = snapshot.ok_or_else(|| anyhow::anyhow!("TLS connection snapshot missing"))?;
+    let meta = snapshot.metadata()?;
+    Ok(match scalar {
+        S::Version => TlsScalarValue::Text(Cow::Owned(match meta.version {
+            0x0303 => b"tls1.2".to_vec(), 0x0304 => b"tls1.3".to_vec(),
+            n => format!("0x{n:04x}").into_bytes(),
+        })),
+        S::CipherSuite => TlsScalarValue::Text(Cow::Owned(
+            format!("{:?}", rustls::CipherSuite::from(meta.cipher_suite))
+                .replacen("TLS13_", "TLS_", 1).into_bytes())),
+        S::Resumed => TlsScalarValue::Bool(meta.did_resume),
+        S::Proto => TlsScalarValue::Text(Cow::Borrowed(&meta.alpn)),
+        S::ProtoMutual => TlsScalarValue::Bool(meta.negotiated_protocol_is_mutual),
+        S::ServerName => TlsScalarValue::Text(Cow::Borrowed(meta.server_name.as_bytes())),
+        S::Ech => TlsScalarValue::Bool(meta.ech_accepted),
+    })
+}
+
 /// Project only request-scoped values. Dynamic globals are deliberately excluded
 /// so a template's input capture cannot freeze later ph(time.now) calls.
 pub(super) fn request(ctx: &Context, name: &str) -> Option<Value> {
@@ -122,16 +171,7 @@ pub(super) fn request(ctx: &Context, name: &str) -> Option<Value> {
     }
     if let Some(field) = name.strip_prefix("http.request.tls.") {
         let field = field.to_ascii_lowercase();
-        let scalar = matches!(
-            field.as_str(),
-            "version"
-                | "cipher_suite"
-                | "resumed"
-                | "proto"
-                | "proto_mutual"
-                | "server_name"
-                | "ech"
-        );
+        let scalar = crate::http_config::helpers::TlsScalar::from_name(name);
         let client = matches!(
             field.as_str(),
             "client.fingerprint"
@@ -143,7 +183,7 @@ pub(super) fn request(ctx: &Context, name: &str) -> Option<Value> {
                 | "client.certificate_pem"
                 | "client.certificate_der_base64"
         ) || field.starts_with("client.san.");
-        if !scalar && !client {
+        if scalar.is_none() && !client {
             return None;
         }
         if !ctx.tls {
@@ -163,26 +203,9 @@ pub(super) fn request(ctx: &Context, name: &str) -> Option<Value> {
                 None => Value::Unavailable("TLS client certificate cache missing".into()),
             });
         }
-        let meta = match snapshot.metadata() {
-            Ok(meta) => meta,
-            Err(e) => return Some(Value::Unavailable(e.to_string())),
-        };
-        return Some(match field.as_str() {
-            "version" => Value::String(match meta.version {
-                0x0303 => "tls1.2".into(),
-                0x0304 => "tls1.3".into(),
-                n => format!("0x{n:04x}"),
-            }),
-            "cipher_suite" => Value::String(
-                format!("{:?}", rustls::CipherSuite::from(meta.cipher_suite))
-                    .replacen("TLS13_", "TLS_", 1),
-            ),
-            "resumed" => Value::Bool(meta.did_resume),
-            "proto" => Value::String(String::from_utf8_lossy(&meta.alpn).into_owned()),
-            "proto_mutual" => Value::Bool(meta.negotiated_protocol_is_mutual),
-            "server_name" => Value::String(meta.server_name.to_string()),
-            "ech" => Value::Bool(meta.ech_accepted),
-            _ => unreachable!(),
+        return Some(match tls_scalar(scalar.expect("recognized scalar"), true, Some(&snapshot)) {
+            Ok(value) => value.into_typed(),
+            Err(error) => Value::Unavailable(error.to_string()),
         });
     }
     if matches!(name, "http.request.body" | "http.request.body_base64") {

@@ -211,15 +211,17 @@ pub(super) async fn apply(ctx: &mut Context, plan: &RequestBodyConfig) -> Result
         let view = ctx.lookup_view();
         let text = if view.map_plans().is_empty() {
             // Keep ordinary replacement bodies on their existing admission pool.
-            replace_accounted(
+            let lookup_error=std::cell::RefCell::new(None);
+            let result=replace_accounted(
                 &plan.set,
                 false,
                 |name| match name {
                     "http.request.body" | "http.request.body_base64" => Some(String::new()),
-                    _ => ctx.lookup(name),
+                    _ => match view.lookup_checked(name) { Ok(value)=>value, Err(error)=>{*lookup_error.borrow_mut()=Some(error);None} },
                 },
                 |bytes| charge(&ctx.resources.request_body_bytes, &mut credit, bytes),
-            ).map(String::into_bytes)
+            ).map(String::into_bytes);
+            if let Some(error)=lookup_error.into_inner(){Err(error)}else{result}
         } else {
             let lookup = ReplacementLookup { view };
             match super::replacer_async::expand(&plan.set, false, &lookup, view.pool()).await {

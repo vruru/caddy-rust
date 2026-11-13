@@ -90,6 +90,45 @@ impl<'a> View<'a> {
             .as_ref()
             .expect("request is consumed only by terminal proxy")
     }
+    // Preserve the Option-only compatibility API without manufacturing values
+    // from unavailable metadata. Result consumers use the checked entry below.
+    fn tls_scalar(&self, name: &str) -> Option<Result<super::super::placeholder_value::TlsScalarValue<'a>>> {
+        if self.probe || self.values.contains_key(name) || self.raw_regex_captures.get(name).is_some() {
+            return None;
+        }
+        let scalar = crate::http_config::helpers::TlsScalar::from_name(name)?;
+        let snapshot = self.request.as_ref().and_then(|r| r.extensions().get::<Arc<ConnectionSnapshot>>());
+        Some(super::super::placeholder_value::tls_scalar(scalar, self.tls, snapshot))
+    }
+    pub(in crate::http_runtime) fn lookup_bytes_checked(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        if let Some(value) = self.tls_scalar(name) { return value.map(|value| Some(value.into_bytes())); }
+        Ok(self.lookup_bytes(name))
+    }
+    pub(in crate::http_runtime) fn lookup_checked(&self, name: &str) -> Result<Option<String>> {
+        if let Some(value) = self.tls_scalar(name) {
+            return Ok(Some(String::from_utf8(value?.into_bytes())?));
+        }
+        Ok(self.lookup(name))
+    }
+    pub(in crate::http_runtime) fn expand_primitive_bytes(&self, text: &str, unknown_empty: bool) -> Result<Vec<u8>> {
+        let error = std::cell::RefCell::new(None);
+        let output = crate::http_config::helpers::replace_bytes(text, unknown_empty, |name| {
+            match self.lookup_bytes_checked(name) { Ok(value) => value, Err(e) => { *error.borrow_mut() = Some(e); None } }
+        });
+        if let Some(error) = error.into_inner() { return Err(error); }
+        output
+    }
+    pub(in crate::http_runtime) fn expand_primitive_text(&self, text: &str, unknown_empty: bool, root: bool) -> Result<String> {
+        let error = std::cell::RefCell::new(None);
+        let output = crate::http_config::helpers::replace(text, unknown_empty, |name| {
+            match self.lookup_checked(name) {
+                Ok(value) => if root { Some(value.unwrap_or_else(|| ".".into())) } else { value },
+                Err(e) => { *error.borrow_mut() = Some(e); None }
+            }
+        });
+        if let Some(error) = error.into_inner() { return Err(error); }
+        output
+    }
     pub(in crate::http_runtime) fn lookup_bytes(&self, name: &str) -> Option<Vec<u8>> {
         self.lookup_bytes_inner(name,&std::cell::Cell::new(false))
     }
@@ -178,6 +217,7 @@ impl<'a> View<'a> {
                 return Some(out);
             }
         }
+        if let Some(value) = self.tls_scalar(name) { return value.ok().map(|value| value.into_bytes()); }
         self.lookup_depth(name,0,missing).map(String::into_bytes)
     }
     pub(super) fn replacer_query(&self) -> &[u8] {
@@ -210,6 +250,9 @@ impl<'a> View<'a> {
         }
         if let Some(value) = self.values.get(name) {
             return Some(value.clone());
+        }
+        if let Some(value) = self.tls_scalar(name) {
+            return value.ok().and_then(|value| String::from_utf8(value.into_bytes()).ok());
         }
         let req = self.request.as_ref();
         let source = req.and_then(|r| {
@@ -311,7 +354,7 @@ impl Future for ResolvedFuture<'_>{
     type Output=Result<Option<ResolvedValue>>;
     fn poll(self:Pin<&mut Self>,cx:&mut std::task::Context<'_>)->std::task::Poll<Self::Output>{
         match self.get_mut(){
-            Self::Primitive(input)=>{let(view,name)=input.take().expect("future polled after completion");std::task::Poll::Ready(Ok(view.lookup_bytes(name).map(|bytes|ResolvedValue{bytes:Bytes::from(bytes),null:false})))},
+            Self::Primitive(input)=>{let(view,name)=input.take().expect("future polled after completion");std::task::Poll::Ready(view.lookup_bytes_checked(name).map(|value|value.map(|bytes|ResolvedValue{bytes:Bytes::from(bytes),null:false})))},
             Self::Running{future,..}=>future.as_mut().poll(cx),Self::Rejected(error)=>std::task::Poll::Ready(Err(error.take().expect("future polled after completion")))
         }
     }
@@ -348,7 +391,7 @@ impl View<'_>{
             let (direct,missing)={
                 let _temporary=self.resources.map_bytes.reserve(8<<20).map_err(|_|failure(http::StatusCode::SERVICE_UNAVAILABLE))?;
                 let missing=std::cell::Cell::new(false);
-                let direct=self.lookup_bytes_inner(name,&missing);
+                let direct=if let Some(value)=self.tls_scalar(name){Some(value?.into_bytes())}else{self.lookup_bytes_inner(name,&missing)};
                 let direct=if let Some(bytes)=direct{
                     ensure!(bytes.len()<=super::super::map_runtime::CAP,"map placeholder value exceeds limit");
                     let credit=self.resources.map_bytes.reserve(bytes.len().saturating_mul(2)+1024).map_err(|_|failure(http::StatusCode::SERVICE_UNAVAILABLE))?;
@@ -376,7 +419,7 @@ impl View<'_>{
         })}
     }
     pub(in crate::http_runtime) async fn root_resolved(&self,text:&str)->Result<String>{
-        if self.maps.is_empty(){return crate::http_config::helpers::replace(text,true,|name|Some(self.lookup(name).unwrap_or_else(||".".into())))}
+        if self.maps.is_empty(){return self.expand_primitive_text(text,true,true)}
         let lookup=RootLookup{view:self,deadline:std::time::Instant::now()+std::time::Duration::from_secs(5)};
         let bytes=super::super::replacer_async::expand(text,true,&lookup,&self.resources.map_bytes).await?;
         let text=std::str::from_utf8(&bytes)?;self.retain_text(bytes.clone())?;Ok(text.to_owned())
@@ -394,19 +437,20 @@ impl View<'_>{
         if let Some(owner)=self.retentions.get(){owner.reserve_copy(bytes).map_err(|_|failure(http::StatusCode::SERVICE_UNAVAILABLE))?;}Ok(())
     }
     pub(in crate::http_runtime) async fn lookup_text_resolved(&self,name:&str)->Result<Option<String>>{
-        if self.maps.is_empty(){return Ok(self.lookup(name))}
+        if self.maps.is_empty(){return self.lookup_checked(name)}
+        if let Some(value)=self.tls_scalar(name){return Ok(Some(String::from_utf8(value?.into_bytes())?))}
         let Some(bytes)=self.lookup_resolved(name).await?else{return Ok(None)};
         let Ok(text)=std::str::from_utf8(&bytes)else{return Ok(None)};
         self.retain_text(bytes.clone())?;Ok(Some(text.to_owned()))
     }
     pub(in crate::http_runtime) async fn expand_text_resolved(&self,text:&str,unknown_empty:bool)->Result<String>{
-        if self.maps.is_empty(){return crate::http_config::helpers::replace(text,unknown_empty,|name|self.lookup(name))}
+        if self.maps.is_empty(){return self.expand_primitive_text(text,unknown_empty,false)}
         if !text.as_bytes().iter().any(|b|matches!(b,b'{'|b'}')){return Ok(text.to_owned())}
         let value=self.expand_resolved(text,unknown_empty).await?;
         let text=std::str::from_utf8(&value)?;self.retain_text(value.clone())?;Ok(text.to_owned())
     }
     pub(in crate::http_runtime) async fn expand_resolved(&self,text:&str,unknown_empty:bool)->Result<Bytes>{
-        if self.maps.is_empty(){return crate::http_config::helpers::replace_bytes(text,unknown_empty,|name|self.lookup_bytes(name)).map(Bytes::from)}
+        if self.maps.is_empty(){return self.expand_primitive_bytes(text,unknown_empty).map(Bytes::from)}
         if !text.as_bytes().iter().any(|b|matches!(b,b'{'|b'}')){return Ok(Bytes::copy_from_slice(text.as_bytes()))}
         let lookup=Depth{view:self,depth:0,deadline:std::time::Instant::now()+std::time::Duration::from_secs(5)};
         super::super::replacer_async::expand(text,unknown_empty,&lookup,&self.resources.map_bytes).await

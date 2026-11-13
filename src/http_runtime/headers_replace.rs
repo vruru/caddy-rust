@@ -137,7 +137,7 @@ impl Snapshot {
                             .map_or_else(Vec::new, |fields| join(fields, field)))
                     })
                 } else {
-                    view.lookup_bytes(name).map(Bytes::from)
+                    view.lookup_bytes_checked(name)?.map(Bytes::from)
                 };
                 if let Some(value) = value {
                     this.store(&value, &ledger)?

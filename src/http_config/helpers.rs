@@ -2,6 +2,23 @@ use anyhow::{Result, ensure};
 use serde_json::{Map, Value};
 use std::time::Duration;
 
+/// Canonical TLS scalars supported by both native typed and text providers.
+#[derive(Clone, Copy)]
+pub(crate) enum TlsScalar { Version, CipherSuite, Resumed, Proto, ProtoMutual, ServerName, Ech }
+impl TlsScalar {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        let field = name.strip_prefix("http.request.tls.")?;
+        Some(if field.eq_ignore_ascii_case("version") { Self::Version }
+        else if field.eq_ignore_ascii_case("cipher_suite") { Self::CipherSuite }
+        else if field.eq_ignore_ascii_case("resumed") { Self::Resumed }
+        else if field.eq_ignore_ascii_case("proto") { Self::Proto }
+        else if field.eq_ignore_ascii_case("proto_mutual") { Self::ProtoMutual }
+        else if field.eq_ignore_ascii_case("server_name") { Self::ServerName }
+        else if field.eq_ignore_ascii_case("ech") { Self::Ech }
+        else { return None })
+    }
+}
+
 pub(crate) fn object<'a>(value: &'a Value, path: &str) -> Result<&'a Map<String, Value>> {
     value
         .as_object()

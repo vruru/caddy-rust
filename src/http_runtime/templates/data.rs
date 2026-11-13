@@ -80,6 +80,15 @@ impl RequestData {
             control.reserve_host_bytes(value.len()+64)?;return Ok(Some(string(value)));
         }
         if let Some((value,_))=self.placeholders.get(name){control.reserve_host_bytes(value.len()+64)?;return Ok(Some(Value::from_go_bytes(value.clone())));}
+        if let Some(scalar)=crate::http_config::helpers::TlsScalar::from_name(name){
+            // Formatting scratch is bounded (version/cipher); borrowed SNI and
+            // ALPN pay their actual output before copying into a Go string.
+            control.reserve_host_bytes(512)?;
+            let value=crate::http_runtime::placeholder_value::tls_scalar(scalar,self.tls,self.tls_snapshot.as_ref()).map_err(|e|error(e.to_string()))?;
+            let length=match &value {crate::http_runtime::placeholder_value::TlsScalarValue::Empty=>0,crate::http_runtime::placeholder_value::TlsScalarValue::Bool(_)=>5,crate::http_runtime::placeholder_value::TlsScalarValue::Text(bytes)=>bytes.len()};
+            control.reserve_host_bytes(length.saturating_mul(2).saturating_add(64))?;
+            return Ok(Some(Value::from_go_bytes(value.into_bytes())));
+        }
         if let Some(name)=name.strip_prefix("http.request.header."){
             let values=self.headers.get_all(name);let count=values.iter().count();
             let length=values.iter().try_fold(count.saturating_sub(1),|n,v|n.checked_add(v.as_bytes().len())).ok_or_else(||error("header placeholder size overflow"))?;

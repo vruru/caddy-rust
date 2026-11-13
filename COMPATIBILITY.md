@@ -1460,3 +1460,27 @@ created. The opt-in Quinn receive-stop operation and generic RecvStream
 destructor release the connection mutex before invoking or destroying removed
 reader/driver wakers. Other Quinn polling and waker paths are not claimed to
 have been converted by this change.
+
+Ordinary TLS scalar placeholders
+--------------------------------
+
+The seven snapshot-backed TLS scalars (`version`, `cipher_suite`, `resumed`,
+`proto`, `proto_mutual`, `server_name`, and `ech`) under `http.request.tls.`
+are available to ordinary text, headers, URI rewrites, demand-driven Maps and
+template `ph`/`placeholder`. They use the same negotiated metadata and scalar
+formatting as the typed provider; typed booleans and plain-HTTP nulls retain
+their existing types. Plain HTTP renders an empty string and health probes
+provide no request TLS value. ALPN remains raw bytes in byte consumers.
+
+Missing or failed TLS metadata is an error in fallible expansion and Map
+consumers, rather than an invented empty/false value. The existing Option-only
+lookup compatibility API reports absence; its String form also cannot represent
+non-UTF-8 ALPN, while byte lookup preserves it. Variable/capture/global provider
+precedence is retained. Ordinary `client.*` and unknown TLS suffixes remain
+rejected before configuration publication; certificate-derived providers are
+not enabled by this scalar change. ASCII case-insensitive scalar suffixes
+retain the native typed provider's existing extension.
+
+Fallible direct scalar String lookups reject non-UTF-8 ALPN even when Maps are
+configured. Generic Map-output Option decoding retains its prior absence
+behavior for byte values that cannot be represented as UTF-8.
