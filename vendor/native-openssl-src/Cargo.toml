@@ -1,0 +1,24 @@
+[package]
+name="native-openssl-src"
+version="400.0.2"
+edition="2021"
+license="MIT OR Apache-2.0"
+description="Pinned OpenSSL builder with explicit legacy EC certificate capability"
+[features]
+default=[]
+tls-deprecated-ec=[]
+camellia=["openssl-src-upstream/camellia"]
+force-engine=["openssl-src-upstream/force-engine"]
+idea=["openssl-src-upstream/idea"]
+ktls=["openssl-src-upstream/ktls"]
+legacy=["openssl-src-upstream/legacy"]
+no-dso=["openssl-src-upstream/no-dso"]
+seed=["openssl-src-upstream/seed"]
+ssl3=["openssl-src-upstream/ssl3"]
+weak-crypto=["openssl-src-upstream/weak-crypto"]
+[dependencies]
+cc="1.0.79"
+openssl-src-upstream={package="openssl-src",version="=400.0.2",default-features=false}
+[lib]
+name="openssl_src"
+path="src/lib.rs"

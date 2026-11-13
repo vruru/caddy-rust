@@ -390,8 +390,8 @@ dependencies = [
  "linux-raw-sys",
  "memchr",
  "mime_guess",
- "native-write-policy",
  "native-ssl-tls",
+ "native-write-policy",
  "openssl",
  "opentelemetry",
  "opentelemetry-http",
@@ -1787,16 +1787,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "native-openssl-src"
+version = "400.0.2"
+dependencies = [
+ "cc",
+ "openssl-src",
+]
+
+[[package]]
 name = "native-ssl-tls"
 version = "0.1.0"
 dependencies = [
  "foreign-types",
+ "futures-util",
  "openssl",
  "openssl-sys",
  "rustls",
  "tokio",
  "tokio-openssl",
  "tokio-util",
+ "zeroize",
 ]
 
 [[package]]
@@ -1954,7 +1964,7 @@ version = "0.9.118"
 dependencies = [
  "cc",
  "libc",
- "openssl-src",
+ "native-openssl-src",
  "pkg-config",
  "vcpkg",
 ]

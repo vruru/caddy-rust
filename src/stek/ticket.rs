@@ -31,6 +31,7 @@ const MAX_AAD: usize = CONTEXT.len() + 2 + MAX_SNI + 2 + 32 + 32 + HEADER;
 struct Key {
     id: [u8; KEY_ID],
     aead: aead::LessSafeKey,
+    ssl_secret:Zeroizing<[u8;32]>,
 }
 
 pub(super) struct KeySet(Vec<Key>);
@@ -62,7 +63,10 @@ impl KeySet {
                 .fill(material.as_mut())
                 .ok()?;
             let unbound = aead::UnboundKey::new(&aead::AES_256_GCM_SIV, material.as_ref()).ok()?;
+            let mut ssl_secret=Zeroizing::new([0u8;32]);
+            prk.expand(&[b"openssl-rfc5077-host-binding-v1"],hkdf::HKDF_SHA256).ok()?.fill(ssl_secret.as_mut()).ok()?;
             keys.push(Key {
+                ssl_secret,
                 id,
                 aead: aead::LessSafeKey::new(unbound),
             });
@@ -290,4 +294,25 @@ fn age_ok(now: u64, issued: u64) -> bool {
         && issued
             .checked_add(u64::from(MAX_AGE))
             .is_some_and(|until| now < until)
+}
+
+// Public SSL callbacks only receive separately derived ticket keys. Raw shared
+// seed material never leaves this module, and record encryption stays in SSL.
+impl native_ssl_tls::ServerTicketProvider for ConnectionTickets {
+ fn key(&self,requested:Option<&[u8;16]>)->Option<(native_ssl_tls::TicketKey,bool)>{
+  if !self.enabled{return None}
+  let selection=self.selection.get()?;
+  if !selection.current(now()?){return None}
+  self.owner.with_ticket_keys(|keys|{
+   let (index,key)=if let Some(id)=requested{keys.0.iter().enumerate().find(|(_,k)|&k.id==id)?}else{(0,keys.0.first()?)};
+   let salt=hkdf::Salt::new(hkdf::HKDF_SHA256,b"caddy-rust/openssl-ticket-key/v1");let prk=salt.extract(key.ssl_secret.as_ref());
+   let mut binding=[0u8;MAX_AAD];let n=selection.aad(&self.realm,&[0u8;HEADER],&mut binding);
+   let mut enc=Zeroizing::new([0u8;32]);let mut mac=Zeroizing::new([0u8;32]);
+   prk.expand(&[b"aes-256-cbc",&binding[..n]],hkdf::HKDF_SHA256).ok()?.fill(enc.as_mut()).ok()?;
+   prk.expand(&[b"hmac-sha256",&binding[..n]],hkdf::HKDF_SHA256).ok()?.fill(mac.as_mut()).ok()?;
+   selection.current(now()?).then(||(native_ssl_tls::TicketKey::new(key.id,enc,mac),index==0))
+  })
+ }
+ fn seal(&self,plain:&[u8])->Option<Vec<u8>>{if plain.len()!=8{return None}ProducesTickets::encrypt(self,plain)}
+ fn open(&self,sealed:&[u8])->Option<Vec<u8>>{if sealed.len()>256{return None}let value=ProducesTickets::decrypt(self,sealed)?;(value.len()==8).then_some(value)}
 }

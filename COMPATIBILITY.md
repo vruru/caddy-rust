@@ -119,7 +119,7 @@ their configuration and behavior require native implementations.
 Known development gaps still include remaining listener/address combinations,
 remaining header-operation/push combinations and
 remaining template receiver methods,
-TLS 1.2 CBC suites, full Go PKIX edge semantics and remaining issuer/trust-loader
+full Go PKIX edge semantics and remaining issuer/trust-loader
 capabilities. This list is not a claim that all other field combinations are
 fully verified. The 135-module baseline is an inventory, not a support registry.
 
@@ -940,7 +940,7 @@ facts and shared-client issuance/trust regressions cover this behavior.
 
 The pinned baseline only recognizes TLS1.2/TLS1.3 as server protocols. Legacy
 TLS1.0/TLS1.1 names fall back to modern defaults and do not enable those wire
-versions; they are not an unimplemented baseline feature. TLS1.2 CBC suites,
+versions; they are not an unimplemented baseline feature.
 automated client certificates and remaining
 issuer features remain separate unfinished work. PKI KeyPair formats other
 than empty/pem_file are likewise not implemented by the pinned baseline.
@@ -1021,9 +1021,9 @@ have a separate aggregate 64 MiB credit pool, a 1 MiB message limit and at most
 Protocol, suite, ALPN, peer certificates, stapled OCSP bytes, session reuse and
 exporter values exposed by this outgoing transport come from its live SSL
 connection; this does not add OCSP-revocation policy to native upstream trust.
-No incoming TLS snapshot or default server/HTTP3 provider is replaced. TLS1.2
-CBC policy and automated managed client identities remain separate unfinished
-work. The generic configuration still rejects invalid renegotiation levels
+The outgoing connector does not replace incoming TLS snapshots or the default
+server/HTTP3 provider. Automated managed client identities remain separate
+unfinished work. The generic configuration still rejects invalid renegotiation levels
 before publication, and a failed HTTPS CA preparation retains the old site.
 
 
@@ -1134,3 +1134,16 @@ are supported. The existing per-server limit applies to expanded endpoints:
 at most 1024, checked before allocating the expanded range. Unknown listener
 networks, unresolved hostnames and Unix HTTP listeners remain explicit gaps;
 this does not claim every NetworkAddress or Caddyfile site-address combination.
+
+
+### Explicit incoming TLS1.2 CBC policies
+
+Explicit policies support ECDHE-ECDSA and ECDHE-RSA with AES128-CBC-SHA and AES256-CBC-SHA. These TLS1.2 connections use the complete pinned OpenSSL SSL record/session engine; Native does not implement CBC record padding, MAC verification or encryption in Rust. Default server policies, TLS1.3 and HTTP3 retain Rustls. Configured suites are an allow-set: available AEAD suites stay ahead of CBC and AES128 ahead of AES256. CBC negotiates HTTP/1.1; mixed policies can negotiate HTTP2 with an allowed AEAD suite.
+
+The original resolver selection, selector/SNI policy, on-demand permission/manager path and live leaf/SPKI veto authorize the same credential. There is no certificate-source I/O inside SSL. Client authentication runs the original Native path/pin/purpose verifier once on the owned crypto worker; SSL separately authenticates CertificateVerify and Finished. Require/request modes retain proof of private-key possession. Snapshot peer DER, verified paths, negotiated group, TLSUnique, resumption and owned binary-label exporters reflect the actual completed handshake. Original stateful cache and standard/distributed ticket ownership stay bound to selected chain, policy and name. A live key-compromise veto prevents application I/O and resumption.
+
+The SSL object moves through bounded CPU steps; socket I/O stays asynchronous. Process-shared Rust temporary pools limit engine/output buffers to32MiB, input/queued writes to16MiB and session serialization staging to4MiB. Raw peer certificates retain the existing shared64MiB admission. These named temporary limits do not bound provider/FFI heap, persistent cache/snapshot owners or whole-process RSS. Cancelled waiters cannot refund data still held by real workers. Listener/request admission closes before graceful drain; record-worker admission stays open for existing HTTP tasks, then closes and joins after HTTP connections and upgrades finish. Hard-stop still terminates blocked connections at the grace limit.
+
+The small native-openssl-src builder obtains unchanged OpenSSL C sources from exact openssl-src400.0.2+4.0.3. Its tls-deprecated-ec build feature makes legacy certificate curves such as P224 available without adding them to configured/default key-exchange groups or enabling TLS1.0/1.1. P224 certificates work when the peer explicitly advertises that curve. Native retains RFC8422's requirement that EC certificate curves respect the peer's supported groups. The pinned Go pair accepted P224 without advertising it; that observed difference is recorded separately and does not cause weaker SSL verification. Security policy is local to the explicit compatibility context; no global security level is changed.
+
+Isolated actual-main checks cover four suites, selection/preference, modern and TLS1.3 controls, Caddyfile, P224/P256/P384/P521/Ed25519 and RSA1024 through RSA8192, leaves above64KiB, same-connection exporters, mTLS and invalid CertificateVerify, modified CBC ciphertext, session/ticket rotation, real reason1 plus restart, real ACME TLS-ALPN-01 proof, parallel large keys, reload, graceful drain and hard-stop. Evidence and fixtures stay local. Remaining client_certificate_automate, issuer and PKIX work is separate; this addition does not claim complete TLS compatibility.

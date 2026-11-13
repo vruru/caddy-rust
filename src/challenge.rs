@@ -48,6 +48,7 @@ struct TlsProof {
     expires: Instant,
     digest: [u8; 32],
     certificate: Arc<CertifiedKey>,
+    native_private_key:openssl::pkey::PKey<openssl::pkey::Private>,
     events:Option<Arc<crate::events::EventsApp>>,
     cancel:tokio_util::sync::CancellationToken,
 }
@@ -55,6 +56,7 @@ impl Drop for TlsProof {fn drop(&mut self){self.cancel.cancel();}}
 #[derive(Clone)]
 pub(crate) struct TlsRegistration {
     pub generation:u64,pub expires:Instant,pub certificate:Arc<CertifiedKey>,
+    pub native_private_key:openssl::pkey::PKey<openssl::pkey::Private>,
     pub events:Option<Arc<crate::events::EventsApp>>,pub cancel:tokio_util::sync::CancellationToken,
 }
 
@@ -175,14 +177,25 @@ impl ChallengeRegistry {
         validate_registration(owner, authorization, ttl)?;
         let digest: [u8; 32] = Sha256::digest(authorization.as_bytes()).into();
         // Key generation and certificate parsing never hold the shared lock.
-        let certificate = Arc::new(challenge_certificate(&domain, &digest, ttl)?);
+        let (certificate,native_private_key)=challenge_certificate(&domain,&digest,ttl)?;
+        let certificate=Arc::new(certificate);
+        let cancel=cancel.child_token();
+        // Proof cancellation can synchronously wake a handshake whose gate
+        // reads this registry. Keep every removed proof until after the write
+        // guard, including all early error paths (declaration/drop order).
+        let _retired_memory;
+        let mut retired=Vec::new();
         let mut map = self
             .inner
             .tls
             .write()
             .map_err(|_| anyhow!("challenge state unavailable"))?;
         let now = Instant::now();
-        map.retain(|_, proof| proof.expires > now);
+        let retired_capacity=map.len().checked_add(1).ok_or(crate::cert_transient::ResourceDenied)?;
+        let bytes=retired_capacity.checked_mul(std::mem::size_of::<TlsProof>()).and_then(|n|n.checked_add(64)).ok_or(crate::cert_transient::ResourceDenied)?;
+        _retired_memory=crate::cert_transient::reserve(bytes)?;
+        retired.try_reserve_exact(retired_capacity).map_err(|_|crate::cert_transient::ResourceDenied)?;
+        for (_,proof) in map.extract_if(|_,proof|proof.expires<=now){retired.push(proof);}
         if let Some(existing) = map.get(&domain) {
             ensure!(
                 existing.owner == owner && existing.digest == digest,
@@ -199,7 +212,7 @@ impl ChallengeRegistry {
             "TLS challenge owner capacity reached"
         );
         let generation = self.generation()?;
-        map.insert(
+        let replaced=map.insert(
             domain.clone(),
             TlsProof {
                 owner: owner.to_owned(),
@@ -207,10 +220,14 @@ impl ChallengeRegistry {
                 expires: now + ttl,
                 digest,
                 certificate,
+                native_private_key,
                 events,
-                cancel:cancel.child_token(),
+                cancel,
             },
         );
+        if let Some(proof)=replaced{retired.push(proof);}
+        drop(map);
+        drop(retired);
         Ok(ChallengeLease {
             inner: self.inner.clone(),
             generation,
@@ -233,11 +250,14 @@ impl ChallengeRegistry {
         let proof = map.get(&domain)?;
         (proof.expires > Instant::now() && !proof.cancel.is_cancelled()).then(|| TlsRegistration {
             generation:proof.generation,expires:proof.expires,certificate:proof.certificate.clone(),
+            native_private_key:proof.native_private_key.clone(),
             events:proof.events.clone(),cancel:proof.cancel.clone(),
         })
     }
     pub(crate) fn tls_generation_current(&self,sni:&str,generation:u64)->bool {
-        self.tls_registration(sni,&[ACME_ALPN]).is_some_and(|r|r.generation==generation)
+        let Ok(domain)=normalize_domain(sni)else{return false};
+        let Ok(map)=self.inner.tls.read()else{return false};
+        map.get(&domain).is_some_and(|p|p.generation==generation && p.expires>Instant::now() && !p.cancel.is_cancelled())
     }
 }
 
@@ -256,19 +276,17 @@ impl Drop for ChallengeLease {
                 }
             }
             LeaseKind::Tls(slot) => {
-                let mut map = self.inner.tls.write().unwrap_or_else(|e| e.into_inner());
-                if map
-                    .get(slot)
-                    .is_some_and(|p| p.generation == self.generation)
-                {
-                    map.remove(slot);
-                }
+                let retired={
+                    let mut map=self.inner.tls.write().unwrap_or_else(|e|e.into_inner());
+                    if map.get(slot).is_some_and(|p|p.generation==self.generation){map.remove(slot)}else{None}
+                };
+                drop(retired);
             }
         }
     }
 }
 
-fn challenge_certificate(domain: &str, digest: &[u8; 32], ttl: Duration) -> Result<CertifiedKey> {
+fn challenge_certificate(domain: &str, digest: &[u8; 32], ttl: Duration) -> Result<(CertifiedKey,openssl::pkey::PKey<openssl::pkey::Private>)> {
     let pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .map_err(|_| anyhow!("challenge key generation failed"))?;
     let mut params = rcgen::CertificateParams::new(vec![domain.to_owned()])
@@ -350,7 +368,11 @@ fn challenge_certificate(domain: &str, digest: &[u8; 32], ttl: Duration) -> Resu
         signer_public.as_ref() == public.raw,
         "challenge key does not match certificate"
     );
-    Ok(CertifiedKey::new(vec![certificate.der().clone()], signer))
+    // The only output is this private fixed-size P256 factory. Its existing
+    // per-owner/global proof counts bound the extra native key, and registry
+    // registration/cancellation retains the complete lease. No PEM is exposed.
+    let native=openssl::pkey::PKey::private_key_from_der(&key).map_err(|_|anyhow!("native challenge signing key invalid"))?;
+    Ok((CertifiedKey::new(vec![certificate.der().clone()], signer),native))
 }
 
 fn validate_registration(owner: &str, authorization: &str, ttl: Duration) -> Result<()> {

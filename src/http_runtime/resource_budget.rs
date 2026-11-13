@@ -453,7 +453,8 @@ impl Resources {
         })
     }
     pub(crate) fn close(&self) {
-        self.ssl_verify.close();
+        // Listener/request admission closes here. Existing SSL records must
+        // remain usable while the outer HTTP tasks drain gracefully.
         self.cel_compile.tasks.close();
         self.proxy_cleanup.close();
         self.proxy_dns.close();
@@ -473,6 +474,10 @@ impl Resources {
         self.fastcgi_admission.diagnostics.close();
     }
     pub(crate) async fn wait(&self) {
+        // shutdown_wait joins HTTP connections and upgrades before this call.
+        // No outer transport can register a new crypto step after this fence;
+        // cancelled/detached blocking results still carry their own tokens.
+        self.ssl_verify.close();
         self.ssl_verify.wait().await;
         self.cel_compile.tasks.wait().await;
         self.proxy_cleanup.wait().await;

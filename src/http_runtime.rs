@@ -69,7 +69,11 @@ mod h3;
 mod lifecycle;
 #[path = "http_runtime/manual_certificates.rs"]
 mod manual_certificates;
+#[path="http_runtime/ssl_capture.rs"]
+mod ssl_capture;
 mod tls_policies;
+#[path="http_runtime/tls_cbc.rs"]
+mod tls_cbc;
 mod certificate_choice;
 pub use lifecycle::{CommitOutcome, HttpStage, StagedAddress};
 #[path = "http_runtime/listener_lease.rs"]
@@ -1072,12 +1076,10 @@ async fn accept_loop(
                             Err(_) => return,
                         },
                     };
-                    let negotiated_h2 = accepted.stream.get_ref().1.alpn_protocol() == Some(b"h2");
-                    let tls_details = fastcgi::TlsDetails::of(accepted.stream.get_ref().1);
-                    let tls_log = Some(Arc::new(access_log::Tls::of(
-                        accepted.stream.get_ref().1,
-                        accepted.identity.server_name(),
-                    )));
+                    let metadata=match accepted.snapshot.metadata(){Ok(m)=>m,Err(_)=>return};
+                    let negotiated_h2=metadata.alpn.as_ref()==b"h2";
+                    let tls_details=fastcgi::TlsDetails::from_metadata(metadata);
+                    let tls_log=Some(Arc::new(access_log::Tls::from_metadata(metadata)));
 
                     let deadline = match server.plan.request_head_limit() {
                         Some(timeout) => match tokio::time::Instant::now().checked_add(timeout) {

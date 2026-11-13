@@ -92,6 +92,7 @@ pub(super) struct Tls {
     server_name: String,
 }
 impl Tls {
+    pub(super) fn from_metadata(m:&super::connection_snapshot::ConnectionMetadata)->Self { Self {version:m.version,suite:m.cipher_suite,resumed:m.did_resume,protocol:m.alpn.to_vec(),server_name:m.server_name.to_string()} }
     pub(super) fn of(connection: &rustls::ServerConnection, offered_name: &str) -> Self {
         Self {
             version: connection.protocol_version().map_or(0, u16::from),

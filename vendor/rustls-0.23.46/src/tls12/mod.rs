@@ -381,7 +381,7 @@ mod tests {
 
 struct NativeTls12Exporter {
     master_secret: zeroize::Zeroizing<[u8; 48]>,
-    suite: &'static Tls12CipherSuite,
+    prf: &'static dyn crypto::tls12::Prf,
     client_random: [u8; 32],
     server_random: [u8; 32],
     ems: bool,
@@ -405,15 +405,19 @@ impl crate::NativeExporter for NativeTls12Exporter {
             seed.extend_from_slice(&(context.len() as u16).to_be_bytes());
             seed.extend_from_slice(context);
         }
-        self.suite.prf_provider.for_secret(output, self.master_secret.as_ref(), label, &seed);
+        self.prf.for_secret(output, self.master_secret.as_ref(), label, &seed);
         Ok(())
     }
 }
 impl ConnectionSecrets {
     pub(crate) fn native_exporter(&self, ems: bool) -> alloc::sync::Arc<dyn crate::NativeExporter> {
-        alloc::sync::Arc::new(NativeTls12Exporter {
-            master_secret: zeroize::Zeroizing::new(self.master_secret), suite: self.suite,
-            client_random: self.randoms.client, server_random: self.randoms.server, ems,
-        })
+        native_tls12_exporter(self.suite.prf_provider,zeroize::Zeroizing::new(self.master_secret),self.randoms.client,self.randoms.server,ems)
     }
+}
+
+/// Capture a completed external TLS1.2 session's immutable exporter secret.
+/// The caller supplies the actual negotiated PRF and authenticated session
+/// values; no stream/record-layer/traffic-key capability is retained.
+pub fn native_tls12_exporter(prf:&'static dyn crypto::tls12::Prf,master_secret:zeroize::Zeroizing<[u8;48]>,client_random:[u8;32],server_random:[u8;32],ems:bool)->alloc::sync::Arc<dyn crate::NativeExporter>{
+    alloc::sync::Arc::new(NativeTls12Exporter{master_secret,prf,client_random,server_random,ems})
 }

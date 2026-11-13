@@ -205,3 +205,6 @@ framing. Hyper HTTP/2 server and hyper-util automatic-server builders add a
 native opt-in for ordinary CONNECT request DATA; extended CONNECT and generic
 raw upgrades retain their existing default behavior. These changes carry no
 application callbacks and do not add background actors or protocol queues.
+
+
+Incoming explicit TLS1.2 CBC uses complete OpenSSL SSL records/sessions via native-ssl-tls server_* modules, owned CPU steps and asynchronous socket I/O. Rustls exposes a read-only client-chain observation and an owned TLS1.2 PRF exporter for exact snapshots. native-openssl-src derives from the pinned openssl-src400.0.2+4.0.3 builder (MIT/Apache-2.0): source_dir/version forward to the original pinned source package; tls-deprecated-ec adds OpenSSL Configure enable-tls-deprecated-ec. openssl-sys uses that named feature for its vendored builder. OpenSSL C sources remain unchanged. Default Native Rustls/H3 groups, versions and verification are unchanged.

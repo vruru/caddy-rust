@@ -318,3 +318,18 @@ impl StoresServerSessions for PerConnectionSessions {
         true
     }
 }
+
+// A namespace prevents an SSL session DER from ever being interpreted as a
+// Rustls secret or vice versa when a policy changes engine after reload.
+impl native_ssl_tls::ServerSessionStore for PerConnectionSessions {
+ fn put(&self,key:Vec<u8>,value:Zeroizing<Vec<u8>>)->bool{
+  if key.len()>32 || value.len()>16*1024+8{return false}
+  let mut namespaced=b"native-ssl12\0".to_vec();namespaced.extend_from_slice(&key);
+  self.shared.remember(namespaced,value,self.handshake.clone())
+ }
+ fn get(&self,key:&[u8])->Option<Zeroizing<Vec<u8>>>{
+  if key.len()>32{return None}
+  let mut namespaced=b"native-ssl12\0".to_vec();namespaced.extend_from_slice(key);
+  self.lookup(&namespaced,false).map(Zeroizing::new)
+ }
+}

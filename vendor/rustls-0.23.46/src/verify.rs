@@ -65,6 +65,10 @@ impl ClientCertVerified {
     pub fn with_observation(observation: crate::ClientChainObservation) -> Self {
         Self(observation)
     }
+    /// Exact paths produced by this verification result; no second X509
+    /// verification is performed when another native TLS engine records them.
+    pub fn observation(&self) -> &crate::ClientChainObservation { &self.0 }
+
 
 }
 

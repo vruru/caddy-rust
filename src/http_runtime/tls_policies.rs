@@ -3,6 +3,8 @@ use crate::tls_policy::{ConnectionPolicy, HelloInfo};
 use sha2::{Digest, Sha256};
 
 pub(super) struct PreparedPolicy {
+    pub native_suites:Option<Arc<[u16]>>,
+    pub native_verifier:Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
     pub definition: ConnectionPolicy,
     pub tls: Arc<rustls::ServerConfig>,
     pub resolver: Arc<CandidateResolver>,
@@ -79,9 +81,9 @@ pub(super) async fn prepare(
         if server.protocols.iter().any(|protocol| protocol == "h1") {
             alpn.push(b"http/1.1".to_vec());
         }
-        let (mut tls, identity, charge) = resources
+        let (mut tls, identity, charge,native_verifier,native_suites) = resources
             .metadata
-            .run(move || prepared_definition.build_prepared(resolver_for_build, &alpn))
+            .run(move || prepared_definition.build_prepared_with_verifier(resolver_for_build, &alpn))
             .await
             .map_err(|_| anyhow::anyhow!("TLS policy provisioning worker unavailable"))??;
         tls.alpn_protocols
@@ -98,6 +100,8 @@ pub(super) async fn prepare(
             "TLS client authentication memory budget exceeded"
         );
         result.push(Arc::new(PreparedPolicy {
+            native_verifier,
+            native_suites,
             definition,
             tls: Arc::new(tls),
             resolver,

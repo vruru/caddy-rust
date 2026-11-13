@@ -12,3 +12,5 @@ tokio={version="1",features=["io-util","rt","sync","macros"]}
 tokio-openssl="=0.6.5"
 rustls={version="=0.23.46",default-features=false,features=["std","tls12"]}
 tokio-util={version="0.7",features=["rt"]}
+zeroize="1"
+futures-util={version="0.3",default-features=false,features=["std"]}

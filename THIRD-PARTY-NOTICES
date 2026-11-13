@@ -78,8 +78,8 @@ rustls and OpenSSL bindings
 vendor/rustls-0.23.46 retains its upstream Apache-2.0, ISC and MIT licenses.
 Its VENDOR.md documents the negotiated-protocol accessor and source checksum.
 vendor/openssl-sys-0.9.118 retains its upstream MIT license. Its VENDOR.md
-documents the pinned OpenSSL source dependency; the FFI and build source are
-unchanged. The openssl Rust wrapper and OpenSSL 4.0.3 are Apache-2.0 licensed;
+documents the pinned OpenSSL source dependency. Its FFI/build source remains
+upstream; its vendored build dependency now selects the named local builder. The openssl Rust wrapper and OpenSSL 4.0.3 are Apache-2.0 licensed;
 the openssl-src build wrapper is dual MIT/Apache-2.0 licensed. These dependencies
 retain their licenses in their original registry distributions. The Apache-2.0
 license text is also provided in LICENSE. No upstream project endorses this
@@ -88,6 +88,9 @@ implementation or its compatibility claims.
 The explicit outgoing SSL connector additionally uses tokio-openssl 0.6.5,
 dual-licensed MIT/Apache-2.0, retaining its license texts in the original registry
 distribution. `vendor/native-ssl-tls` contains first-party Apache-2.0 source.
+`vendor/native-openssl-src` derives from the dual MIT/Apache-2.0 openssl-src
+400.0.2 builder, retains both license texts, and documents its build-only changes
+in UPSTREAM.md. The pinned OpenSSL C source remains unchanged.
 
 Caddy and CertMagic
 ------------------

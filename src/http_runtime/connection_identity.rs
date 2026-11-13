@@ -181,6 +181,15 @@ async fn proof_event(inner:&Arc<Inner>,registration:Option<&crate::challenge::Tl
         }
     }else{future.await}
 }
+async fn proof_lifetime<T>(future:impl std::future::Future<Output=Result<T>>,owner:Option<(CancellationToken,std::time::Instant)>)->Result<T>{
+ if let Some((cancel,expires))=owner{
+  tokio::select!{biased;
+    _=cancel.cancelled()=>anyhow::bail!("TLS proof owner cancelled"),
+    _=tokio::time::sleep_until(expires.into())=>anyhow::bail!("TLS proof expired"),
+    result=future=>result,
+  }
+ }else{future.await}
+}
 pub(super) async fn accept_proof<I>(inner:&Arc<Inner>,stream:I,config:Arc<rustls::ServerConfig>,
     peer_local:(NetAddress,NetAddress),cancel:CancellationToken)->Result<()>
 where I:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin+Send+'static {
@@ -192,10 +201,11 @@ where I:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin+Send+'static {
     let registration=inner.registry.tls_registration(&name,&protocols);
     let app=registration.as_ref().and_then(|r|r.events.clone());
     proof_event(inner,registration.as_ref(),app.as_ref(),&fields,peer_local,&cancel).await?;
+    let proof_owner=registration.as_ref().map(|r|(r.cancel.clone(),r.expires));
     let mut config=(*config).clone();
     config.cert_resolver=Arc::new(PinnedProof{registry:inner.registry.clone(),sni:name,registration});
     let executor=inner.tls_executor.get().ok_or_else(||anyhow::anyhow!("TLS executor unavailable"))?;
-    executor.execute_proof(async move {let stream=start.into_stream(Arc::new(config)).await?;drop(stream);Ok(())},cancel,None).await
+    executor.execute_proof(proof_lifetime(async move {let stream=start.into_stream(Arc::new(config)).await?;drop(stream);Ok(())},proof_owner),cancel,None).await
 }
 struct FixedResolver {
     policy: Arc<tls_policies::PreparedPolicy>,
@@ -319,10 +329,24 @@ impl ResolvesServerCert for FixedResolver {
     }
 }
 pub(super) struct AcceptedTls<I> {
-    pub stream: tokio_rustls::server::TlsStream<I>,
+    pub stream: TlsStream<I>,
     pub identity: Arc<TlsIdentity>,
     pub snapshot: Arc<ConnectionSnapshot>,
     pub server: Arc<ActiveServer>,
+}
+pub(super) enum TlsStream<I> {
+    Rustls(tokio_rustls::server::TlsStream<I>),
+    Native(native_ssl_tls::ServerStream<I>),
+}
+impl<I: tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin> tokio::io::AsyncRead for TlsStream<I>{
+ fn poll_read(self:std::pin::Pin<&mut Self>,cx:&mut std::task::Context<'_>,buf:&mut tokio::io::ReadBuf<'_>)->std::task::Poll<std::io::Result<()>>{match self.get_mut(){Self::Rustls(v)=>std::pin::Pin::new(v).poll_read(cx,buf),Self::Native(v)=>std::pin::Pin::new(v).poll_read(cx,buf)}}
+}
+impl<I: tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin> tokio::io::AsyncWrite for TlsStream<I>{
+ fn poll_write(self:std::pin::Pin<&mut Self>,cx:&mut std::task::Context<'_>,buf:&[u8])->std::task::Poll<std::io::Result<usize>>{match self.get_mut(){Self::Rustls(v)=>std::pin::Pin::new(v).poll_write(cx,buf),Self::Native(v)=>std::pin::Pin::new(v).poll_write(cx,buf)}}
+ fn poll_flush(self:std::pin::Pin<&mut Self>,cx:&mut std::task::Context<'_>)->std::task::Poll<std::io::Result<()>>{match self.get_mut(){Self::Rustls(v)=>std::pin::Pin::new(v).poll_flush(cx),Self::Native(v)=>std::pin::Pin::new(v).poll_flush(cx)}}
+ fn poll_shutdown(self:std::pin::Pin<&mut Self>,cx:&mut std::task::Context<'_>)->std::task::Poll<std::io::Result<()>>{match self.get_mut(){Self::Rustls(v)=>std::pin::Pin::new(v).poll_shutdown(cx),Self::Native(v)=>std::pin::Pin::new(v).poll_shutdown(cx)}}
+ fn is_write_vectored(&self)->bool{match self{Self::Rustls(v)=>tokio::io::AsyncWrite::is_write_vectored(v),Self::Native(v)=>tokio::io::AsyncWrite::is_write_vectored(v)}}
+ fn poll_write_vectored(self:std::pin::Pin<&mut Self>,cx:&mut std::task::Context<'_>,bufs:&[std::io::IoSlice<'_>])->std::task::Poll<std::io::Result<usize>>{match self.get_mut(){Self::Rustls(v)=>tokio::io::AsyncWrite::poll_write_vectored(std::pin::Pin::new(v),cx,bufs),Self::Native(v)=>tokio::io::AsyncWrite::poll_write_vectored(std::pin::Pin::new(v),cx,bufs)}}
 }
 fn same_business_view(
     generation: &Generation,
@@ -591,13 +615,13 @@ pub(super) async fn accept<I>(
     deadline: Option<tokio::time::Instant>,
     reply_http: bool,
     peer_local: (NetAddress, NetAddress),
-) -> Result<AcceptedTls<http_redirect::ReplayIo<I>>>
+) -> Result<AcceptedTls<super::ssl_capture::CaptureIo<http_redirect::ReplayIo<I>>>>
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (peer, local) = peer_local;
-    let start = tls_io_deadline(deadline, async move {
-        let stream = tls_first_record::prepare(stream, reply_http).await?;
+    let mut start = tls_io_deadline(deadline, async move {
+        let stream = super::ssl_capture::CaptureIo::new(tls_first_record::prepare(stream, reply_http).await?);
         Ok(
             tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream)
                 .await?,
@@ -619,6 +643,8 @@ where
         .map(Vec::as_slice)
         .collect::<Vec<_>>();
     let schemes = hello.signature_schemes().to_vec();
+    let offers_tls13=hello.offered_versions().is_some_and(|v|v.contains(&ProtocolVersion::TLSv1_3));
+    let offered_ciphers=hello.cipher_suites().iter().copied().map(u16::from).collect::<Vec<_>>();
     ensure!(
         !protocols.contains(&ACME_ALPN) || protocols == [ACME_ALPN],
         "mixed ACME ALPN offer"
@@ -634,6 +660,7 @@ where
         connection_budget::classify_proof(&admission, deadline).await?;
         let registration=inner.registry.tls_registration(&sni,&protocols);
         let mut event_app=registration.as_ref().and_then(|r|r.events.clone());
+        let mut proof_native=None;
         let config = if let Some((business, _)) = inner.current.load_full().business(&address) {
             event_app=business.events.clone();
             let matching = business.clone();
@@ -650,6 +677,9 @@ where
                 !policy.definition.drop,
                 "TLS connection policy dropped proof connection"
             );
+            if policy.definition.protocol_min!=Some(crate::tls_policy::ProtocolVersion::Tls13) && policy.native_suites.is_some() && (!offers_tls13 || policy.definition.protocol_max==Some(crate::tls_policy::ProtocolVersion::Tls12)) {
+                proof_native=Some((policy.native_suites.clone().expect("native suite policy"),policy.native_verifier.clone()));
+            }
             let mut config = (*policy.tls).clone();
             config.cert_resolver = inner.challenge_resolver.clone();
             config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
@@ -661,19 +691,35 @@ where
             proof_tls_config(inner.challenge_resolver.clone())?
         };
         proof_event(inner,registration.as_ref(),event_app.as_ref(),&event_fields,(peer.clone(),local.clone()),&inner.stopped).await?;
+        let proof_owner=registration.as_ref().map(|r|(r.cancel.clone(),r.expires));
+        if let Some((suites,verifier))=proof_native {
+            let registration=registration.ok_or_else(||anyhow::anyhow!("native TLS proof unavailable"))?;
+            let registry=inner.registry.clone();let name=sni.clone();let generation=registration.generation;
+            let gate:Arc<dyn Fn()->bool+Send+Sync>=Arc::new(move||registry.tls_generation_current(&name,generation));
+            let key=registration.certificate;let credential=registration.native_private_key;
+            let auth=native_ssl_tls::ServerClientAuth::new(verifier);let scope=inner.resources.ssl_verify.clone();
+            let io=start.io.replay();drop(start.accepted);
+            let executor=inner.tls_executor.get().ok_or_else(||anyhow::anyhow!("TLS executor unavailable"))?;
+            executor.execute_proof(proof_lifetime(async move {
+                let stream=native_ssl_tls::ServerStream::prepare(io,scope,move ||super::tls_cbc::engine_with_key(key,config,super::tls_cbc::ordered(&suites,&offered_ciphers),auth,None,credential,gate,Arc::new(||false))).await?;
+                drop(stream);Ok(())
+            },proof_owner),inner.stopped.child_token(),deadline).await?;
+            anyhow::bail!("TLS validation completed");
+        }
         let mut config=(*config).clone();
         config.cert_resolver=Arc::new(PinnedProof{registry:inner.registry.clone(),sni:sni.clone(),registration});
         let config=Arc::new(config);
         let Some(executor) = inner.tls_executor.get() else {
             anyhow::bail!("TLS executor unavailable");
         };
+        start.io.discard();
         executor
             .execute_proof(
-                async move {
+                proof_lifetime(async move {
                     let stream = start.into_stream(config).await?;
                     drop(stream);
                     Ok(())
-                },
+                },proof_owner),
                 inner.stopped.child_token(),
                 deadline,
             )
@@ -714,6 +760,67 @@ where
             "TLS identity unavailable"
         }
     );
+    let native_tls12=policy.definition.protocol_min!=Some(crate::tls_policy::ProtocolVersion::Tls13) && policy.native_suites.is_some()
+        && (!offers_tls13 || policy.definition.protocol_max==Some(crate::tls_policy::ProtocolVersion::Tls12));
+    if native_tls12 {
+        let ids=policy.native_suites.clone().expect("native cipher policy");
+        let worker_policy=policy.clone(); let worker_acquired=acquired.clone();let worker_sni=sni.clone();let worker_local=local_ip.clone();let worker_protocols=offered_protocols.clone();let worker_schemes=schemes.clone();let worker_ids=ids;
+        let (selection,names)=inner.resources.metadata.run(move ||{
+            let protocols=worker_protocols.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let schemes=super::tls_cbc::compatible_schemes(&worker_ids,&offered_ciphers,&worker_schemes);
+            if schemes.is_empty(){return None}
+            let (certificate,origin)=if let Some(acquired)=&worker_acquired{acquired.select(&worker_policy.resolver.managed,&schemes,Some(ProtocolVersion::TLSv1_2)).map(|c|(c,CertificateOrigin::Managed))}else{worker_policy.resolver.choose(eligible_names(&worker_policy.definition,&worker_sni,&worker_local,primary_certificate_only),(!worker_sni.is_empty()).then_some(worker_sni.as_str()),&protocols,&schemes,Some(ProtocolVersion::TLSv1_2)).selected()}?;
+            let native=certificate.native.as_ref()?;
+            if !native.admitted() || !certificate.signature_compatibility.allows(ProtocolVersion::TLSv1_2){return None}
+            let not_after=native.not_after;let leaf=native.leaf.clone();let chain_hash=chain_hash(&certificate.key);
+            let ordered=super::tls_cbc::ordered(&worker_ids,&offered_ciphers);
+            Some((FixedSelection{version:ProtocolVersion::TLSv1_2,certificate,origin,chain_hash,not_after,leaf},ordered))
+        }).await.map_err(|_|anyhow::anyhow!("native TLS certificate selection worker unavailable"))?.ok_or_else(||anyhow::anyhow!("native TLS identity unavailable"))?;
+        let session_name:Arc<str>=if sni.is_empty(){if local.socket().is_some(){format!("no-sni:{local_ip}").into()}else{format!("no-sni:{}:{}",local.network(),local.raw_text().iter().map(|v|format!("{v:02x}")).collect::<String>()).into()}}else if ip_sni{format!("ip-sni:{sni}").into()}else{sni.as_str().into()};
+        let native_config=Arc::new(super::tls_cbc::alpn_config(&policy.tls,&protocols));
+        let identity=Arc::new(TlsIdentity{sni:sni.clone(),wire_sni:raw_sni.clone(),local_ip,primary_certificate_only,acquired,session_name,offered_alpn:offered_protocols,schemes,chain_hash:selection.chain_hash,not_after:selection.not_after,version:selection.version,leaf:selection.leaf.clone(),scope:Arc::downgrade(&policy.resolver),origin:selection.origin,policy_index,policy_identity:server.policy_identity,explicit_selector:policy.definition.certificate_selection.is_some(),instance:selection.certificate.instance});
+        let state=Arc::new(connection_sessions::HandshakeState::new(identity.session_name.clone()));
+        let _=state.selected_chain.set(identity.chain_hash);
+        let mut ticket_auth:Option<Arc<ConnectionTickets>>=None;
+        let mut hash=Sha256::new();hash.update(b"native-ssl12-session-context-v1");hash.update(policy.identity);hash.update(identity.session_name.as_bytes());hash.update(identity.chain_hash);
+        let binding:[u8;32]=hash.finalize().into();
+        let sessions=if policy.definition.client_auth.is_some(){None}else{match &server.tickets{
+          crate::stek::TicketRuntime::RuntimeDefault=>{
+            let cache=Arc::new(connection_sessions::PerConnectionSessions::new(policy.sessions.clone(),state.clone()));
+            Some((super::tls_cbc::Sessions::Cache(native_ssl_tls::ServerSessions::new(cache)),binding))
+          }
+          #[cfg(feature="native-run")]
+          crate::stek::TicketRuntime::Disabled=>None,
+          #[cfg(feature="native-run")]
+          crate::stek::TicketRuntime::Rotating{owner,realm,..}=>{
+            let mut bound=Sha256::new();bound.update(b"caddy-connection-ticket-policy-v1");bound.update(realm);bound.update(policy.identity);
+            let tickets=Arc::new(ConnectionTickets::new(owner.clone(),bound.finalize().into()));
+            ensure!(tickets.select(&identity.session_name,ProtocolVersion::TLSv1_2,identity.chain_hash,identity.leaf.clone(),identity.not_after),"native TLS ticket selection unavailable");
+            let bridge=native_ssl_tls::ServerTickets::new(tickets.clone());ticket_auth=Some(tickets);
+            Some((super::tls_cbc::Sessions::Tickets(bridge),binding))
+          }
+        }};
+        let session_evidence=sessions.as_ref().map(|(s,_)|s.clone());
+        let auth=native_ssl_tls::ServerClientAuth::new(policy.native_verifier.clone());
+        let engine_auth=auth.clone();let config=native_config;let certificate=selection.certificate;
+        let final_credential=certificate.native.clone().ok_or_else(||anyhow::anyhow!("native TLS credential unavailable"))?;
+        let local_key=certificate.key.clone();let capture_name=raw_sni.clone();
+        let scope=inner.resources.ssl_verify.clone();
+        let executor=inner.tls_executor.get().ok_or_else(||anyhow::anyhow!("TLS executor unavailable"))?;
+        let io=start.io.replay();drop(start.accepted);
+        let handshake=async move {
+            let stream=native_ssl_tls::ServerStream::prepare(io,scope,move ||super::tls_cbc::engine(certificate,config,names,engine_auth,sessions)).await?;
+            let (stream,snapshot)=stream.inspect(move |ssl|ConnectionSnapshot::capture_ssl(ssl,&capture_name,&local_key.cert,&auth,session_evidence.as_ref().and_then(|e|e.resumed_group()))).await?;
+            let metadata=snapshot.metadata()?;
+            if metadata.did_resume {ensure!(if let Some(tickets)=&ticket_auth{tickets.authenticated()}else{state.resumed().is_some()},"native TLS resumption identity unavailable");}
+            ensure!(final_credential.admitted(),"native TLS selected certificate withdrawn");
+            state.identity.set(identity.clone()).map_err(|_|anyhow::anyhow!("native TLS identity already finalized"))?;
+            let snapshot=Arc::new(snapshot.accept());
+            Ok(AcceptedTls{stream:TlsStream::Native(stream),identity,snapshot,server})
+        };
+        return executor.execute(handshake,inner.stopped.child_token(),deadline).await;
+    }
+    start.io.discard();
     let mut config = (*policy.tls).clone();
     // Go permits an h1-only client to reach a server which only advertised h2
     // without negotiating ALPN. This exception never applies to QUIC or proof.
@@ -822,7 +929,7 @@ where
             .set(identity.clone())
             .map_err(|_| anyhow::anyhow!("TLS identity already finalized"))?;
         Ok(AcceptedTls {
-            stream,
+            stream:TlsStream::Rustls(stream),
             identity,
             snapshot,
             server,

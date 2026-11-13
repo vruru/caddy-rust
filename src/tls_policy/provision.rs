@@ -17,19 +17,27 @@ impl ConnectionPolicy {
         resolver: Arc<dyn ResolvesServerCert>,
         default_alpn: &[Vec<u8>],
     ) -> Result<ServerConfig> {
+        ensure!(!self.cipher_suites.as_ref().is_some_and(|names|names.iter().any(|n|native_cipher(n))), "CBC policy requires the native HTTP TLS runtime");
         Ok(self.build_prepared(resolver, default_alpn)?.0)
     }
-    pub(crate) fn build_prepared(
+    pub(crate) fn build_prepared(&self,resolver:Arc<dyn ResolvesServerCert>,default_alpn:&[Vec<u8>])->Result<(ServerConfig,[u8;32],usize)>{
+        let(config,identity,bytes,_,_)=self.build_prepared_with_verifier(resolver,default_alpn)?;
+        Ok((config,identity,bytes))
+    }
+    pub(crate) fn build_prepared_with_verifier(
         &self,
         resolver: Arc<dyn ResolvesServerCert>,
         default_alpn: &[Vec<u8>],
-    ) -> Result<(ServerConfig, [u8; 32], usize)> {
+    ) -> Result<(ServerConfig, [u8; 32], usize,Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,Option<Arc<[u16]>>)> {
         let mut provider = (*crate::crypto::provider()).clone();
+        let mut native_ids=Vec::new();let mut has_cbc=false;
         if let Some(names) = &self.cipher_suites
             && !names.is_empty()
         {
             let mut selected = Vec::new();
             for name in names {
+                if let Some(id)=native_cipher_id(name){has_cbc=true;if !native_ids.contains(&id){native_ids.push(id)}continue}
+
                 let suite = cipher(name)?;
                 // Go's CipherSuites only controls TLS1.2. Names of supported
                 // TLS1.3 suites are accepted but never restrict TLS1.3.
@@ -39,7 +47,14 @@ impl ConnectionPolicy {
                         .any(|existing: &SupportedCipherSuite| existing.suite() == suite.suite())
                 {
                     selected.push(suite);
+                    native_ids.push(u16::from(suite.suite()));
                 }
+            }
+            // CBC-only policies still need a TLS12 parser configuration. Its
+            // TLS12 wire is exclusively routed to SSL; these suites are never
+            // negotiated by the Rustls fallback for such a policy.
+            if selected.is_empty() && has_cbc {
+                selected.extend(provider.cipher_suites.iter().copied().filter(|s|s.version().version==rustls::ProtocolVersion::TLSv1_2));
             }
             selected.extend(
                 provider
@@ -77,6 +92,7 @@ impl ConnectionPolicy {
             versions.push(&rustls::version::TLS12);
         }
         let auth = super::client_auth::prepare(self.client_auth.as_ref())?;
+        let native_verifier=auth.verifier.clone();
         let builder = ServerConfig::builder_with_provider(Arc::new(provider))
             .with_protocol_versions(&versions)?;
         let builder = if let Some(verifier) = auth.verifier {
@@ -116,7 +132,7 @@ impl ConnectionPolicy {
         digest.update(b"caddy-connection-policy-v1");
         digest.update(self.identity);
         digest.update(auth.digest);
-        Ok((config, digest.finalize().into(), auth.retained_bytes))
+        Ok((config,digest.finalize().into(),auth.retained_bytes+if has_cbc{native_ids.len()*2+64}else{0},native_verifier,has_cbc.then(||Arc::from(native_ids))))
     }
     pub fn has_custom_settings(&self) -> bool {
         !self.matcher.is_empty()
@@ -213,3 +229,6 @@ pub(crate) fn key_exchange_group(name: &str) -> Result<&'static dyn SupportedKxG
         _ => anyhow::bail!("unsupported TLS key exchange group"),
     })
 }
+
+pub(crate) fn native_cipher(name:&str)->bool{native_cipher_id(name).is_some()}
+fn native_cipher_id(name:&str)->Option<u16>{Some(match name{"TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA"=>0xc009,"TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA"=>0xc00a,"TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA"=>0xc013,"TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA"=>0xc014,_=>return None})}

@@ -2,6 +2,11 @@
 //! replaced. Exact-wire certificate validation remains the caller's verifier.
 mod io;
 mod raw;
+mod server_auth;
+pub use server_auth::{ServerClientAuth, signature_scheme_name};
+pub mod server_engine;
+mod server_io;
+pub use server_io::ServerStream;
 mod verify;
 use foreign_types::{ForeignType, ForeignTypeRef};
 pub use io::Stream;
@@ -10,6 +15,25 @@ pub use verify::VerificationScope;
 /// OpenSSL's internal state and caller-owned verifier allocations are separate.
 pub fn certificate_observation_usage() -> (usize, usize) {
     raw::usage()
+}
+
+/// Exact bytes and observation credits remain one shared owner. This is a
+/// parser/owner for the public SSL handshake message callback, not X509 trust.
+#[derive(Clone)]
+pub struct PeerCertificates(Arc<raw::Chain>);
+impl PeerCertificates {
+    pub fn from_handshake(message: &[u8], tls13: bool) -> stdio::Result<Self> {
+        raw::Chain::parse(message, tls13).map(Self)
+    }
+    pub fn leaf(&self) -> &[u8] {
+        self.0.leaf()
+    }
+    pub fn intermediates(&self) -> impl Iterator<Item = &[u8]> {
+        self.0.intermediates()
+    }
+    pub fn certificates(&self) -> impl Iterator<Item = &[u8]> {
+        self.0.certificates()
+    }
 }
 
 use openssl::{
@@ -301,16 +325,7 @@ unsafe extern "C" fn verify_chain(
         }
         let leaf = ssl.peer_cert_chain()?.get(0)?;
         let key = leaf.public_key().ok()?;
-        use openssl::{nid::Nid, pkey::Id};
-        let supported = match key.id() {
-            Id::RSA | Id::RSA_PSS => (1024..=8192).contains(&key.bits()),
-            Id::EC => matches!(
-                key.ec_key().ok()?.group().curve_name(),
-                Some(Nid::SECP224R1 | Nid::X9_62_PRIME256V1 | Nid::SECP384R1 | Nid::SECP521R1)
-            ),
-            Id::ED25519 => true,
-            _ => false,
-        };
+        let supported = supported_public_key(&key);
         if !supported {
             guard.reject(2);
             return Some(false);
@@ -333,6 +348,32 @@ unsafe extern "C" fn verify_chain(
         openssl::x509::X509VerifyResult::APPLICATION_VERIFICATION
     });
     i32::from(valid)
+}
+fn supported_public_key(key: &openssl::pkey::PKeyRef<openssl::pkey::Public>) -> bool {
+    use openssl::{nid::Nid, pkey::Id};
+    match key.id() {
+        Id::RSA | Id::RSA_PSS => (1024..=8192).contains(&key.bits()),
+        Id::EC => key.ec_key().ok().is_some_and(|k| {
+            matches!(
+                k.group().curve_name(),
+                Some(Nid::SECP224R1 | Nid::X9_62_PRIME256V1 | Nid::SECP384R1 | Nid::SECP521R1)
+            )
+        }),
+        Id::ED25519 => true,
+        _ => false,
+    }
+}
+/// Actual pending/negotiated cipher during server ALPN selection.
+pub fn pending_cipher(ssl: &openssl::ssl::SslRef) -> Option<u16> {
+    unsafe extern "C" {
+        fn SSL_get_pending_cipher(ssl: *const openssl_sys::SSL) -> *const openssl_sys::SSL_CIPHER;
+    }
+    let pointer = unsafe { SSL_get_pending_cipher(ssl.as_ptr()) };
+    (!pointer.is_null()).then(|| {
+        u16::from_be_bytes(
+            unsafe { openssl::ssl::SslCipherRef::from_ptr(pointer.cast_mut()) }.protocol_id(),
+        )
+    })
 }
 /// Prepared on the caller's bounded provisioning CPU lane; no material I/O in
 /// connect or callbacks. Credential parsing is confined to this constructor.
@@ -481,3 +522,14 @@ impl ClientConfig {
         Ok(Stream { inner, guard })
     }
 }
+
+/// Actual OpenSSL negotiated group NID (or provider group identifier).
+pub fn negotiated_group(ssl:&openssl::ssl::SslRef)->i64 {unsafe{openssl_sys::SSL_ctrl(ssl.as_ptr(),134,0,std::ptr::null_mut()) as i64}}
+/// Actual Extended Master Secret support on this completed connection.
+pub fn extended_master_secret(ssl:&openssl::ssl::SslRef)->bool{unsafe{openssl_sys::SSL_ctrl(ssl.as_ptr(),122,0,std::ptr::null_mut())==1}}
+
+mod server_sessions;
+pub use server_sessions::{ServerSessions,ServerSessionStore};
+
+mod server_tickets;
+pub use server_tickets::{ServerTickets,ServerTicketProvider,TicketKey};

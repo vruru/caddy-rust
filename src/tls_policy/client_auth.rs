@@ -571,7 +571,9 @@ impl ClientCertVerifier for Verifier {
             return Err(invalid());
         }
         for cert in std::iter::once(end_entity).chain(intermediates.iter()) {
-            parse_certificate(cert).map_err(|_| invalid())?;
+            let (remaining,parsed)=crate::cert_transient::parse_certificate(cert).map_err(|_|invalid())?;
+            if !remaining.is_empty(){return Err(invalid())}
+            crate::cert_transient::check_unique_extensions(&parsed).map_err(|_|invalid())?;
         }
         let observation = if self.verify_chain {
             let roots = self.roots.as_ref().ok_or(Error::InvalidCertificate(

@@ -3,6 +3,9 @@
 //! on-demand issuance or listener configuration is performed here. Callers own
 //! those policies. Successful replacement affects future handshakes only.
 
+#[path="tls_resolver/native_key.rs"]
+mod native_key;
+pub(crate) use native_key::{NativeCertificate,NativePrivateKey};
 use crate::challenge::{ACME_ALPN, ChallengeRegistry, normalize_domain};
 use crate::leaf_guard::{LeafGuard, LeafState, Observation, leaf_id};
 use crate::tls_policy::certificate_selection::{CertificateFacts, CertificateFilter};
@@ -104,6 +107,7 @@ impl SignatureCompatibility {
 /// the authoritative, already negotiated protocol to return its bound key.
 #[derive(Clone)]
 pub struct CertificateSelection {
+    pub(crate) native:Option<NativeCertificate>,
     pub key: Arc<CertifiedKey>,
     pub(crate) instance: Option<CertificateInstance>,
     pub(crate) leaf_state: Option<Arc<LeafState>>,
@@ -256,6 +260,7 @@ struct Staple {
 
 #[derive(Clone)]
 struct LoadedCertificate {
+    native_key:Arc<NativePrivateKey>,
     managed_key_veto: bool,
     key_state: Arc<crate::key_compromise::KeyState>,
     key: Arc<CertifiedKey>,
@@ -1241,6 +1246,7 @@ impl HotCertificateResolver {
             }
             key.key.choose_scheme(signature_schemes)?;
             return Some(CertificateSelection {
+                native:None,
                 key,
                 instance: None,
                 signature_compatibility: SignatureCompatibility::Tls12Or13,
@@ -1301,6 +1307,7 @@ fn select_loaded(
     };
     key.key.choose_scheme(signature_schemes)?;
     Some(CertificateSelection {
+        native:Some(NativeCertificate{private:entry.native_key.clone(),leaf:entry.leaf_state.clone(),key_state:entry.key_state.clone(),enforce_key_veto:entry.managed_key_veto||entry.owner.is_some(),not_after:entry.not_after}),
         key,
         instance: Some(CertificateInstance {
             identity: entry.identity,
@@ -1622,6 +1629,8 @@ fn load_certificate(
     }
     for name in input.names {output=output.checked_add(name.len().checked_mul(8).ok_or(crate::cert_transient::ResourceDenied)?+8*std::mem::size_of::<String>()).ok_or(crate::cert_transient::ResourceDenied)?;}
     output=output.checked_add(crate::cert_transient::key_decode_bound(input.private_key_pem)?).ok_or(crate::cert_transient::ResourceDenied)?;
+    let native_key_cost=NativePrivateKey::retained_bound(input.private_key_pem)?;
+    output=output.checked_add(native_key_cost).ok_or(crate::cert_transient::ResourceDenied)?;
     let preparation=crate::tls_app_config::CertificatePreparation::reserve(output)?;
     let mut chain = Vec::with_capacity(blocks.len());
     for (label, der) in &blocks {
@@ -1712,11 +1721,13 @@ fn load_certificate(
     };
     let facts = Arc::new(CertificateFacts::from_leaf(&leaf));
     let management_name = certificate_management_name(&leaf)?;
+    let native_key=NativePrivateKey::new(input.private_key_pem,preparation.clone())?;
     let size = input
         .certificate_pem
         .len()
         .checked_add(input.private_key_pem.len())
         .and_then(|v| v.checked_add(extra_key_bytes))
+        .and_then(|v|v.checked_add(native_key_cost))
         .and_then(|v| v.checked_add(facts.retained_bytes()))
         .and_then(|v| v.checked_add(leaf.public_key().raw.len()))
         .and_then(|v| v.checked_add(management_name.len() + 2 * std::mem::size_of::<usize>()))
@@ -1727,6 +1738,7 @@ fn load_certificate(
     Ok((
         names,
         LoadedCertificate {
+            native_key,
             managed_key_veto: false,
             key_state: leaf_guard.key_deny().register_spki(Arc::from(leaf.public_key().raw))?,
             key,

@@ -68,7 +68,63 @@ pub struct ConnectionMetadata {
 pub struct ConnectionSnapshot {
     metadata: Result<ConnectionMetadata, ConnectionSnapshotError>,
 }
+/// Worker output owns its actual staged data before its credit. An abandoned
+/// finished JoinHandle must not refund credit while its certificate copies live.
+pub(super) struct StagedSnapshot {
+    snapshot:ConnectionSnapshot,
+    _memory:Option<crate::acme_wire::chain_memory::Scratch>,
+}
+impl StagedSnapshot {
+    pub(super) fn metadata(&self)->Result<&ConnectionMetadata,ConnectionSnapshotError>{self.snapshot.metadata()}
+    /// Call only after the host accepts this completed handshake's identity.
+    /// Persistent connection/request snapshots retain their existing separate
+    /// output/escaped-Arc boundary; the CPU staging loan ends at that handoff.
+    pub(super) fn accept(self)->ConnectionSnapshot{
+        let Self{snapshot,_memory}=self;drop(_memory);snapshot
+    }
+}
 impl ConnectionSnapshot {
+    pub(super) fn capture_ssl(ssl:&openssl::ssl::SslRef,offered_name:&str,local_chain:&[rustls::pki_types::CertificateDer<'_>],auth:&native_ssl_tls::ServerClientAuth,resumed_group:Option<i64> )->StagedSnapshot{
+      let result=(||{
+        use ConnectionSnapshotError::Unavailable;
+        if !ssl.is_init_finished() || ssl.version2()!=Some(openssl::ssl::SslVersion::TLS1_2){return Err(Unavailable("completed native TLS12 handshake"))}
+        let resumed=ssl.session_reused();
+        let suite=u16::from_be_bytes(ssl.current_cipher().ok_or(Unavailable("native cipher"))?.protocol_id());
+        let group=if resumed{resumed_group.ok_or(Unavailable("authenticated native session group"))?}else{native_ssl_tls::negotiated_group(ssl)};
+        let curve=match group{415=>Ok(23),715=>Ok(24),716=>Ok(25),1034=>Ok(29),_=>Err(Unavailable("native negotiated group"))};
+        let ems=native_ssl_tls::extended_master_secret(ssl);
+        let mut master=zeroize::Zeroizing::new([0u8;48]);
+        let session=ssl.session().ok_or(Unavailable("native session secret"))?;
+        if session.master_key(master.as_mut())!=48{return Err(Unavailable("native master secret length"))}
+        let mut client_random=[0u8;32];let mut server_random=[0u8;32];
+        if ssl.client_random(&mut client_random)!=32 || ssl.server_random(&mut server_random)!=32{return Err(Unavailable("native handshake randoms"))}
+        use rustls::crypto::aws_lc_rs::cipher_suite::{TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384};
+        let prf_suite=if matches!(suite,0xc02c|0xc030){TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384}else{TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256};
+        let rustls::SupportedCipherSuite::Tls12(prf_suite)=prf_suite else{return Err(Unavailable("native PRF"))};let prf=prf_suite.prf_provider;
+        let exporter=rustls::native_tls12_exporter(prf,master,client_random,server_random,ems);
+        let (peer,observation)=auth.evidence().map_err(|_|Unavailable("native client authentication observation"))?;
+        // Output staging covers the actual copied DER until it is accepted by
+        // the existing immutable connection snapshot owner. Retained request
+        // snapshots keep the existing output/escaped-Arc boundary, not an RSS
+        // promise from this short CPU scratch pool.
+        let peer_bytes=peer.as_ref().map_or(0,|p|p.certificates().map(<[u8]>::len).sum::<usize>());
+        let root_bytes=match &observation {Some(rustls::ClientChainObservation::Verified(set))=>set.paths().iter().filter_map(|p|p.root).map(|i|set.roots().get(usize::from(i)).map_or(0,|r|r.len())).sum::<usize>(),_=>0};
+        let local_bytes=local_chain.iter().map(|c|c.len()).sum::<usize>();
+        let output_cost=peer_bytes.checked_add(root_bytes).and_then(|n|n.checked_add(local_bytes)).and_then(|n|n.checked_mul(2)).and_then(|n|n.checked_add(65536)).ok_or(Unavailable("native snapshot output staging size"))?;
+        let _output=crate::cert_transient::reserve(output_cost).map_err(|_|Unavailable("native snapshot output staging budget"))?;
+        let peer:CertificateChain=peer.as_ref().map(|p|p.certificates().map(Arc::<[u8]>::from).collect::<Vec<_>>().into()).unwrap_or_else(||Arc::from([]));
+        let verified=verified_paths(observation.as_ref(),&peer);
+        let mut finished=[0u8;64];let n=if resumed{ssl.finished(&mut finished)}else{ssl.peer_finished(&mut finished)};
+        if n>finished.len(){return Err(Unavailable("native Finished length"))}
+        let unique=(n!=0 && (!resumed || ems)).then(||Arc::from(&finished[..n]));
+        Ok((ConnectionMetadata{version:0x303,handshake_complete:true,did_resume:resumed,cipher_suite:suite,curve_id_observation:curve,alpn:ssl.selected_alpn_protocol().unwrap_or_default().into(),negotiated_protocol_is_mutual:true,server_name:offered_name.into(),peer_certificates:peer,ech_accepted:false,verified_chains_observation:verified,signed_certificate_timestamps_observation:Ok(Arc::from([])),ocsp_response_observation:Ok(Arc::from([])),tls_unique_observation:Ok(unique),hello_retry_request_observation:Ok(false),local_certificate_observation:Ok(Some(chain(local_chain))),exporter:Some(Arc::new(OwnedExporter(exporter)))},_output))
+      })();
+      match result {
+        Ok((metadata,memory))=>StagedSnapshot{snapshot:Self::from_metadata(Ok(metadata)),_memory:Some(memory)},
+        Err(error)=>StagedSnapshot{snapshot:Self::from_metadata(Err(error)),_memory:None},
+      }
+    }
+
     pub(super) fn capture_tcp(
         connection: &rustls::ServerConnection,
         offered_name: &str,
@@ -370,8 +426,9 @@ fn verified_paths(observation: Option<&rustls::ClientChainObservation>, peer: &C
         })),
         Some(Observation::Verified(set)) => {
             let leaf = peer.first().ok_or(Unavailable("verified certificate peer leaf"))?;
-            let roots = set.roots().iter().map(|root|Arc::<[u8]>::from(root.as_ref()))
-                .collect::<Vec<_>>();
+            // Path root indices are u8. Avoid copying every configured root
+            // when only a small subset participated in actual verification.
+            let mut roots:[Option<CertificateDer>;256]=std::array::from_fn(|_|None);
             let mut chains = Vec::with_capacity(set.paths().len());
             for path in set.paths() {
                 let mut chain = vec![leaf.clone()];
@@ -380,8 +437,10 @@ fn verified_paths(observation: Option<&rustls::ClientChainObservation>, peer: &C
                         .ok_or(Unavailable("verified certificate intermediate index"))?.clone());
                 }
                 if let Some(index) = path.root {
-                    chain.push(roots.get(usize::from(index))
-                        .ok_or(Unavailable("verified certificate root index"))?.clone());
+                    let index=usize::from(index);
+                    let slot=&mut roots[index];
+                    if slot.is_none(){*slot=Some(Arc::from(set.roots().get(index).ok_or(Unavailable("verified certificate root index"))?.as_ref()));}
+                    chain.push(slot.as_ref().ok_or(Unavailable("verified certificate root source"))?.clone());
                 }
                 chains.push(Arc::<[CertificateDer]>::from(chain));
             }

@@ -435,6 +435,8 @@ mod native_client_chains;
 mod native_peer_extras;
 pub use native_client_chains::{ChainUnavailable, ClientChainObservation, VerifiedChainSet, VerifiedChainRef};
 pub use native_exporter::NativeExporter;
+#[cfg(feature="tls12")]
+pub use tls12::native_tls12_exporter;
 pub mod compress;
 mod conn;
 /// Crypto provider interface.
