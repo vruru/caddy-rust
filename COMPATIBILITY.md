@@ -1261,3 +1261,12 @@ header field. Nil typed maps use `type(nil)` for sharp Go formatting. Direct
 request-header Set/Add/Del calls remain rejected by templates, as in the
 baseline whose methods have zero return values; the Caddy RespHeader wrapper's
 supported mutation methods remain available.
+
+Template response-header mutations prepay their host allocations before
+constructing names or values. Set/Add check the existing 128KiB template field
+allowance on the resulting map under its mutex; Set removes the replaced
+field's full prior value count from that calculation, and Del remains able to
+remove a field. The allowance includes per-field metadata as well as name and
+value bytes. It is enforced during mutation rather than relying on an initial
+header check or emitting an oversized error response. This is an explicit
+resource boundary; ordinary within-limit wrapper behavior is unchanged.
