@@ -73,8 +73,36 @@ enum Phase {
     Done,
 }
 
+fn read_error_code(error: &h3::error::StreamError) -> Code {
+    match error {
+        h3::error::StreamError::RemoteTerminate { code, .. }
+        | h3::error::StreamError::StreamError { code, .. } => *code,
+        // Cancellation/connection failure is not a newly malformed request.
+        _ => Code::H3_REQUEST_CANCELLED,
+    }
+}
+
+// Concrete connection/id ownership reaches a receive handle even while the
+// h3-quinn adapter's pending future owns that handle. It allocates no task/cell.
+struct ReceiveRetirement {
+    connection: quinn::Connection,
+    stream: quinn::StreamId,
+    retired: bool,
+}
+impl ReceiveRetirement {
+    fn stop(&mut self, code: Code) {
+        if self.retired { return; }
+        self.retired = true;
+        // Already closed/reset/stopped is terminal. Do not overwrite its first
+        // disposition, and never manufacture another RecvStream owner.
+        let _ = self.connection.stop_receive_stream(self.stream,
+            quinn::VarInt::from_u64(code.value()).expect("HTTP/3 code fits QUIC varint"));
+    }
+}
+
 pub struct Incoming {
     stream: Option<Receiving>,
+    retirement: ReceiveRetirement,
     phase: Phase,
     remaining: Option<u64>,
     expect_continue: bool,
@@ -83,7 +111,10 @@ pub struct Incoming {
 
 impl Drop for Incoming {
     fn drop(&mut self) {
-        if let Some(flow) = self.continue_flow.take() { flow.retire_reader(); }
+        if let Some(flow) = &self.continue_flow { flow.retire_reader(); }
+        if !matches!(self.phase, Phase::Done) { self.retirement.stop(Code::H3_NO_ERROR); }
+        // Fields drop in declaration order: the actual receive handle/future
+        // and connection are retired before the last Flow metadata allowance.
     }
 }
 impl Incoming {
@@ -91,11 +122,11 @@ impl Incoming {
         writer.flow.set_expected(self.expect_continue && self.remaining != Some(0));
         self.continue_flow = Some(writer.flow.clone());
     }
-    fn fail(&mut self, error: Failure) -> Poll<Option<Result<Frame<Bytes>, Failure>>> {
+    fn fail(&mut self, error: Failure, code: Code) -> Poll<Option<Result<Frame<Bytes>, Failure>>> {
         self.phase = Phase::Done;
-        // h3-quinn moves the native receive stream into the pending read
-        // future. Dropping that owned future lets Quinn cancel safely even
-        // when the shim's explicit stop_sending handle is temporarily empty.
+        // Install the protocol failure before dropping a pending adapter read;
+        // its native RecvStream Drop must not replace this reason with code0.
+        self.retirement.stop(code);
         drop(self.stream.take());
         Poll::Ready(Some(Err(error)))
     }
@@ -111,7 +142,7 @@ impl Body for Incoming {
         if matches!(self.phase, Phase::Data) {
             if let Some(flow) = self.continue_flow.as_ref() {
                 if let Err(message) = ready!(flow.poll_continue(cx)) {
-                    return self.fail(malformed(message));
+                    return self.fail(io::Error::new(io::ErrorKind::ConnectionAborted, message).into(), Code::H3_REQUEST_CANCELLED);
                 }
             }
             // Convert the opaque Buf while the recv stream is mutably borrowed.
@@ -126,7 +157,7 @@ impl Body for Incoming {
                 Ok(Some(bytes)) => {
                     if let Some(n) = self.remaining {
                         let Some(left) = n.checked_sub(bytes.len() as u64) else {
-                            return self.fail(malformed("HTTP/3 data exceeded content-length"));
+                            return self.fail(malformed("HTTP/3 data exceeded content-length"), Code::H3_MESSAGE_ERROR);
                         };
                         self.remaining = Some(left);
                     }
@@ -134,12 +165,12 @@ impl Body for Incoming {
                 }
                 Ok(None) => {
                     if self.remaining.is_some_and(|n| n != 0) {
-                        return self.fail(malformed("HTTP/3 data ended before content-length"));
+                        return self.fail(malformed("HTTP/3 data ended before content-length"), Code::H3_MESSAGE_ERROR);
                     }
                     self.phase = Phase::Trailers;
                     if let Some(flow) = self.continue_flow.as_ref() { flow.retire_reader(); }
                 }
-                Err(error) => return self.fail(Box::new(error)),
+                Err(error) => { let code = read_error_code(&error); return self.fail(Box::new(error), code); },
             }
         }
         if matches!(self.phase, Phase::Trailers) {
@@ -149,12 +180,11 @@ impl Body for Incoming {
                     .expect("live request stream")
                     .poll_recv_trailers(cx)
             );
-            self.phase = Phase::Done;
-            return Poll::Ready(match next {
-                Ok(Some(headers)) => Some(Ok(Frame::trailers(headers))),
-                Ok(None) => None,
-                Err(error) => Some(Err(Box::new(error))),
-            });
+            return match next {
+                Ok(Some(headers)) => { self.phase = Phase::Done; Poll::Ready(Some(Ok(Frame::trailers(headers)))) },
+                Ok(None) => { self.phase = Phase::Done; Poll::Ready(None) },
+                Err(error) => { let code = read_error_code(&error); self.fail(Box::new(error), code) },
+            };
         }
         Poll::Ready(None)
     }
@@ -170,6 +200,7 @@ impl Body for Incoming {
 pub fn start(
     request: Request<()>,
     stream: Stream,
+    connection: quinn::Connection,
 ) -> Result<(Request<Incoming>, Sending), Failure> {
     let mut invalid = request
         .headers()
@@ -181,6 +212,7 @@ pub fn start(
         .iter()
         .any(|v| !v.as_bytes().trim_ascii().eq_ignore_ascii_case(b"trailers"));
     let length = content_length(request.headers());
+    let id = quinn::StreamId::from(quinn::VarInt::from_u64(stream.id().into_inner())?);
     let (mut send, mut recv) = stream.split();
     if invalid || length.is_err() {
         recv.stop_sending(Code::H3_MESSAGE_ERROR);
@@ -195,6 +227,7 @@ pub fn start(
             parts,
             Incoming {
                 stream: Some(recv),
+                retirement: ReceiveRetirement { connection, stream: id, retired: false },
                 phase: Phase::Data,
                 remaining: length?,
                 expect_continue,

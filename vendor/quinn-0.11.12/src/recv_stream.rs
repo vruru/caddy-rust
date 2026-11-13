@@ -535,18 +535,23 @@ impl Drop for RecvStream {
             );
             return;
         }
-        let mut conn = self.conn.state.lock("RecvStream::drop");
-
-        // clean up any previously registered wakers
-        conn.blocked_readers.remove(&self.stream);
-
-        if conn.error.is_some() || (self.is_0rtt && conn.check_0rtt().is_err()) {
-            return;
+        // Declared outside the lock scope so unwinding also retires arbitrary
+        // wakers only after the connection guard has gone away.
+        let reader;
+        let mut driver = None;
+        {
+            let mut conn = self.conn.state.lock("RecvStream::drop");
+            reader = conn.blocked_readers.remove(&self.stream);
+            if conn.error.is_none() && !(self.is_0rtt && conn.check_0rtt().is_err()) {
+                // Preserve the generic default code. An already stopped/closed
+                // stream changes no state and needs no second driver wake.
+                if conn.inner.recv_stream(self.stream).stop(0u32.into()).is_ok() {
+                    driver = conn.take_driver_waker();
+                }
+            }
         }
-
-        // Ignore ClosedStream errors
-        let _ = conn.inner.recv_stream(self.stream).stop(0u32.into());
-        conn.wake();
+        drop(reader);
+        if let Some(driver) = driver { driver.wake(); }
     }
 }
 

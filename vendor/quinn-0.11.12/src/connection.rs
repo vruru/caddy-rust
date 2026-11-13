@@ -732,6 +732,37 @@ impl Connection {
         result
     }
 
+    /// Stop the receive half of an established server peer-bidirectional stream.
+    ///
+    /// This addresses the real protocol state even when an adapter has moved
+    /// its receive handle into a pending read future. No synthetic stream is
+    /// created. The first stop/error disposition is retained. Driver and reader
+    /// wakers are taken under the connection lock and woken/dropped outside it.
+    #[cfg(feature = "native-stream-observer")]
+    pub fn stop_receive_stream(&self, stream: StreamId, code: VarInt) -> Result<(), io::Error> {
+        let (status, reader, driver) = {
+            let mut state = self.0.state.lock("stop_receive_stream");
+            if !state.connected || state.inner.side() != Side::Server
+                || stream.dir() != Dir::Bi || stream.initiator() != Side::Client
+            {
+                (0u8, None, None)
+            } else {
+                let status = if state.inner.recv_stream(stream).stop(code).is_ok() { 1 } else { 2 };
+                let reader = state.blocked_readers.remove(&stream);
+                let driver = if status == 1 { state.driver.take() } else { None };
+                (status, reader, driver)
+            }
+        };
+        if let Some(reader) = reader { reader.wake(); }
+        if let Some(driver) = driver { driver.wake(); }
+        match status {
+            1 => Ok(()),
+            2 => Err(io::Error::new(io::ErrorKind::NotFound, "receive stream already closed or stopped")),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "receive stop requires an established server peer-bidi stream")),
+        }
+    }
+
     /// If the connection is closed, the reason why.
     ///
     /// Returns `None` if the connection is still open.
@@ -1597,6 +1628,12 @@ impl State {
         self.inner.handle_timeout(self.runtime.now());
         self.timer_deadline = None;
         true
+    }
+
+    /// Transfer a driver registration to a caller which retires/wakes it only
+    /// after releasing this state lock.
+    pub(crate) fn take_driver_waker(&mut self) -> Option<Waker> {
+        self.driver.take()
     }
 
     /// Wake up a blocked `Driver` task to process I/O

@@ -972,7 +972,7 @@ async fn serve_connection(
                         rejected.stop_sending(::h3::error::Code::H3_REQUEST_REJECTED);
                         return;
                     };
-                    let Ok((mut request,wire))=stream::start(request,wire) else{return;};
+                    let Ok((mut request,wire))=stream::start(request,wire,quic_for_stream.clone()) else{return;};
                     request.body_mut().attach_interim(&interim);
                     let task=async move {
                         let response = request::handle_business(runtime,server,request,request::RequestOrigin { peer:crate::net_address::NetAddress::udp(canonical(peer.peer)), local:crate::net_address::NetAddress::udp(canonical(peer.local)), tls:true, sni:sni.as_deref() },business.clone(),Some(request::InformationalOutput::Quic(interim)));

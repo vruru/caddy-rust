@@ -1440,3 +1440,23 @@ with IPv4/IPv6/port-zero aliases, same-policy DNS-move continuity, incompatible
 client-auth policy rejection, real HTTP-01/TLS-ALPN-01 signing through an isolated
 Go ACME CA, and cancellation while actual lookup workers remain blocked. Private
 fixtures, keys, helper programs and output do not belong in this repository.
+
+
+HTTP/3 request receive retirement
+--------------------------------
+
+A handler that finishes without consuming its HTTP/3 request body retires the
+receive half with H3_NO_ERROR, including when the adapter has moved its actual
+receive handle into a pending read future. This does not cancel a valid response
+or turn a real request/response cancellation into success. Content-length
+violations retain H3_MESSAGE_ERROR, and explicit protocol errors retain their
+original codes. Reader cancellation remains distinct from malformed framing.
+
+The real receive handle, pending future and connection references drop before
+the final per-request Flow metadata credit. Its fixed scalar allowance includes
+the added Incoming layout, but does not bound every channel, packet buffer or
+provider allocation. No synthetic receive stream or detached cleanup task is
+created. The opt-in Quinn receive-stop operation and generic RecvStream
+destructor release the connection mutex before invoking or destroying removed
+reader/driver wakers. Other Quinn polling and waker paths are not claimed to
+have been converted by this change.

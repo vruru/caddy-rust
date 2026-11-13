@@ -239,3 +239,16 @@ completed result, with data destroyed before those tickets. Admission therefore
 bounds waiting, executing and completed-unconsumed jobs together. This prevents
 a nested-TLS single-slot wait cycle; it neither releases data credits early nor
 adds a default Rustls executor or CBC retry to unrelated HTTPS clients.
+
+
+## HTTP/3 request receive retirement
+
+The existing Quinn native-stream-observer feature also exposes a narrow
+receive-half stop operation for established server peer-bidirectional streams.
+It changes the real receive state without creating another stream handle and
+preserves the first stopped disposition. Removed reader and driver wakers are
+invoked or destroyed after releasing the connection mutex. Generic RecvStream
+Drop keeps its original default stop code, while moving those removed wakers
+outside the mutex and avoiding a redundant driver wake when no state changed.
+Other Quinn waker paths retain their original behavior. No public feature,
+dependency or package version is added for this operation.

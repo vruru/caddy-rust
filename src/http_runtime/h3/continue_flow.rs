@@ -17,13 +17,16 @@ fn get_pool() -> &'static Pool {
 
 const CREDIT: usize = 1024;
 
-// Layout static assert: CREDIT covers size of Self + Arc overhead + alignment + 256 bytes mutex slack.
+// Fixed scalar allowance covers Flow/Arc, Incoming metadata, alignment, and
+// 256 bytes mutex slack. It is not a bound on all channel/network allocations.
 // Interpretation: Native waker registration causes no new heap allocation in this pool;
 // the task itself is not counted against this pool's credit.
 const _: () = assert!(
     CREDIT >= std::mem::size_of::<Flow>()
+        + std::mem::size_of::<super::stream::Incoming>()
         + 2 * std::mem::size_of::<usize>()
         + std::mem::align_of::<Flow>()
+        + std::mem::align_of::<super::stream::Incoming>()
         + 256,
     "CREDIT insufficient for Flow layout"
 );
