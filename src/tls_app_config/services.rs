@@ -376,8 +376,14 @@ impl CertificateServices {
     }
     pub(crate) async fn prepare_acme_server(self:&Arc<Self>,config:Arc<crate::acme_server::Config>,cancel:CancellationToken)
         ->Result<Arc<crate::acme_server::Controller>> {
-        self.validate_acme_server_config(&config)?;
         self.owned(cancel,move|this,token|Box::pin(async move {
+            // Resolver lists can be large. Keep pure validation ahead of CA
+            // side effects, on the same owned CPU lane as certificate work.
+            let validator=this.clone();
+            let config=crate::cert_cpu::run(this.context.resources.cpu.clone(),token.clone(),move||{
+                validator.validate_acme_server_config(&config)?;
+                Ok(config)
+            }).await?;
             let pki=this.authority(&config.ca,token.clone()).await?;
             let snapshot=pki.provision(&config.ca,token.clone()).await?;drop(snapshot);
             this.context.resources.acme_server.prepare(config,this.plan.tls_resolvers.clone(),pki,&this.context.paths.default_storage,token).await

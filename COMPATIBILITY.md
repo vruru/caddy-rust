@@ -1211,3 +1211,15 @@ that mutex. An aborted stop actor fences the runtime and completes both the
 admission and business-drain receipts as forced. Starting a new stop without
 an executor returns an error without publishing a half-started stop; existing
 receipts remain readable without an executor.
+
+ACME configuration validation scheduling
+----------------------------------------
+
+Large resolver lists and ACME route-reference validation run on existing bounded
+CPU workers instead of HTTP executor threads. Certificate-service validation
+remains generation-owned and completes before CA material is loaded or
+provisioned. HTTP capability validation preserves its original ordering and
+errors, including duplicate route references; it does not skip invalid inputs
+or substitute successful configuration parsing for actual ACME execution.
+Cancellation does not release CPU capacity while an accepted worker still owns
+its configuration. Route traversal cooperatively yields between handlers.

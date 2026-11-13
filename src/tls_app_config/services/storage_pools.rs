@@ -130,7 +130,17 @@ impl CertificateServices {
         config: crate::http_config::PreparedConfig,
         cancel: CancellationToken,
     ) -> Result<crate::http_config::PreparedConfig> {
-        self.validate_acme_routes(&config)?;
+        // Validate every route before loading/provisioning CA material. The
+        // tracked owner keeps the config and CPU permit until real completion.
+        let config = self.owned(cancel.clone(), move |this, token| {
+            Box::pin(async move {
+                let validator = this.clone();
+                crate::cert_cpu::run(this.context.resources.cpu.clone(), token, move || {
+                    validator.validate_acme_routes(&config)?;
+                    Ok(config)
+                }).await
+            })
+        }).await?;
         let config = self.prepare_pki_pools(config, cancel.clone()).await?;
         self.owned(cancel, move |this, token| {
             Box::pin(async move {

@@ -729,7 +729,7 @@ async fn prepare_servers(
         for client in clients.values(){metrics.upstreams(client.metric_probes());}
         let active = ActiveServer {
             tracing: tracing.clone(),
-            acme_servers:prepare_acme_handlers(server,provider,validate_only).await?,
+            acme_servers:prepare_acme_handlers(server,provider,validate_only,resources).await?,
             metrics: metrics.clone(),
             events: config.events.clone(),
             logging: logging.cloned(),
@@ -880,18 +880,22 @@ fn plain_transport_compatible(old: &ServerConfig, next: &ServerConfig) -> bool {
         && old.listener_stack==next.listener_stack
         && old.request_head_limit() == next.request_head_limit()
 }
-async fn prepare_acme_handlers(server:&ServerConfig,provider:Option<&Arc<dyn ScopedCertificateProvider>>,validate_only:bool)
+async fn prepare_acme_handlers(server:&ServerConfig,provider:Option<&Arc<dyn ScopedCertificateProvider>>,validate_only:bool,resources:&Arc<resource_budget::Resources>)
     ->Result<Arc<HashMap<usize,Arc<crate::acme_server::Controller>>>> {
     let mut pending=Vec::new();pending.extend(server.routes.iter());pending.extend(server.errors.iter());pending.extend(server.named_routes.values());
     let mut output=HashMap::new();
     while let Some(route)=pending.pop() {
-        for handler in &route.handlers {match handler {
+        for handler in &route.handlers {
+            tokio::task::consume_budget().await;
+            match handler {
             Handler::AcmeServer(config)=>{
                 // Provision-only HTTP name planning deliberately has no
                 // provider. CertificateServices checks references beforehand.
                 if validate_only {continue;}
                 let provider=provider.ok_or_else(||anyhow::anyhow!("ACME server requires a generation signing capability"))?;
-                provider.validate_acme_server(config)?;
+                let validator=provider.clone();let validation_config=config.clone();
+                resources.metadata.run(move||validator.validate_acme_server(&validation_config)).await
+                    .map_err(|_|anyhow::anyhow!("ACME configuration validation worker unavailable"))??;
                 let identity=Arc::as_ptr(config)as usize;
                 if !output.contains_key(&identity) {
                     output.insert(identity,provider.prepare_acme_server(config.clone(),CancellationToken::new()).await?);
