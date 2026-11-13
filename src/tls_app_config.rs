@@ -50,6 +50,11 @@ pub struct CertificateViews<'a> {
 }
 
 impl CertificatePlan {
+    pub(crate) fn challenge_bind_hosts(&self)->impl Iterator<Item=&str>+Clone {
+        self.policies.iter().flat_map(|policy|policy.issuers.iter()).chain(self.identity.iter().flat_map(|identity|identity.issuers.iter())).filter_map(|issuer|match issuer {
+            model::Issuer::Acme(settings) if !settings.bind_host.is_empty() && !settings.config.challenge_types.is_empty()=>Some(settings.bind_host.as_str()),_=>None,
+        })
+    }
     pub fn parse(views: CertificateViews<'_>) -> Result<Self, ConfigError> {
         parse::parse(views)
     }

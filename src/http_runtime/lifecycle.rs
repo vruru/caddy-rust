@@ -28,13 +28,14 @@ impl ListenerKind {
 struct Pending {
     identity: Arc<()>,
     cancel: CancellationToken,
-    bindings: HashMap<SocketAddr, ListenerKind>,
+    bindings: HashMap<ListenerKey, ListenerKind>,
     retirement: HttpRetirement,
 }
 struct ListenerControl {
     admission: Arc<connection_budget::ListenerBudget>,
     cancel: CancellationToken,
     actual: SocketAddr,
+    actual_only_v6: bool,
     proof: Arc<ArcSwap<ProofListener>>,
 }
 impl Drop for ListenerControl {
@@ -47,12 +48,13 @@ struct PoolSlot {
     owner: Weak<ListenerControl>,
     actual: SocketAddr,
     only_v6: bool,
+    actual_only_v6: bool,
     cancel: CancellationToken,
     finished: CancellationToken,
 }
 struct LeaseRecord {
     identity: Arc<()>,
-    bindings: Vec<(SocketAddr, ListenerKind)>,
+    bindings: Vec<(ListenerKey, ListenerKind)>,
 }
 /// The completion token is signalled only after the actual descriptor closes,
 /// including an unpolled or unwinding accept task.
@@ -76,8 +78,8 @@ struct Control {
     phase: Phase,
     pending: Option<Pending>,
     generation: u64,
-    listeners: HashMap<SocketAddr, Arc<ListenerControl>>,
-    pool: HashMap<SocketAddr, PoolSlot>,
+    listeners: HashMap<ListenerKey, Arc<ListenerControl>>,
+    pool: HashMap<ListenerKey, PoolSlot>,
     quic_pool: h3::Pool,
     leases: Vec<LeaseRecord>,
     retirements: HashMap<u64, Arc<RetirementOwner>>,
@@ -270,6 +272,8 @@ async fn retire_generation(
 pub struct StagedAddress {
     pub declared: SocketAddr,
     pub actual: SocketAddr,
+    /// Actual IPV6_V6ONLY socket option; false for IPv4 sockets.
+    pub only_v6: bool,
     pub reused: bool,
     pub http01: bool,
     pub tls_alpn01: bool,
@@ -285,7 +289,7 @@ pub struct HttpStage {
     inner: Arc<Inner>,
     guard: PendingGuard,
     next: Option<Arc<Generation>>,
-    listeners: Option<HashMap<SocketAddr, Arc<ListenerControl>>>,
+    listeners: Option<HashMap<ListenerKey, Arc<ListenerControl>>>,
     addresses: Vec<StagedAddress>,
     retirement: Arc<RetirementOwner>,
     overridden: Vec<Arc<RetiringBinding>>,
@@ -409,6 +413,7 @@ impl HttpRuntime {
                 logging: None,
                 tickets: None,
                 validate_only: true,
+                listener_plan: None,
             },
             &self.inner.resources,
         );
@@ -454,6 +459,7 @@ impl HttpRuntime {
                 logging: None,
                 tickets: None,
                 validate_only: true,
+                listener_plan: None,
             },
             &self.inner.resources,
         );
@@ -480,7 +486,7 @@ impl HttpRuntime {
         config: PreparedConfig,
         managed: Arc<HotCertificateResolver>,
     ) -> Result<HttpStage> {
-        self.stage_inner(config, managed, None, None, None, None)
+        self.stage_inner(config, managed, None, None, None, None, None)
             .await
     }
     /// The supplied inventory is already provisioned by the TLS app. Raw
@@ -494,7 +500,7 @@ impl HttpRuntime {
         managed: Arc<HotCertificateResolver>,
         manual: ManualCertificates,
     ) -> Result<HttpStage> {
-        self.stage_inner(config, managed, Some(manual), None, None, None)
+        self.stage_inner(config, managed, Some(manual), None, None, None, None)
             .await
     }
     /// Attach this generation's immutable automation-policy capability. It is
@@ -506,7 +512,7 @@ impl HttpRuntime {
         manual: ManualCertificates,
         provider: Arc<dyn ScopedCertificateProvider>,
     ) -> Result<HttpStage> {
-        self.stage_inner(config, managed, Some(manual), Some(provider), None, None)
+        self.stage_inner(config, managed, Some(manual), Some(provider), None, None, None)
             .await
     }
     pub async fn stage_with_generation_resources(
@@ -523,6 +529,7 @@ impl HttpRuntime {
             Some(manual),
             Some(provider),
             Some(logging),
+            None,
             None,
         )
         .await
@@ -544,8 +551,16 @@ impl HttpRuntime {
             Some(provider),
             Some(logging),
             Some(tickets),
+            None,
         )
         .await
+    }
+    pub(crate) async fn resolve_listener_plan<'a>(&self,config:&PreparedConfig,extra:impl Iterator<Item=&'a str>+Clone,cancel:CancellationToken)->Result<Arc<ListenerPlan>> {
+        listener_resolve::prepare(&self.inner,config,extra,cancel).await
+    }
+    #[cfg(feature="native-run")]
+    pub(crate) async fn stage_with_resolved_listeners(&self,config:PreparedConfig,managed:Arc<HotCertificateResolver>,manual:ManualCertificates,provider:Arc<dyn ScopedCertificateProvider>,logging:Arc<crate::logging::Logging>,tickets:crate::stek::TicketRuntime,plan:Arc<ListenerPlan>)->Result<HttpStage> {
+        self.stage_inner(config,managed,Some(manual),Some(provider),Some(logging),Some(tickets),Some(plan)).await
     }
     async fn stage_inner(
         &self,
@@ -555,6 +570,7 @@ impl HttpRuntime {
         provider: Option<Arc<dyn ScopedCertificateProvider>>,
         logging: Option<Arc<crate::logging::Logging>>,
         tickets: Option<crate::stek::TicketRuntime>,
+        listener_plan: Option<Arc<ListenerPlan>>,
     ) -> Result<HttpStage> {
         ensure!(
             Arc::ptr_eq(&self.inner.managed.leaf_guard(), &managed.leaf_guard()),
@@ -596,6 +612,8 @@ impl HttpRuntime {
             });
             (guard, generation)
         };
+        let listener_plan=match listener_plan {Some(plan)=>plan,None=>self.resolve_listener_plan(&config,std::iter::empty(),guard.cancel.clone()).await?};
+        listener_plan.verify(&self.inner,&config,&guard.cancel).await?;
         let prepared = prepare_servers(
             &config,
             &self.inner.metrics_process,
@@ -608,6 +626,7 @@ impl HttpRuntime {
                 logging: logging.as_ref(),
                 tickets: tickets.as_ref(),
                 validate_only: false,
+                listener_plan: Some(&listener_plan),
             },
             &self.inner.resources,
         );
@@ -626,7 +645,7 @@ impl HttpRuntime {
         let bindings = servers
             .iter()
             .filter(|(_, server)| h3::tcp_enabled(server))
-            .map(|(address, server)| (*address, ListenerKind::of(server)))
+            .map(|(address, server)| (address.clone(), ListenerKind::of(server)))
             .collect::<HashMap<_, _>>();
         let (listeners, mut addresses) = loop {
             let waiting = {
@@ -641,7 +660,7 @@ impl HttpRuntime {
                     "HTTP candidate was stopped"
                 );
                 prune_pool(&mut control);
-                let (_pins, closing) = pin_pool(&control, bindings.keys().copied(), false)?;
+                let (_pins, closing) = pin_pool(&control, bindings.keys().cloned(), false)?;
                 if let Some(finished) = closing {
                     Some(finished)
                 } else {
@@ -650,14 +669,17 @@ impl HttpRuntime {
                             control.leases.iter().all(|record| record
                                 .bindings
                                 .iter()
-                                .all(|(key, owned)| key != address || owned == kind)),
+                                .all(|(key, owned)| {
+                                    let overlap=control.pool.get(key).is_some_and(|slot|overlaps(slot.actual,slot.actual_only_v6,address));
+                                    !overlap || owned==kind
+                                })),
                             "HTTP candidate conflicts with a challenge listener lease"
                         );
                     }
                     // Validate every shared proof policy before changing any owner.
                     for address in bindings.keys(){
                         if let Some(slot)=control.pool.get(address) {
-                            ensure!(slot.only_v6==servers[address].plan.listen_v6_only.contains(address),
+                            ensure!(slot.only_v6==servers[address].only_v6(address),
                                 "HTTP listener IPv6-only mode changed across reload");
                         }
                         if control.leases.iter().any(|record|record.bindings.iter().any(|(key,_)|key==address)){
@@ -674,9 +696,9 @@ impl HttpRuntime {
                     for (address, kind) in &bindings {
                         let (listener, reused) = own_socket(
                             &mut control,
-                            *address,
+                            address.clone(),
                             *kind,
-                            Some(servers[address].plan.listen_v6_only.contains(address)),
+                            Some(servers[address].only_v6(address)),
                             &proof_tls,
                             false,
                             &mut launches,
@@ -690,13 +712,14 @@ impl HttpRuntime {
                             .map(|server| ListenerKind::of(server))
                             .unwrap_or(*kind);
                         addresses.push(StagedAddress {
-                            declared: *address,
+                            declared: address.address,
                             actual: listener.actual,
+                            only_v6: listener.actual_only_v6,
                             reused,
                             http01: capability == ListenerKind::Http,
                             tls_alpn01: capability == ListenerKind::Tls,
                         });
-                        listeners.insert(*address, listener);
+                        listeners.insert(address.clone(), listener);
                     }
                     control
                         .pending
@@ -715,22 +738,24 @@ impl HttpRuntime {
                 }
             }
         };
+        let tcp_bindings=listeners.iter().map(|(key,owner)|(key.clone(),owner.actual)).collect::<HashMap<_,_>>();
         let quic = {
             let mut state = self.control.lock();
             ensure!(!guard.cancel.is_cancelled(), "HTTP candidate was stopped");
-            h3::stage(&self.inner, &mut state.quic_pool, &servers, &addresses)?
+            h3::stage(&self.inner, &mut state.quic_pool, &servers, &tcp_bindings)?
         };
-        for (&declared, listener) in &quic {
-            if !bindings.contains_key(&declared) {
+        for (declared, listener) in &quic {
+            if !bindings.contains_key(declared) {
                 addresses.push(StagedAddress {
-                    declared,
+                    declared: declared.address,
                     actual: listener.binding.actual,
+                    only_v6: listener.binding.actual_only_v6,
                     reused: self
                         .inner
                         .current
                         .load()
                         .quic
-                        .get(&declared)
+                        .get(declared)
                         .is_some_and(|old| Arc::ptr_eq(&old.binding, &listener.binding)),
                     http01: false,
                     tls_alpn01: false,
@@ -749,7 +774,7 @@ impl HttpRuntime {
                     if servers.contains_key(address) {
                         overridden.push(binding);
                     } else {
-                        retiring.insert(*address, Arc::downgrade(&binding));
+                        retiring.insert(address.clone(), Arc::downgrade(&binding));
                     }
                 }
             }
@@ -772,7 +797,7 @@ impl HttpRuntime {
                     accepting: std::sync::atomic::AtomicBool::new(true),
                     owner: Mutex::new(Some(listener.clone())),
                 });
-                retiring.insert(*address, Arc::downgrade(&binding));
+                retiring.insert(address.clone(), Arc::downgrade(&binding));
                 bindings.push(binding);
             }
             (
@@ -795,6 +820,8 @@ impl HttpRuntime {
         );
         let proxy_cleanup = self.inner.resources.proxy_cleanup.reserve(owners).await?;
         let next = Arc::new(Generation {
+            listener_plan: Some(listener_plan),
+            business_bindings: servers.keys().map(|key|(key.identity.clone(),key.clone())).collect(),
             tracing,
             metrics,
             id: generation,
@@ -828,7 +855,7 @@ impl HttpRuntime {
             .filter_map(|(key, slot)| {
                 slot.owner
                     .upgrade()
-                    .map(|owner| (*key, slot.actual, owner.admission.snapshot()))
+                    .map(|owner| (key.address, slot.actual, owner.admission.snapshot()))
             })
             .collect::<Vec<_>>();
         rows.sort_by_key(|row| row.0);
@@ -1061,7 +1088,7 @@ async fn stop_runtime(inner: Arc<Inner>, lifecycle: Arc<Lifecycle>, signal: Http
 }
 
 type Launch = (
-    SocketAddr,
+    ListenerKey,
     ListenerSocket,
     CancellationToken,
     Arc<ArcSwap<ProofListener>>,
@@ -1078,27 +1105,31 @@ fn covers(bound: SocketAddr, requested: SocketAddr, only_v6: bool) -> bool {
             && (bound.is_ipv6() && (!only_v6 || requested.is_ipv6())
                 || bound.is_ipv4() && requested.is_ipv4())
 }
-fn pool_key(control: &Control, address: SocketAddr, coverage: bool) -> Option<SocketAddr> {
-    if control.pool.contains_key(&address) {
-        return Some(address);
+fn overlaps(bound:SocketAddr,bound_only_v6:bool,requested:&ListenerKey)->bool {
+    requested.port()!=0 && (covers(bound,requested.address,bound_only_v6)
+        || covers(requested.address,bound,requested.requested_v6()))
+}
+fn pool_key(control: &Control, address: &ListenerKey, coverage: bool) -> Option<ListenerKey> {
+    if control.pool.contains_key(address) {
+        return Some(address.clone());
     }
     if coverage {
         control
             .pool
             .iter()
-            .find_map(|(key, slot)| covers(slot.actual, address, slot.only_v6).then_some(*key))
+            .find_map(|(key, slot)| covers(slot.actual, address.address, slot.actual_only_v6).then(||key.clone()))
     } else {
         None
     }
 }
 fn pin_pool(
     control: &Control,
-    addresses: impl IntoIterator<Item = SocketAddr>,
+    addresses: impl IntoIterator<Item = ListenerKey>,
     coverage: bool,
 ) -> Result<(Vec<Arc<ListenerControl>>, Option<CancellationToken>)> {
     let mut pins = Vec::new();
     for address in addresses {
-        if let Some(key) = pool_key(control, address, coverage) {
+        if let Some(key) = pool_key(control, &address, coverage) {
             let slot = &control.pool[&key];
             ensure!(
                 !slot.finished.is_cancelled(),
@@ -1124,7 +1155,7 @@ fn configure_proof(owner: &ListenerControl, kind: ListenerKind, tls: &Arc<rustls
 }
 fn own_socket(
     control: &mut Control,
-    address: SocketAddr,
+    address: ListenerKey,
     kind: ListenerKind,
     only_v6: Option<bool>,
     tls: &Arc<rustls::ServerConfig>,
@@ -1132,7 +1163,7 @@ fn own_socket(
     launches: &mut Vec<Launch>,
     connections: &Arc<connection_budget::Budgets>,
 ) -> Result<(Arc<ListenerControl>, bool)> {
-    if let Some(key) = pool_key(control, address, coverage) {
+    if let Some(key) = pool_key(control, &address, coverage) {
         ensure!(only_v6.is_none_or(|mode|mode==control.pool[&key].only_v6),
             "HTTP listener IPv6-only mode changed across reload");
         ensure!(
@@ -1145,14 +1176,12 @@ fn own_socket(
             .ok_or_else(|| anyhow::anyhow!("listener closing after admission"))?;
         return Ok((owner, true));
     }
-    let only_v6=only_v6.unwrap_or(false);
-    ensure!(
-        !control.pool.values().any(|slot| address.port() != 0
-            && (covers(slot.actual, address, slot.only_v6) || covers(address, slot.actual, only_v6))),
-        "HTTP listener binding scope overlaps an existing shared listener"
-    );
-    let socket =
-        bind_listener(address,only_v6).map_err(|_| anyhow::anyhow!("HTTP listener bind failed"))?;
+    let only_v6=only_v6.unwrap_or_else(||address.requested_v6());
+    // Different declarations are real distinct SO_REUSEPORT owners. Proof
+    // acquisition uses coverage above and never invents a routing alias.
+
+    let (socket,actual_only_v6) =
+        bind_listener(address.address,only_v6).map_err(|_| anyhow::anyhow!("HTTP listener bind failed"))?;
     let finished = CancellationToken::new();
     let admission = connections.listener();
     let socket = ListenerSocket {
@@ -1174,14 +1203,16 @@ fn own_socket(
         admission,
         cancel: cancel.clone(),
         actual,
+        actual_only_v6,
         proof: proof.clone(),
     });
     control.pool.insert(
-        address,
+        address.clone(),
         PoolSlot {
             owner: Arc::downgrade(&owner),
             actual,
             only_v6,
+            actual_only_v6,
             cancel: cancel.clone(),
             finished,
         },
@@ -1200,13 +1231,14 @@ fn launch_listeners(inner: &Arc<Inner>, launches: Vec<Launch>) {
 struct RuntimeChallengeProvider {
     inner: Weak<Inner>,
     control: Weak<Lifecycle>,
+    plan: Option<Arc<ListenerPlan>>,
 }
 struct RuntimeChallengeLease {
     control: Arc<Lifecycle>,
     identity: Arc<()>,
     owners: Vec<Arc<ListenerControl>>,
     addresses: Vec<StagedAddress>,
-    keys: Vec<SocketAddr>,
+    keys: Vec<ListenerKey>,
 }
 impl Drop for RuntimeChallengeLease {
     fn drop(&mut self) {
@@ -1246,44 +1278,42 @@ impl ChallengeListenerLease for RuntimeChallengeLease {
     }
 }
 impl HttpRuntime {
+    pub(crate) fn challenge_listener_provider_for(&self,plan:Arc<ListenerPlan>)->Arc<dyn ChallengeListenerProvider> {
+        Arc::new(RuntimeChallengeProvider{inner:Arc::downgrade(&self.inner),control:Arc::downgrade(&self.control),plan:Some(plan)})
+    }
     pub fn challenge_listener_provider(&self) -> Arc<dyn ChallengeListenerProvider> {
         Arc::new(RuntimeChallengeProvider {
             inner: Arc::downgrade(&self.inner),
             control: Arc::downgrade(&self.control),
+            plan: self.inner.current.load().listener_plan.clone(),
         })
     }
 }
 fn requested_bindings(
+    provider: &RuntimeChallengeProvider,
     requests: Vec<ChallengeBindingRequest>,
-) -> Result<Vec<(SocketAddr, ListenerKind)>> {
+) -> Result<Vec<(ListenerKey, ListenerKind)>> {
     ensure!(
         !requests.is_empty() && requests.len() <= 32,
         "challenge binding count outside bounds"
     );
-    let mut bindings = Vec::new();
+    let mut bindings:Vec<(ListenerKey,ListenerKind)> = Vec::new();
     for request in requests {
-        let ip = if request.bind_host.is_empty() {
-            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
-        } else {
-            request
-                .bind_host
-                .parse::<std::net::IpAddr>()
-                .map_err(|_| anyhow::anyhow!("hostname challenge binding is not yet supported"))?
-        };
+        let selected=provider.resolve_bind_host(&request.bind_host)?.unwrap_or_else(||SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(),0));
         for (port, kind) in [
             (request.http_port, ListenerKind::Http),
             (request.tls_alpn_port, ListenerKind::Tls),
         ] {
             if let Some(port) = port {
                 ensure!(port != 0, "challenge port must be explicit");
-                let address = SocketAddr::new(ip, port);
-                if let Some((_, other)) = bindings.iter().find(|(bound, _)| *bound == address) {
+                let mut address=selected;address.set_port(port);
+                if let Some((_, other)) = bindings.iter().find(|(bound, _)| bound.address == address) {
                     ensure!(
                         *other == kind,
                         "challenge protocols conflict on one address"
                     );
                 } else {
-                    bindings.push((address, kind));
+                    bindings.push((ListenerKey::numeric(address), kind));
                 }
             }
         }
@@ -1298,34 +1328,51 @@ fn requested_bindings(
 // exact listener and lease a separate IPv4 socket rather than treating its
 // SocketAddr as a dual-stack capability. Recompute under the pool fence after
 // waiting for a closing descriptor, before creating or modifying any owner.
-fn proof_bindings(control:&Control,requests:&[(SocketAddr,ListenerKind)])->Result<Vec<(SocketAddr,ListenerKind)>> {
-    let mut bindings:Vec<(SocketAddr,ListenerKind)>=Vec::with_capacity(requests.len()*2);
+fn proof_bindings(control:&Control,requests:&[(ListenerKey,ListenerKind)])->Result<Vec<(ListenerKey,ListenerKind)>> {
+    let mut bindings:Vec<(ListenerKey,ListenerKind)>=Vec::with_capacity(requests.len()*2);
     let mut add=|address,kind|->Result<()> {
         if let Some((_,previous))=bindings.iter().find(|(bound,_)|*bound==address) {
             ensure!(*previous==kind,"challenge protocols conflict on one address");
         } else {bindings.push((address,kind));}
         Ok(())
     };
-    for &(address,kind) in requests {
-        if address.is_ipv6() && address.ip().is_unspecified()
-            && control.pool.values().any(|slot|slot.actual==address&&slot.only_v6) {
+    for (address,kind) in requests {
+        let kind=*kind;
+        if address.is_ipv6() && address.ip().is_unspecified() {
             let ipv4=SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(),address.port());
-            add(ipv4,kind)?;
+            let has4=control.pool.values().any(|slot|covers(slot.actual,ipv4,slot.actual_only_v6));
+            let has6=control.pool.values().any(|slot|covers(slot.actual,address.address,slot.actual_only_v6));
+            if has4 || has6 {
+                add(ListenerKey::numeric(ipv4),kind)?;
+                let mut ipv6=address.clone();
+                if has4 && !has6 {
+                    // Keep the real IPv4 owner; the missing family gets its own
+                    // IPv6-only socket, never a mode change on the old socket.
+                    ipv6.identity=Arc::new(crate::http_config::ListenIdentity{host:ipv6.identity.host.clone(),family:crate::http_config::ListenerFamily::V6,port:ipv6.port()});
+                }
+                add(ipv6,kind)?;
+                continue;
+            }
         }
-        add(address,kind)?;
+        add(address.clone(),kind)?;
     }
     Ok(bindings)
 }
 impl ChallengeListenerProvider for RuntimeChallengeProvider {
+    fn resolve_bind_host(&self,host:&str)->Result<Option<SocketAddr>> {
+        if let Some(plan)=&self.plan {return plan.bind_host(host);}
+        listener_lease::numeric_bind_host(host)
+    }
     fn acquire(
         &self,
         requests: Vec<ChallengeBindingRequest>,
         cancel: CancellationToken,
     ) -> futures_util::future::BoxFuture<'static, Result<Box<dyn ChallengeListenerLease>>> {
+        let requested=requested_bindings(self,requests);
         let weak_inner = self.inner.clone();
         let weak_control = self.control.clone();
         Box::pin(async move {
-            let requested = requested_bindings(requests)?;
+            let requested = requested?;
             let inner = weak_inner
                 .upgrade()
                 .ok_or_else(|| anyhow::anyhow!("HTTP runtime unavailable"))?;
@@ -1354,7 +1401,7 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
                     prune_pool(&mut state);
                     let bindings=proof_bindings(&state,&requested)?;
                     let (_pins, closing) =
-                        pin_pool(&state, bindings.iter().map(|(a, _)| *a), true)?;
+                        pin_pool(&state, bindings.iter().map(|(a, _)| a.clone()), true)?;
                     if let Some(finished) = closing {
                         Err(finished)
                     } else {
@@ -1362,28 +1409,20 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
                         // All compatibility checks and ownership publication use
                         // the same short lock as stage registration and commit.
                         for (address, kind) in &bindings {
-                            let key = pool_key(&state, *address, true).unwrap_or(*address);
-                            if let Some((server, _)) = current.business(&key) {
-                                ensure!(
-                                    ListenerKind::of(&server) == *kind,
-                                    "challenge protocol conflicts with published listener"
-                                );
+                            // Every overlapping reuseport owner can receive proof
+                            // traffic. Inspect them all before changing any mode.
+                            for (key,slot) in &state.pool {
+                                if !overlaps(slot.actual,slot.actual_only_v6,address){continue;}
+                                if let Some((server,_))=current.business(key) {
+                                    ensure!(ListenerKind::of(&server)==*kind,"challenge protocol conflicts with published listener");
+                                }
+                                ensure!(state.leases.iter().all(|record|record.bindings.iter().all(|(owned,mode)|owned!=key || mode==kind)),"challenge protocol conflicts with another lease");
                             }
-                            if let Some(pending) = &state.pending
-                                && let Some(prepared) = pending.bindings.get(&key)
-                            {
-                                ensure!(
-                                    *prepared == *kind,
-                                    "challenge protocol conflicts with pending listener"
-                                );
+                            if let Some(pending)=&state.pending {
+                                for (key,prepared) in &pending.bindings {
+                                    if overlaps(key.address,key.requested_v6(),address){ensure!(prepared==kind,"challenge protocol conflicts with pending listener");}
+                                }
                             }
-                            ensure!(
-                                state.leases.iter().all(|record| record
-                                    .bindings
-                                    .iter()
-                                    .all(|(owned, mode)| *owned != key || *mode == *kind)),
-                                "challenge protocol conflicts with another lease"
-                            );
                         }
                         let mut owners = Vec::new();
                         let mut addresses = Vec::new();
@@ -1393,7 +1432,7 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
                         for (address, kind) in &bindings {
                             let (owner, reused) = own_socket(
                                 &mut state,
-                                *address,
+                                address.clone(),
                                 *kind,
                                 None,
                                 &tls,
@@ -1402,7 +1441,7 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
                                 &inner.connections,
                             )?;
                             let key =
-                                pool_key(&state, *address, true).expect("new or pinned listener");
+                                pool_key(&state, address, true).expect("new or pinned listener");
                             // Separate input addresses can resolve to one wildcard
                             // socket; they must not request conflicting protocols.
                             if let Some((_, mode)) = modes.iter().find(|(owned, _)| *owned == key) {
@@ -1411,13 +1450,14 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
                                     "challenge protocols conflict on shared listener"
                                 );
                             } else {
-                                modes.push((key, *kind));
+                                modes.push((key.clone(), *kind));
                                 keys.push(key);
                             }
                             configure_proof(&owner, *kind, &tls,None);
                             addresses.push(StagedAddress {
-                                declared: *address,
+                                declared: address.address,
                                 actual: owner.actual,
+                                only_v6: owner.actual_only_v6,
                                 reused,
                                 http01: *kind == ListenerKind::Http,
                                 tls_alpn01: *kind == ListenerKind::Tls,

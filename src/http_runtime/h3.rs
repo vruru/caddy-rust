@@ -14,7 +14,7 @@ mod write_control;
 mod continue_flow;
 mod sessions;
 pub(super) mod stream;
-pub(super) type Pool = HashMap<SocketAddr, Weak<Binding>>;
+pub(super) type Pool = HashMap<ListenerKey, Weak<Binding>>;
 const STREAMS: usize = 64;
 const MAX_CONNECTIONS: usize = 256;
 struct PreflightLanes {
@@ -52,6 +52,7 @@ pub(super) struct AltSvc(pub(super) HeaderValue);
 pub(super) struct Binding {
     pub(super) actual: SocketAddr,
     only_v6: bool,
+    pub(super) actual_only_v6: bool,
     pub(super) advertisement: AltSvc,
     _endpoint: Endpoint,
     accept_stop: CancellationToken,
@@ -102,12 +103,12 @@ fn initial_config(
 pub(super) fn stage(
     inner: &Arc<Inner>,
     pool: &mut Pool,
-    servers: &HashMap<SocketAddr, Arc<ActiveServer>>,
-    tcp: &[StagedAddress],
-) -> Result<HashMap<SocketAddr, Listener>> {
+    servers: &HashMap<ListenerKey, Arc<ActiveServer>>,
+    tcp: &HashMap<ListenerKey,SocketAddr>,
+) -> Result<HashMap<ListenerKey, Listener>> {
     pool.retain(|_, binding| binding.strong_count() != 0);
     let mut listeners = HashMap::new();
-    for (&key, server) in servers.iter().filter(|(_, server)| enabled(server)) {
+    for (key, server) in servers.iter().filter(|(_, server)| enabled(server)) {
         let resolver = server
             .resolver
             .clone()
@@ -130,13 +131,9 @@ pub(super) fn stage(
             .send_window(2u64 * 1024 * 1024);
         let transport = Arc::new(transport);
         let scope = IpScope::of(server);
-        let tcp_actual = tcp
-            .iter()
-            .find(|address| address.declared == key)
-            .map(|a| a.actual);
-        let wanted = tcp_actual.unwrap_or(key);
-        let only_v6=server.plan.listen_v6_only.contains(&key);
-        let binding = if let Some(binding) = pool.get(&key).and_then(Weak::upgrade) {
+        let wanted = tcp.get(key).copied().unwrap_or(key.address);
+        let only_v6=server.only_v6(key);
+        let binding = if let Some(binding) = pool.get(key).and_then(Weak::upgrade) {
             ensure!(binding.only_v6==only_v6,"HTTP/3 listener IPv6-only mode changed across reload");
             ensure!(
                 wanted.port() == 0 || wanted == binding.actual,
@@ -144,7 +141,7 @@ pub(super) fn stage(
             );
             binding
         } else {
-            let socket = udp_socket(wanted,only_v6)?;
+            let (socket,actual_only_v6) = udp_socket(wanted,only_v6)?;
             let endpoint = Endpoint::new(
                 quinn::EndpointConfig::default(),
                 Some(initial_config(crypto.clone(), &transport, scope)?),
@@ -155,6 +152,7 @@ pub(super) fn stage(
             let binding = Arc::new(Binding {
                 actual,
                 only_v6,
+                actual_only_v6,
                 advertisement: AltSvc(HeaderValue::from_str(&format!(
                     "h3=\":{}\"; ma=2592000",
                     actual.port()
@@ -165,18 +163,18 @@ pub(super) fn stage(
                 preflight: PreflightLanes::new(4, 8),
                 connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             });
-            pool.insert(key, Arc::downgrade(&binding));
+            pool.insert(key.clone(), Arc::downgrade(&binding));
             inner.tasks.spawn(accept_loop(
                 Arc::downgrade(inner),
                 Arc::downgrade(&binding),
                 endpoint,
-                key,
+                key.clone(),
                 binding.accept_stop.clone(),
             ));
             binding
         };
         listeners.insert(
-            key,
+            key.clone(),
             Listener {
                 binding,
                 crypto: Arc::new(crypto),
@@ -189,7 +187,7 @@ pub(super) fn stage(
     Ok(listeners)
 }
 
-fn udp_socket(address: SocketAddr, only_v6: bool) -> std::io::Result<UdpSocket> {
+fn udp_socket(address: SocketAddr, only_v6: bool) -> std::io::Result<(UdpSocket,bool)> {
     use socket2::{Domain, Protocol, Socket, Type};
     let socket = Socket::new(
         Domain::for_address(address),
@@ -199,9 +197,12 @@ fn udp_socket(address: SocketAddr, only_v6: bool) -> std::io::Result<UdpSocket> 
     if let SocketAddr::V6(address) = address {
         socket.set_only_v6(only_v6 || !address.ip().is_unspecified())?;
     }
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;
     socket.bind(&address.into())?;
-    Ok(socket.into())
+    let actual_only_v6=if address.is_ipv6(){socket.only_v6()?}else{false};
+    Ok((socket.into(),actual_only_v6))
 }
 struct Preselected {
     certificate: crate::tls_resolver::CertificateSelection,
@@ -505,7 +506,7 @@ async fn accept_loop(
     inner: Weak<Inner>,
     listener: Weak<Binding>,
     endpoint: Endpoint,
-    key: SocketAddr,
+    key: ListenerKey,
     stop: CancellationToken,
 ) {
     let Some(runtime) = inner.upgrade() else {
@@ -562,6 +563,7 @@ async fn accept_loop(
             binding.actual.port(),
         );
         let runtime = inner.clone();
+        let key=key.clone();
         inner.tasks.spawn(async move {
             let _connection_slot=(connection_slot,process_connection);
             let budget = server.plan.read_header_timeout.unwrap_or(Duration::from_secs(15)).min(Duration::from_secs(15));
@@ -801,9 +803,9 @@ impl IpScope {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Peer {
-    key: SocketAddr,
+    key: ListenerKey,
     peer: SocketAddr,
     local: SocketAddr,
     scope: IpScope,
@@ -918,6 +920,7 @@ async fn serve_connection(
                 let tls_log = tls_log.clone();
                 let client_cert_cache = client_cert_cache.clone();
                 let quic_for_stream=quic.clone();
+                let peer=peer.clone();
                 streams.spawn(async move {
                     let _stream_slot=stream_slot;
                     let head = async {

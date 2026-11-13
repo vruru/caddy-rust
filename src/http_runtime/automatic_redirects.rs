@@ -1,33 +1,36 @@
 //! Automatic HTTP redirects preserve explicit routes and canonical TLS ports.
-use std::{collections::BTreeMap,net::SocketAddr};
+use std::collections::BTreeMap;
+use super::ListenerKey;
 use crate::http_config::types::{Route,Matcher,Handler,HeaderOps};
 #[derive(Default)]
-pub(super) struct Domains(BTreeMap<String,Vec<SocketAddr>>);
+pub(super) struct Domains(BTreeMap<String,Vec<(ListenerKey,bool)>>);
 impl Domains {
-    pub(super) fn record(&mut self,names:&[String],addresses:&[SocketAddr],https_port:u16){
+    pub(super) fn record(&mut self,names:&[String],addresses:&[ListenerKey],v6_only:&impl Fn(&ListenerKey)->bool,https_port:u16){
         for name in names.iter().map(String::as_str).chain(names.is_empty().then_some("")) {
             for address in addresses {
                 let selected=self.0.entry(name.to_owned()).or_default();
                 if let Some(first)=selected.first() {
-                    if first.port()!=address.port() {
+                    if first.0.port()!=address.port() {
                         if address.port()!=https_port {continue;}
                         selected.clear();
                     }
                 }
-                if !selected.contains(address){selected.push(*address);}
+                let address=(address.clone(),v6_only(address));
+                if !selected.contains(&address){selected.push(address);}
             }
         }
     }
-    pub(super) fn routes(self,http_port:u16,https_port:u16)->BTreeMap<SocketAddr,Vec<Route>>{
-        let mut by_target=BTreeMap::<SocketAddr,Vec<String>>::new();
+    pub(super) fn routes(self,http_port:u16,https_port:u16)->BTreeMap<(ListenerKey,bool),Vec<Route>>{
+        let mut by_target=BTreeMap::<(ListenerKey,bool),Vec<String>>::new();
         for (name,addresses) in self.0{for address in addresses{by_target.entry(address).or_default().push(name.clone());}}
-        let mut listeners=BTreeMap::<SocketAddr,Vec<(String,SocketAddr,Route)>>::new();
-        for (target,names) in by_target {
+        let mut listeners=BTreeMap::<(ListenerKey,bool),Vec<(String,ListenerKey,Route)>>::new();
+        for ((target,only_v6),names) in by_target {
             let host=names.first().cloned().unwrap_or_default();
             let mut matchers=vec![Matcher::Protocol("http".into())];
             if names.len()!=1||!host.is_empty(){matchers.push(Matcher::Host(names));}
-            listeners.entry(SocketAddr::new(target.ip(),http_port)).or_default()
-                .push((host,target,make(http_port,https_port,target.port(),matchers)));
+            let redirect=target.with_port(http_port);
+            listeners.entry((redirect,only_v6)).or_default()
+                .push((host,target.clone(),make(http_port,https_port,target.port(),matchers)));
         }
         listeners.into_iter().map(|(address,mut routes)|{
             routes.sort_by(|(a,at,_),(b,bt,_)|a.is_empty().cmp(&b.is_empty())

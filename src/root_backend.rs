@@ -251,6 +251,8 @@ impl NativeBackend {
                         .map(|address| crate::http_runtime::StagedAddress {
                             declared: *address,
                             actual: *address,
+                            // Dormant planning has no socket and cannot prove IPv4 coverage.
+                            only_v6: true,
                             reused: false,
                             http01: !server.tls,
                             tls_alpn01: server.tls,
@@ -365,6 +367,8 @@ impl Root {
             self.guard.clone(),
         ));
         let token = self.cancel.child_token();
+        let listener_plan=self.http.resolve_listener_plan(&prepared.http,prepared.certificates.challenge_bind_hosts(),self.candidates.child_token()).await
+            .map_err(|_|failed("http_listener_resolution_failed"))?;
         let services = CertificateServices::new(
             prepared.certificates,
             PrepareContext {
@@ -377,7 +381,7 @@ impl Root {
                 cancel: token.clone(),
                 configuration_digest: prepared.digest,
                 trust_installer: self.options.trust_installer.clone(),
-                listener_provider: Some(self.http.challenge_listener_provider()),
+                listener_provider: Some(self.http.challenge_listener_provider_for(listener_plan.clone())),
             },
             mode,
         )
@@ -415,13 +419,14 @@ impl Root {
             };
             let stage = self
                 .http
-                .stage_with_native_tickets(
+                .stage_with_resolved_listeners(
                     prepared.http,
                     services.business_resolver(),
                     manual,
                     services.certificate_provider(),
                     logging.clone(),
                     tickets.clone(),
+                    listener_plan,
                 )
                 .await
                 .map_err(|_| failed("http_candidate_staging_failed"))?;

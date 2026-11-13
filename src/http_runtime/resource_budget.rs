@@ -291,6 +291,7 @@ pub(crate) struct Resources {
     pub(super) map_lookup:BlockingBudget,
     pub request_regexp: BlockingBudget,
     pub directory_listing: BlockingBudget,
+    pub(super) listener_dns: super::listener_resolve::Resolver,
     pub directory_listing_bytes: Arc<Semaphore>,
     pub(super) fastcgi_admission: super::fastcgi::admission::Admission,
     pub fastcgi_dns: BlockingBudget,
@@ -391,9 +392,13 @@ impl Resources {
         // These new lanes are included in the same scalar spare allowance;
         // their separate queues are not a physical CPU/thread isolation claim.
         let remaining=spare.saturating_sub(selection_running).saturating_sub(regex_running).saturating_sub(listing_running);
-        // Leave headroom for compression after admitting both new lanes.
-        // Filling every remaining slot here would force compression's minimum
-        // admission above the same scalar allowance at large custom limits.
+        // Reserve one or more slots for each independent resolver, Map and
+        // compression lane within the same scalar allowance. Valid custom
+        // limits leave at least four slots after the established lanes above.
+        anyhow::ensure!(remaining>=4,"insufficient derived blocking headroom");
+        let listener_running=cpu.clamp(1,8).min((remaining/4).max(1));
+        let listener_dns=super::listener_resolve::Resolver::new(listener_running)?;
+        let remaining=remaining-listener_running;
         let dial_dns_running=cpu.clamp(2,16).min((remaining/3).max(1));
         let map_running=cpu.div_ceil(2).clamp(1,16).min((remaining.saturating_sub(dial_dns_running)/2).max(1));
         let proxy_dial_dns=BlockingBudget::new(dial_dns_running,64,Duration::from_secs(2))?;
@@ -413,6 +418,7 @@ impl Resources {
             proxy_client_cache_bytes:native_write_policy::Pool::new(32<<20),
             proxy_dial_dns,
             map_lookup,
+            listener_dns,
             transfer_deadlines: native_write_policy::Pool::new(cpu.saturating_mul(8<<20).clamp(32<<20,256<<20)),
             ssl_verify:native_ssl_tls::VerificationScope::new(),
             client_tls:Arc::new(super::tls_executor::ClientTlsExecutor::new()),
@@ -439,7 +445,7 @@ impl Resources {
             compression: super::encode_body::CompressionBudget::new(
                 cpu,
                 established + selection_running + regex_running + listing_running
-                    + dial_dns_running + map_running,
+                    + listener_running + dial_dns_running + map_running,
             )?,
             proxy_hosts: Arc::new(super::proxy_policy::HostRegistry::default()),
             proxy_selection,
@@ -509,6 +515,7 @@ impl Resources {
     /// Called only after HTTP owners join, or immediately for explicit force.
     /// It is idempotent, and does not refund a real worker's retained credit.
     pub(crate) fn cancel_work(&self) {
+        self.listener_dns.close();
         self.client_tls.close();
         self.ssl_verify.close();
         self.proxy_cleanup.close();
@@ -521,6 +528,7 @@ impl Resources {
         // cancelled/detached blocking results still carry their own tokens.
         let _ = self.client_tls.shutdown().await;
         self.cancel_work();
+        self.listener_dns.wait().await;
         self.ssl_verify.wait().await;
         self.cel_compile.tasks.wait().await;
         self.proxy_cleanup.wait().await;

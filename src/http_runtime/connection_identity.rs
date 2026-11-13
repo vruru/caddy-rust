@@ -350,7 +350,7 @@ impl<I: tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin> tokio::io::AsyncWrite 
 }
 fn same_business_view(
     generation: &Generation,
-    address: &SocketAddr,
+    address: &ListenerKey,
     server: &Arc<ActiveServer>,
     activity: &Arc<BusinessGeneration>,
 ) -> bool {
@@ -365,7 +365,7 @@ fn same_business_view(
 /// and choose from the latest published view before any TLS identity is pinned.
 async fn server_for_hello(
     inner: &Arc<Inner>,
-    address: SocketAddr,
+    address: ListenerKey,
     sni: &str,
     wire_sni: &str,
     alpn: &[&[u8]],
@@ -611,7 +611,7 @@ pub(super) async fn accept<I>(
     inner: &Arc<Inner>,
     stream: I,
     admission: std::sync::Weak<connection_budget::Admission>,
-    address: SocketAddr,
+    address: ListenerKey,
     deadline: Option<tokio::time::Instant>,
     reply_http: bool,
     peer_local: (NetAddress, NetAddress),

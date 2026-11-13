@@ -1140,7 +1140,7 @@ path. Bare numeric IPs and omitted ports retain the reference's ephemeral-port
 semantics. IPv4, IPv6, wildcard addresses and the optional TCP network prefix
 are supported. The existing per-server limit applies to expanded endpoints:
 at most 1024, checked before allocating the expanded range. Unknown listener
-networks, unresolved hostnames and Unix HTTP listeners remain explicit gaps;
+networks and Unix HTTP listeners remain explicit gaps;
 this does not claim every NetworkAddress or Caddyfile site-address combination.
 
 
@@ -1242,12 +1242,13 @@ Unqualified TCP keeps its existing dual-stack wildcard behavior. IPv6 scope IDs
 and duplicate/ephemeral declaration behavior are retained.
 
 Shared-socket ownership includes IPv6-only mode. A reload cannot silently reuse
-a descriptor with a different mode; the candidate is refused with the existing
-generation intact. An IPv6-only wildcard does not count as an IPv4 challenge
+a descriptor with a different mode. A distinct declaration may acquire its own
+real descriptor when the operating system permits, without changing the old
+socket mode; failed candidates leave the existing generation intact. An IPv6-only wildcard does not count as an IPv4 challenge
 capability. A default dual-family challenge lease reuses the actual IPv6
 listener and acquires a separate IPv4 listener, retaining/releasing each real
 descriptor independently, including listeners initially bound with port zero.
-This addition does not claim hostname, Unix or file-descriptor HTTP listeners.
+Hostname TCP listeners are described below; Unix and file-descriptor HTTP listeners remain separate gaps.
 
 Template HTTP header accessors
 ------------------------------
@@ -1366,3 +1367,76 @@ is not established by this finite guard.
 Reqwest's explicitly prepared native TLS origin and HTTPS-proxy paths use the complete owned SSL engine. SSL construction, handshake crypto and authenticated records use its bounded CPU lane; socket IO remains asynchronous. Origin SNI, the HTTPS proxy's own SNI and empty CONNECT ALPN, verifier and client identity, renegotiation policy, timeout and connection facts are retained. Direct TlsInfo visits exact authenticated peer DER through the same Guard evidence outside its mutex; existing CONNECT TlsInfo=None behavior is unchanged. The older public ClientConfig/Stream API remains available. This does not move default Rustls CA/ACME/metrics handshakes or add CBC compatibility to these callers.
 
 Completed SSL CPU work returns its running permit from the real worker. Actual data, the existing admission ticket and tracker remain with an unconsumed result, preventing a single-slot nested-TLS wait cycle without returning data credit early. The process-shared admission limit (32..256, derived from available CPUs) now counts waiting, running and completed-unconsumed jobs together; it previously bounded only waiting jobs in addition to separately retained running slots. Full admission still returns an explicit WouldBlock error and recovers when an actual result owner drops. Worker cancellation does not return active CPU capacity early; spawn and payload/ticket destruction occur outside the scope admission mutex. These are bounded ownership/scheduling claims, not OpenSSL heap or process-RSS accounting.
+
+
+TCP hostname listener snapshots
+------------------------------
+
+HTTP `tcp`, `tcp4` and `tcp6` listener declarations accept hostnames without
+performing DNS in the parser or provision-only validation. Candidate preparation
+resolves each name once on its own bounded blocking lane, then seals the selected
+IPv4/IPv6 answers. Like Go's TCP listen selection, unqualified TCP selects the
+first IPv4 answer when one exists; family-qualified declarations select their
+corresponding family. This is one selected endpoint, not all-answer fanout.
+Independent names use a rolling set of at most the lane's admitted concurrency;
+a slow name does not prevent sibling lookups from starting. The complete
+snapshot is required before publication. On failure the batch cancels its
+bounded async waiters while actual libc jobs retain their own lifetime.
+Automatic redirects, configured ACME challenge binds and TCP/HTTP3 UDP pairing
+use that same immutable candidate snapshot. Reload performs fresh resolution;
+failed resolution or binding does not replace a working generation or its proof
+leases. A port-zero TCP/UDP pair uses the actual port from its own TCP socket.
+
+Original expanded network, original host spelling and individual port form the
+logical declaration identity. Repeated identical declarations are rejected;
+different aliases use distinct real `SO_REUSEPORT` owners even when DNS chooses
+the same physical address. Different port-zero aliases bind independently.
+Connection distribution is the operating system's behavior: Linux and macOS
+need not choose the same distribution. A connection stays with its accepted
+binding. Established H1/H2 connections under compatible policy look up current routes
+by stable declaration while retaining the actual old local address, including
+when DNS moves.
+Fresh candidate resolution and this DNS-move handoff are verified native
+behavior, not a claim of Go reload equivalence. HTTP/3 keeps its existing
+transport retirement policy. The existing TLS identity/client-authentication
+policy checks still reject
+incompatible old connections; a changed declaration follows normal retirement.
+
+`StagedAddress::only_v6` is an additive public Rust source field. Bound capability
+records read the actual `IPV6_V6ONLY` socket option; IPv6 family alone is not a
+dual-stack claim. Dormant provision-only planning has no bound socket and cannot establish a
+live dual-stack claim. An IPv6-only wildcard cannot satisfy a
+configured IPv4 challenge bind: the broker acquires a real IPv4 proof owner and
+retains/releases that descriptor independently. Empty wildcard binds combine
+actual capabilities from both families: an existing single-family wildcard is
+borrowed and only the missing family is rented, without changing the original
+socket mode. Selected IPv6 scope IDs participate in proof coverage, so a
+link-local address on another interface cannot satisfy the requested scope.
+Existing provider implementers
+retain a conservative snapshot-only default for the new `resolve_bind_host`
+method: empty/numeric hosts work, and absent hostname snapshots fail without a
+second DNS lookup. Rust clients using `StagedAddress` literals must provide the
+new field.
+
+The listener lookup lane has at most min(available CPUs, 8) running calls and
+32 waiting calls, allocated from the common blocking headroom with compression
+headroom retained. This is bounded admission, not physical thread isolation.
+Known native lookup payloads are prepaid (16 KiB per lookup) and known immutable
+plan metadata shares a 64 MiB pool; the original input configuration, existing
+HTTP engine allocations and opaque libc/NSS allocations are not a whole-process
+RSS guarantee. A waiter has a 30-second resolution deadline and cancellation;
+an already-started libc call cannot be interrupted, so its actual worker keeps
+its slot, tracker and concrete credit until it returns. Shutdown joins that real
+work. `listener_resolution_diagnostics()` exposes only read-only lane, tracked
+job and retained-credit observations. Plan/result graphs keep their allowances
+until their actual final owner retires, not merely until an await completes.
+
+This layer does not implement Unix, unixpacket, inherited-fd or large-range HTTP
+listeners, and does not add a configuration-level custom resolver plugin API. The existing
+1024-entry per-server range capacity remains explicit. Current native hostname
+runtime validation covers macOS and Linux ARM64; unsupported system resolver
+platforms return an explicit error. Private acceptance includes strict H1/H2/H3
+with IPv4/IPv6/port-zero aliases, same-policy DNS-move continuity, incompatible
+client-auth policy rejection, real HTTP-01/TLS-ALPN-01 signing through an isolated
+Go ACME CA, and cancellation while actual lookup workers remain blocked. Private
+fixtures, keys, helper programs and output do not belong in this repository.

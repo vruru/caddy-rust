@@ -67,6 +67,13 @@ pub use tls_executor::TlsHandshakeDiagnostics;
 mod h3;
 #[path = "http_runtime/lifecycle.rs"]
 mod lifecycle;
+#[path="http_runtime/listener_resolve.rs"]
+mod listener_resolve;
+#[path="http_runtime/listener_key.rs"]
+mod listener_key;
+use listener_key::ListenerKey;
+pub(crate) use listener_resolve::Plan as ListenerPlan;
+pub use listener_resolve::ListenerResolutionDiagnostics;
 #[path = "http_runtime/manual_certificates.rs"]
 mod manual_certificates;
 #[path="http_runtime/ssl_capture.rs"]
@@ -77,7 +84,7 @@ mod tls_cbc;
 mod certificate_choice;
 pub use lifecycle::{CommitOutcome, HttpStage, StagedAddress};
 #[path = "http_runtime/listener_lease.rs"]
-mod listener_lease;
+pub(crate) mod listener_lease;
 pub use listener_lease::{
     ChallengeBindingRequest, ChallengeListenerLease, ChallengeListenerProvider,
 };
@@ -209,6 +216,11 @@ pub struct HttpRuntime {
     control: Arc<lifecycle::Lifecycle>,
 }
 impl HttpRuntime {
+    /// Observe actual queued/running lookup ownership and retained plan/worker
+    /// allowances. A cancelled waiter cannot refund a live libc lookup worker.
+    pub fn listener_resolution_diagnostics(&self)->ListenerResolutionDiagnostics {
+        self.inner.resources.listener_dns.snapshot()
+    }
     pub fn metrics_registry(&self)->Arc<crate::metrics::Registry>{self.inner.current.load().metrics.clone()}
     pub fn metrics_process(&self)->Arc<crate::metrics::Process>{self.inner.metrics_process.clone()}
 
@@ -250,19 +262,25 @@ struct Inner {
     stopped: CancellationToken,
 }
 struct Generation {
+    listener_plan: Option<Arc<ListenerPlan>>,
+    business_bindings: HashMap<Arc<crate::http_config::ListenIdentity>,ListenerKey>,
     tracing: Option<Arc<crate::metrics::distributed_trace::provider::Provider>>,
     metrics: Arc<crate::metrics::Registry>,
     id: u64,
     proxy_cleanup: Option<proxy_cleanup::Reservation>,
     activity: Arc<BusinessGeneration>,
-    servers: HashMap<SocketAddr, Arc<ActiveServer>>,
-    quic: HashMap<SocketAddr, h3::Listener>,
-    retiring: HashMap<SocketAddr, std::sync::Weak<lifecycle::RetiringBinding>>,
+    servers: HashMap<ListenerKey, Arc<ActiveServer>>,
+    quic: HashMap<ListenerKey, h3::Listener>,
+    retiring: HashMap<ListenerKey, std::sync::Weak<lifecycle::RetiringBinding>>,
     drain: CancellationToken,
     managed_names: Vec<Vec<String>>,
 }
 impl Generation {
-    fn business(&self, key: &SocketAddr) -> Option<(Arc<ActiveServer>, Arc<BusinessGeneration>)> {
+    fn business(&self, key: &ListenerKey) -> Option<(Arc<ActiveServer>, Arc<BusinessGeneration>)> {
+        // A connection keeps its real old socket address, while publication
+        // selects policy by the unchanged original declaration. DNS movement
+        // must not turn a still-compatible accepted connection into a 404/503.
+        let key=self.business_bindings.get(&key.identity).unwrap_or(key);
         if let Some(server) = self.servers.get(key) {
             return self
                 .activity
@@ -277,6 +295,7 @@ impl Generation {
 }
 #[derive(Clone)]
 struct ActiveServer {
+    resolved_listener: Option<Arc<listener_resolve::ResolvedServer>>,
     tracing: Option<Arc<crate::metrics::distributed_trace::provider::Provider>>,
     acme_servers:Arc<HashMap<usize,Arc<crate::acme_server::Controller>>>,
     metrics: Arc<crate::metrics::Registry>,
@@ -382,6 +401,8 @@ impl HttpRuntime {
             BusinessGeneration::new(0, crate::http_config::HttpShutdownPolicy::default());
         let metrics_process=crate::metrics::Process::new();
         let initial = Generation {
+            listener_plan: None,
+            business_bindings: HashMap::new(),
             tracing: None,
             metrics: crate::metrics::Registry::initial(metrics_process.clone()),
             id: 0,
@@ -579,6 +600,7 @@ struct ServingMaterial<'a> {
     logging: Option<&'a Arc<crate::logging::Logging>>,
     tickets: Option<&'a crate::stek::TicketRuntime>,
     validate_only: bool,
+    listener_plan: Option<&'a Arc<ListenerPlan>>,
 }
 
 async fn prepare_servers(
@@ -589,14 +611,16 @@ async fn prepare_servers(
     challenges: &Arc<HotCertificateResolver>,
     material: ServingMaterial<'_>,
     resources: &Arc<resource_budget::Resources>,
-) -> Result<(HashMap<SocketAddr, Arc<ActiveServer>>, Vec<Vec<String>>, Arc<crate::metrics::Registry>, Option<Arc<crate::metrics::distributed_trace::provider::Provider>>)> {
+) -> Result<(HashMap<ListenerKey, Arc<ActiveServer>>, Vec<Vec<String>>, Arc<crate::metrics::Registry>, Option<Arc<crate::metrics::distributed_trace::provider::Provider>>)> {
     let ServingMaterial {
         manual,
         provider,
         logging,
         tickets,
         validate_only,
+        listener_plan,
     } = material;
+    ensure!(validate_only || listener_plan.is_some(),"runtime listener snapshot missing");
     let logging_available = logging.is_some() || validate_only;
     let mut allowed=crate::metrics::allowed::Inputs::default();
     if config.metrics.is_some_and(|c|c.per_host&&!c.observe_catchall_hosts){
@@ -632,9 +656,13 @@ async fn prepare_servers(
     let mut retained_client_auth_bytes = 0usize;
     let mut actual_managed = std::collections::BTreeSet::new();
     let mut redirect_domains = automatic_redirects::Domains::default();
-    let mut output:HashMap<SocketAddr,Arc<ActiveServer>> = HashMap::new();
+    let mut output:HashMap<ListenerKey,Arc<ActiveServer>> = HashMap::new();
     resources.proxy_hosts.prune();
-    for server in &config.servers {
+    for (server_index,server) in config.servers.iter().enumerate() {
+        let resolved_listener=listener_plan.map(|plan|plan.servers[server_index].clone());
+        let validation_keys;
+        let addresses=if let Some(resolved)=&resolved_listener {resolved.addresses.as_slice()}else{validation_keys=server.listen_specs.iter().filter_map(|spec|spec.numeric().map(|(address,_)|ListenerKey{address,identity:spec.identity().clone()})).collect::<Vec<_>>();validation_keys.as_slice()};
+        let only_v6=|key:&ListenerKey|resolved_listener.as_ref().map_or_else(||server.listen_v6_only.contains(&key.address),|plan|plan.v6_only.contains(key));
         // One generation owns one manual resolver. Tags are per-server
         // identity filters, not separate key/OCSP snapshots.
         let loaded_names = manual
@@ -671,7 +699,7 @@ async fn prepare_servers(
                         .any(|s| s.eq_ignore_ascii_case(name))
                 })
                 .collect::<Vec<_>>();
-            redirect_domains.record(&names, &server.listen, config.https_port);
+            redirect_domains.record(&names, addresses, &only_v6, config.https_port);
         }
 
         let policies = tls_policies::prepare(
@@ -728,6 +756,7 @@ async fn prepare_servers(
         .map_err(|_| anyhow::anyhow!("candidate proxy provisioning task failed"))??;
         for client in clients.values(){metrics.upstreams(client.metric_probes());}
         let active = ActiveServer {
+            resolved_listener: resolved_listener.clone(),
             tracing: tracing.clone(),
             acme_servers:prepare_acme_handlers(server,provider,validate_only,resources).await?,
             metrics: metrics.clone(),
@@ -741,15 +770,15 @@ async fn prepare_servers(
             tickets: tickets.cloned().unwrap_or_default(),
             clients: Arc::new(clients),
         };
-        for addr in &server.listen {
+        for addr in addresses {
             if let Some(previous)=output.get(addr) {
-                ensure!(previous.plan.listen_v6_only.contains(addr)==server.listen_v6_only.contains(addr),
+                ensure!(previous.only_v6(addr)==only_v6(addr),
                     "HTTP listener address has conflicting IPv6-only modes");
             }
-            output.insert(*addr, Arc::new(active.clone()));
+            output.insert(addr.clone(), Arc::new(active.clone()));
         }
     }
-    for (address, mut routes) in redirect_domains.routes(config.http_port, config.https_port) {
+    for ((address,only_v6), mut routes) in redirect_domains.routes(config.http_port, config.https_port) {
         if let Some(existing) = output.get(&address).cloned() {
             ensure!(
                 !existing.plan.tls,
@@ -809,6 +838,7 @@ async fn prepare_servers(
                 Arc::new(ActiveServer {
                     tracing: tracing.clone(),
                     acme_servers:existing.acme_servers.clone(),
+                    resolved_listener: existing.resolved_listener.clone(),
                     metrics: metrics.clone(),
                     events: config.events.clone(),
                     logging: logging.cloned(),
@@ -828,8 +858,9 @@ async fn prepare_servers(
                 access_logs: None,
                 named_routes: Default::default(),
                 header_aliases: Default::default(),
-                listen: vec![address],
-                listen_v6_only: Default::default(),
+                listen_specs: vec![crate::http_config::ListenSpec::Numeric{address:address.address,only_v6,identity:address.identity.clone()}],
+                listen: vec![address.address],
+                listen_v6_only: if only_v6 {std::collections::HashSet::from([address.address])}else{Default::default()},
                 routes,
                 errors: Vec::new(),
                 tls: false,
@@ -861,6 +892,7 @@ async fn prepare_servers(
                     logging: logging.cloned(),
                     plan: Arc::new(plan),
                     acme_servers:Arc::new(HashMap::new()),
+                    resolved_listener: None,
                     tls: None,
                     resolver: None,
                     tls_policies: Vec::new(),
@@ -877,6 +909,11 @@ async fn prepare_servers(
         metrics,
         tracing,
     ))
+}
+impl ActiveServer {
+    fn only_v6(&self,address:&ListenerKey)->bool {
+        self.resolved_listener.as_ref().map_or_else(||self.plan.listen_v6_only.contains(&address.address),|plan|plan.v6_only.contains(address))
+    }
 }
 fn plain_transport_compatible(old: &ServerConfig, next: &ServerConfig) -> bool {
     !old.tls
@@ -925,7 +962,7 @@ fn dns_covers(pattern: &str, name: &str) -> bool {
             .is_some_and(|(_, rest)| rest.eq_ignore_ascii_case(suffix))
     })
 }
-fn bind_listener(address: SocketAddr, only_v6: bool) -> Result<TcpListener> {
+fn bind_listener(address: SocketAddr, only_v6: bool) -> Result<(TcpListener,bool)> {
     let domain = if address.is_ipv6() {
         socket2::Domain::IPV6
     } else {
@@ -933,13 +970,16 @@ fn bind_listener(address: SocketAddr, only_v6: bool) -> Result<TcpListener> {
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
     socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
     if address.is_ipv6() && (only_v6 || address.ip().is_unspecified()) {
         socket.set_only_v6(only_v6)?;
     }
     socket.set_nonblocking(true)?;
     socket.bind(&address.into())?;
     socket.listen(1024)?;
-    Ok(TcpListener::from_std(socket.into())?)
+    let actual_only_v6=if address.is_ipv6(){socket.only_v6()?}else{false};
+    Ok((TcpListener::from_std(socket.into())?,actual_only_v6))
 }
 
 fn certificate_names(chain: &[u8]) -> Result<Vec<String>> {
@@ -997,7 +1037,7 @@ fn proof_tls_config(challenges: Arc<HotCertificateResolver>) -> Result<Arc<rustl
 async fn accept_loop(
     inner: Arc<Inner>,
     socket: lifecycle::ListenerSocket,
-    key: SocketAddr,
+    key: ListenerKey,
     cancel: CancellationToken,
     fallback: Arc<ArcSwap<ProofListener>>,
 ) {
@@ -1030,7 +1070,7 @@ async fn accept_loop(
             .filter(|server| h3::tcp_enabled(server));
         let canonical = crate::net_address::canonical_socket;
         let peer = canonical(peer);
-        let local = canonical(stream.local_addr().unwrap_or(key));
+        let local = canonical(stream.local_addr().unwrap_or(key.address));
         let _ = stream.set_nodelay(true);
         let task_inner = inner.clone();
         let class = if server.is_some() {
@@ -1047,6 +1087,7 @@ async fn accept_loop(
         let admission = stream.admission();
         let eviction = stream.eviction_token();
         if let Some(server) = server {
+            let key=key.clone();
             spawn_admitted(&inner, eviction, Some((cancel.clone(), admission.clone())), async move {
                 let (mut peer,mut local)=(crate::net_address::NetAddress::from(peer),crate::net_address::NetAddress::from(local));
                 let accepted_listener_stack=server.plan.listener_stack.clone();
@@ -1071,7 +1112,7 @@ async fn accept_loop(
                         &task_inner,
                         stream,
                         admission.clone(),
-                        key,
+                        key.clone(),
                         deadline,
                         server.plan.redirect_after_tls.is_none(),
                         (peer.clone(), local.clone()),
@@ -1244,7 +1285,7 @@ where
 struct ConnectionView {
     listener_stack:Arc<listener_stack::Stack>,
     admission: std::sync::Weak<connection_budget::Admission>,
-    key: SocketAddr,
+    key: ListenerKey,
     server: Arc<ActiveServer>,
     negotiated_tls_h2: Option<bool>,
     tls_log: Option<Arc<access_log::Tls>>,
@@ -1290,6 +1331,7 @@ async fn serve_connection<I>(
         let client_cert_cache = client_cert_cache.clone();
         let peer=peer.clone();let local=local.clone();let listener_stack=listener_stack.clone();
         let admission = admission.clone();
+        let key=key.clone();
         async move {
             if !service_entered {
                 return Err(h2::Error::from(h2::Reason::CANCEL));

@@ -2,6 +2,7 @@
 //! before activation. The raw configuration may contain secrets; do not Debug it.
 #[path = "http_config/listeners.rs"]
 mod listeners;
+pub(crate) use listeners::{ListenSpec,ListenIdentity,Family as ListenerFamily};
 mod header_ops;
 pub(crate) mod header_compile;
 #[path = "http_config/helpers.rs"]
@@ -55,6 +56,9 @@ pub(crate) struct ServerConfig {
     pub(crate) access_logs: Option<AccessLogConfig>,
     pub(crate) header_aliases: HeaderAliases,
     pub(crate) listener_stack:Arc<crate::http_runtime::listener_stack::Stack>,
+    /// Original declarations are authoritative for ports and hostname identity.
+    pub(crate) listen_specs: Vec<ListenSpec>,
+    /// Numeric subset for provision-only validation; stage uses its sealed plan.
     pub(crate) listen: Vec<SocketAddr>,
     pub(crate) listen_v6_only: std::collections::HashSet<SocketAddr>,
     pub(crate) routes: Vec<Route>,
@@ -290,7 +294,7 @@ pub fn validate_json(value: &Value) -> Result<PreparedConfig> {
     let mut servers = Vec::new();
     let mut compiled_tls_memory = 0usize;
     let mut regex_remaining = 64 << 20;
-    let mut listen = std::collections::HashSet::new();
+    let mut declared = std::collections::HashSet::new();
     for (name,value) in raw {
         let mut config = parse_server(value, &mut regex_remaining,http_port,https_port)?;
         config.name=Arc::from(if name.is_empty(){"UNKNOWN"}else{name.as_str()});
@@ -305,9 +309,8 @@ pub fn validate_json(value: &Value) -> Result<PreparedConfig> {
             compiled_tls_memory <= 64 << 20,
             "TLS regexp configuration memory budget exceeded"
         );
-        for addr in &config.listen {
-            ensure!(listen.insert(*addr), "duplicate listener address");
-        }
+        for spec in &config.listen_specs {ensure!(declared.insert(spec.clone()),"duplicate listener declaration");}
+        // Distinct declarations may intentionally share a physical TCP port.
         servers.push(Arc::new(config));
     }
     Ok(PreparedConfig {
@@ -414,16 +417,14 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
         .filter(|value| !value.is_null())
         .map(|value| access_logs(value, path))
         .transpose()?;
-    let mut listen = Vec::new();
-    let mut listen_v6_only = std::collections::HashSet::new();
+    let mut listen_specs = Vec::new();
     for raw in strings(required(m, "listen")?, path)? {
         let raw = helpers::replace(&raw, true, helpers::global_lookup)?;
-        listeners::append(&raw,&mut listen,&mut listen_v6_only)?;
+        listeners::append_specs(&raw,&mut listen_specs)?;
     }
-    ensure!(
-        !listen.is_empty() && listen.len() <= 1024,
-        "listener count invalid"
-    );
+    ensure!(!listen_specs.is_empty()&&listen_specs.len()<=1024,"listener count invalid");
+    let mut listen=Vec::new();let mut listen_v6_only=std::collections::HashSet::new();
+    for spec in &listen_specs {if let Some((address,only_v6))=spec.numeric(){listen.push(address);if only_v6{listen_v6_only.insert(address);}}}
     let policies = m
         .get("tls_connection_policies")
         .filter(|value| !value.is_null());
@@ -525,14 +526,14 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
     }
     let routes = parse_routes(m.get("routes"), 0, false, regex_remaining)?;
     let inferred = !disabled
-        && listen.iter().any(|a| a.port() != http_port)
+        && listen_specs.iter().any(|a| a.port() != http_port)
         && route_names(&routes)
             .iter()
             .any(|n| !skip_redirect.iter().any(|s| s.eq_ignore_ascii_case(n)));
     let tls = policies
         .and_then(Value::as_array)
         .is_some_and(|policies| !policies.is_empty())
-        || (!disabled && listen.iter().any(|a| a.port() == https_port))
+        || (!disabled && listen_specs.iter().any(|a| a.port() == https_port))
         || inferred;
     let protocols = m
         .get("protocols")
@@ -595,6 +596,7 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
         name: Arc::from("UNKNOWN"),
         access_logs,
         header_aliases,
+        listen_specs,
         listen,
         listen_v6_only,
         routes,

@@ -14,7 +14,7 @@ pub(super) struct SolverBroker {
 struct BindingSettings {
     directory: String,
     bind_host: String,
-    bind_ip: Option<std::net::IpAddr>,
+    bind_address: Option<std::net::SocketAddr>,
     http_port: u16,
     alpn_port: u16,
 }
@@ -35,17 +35,11 @@ impl SolverBroker {
                     directories.insert(directory.clone()),
                     "duplicate challenge issuer directory requires separate policy"
                 );
-                let bind_ip = if settings.bind_host.is_empty() {
-                    None
-                } else {
-                    Some(settings.bind_host.parse().map_err(|_| {
-                        anyhow!("hostname challenge bindings require resolver support")
-                    })?)
-                };
+                let bind_address=if let Some(provider)=&provider {provider.resolve_bind_host(&settings.bind_host)?}else{crate::http_runtime::listener_lease::numeric_bind_host(&settings.bind_host)?};
                 Ok(BindingSettings {
                     directory,
                     bind_host: settings.bind_host,
-                    bind_ip,
+                    bind_address,
                     http_port: settings.http_port.unwrap_or(80),
                     alpn_port: settings.alpn_port.unwrap_or(443),
                 })
@@ -84,14 +78,14 @@ impl SolverBroker {
             ChallengeType::Http01 => settings.http_port,
             ChallengeType::TlsAlpn01 => settings.alpn_port,
         };
-        let capable = |binding: &StagedAddress| serves(binding, kind, port, settings.bind_ip);
-        if self.staged.iter().any(&capable) {
+        let capable=|bindings:&[StagedAddress]|coverage(bindings.iter(),kind,port,settings.bind_address);
+        if capable(&self.staged) {
             return Ok(());
         }
         let mut leases = tokio::select! { biased; _ = cancel.cancelled() => return Err(anyhow!("challenge listener preparation cancelled")), leases = self.leases.lock() => leases };
         if leases
             .iter()
-            .any(|lease| lease.addresses().iter().any(&capable))
+            .any(|lease| capable(lease.addresses()))
         {
             return Ok(());
         }
@@ -109,13 +103,9 @@ impl SolverBroker {
             tls_alpn_port: (kind == ChallengeType::TlsAlpn01).then_some(port),
         };
         let lease = provider.acquire(vec![request], cancel.clone()).await?;
-        if !lease.addresses().iter().any(|binding| {
-            capable(binding)
-                && binding.declared.port() == port
-                && settings
-                    .bind_ip
-                    .is_none_or(|ip| binding.declared.ip() == ip)
-        }) {
+        let valid=lease.addresses().iter().filter(|binding|binding.declared.port()==port
+            && settings.bind_address.is_none_or(|mut requested| {requested.set_port(port);binding.declared==requested}));
+        if !coverage(valid,kind,port,settings.bind_address) {
             let _ = lease.release().await;
             return Err(anyhow!(
                 "challenge listener provider returned an invalid proof"
@@ -146,11 +136,21 @@ impl SolverBroker {
     }
 }
 
+// Empty host requests the OS wildcard convention. Aggregate real capabilities
+// across the borrowed IPv4 and IPv6 owners; one v6-only socket is not dual-stack.
+fn coverage<'a>(bindings:impl Iterator<Item=&'a StagedAddress>+Clone,kind:ChallengeType,port:u16,bind:Option<std::net::SocketAddr>)->bool {
+    if bind.is_some(){return bindings.clone().any(|binding|serves(binding,kind,port,bind));}
+    let ipv4=std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(),port);
+    let ipv6=std::net::SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(),port);
+    bindings.clone().any(|binding|serves(binding,kind,port,Some(ipv4)))
+        && bindings.clone().any(|binding|serves(binding,kind,port,Some(ipv6)))
+}
+
 fn serves(
     binding: &StagedAddress,
     kind: ChallengeType,
     port: u16,
-    bind: Option<std::net::IpAddr>,
+    bind: Option<std::net::SocketAddr>,
 ) -> bool {
     let protocol = match kind {
         ChallengeType::Http01 => binding.http01,
@@ -159,13 +159,18 @@ fn serves(
     protocol
         && binding.actual.port() == port
         && bind.is_none_or(|requested| {
-            let actual = binding.actual.ip();
-            actual == requested
-                || match actual {
+            let actual = binding.actual;
+            let scope_matches=match (actual,requested) {
+                (std::net::SocketAddr::V6(a),std::net::SocketAddr::V6(r))=>
+                    r.scope_id()==0 || a.scope_id()==r.scope_id()
+                        || a.ip().is_unspecified()&&a.scope_id()==0,
+                _=>true,
+            };
+            scope_matches && (actual.ip() == requested.ip()
+                || match actual.ip() {
                     std::net::IpAddr::V4(ip) => ip.is_unspecified() && requested.is_ipv4(),
-                    // The native listener provider explicitly creates IPv6 wildcard
-                    // sockets with only_v6(false). Its proof contract is dual-stack.
-                    std::net::IpAddr::V6(ip) => ip.is_unspecified(),
-                }
+                    std::net::IpAddr::V6(ip) => ip.is_unspecified()
+                        && (!binding.only_v6 || requested.is_ipv6()),
+                })
         })
 }
