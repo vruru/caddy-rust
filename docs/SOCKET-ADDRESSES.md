@@ -1,9 +1,14 @@
 # Socket address identity
 
-Accepted TCP and QUIC addresses retain the operating system's IPv6 scope and
-flow information. Only IPv4-mapped IPv6 endpoints are canonicalized to IPv4.
+Socket addresses supplied to the HTTP runtime retain their IPv6 scope and flow
+information. Only IPv4-mapped IPv6 endpoints are canonicalized to IPv4.
 The connection's original local endpoint remains an actual socket fact across
 configuration reloads and listener hostname changes.
+
+QUIC destination metadata containing only an IP does not overwrite the more
+complete socket address of a matching fixed listener. With an unspecified UDP
+binding, the current provider exposes the packet's destination IP; an interface
+index is not inferred or fabricated from the remote endpoint.
 
 Address and host placeholders, template connection addresses and FastCGI
 address output retain a numeric `%scope_id` on scoped IPv6 endpoints. Numeric

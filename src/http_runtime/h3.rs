@@ -558,10 +558,15 @@ async fn accept_loop(
         };
         let peer = incoming.remote_address();
         let local_ip = incoming.local_ip();
-        let local = SocketAddr::new(
-            local_ip.unwrap_or(binding.actual.ip()),
-            binding.actual.port(),
-        );
+        // The packet metadata exposes only an IP here. A fixed listener with
+        // that same destination still owns the complete scoped socket address.
+        // Do not rebuild it and discard its real interface/flow information.
+        let local = match local_ip {
+            Some(ip) if ip != binding.actual.ip() => {
+                SocketAddr::new(ip, binding.actual.port())
+            }
+            _ => binding.actual,
+        };
         let runtime = inner.clone();
         let key=key.clone();
         inner.tasks.spawn(async move {
