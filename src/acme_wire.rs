@@ -5,6 +5,8 @@
 #[path = "acme_wire/signer.rs"]
 mod signer;
 mod network_proxy;
+mod client_build;
+pub(crate) use client_build::ClientOwner;
 pub(crate) mod directory_url;
 mod order_parameters;
 mod chain_preference;
@@ -195,7 +197,7 @@ struct WireInner {
     allowed_http_origin: Option<String>,
     nonces: Mutex<Vec<String>>,
     // Last owner: no early refund when an AccountSession outlives its manager.
-    issuer_values_credit:Option<Arc<chain_memory::Lease>>,
+    _issuer_owner:ClientOwner,
 }
 
 pub struct AccountSession {
@@ -231,9 +233,9 @@ impl AcmeWire {
         Self::connect_with_resources(options,cpu,shared_chain_memory(),cancel).await
     }
     pub(crate) async fn connect_with_resources(options:WireOptions,cpu:Arc<Semaphore>,chain_memory:Arc<ChainMemoryPools>,cancel:&CancellationToken)->Result<Self> {
-        Self::connect_with_client_tls_scope(options,cpu,chain_memory,#[cfg(feature="native-run")] None,cancel).await
+        Self::connect_with_client_tls_scope(options,cpu,chain_memory,#[cfg(feature="native-run")] None,ClientOwner::default(),cancel).await
     }
-    pub(crate) async fn connect_with_client_tls_scope(options:WireOptions,cpu:Arc<Semaphore>,chain_memory:Arc<ChainMemoryPools>,#[cfg(feature="native-run")] scope:Option<Arc<crate::outgoing_tls::Scope>>,cancel:&CancellationToken)->Result<Self> {
+    pub(crate) async fn connect_with_client_tls_scope(options:WireOptions,cpu:Arc<Semaphore>,chain_memory:Arc<ChainMemoryPools>,#[cfg(feature="native-run")] scope:Option<Arc<crate::outgoing_tls::Scope>>,owner:ClientOwner,cancel:&CancellationToken)->Result<Self> {
         ensure!(
             !options.request_timeout.is_zero()
                 && options.request_timeout <= Duration::from_secs(3600),
@@ -262,26 +264,10 @@ impl AcmeWire {
         }
         validate_url(&directory_url, &trusted, options.allow_insecure_loopback, allowed_http_origin.as_deref())?;
         if let Some(proxy)=&options.network_proxy {proxy.validate()?;}
-        let client = crate::cert_cpu::run(cpu.clone(),cancel.clone(),move || {
-        let mut builder = reqwest::Client::builder()
-            .tls_crypto_provider(crate::crypto::client_provider())
-            .rustls_certificate_verifier_wrapper(crate::cert_uri_san::wrap_server_verifier)
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(options.request_timeout)
-            .user_agent("Caddy-Rust-ACME/0.1");
-        if let Some(proxy)=options.network_proxy {builder=proxy.apply(builder)?;}
-        for pem in options.extra_ca_pem {
-            ensure!(pem.len() <= 1024 * 1024, "ACME trust root exceeds bounds");
-            builder = append_trusted_root_pem(builder, &pem)?;
-        }
-        #[cfg(feature="native-run")]
-        if let Some(scope)=scope{builder=builder.connector_layer(scope.layer()?);}
-        builder
-            .build()
-            .map_err(|_| anyhow!("ACME client construction failed"))
-        }).await?;
-        let response = send(&client, Method::GET, directory_url.clone(), None, cancel).await?;
+        let allow_loopback=options.allow_insecure_loopback;
+        let input=client_build::Input::new(options,#[cfg(feature="native-run")] scope,owner);
+        let built=crate::cert_cpu::run(cpu.clone(),cancel.clone(),move||input.build()).await?;
+        let response = send(&built.client, Method::GET, directory_url.clone(), None, cancel).await?;
         check_status(&response)?;
         let body=response.body;
         let directory: Directory = crate::cert_cpu::run(cpu.clone(),cancel.clone(),move || serde_json::from_slice(&body)
@@ -298,29 +284,24 @@ impl AcmeWire {
             validate_url(
                 &Url::parse(endpoint).map_err(|_| anyhow!("invalid ACME directory endpoint"))?,
                 &trusted,
-                options.allow_insecure_loopback,
+                allow_loopback,
                 allowed_http_origin.as_deref(),
             )?;
         }
         Ok(Self {
             inner: Arc::new(WireInner {
-                client,
+                client:built.client,
                 cpu,
                 chain_memory,
                 directory_url,
                 directory,
                 trusted,
-                allow_loopback: options.allow_insecure_loopback,
+                allow_loopback,
                 allowed_http_origin,
                 nonces: Mutex::new(Vec::new()),
-                issuer_values_credit:None,
+                _issuer_owner:built.owner,
             }),
         })
-    }
-
-    pub(crate) fn with_issuer_values_credit(mut self,credit:Option<Arc<chain_memory::Lease>>)->Result<Self>{
-        Arc::get_mut(&mut self.inner).ok_or_else(||anyhow!("ACME wire already shared"))?.issuer_values_credit=credit;
-        Ok(self)
     }
 
     /// Original Caddy's ZeroSSL convenience registration, scoped to its fixed

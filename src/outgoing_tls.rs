@@ -293,14 +293,15 @@ impl Scope {
         Ok(ConnectLayer {
             scope: self.clone(),
             executor,
+            issuer_owner:Default::default(),
         })
     }
     pub(crate) fn connection(self: &Arc<Self>, bytes: usize) -> Result<ConnectionLease> {
         // Every scope child pays this checked minimum, including callers that
         // have not entered the executor queue. Parent Vec bounds rely on it.
-        Ok(ConnectionLease(self.admit(metadata_sum(&[bytes, minimum_connection_loan()?])?)?))
+        Ok(ConnectionLease(self.admit(metadata_sum(&[bytes, minimum_connection_loan()?])?,Default::default())?))
     }
-    fn admit(self: &Arc<Self>, bytes: usize) -> Result<Arc<Life>> {
+    fn admit(self: &Arc<Self>, bytes: usize,issuer_owner:crate::acme_wire::ClientOwner) -> Result<Arc<Life>> {
         let loan = self.master.loan(bytes)?;
         let (global, local) = {
             let master = self
@@ -321,6 +322,7 @@ impl Scope {
             scope: self.clone(),
             input: loan,
             extra: Mutex::new(None),
+            _issuer_owner:issuer_owner,
             _global: global,
             _local: local,
         }))
@@ -331,6 +333,7 @@ struct Life {
     scope: Arc<Scope>,
     input: Loan,
     extra: Mutex<Option<Loan>>,
+    _issuer_owner:crate::acme_wire::ClientOwner,
     _global: TaskTrackerToken,
     _local: TaskTrackerToken,
 }
@@ -421,6 +424,10 @@ impl Lifetime {
 pub(crate) struct ConnectLayer {
     scope: Arc<Scope>,
     executor: Arc<TlsExecutor>,
+    issuer_owner:crate::acme_wire::ClientOwner,
+}
+impl ConnectLayer {
+    pub(crate) fn with_issuer_owner(mut self,owner:crate::acme_wire::ClientOwner)->Self {self.issuer_owner=owner;self}
 }
 impl<S> Layer<S> for ConnectLayer {
     type Service = ConnectService<S>;
@@ -429,6 +436,7 @@ impl<S> Layer<S> for ConnectLayer {
             inner,
             scope: self.scope.clone(),
             executor: self.executor.clone(),
+            issuer_owner:self.issuer_owner.clone(),
         }
     }
 }
@@ -437,6 +445,7 @@ pub(crate) struct ConnectService<S> {
     inner: S,
     scope: Arc<Scope>,
     executor: Arc<TlsExecutor>,
+    issuer_owner:crate::acme_wire::ClientOwner,
 }
 struct Call<S, R> {
     service: Option<S>,
@@ -511,7 +520,7 @@ where
             3,
             128,
         ]);
-        let life = match input.and_then(|bytes| self.scope.admit(bytes)) {
+        let life = match input.and_then(|bytes| self.scope.admit(bytes,self.issuer_owner.clone())) {
             Ok(life) => life,
             Err(error) => {
                 return futures_util::future::Either::Left(std::future::ready(Err(Box::new(

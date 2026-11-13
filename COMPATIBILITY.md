@@ -227,7 +227,15 @@ than rereading current environment or file contents.
 Expanded fields have a one-MiB limit. Their temporary preparation, resident
 values and actual configured-string copies use separate allowances. A shared
 eight-MiB issuer-control pool spans generations; copies remain charged through
-manager, challenge broker, wire and escaped account-session owners. Exhaustion
+manager, challenge broker, wire and escaped account-session owners. Client
+construction receives these owners before entering the CPU queue. Its complete
+input and unconsumed output retain both configured-value and existing material
+allowances after the waiting caller is dropped. Native connection services,
+queued/running calls, returned IO and retained source errors carry the same
+concrete loan owners; they never retain a manager or its cancellation authority.
+Their extra wrapper layout is included in the existing connection admission.
+This does not add a per-issuer physical-retirement receipt or claim ownership of
+an untracked system resolver's opaque allocations. Exhaustion
 rejects preparation or group admission instead of silently using an unexpanded
 value or a different CA. This controls configured values and their bounded
 copies, not all ACME/TLS allocations or process RSS. Transport sources retain
