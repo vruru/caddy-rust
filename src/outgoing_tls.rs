@@ -297,9 +297,15 @@ impl Scope {
         })
     }
     pub(crate) fn connection(self: &Arc<Self>, bytes: usize) -> Result<ConnectionLease> {
+        self.connection_with_issuer_owner(bytes, Default::default())
+    }
+    pub(crate) fn client_bytes(&self, bytes: usize) -> Result<ConnectionBytes> {
+        Ok(ConnectionBytes { loan: self.master.loan(bytes)?, master: self.master.clone() })
+    }
+    pub(crate) fn connection_with_issuer_owner(self: &Arc<Self>, bytes: usize, owner: crate::acme_wire::ClientOwner) -> Result<ConnectionLease> {
         // Every scope child pays this checked minimum, including callers that
         // have not entered the executor queue. Parent Vec bounds rely on it.
-        Ok(ConnectionLease(self.admit(metadata_sum(&[bytes, minimum_connection_loan()?])?,Default::default())?))
+        Ok(ConnectionLease(self.admit(metadata_sum(&[bytes, minimum_connection_loan()?])?,owner)?))
     }
     fn admit(self: &Arc<Self>, bytes: usize,issuer_owner:crate::acme_wire::ClientOwner) -> Result<Arc<Life>> {
         let loan = self.master.loan(bytes)?;

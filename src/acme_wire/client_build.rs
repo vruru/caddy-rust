@@ -36,7 +36,11 @@ impl Input {
             builder=append_trusted_root_pem(builder,&pem)?;
         }
         #[cfg(feature="native-run")]
-        if let Some(scope)=self.scope.take(){builder=builder.connector_layer(scope.layer()?.with_issuer_owner(self.owner.clone()));}
+        if let Some(scope)=self.scope.take(){
+            #[cfg(unix)]
+            {builder=builder.dns_resolver(crate::http_runtime::acme_client_dns::Resolver::new(scope.clone(),self.owner.clone())?);}
+            builder=builder.connector_layer(scope.layer()?.with_issuer_owner(self.owner.clone()));
+        }
         let client=builder.build().map_err(|_|anyhow!("ACME client construction failed"))?;
         let built=Built{client,owner:std::mem::take(&mut self.owner)};
         Ok(built)

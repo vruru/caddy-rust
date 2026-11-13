@@ -1,4 +1,4 @@
-//! Metrics-only owned system DNS. Rust buffers are admitted before allocation;
+//! Scoped owned system DNS. Rust buffers are admitted before allocation;
 //! libc/NSS allocations stay provider-owned, not a claimed Rust/RSS allowance.
 use super::http_dial::{Family, FamilyAddrs};
 use crate::outgoing_tls::{ConnectionBytes, ConnectionLease};
@@ -10,10 +10,24 @@ pub(super) struct Resident {
     _lease: ConnectionLease,
 }
 struct Job {
-    name: Name,
+    name: SystemName,
     family: Family,
     bytes: Option<ConnectionBytes>,
     lease: Option<ConnectionLease>,
+}
+enum SystemName {
+    Metrics(Name),
+    #[cfg(unix)]
+    Acme(reqwest::dns::Name),
+}
+impl SystemName {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Metrics(name) => name.as_str(),
+            #[cfg(unix)]
+            Self::Acme(name) => name.as_str(),
+        }
+    }
 }
 impl Drop for Job {
     fn drop(&mut self) {}
@@ -63,6 +77,13 @@ pub(super) async fn lookup(
     family: Family,
     lease: ConnectionLease,
 ) -> io::Result<FamilyAddrs> {
+    lookup_inner(SystemName::Metrics(name), family, lease).await
+}
+#[cfg(unix)]
+pub(super) async fn lookup_reqwest(name: reqwest::dns::Name, lease: ConnectionLease) -> io::Result<FamilyAddrs> {
+    lookup_inner(SystemName::Acme(name), Family::Any, lease).await
+}
+async fn lookup_inner(name: SystemName, family: Family, lease: ConnectionLease) -> io::Result<FamilyAddrs> {
     let metadata = std::mem::size_of::<Job>()
         .checked_add(std::mem::size_of::<Output>())
         .and_then(|n| n.checked_add(name.as_str().len() + 1))

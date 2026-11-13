@@ -182,6 +182,8 @@ mod upstream_tls;
 pub(crate) use upstream_tls::{ca_source_client_tls,ca_source_prepared_tls};
 pub(crate) mod metrics_client;
 mod metrics_dns;
+#[cfg(unix)]
+pub(crate) mod acme_client_dns;
 pub use upstream_tls::NativeTrustDiagnostics;
 
 use crate::{

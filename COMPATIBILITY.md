@@ -211,6 +211,18 @@ Explicit proxy policy remains effective when the HTTP app fills in ACME challeng
 
 Proxy URL global placeholders are resolved once, on the existing bounded CPU lane, when each independent ACME HTTP client is constructed. Business-request placeholders have no ACME request context. The expanded URL must retain a valid host; errors cannot silently select a direct connection. URLs are limited to 64 KiB, shared across cloned issuer configurations, and credentials are not included in proxy validation diagnostics. Existing ACME request/body limits, CA concurrency budgets, storage leases, certificate/key revocation gates and generation cancellation continue to apply. Proxy routing covers account, order, authorization, certificate and ARI requests, plus the same client's automatic ZeroSSL EAB request; it does not replace the separate OCSP transport policy.
 
+On native macOS/Linux scoped ACME clients, local system DNS reuses the owned
+lookup implementation used by observability. Configured-value and construction
+loans travel with the actual blocking lookup, unconsumed address iterator and
+retained error. Abandoning the request cannot refund a still-running lookup.
+The resolver moves the original host name, preserves system address order and
+IPv6 scope/flow facts, and prepays new Rust wrapper/buffer allocations from the
+existing certificate connection pool. It adds no pool or concurrency override;
+libc/NSS and runtime heaps are not a process-memory bound. Scope shutdown still
+waits for actual lookup owners, including retained errors. This is not a
+per-issuer physical-retirement receipt and does not enable timeout failover.
+Standalone unscoped clients and non-Unix targets keep their prior DNS path.
+
 
 ACME directory and configured global values
 ------------------------------------------
