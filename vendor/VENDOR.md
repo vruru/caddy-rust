@@ -250,5 +250,8 @@ preserves the first stopped disposition. Removed reader and driver wakers are
 invoked or destroyed after releasing the connection mutex. Generic RecvStream
 Drop keeps its original default stop code, while moving those removed wakers
 outside the mutex and avoiding a redundant driver wake when no state changed.
-Other Quinn waker paths retain their original behavior. No public feature,
+Explicit `RecvStream::stop` and generic `SendStream::drop` likewise retire
+removed operation wakers and invoke the driver waker after releasing the
+connection guard. Their original error, finish/reset, 0-RTT and stop-code
+semantics are retained. Other Quinn waker paths retain their original behavior. No public feature,
 dependency or package version is added for this operation.

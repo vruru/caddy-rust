@@ -343,24 +343,28 @@ impl tokio::io::AsyncWrite for SendStream {
 
 impl Drop for SendStream {
     fn drop(&mut self) {
-        let mut conn = self.conn.state.lock("SendStream::drop");
-
-        // clean up any previously registered wakers
-        conn.blocked_writers.remove(&self.stream);
-
-        if conn.error.is_some() || (self.is_0rtt && conn.check_0rtt().is_err()) {
-            return;
-        }
-        match conn.inner.send_stream(self.stream).finish() {
-            Ok(()) => conn.wake(),
-            Err(FinishError::Stopped(reason)) => {
-                if conn.inner.send_stream(self.stream).reset(reason).is_ok() {
-                    conn.wake();
+        // Arbitrary waker destructors and wake callbacks may reenter this
+        // connection. Keep them outside the guard, including during unwinding.
+        let writer;
+        let mut driver = None;
+        {
+            let mut conn = self.conn.state.lock("SendStream::drop");
+            writer = conn.blocked_writers.remove(&self.stream);
+            if conn.error.is_none() && !(self.is_0rtt && conn.check_0rtt().is_err()) {
+                match conn.inner.send_stream(self.stream).finish() {
+                    Ok(()) => driver = conn.take_driver_waker(),
+                    Err(FinishError::Stopped(reason)) => {
+                        if conn.inner.send_stream(self.stream).reset(reason).is_ok() {
+                            driver = conn.take_driver_waker();
+                        }
+                    }
+                    // Already finished or reset, which is fine.
+                    Err(FinishError::ClosedStream) => {}
                 }
             }
-            // Already finished or reset, which is fine.
-            Err(FinishError::ClosedStream) => {}
         }
+        drop(writer);
+        if let Some(driver) = driver { driver.wake(); }
     }
 }
 

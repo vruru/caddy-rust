@@ -270,16 +270,21 @@ impl RecvStream {
     /// Discards unread data and notifies the peer to stop transmitting. Once stopped, further
     /// attempts to operate on a stream will yield `ClosedStream` errors.
     pub fn stop(&mut self, error_code: VarInt) -> Result<(), ClosedStream> {
-        let mut conn = self.conn.state.lock("RecvStream::stop");
-        if self.is_0rtt && conn.check_0rtt().is_err() {
-            return Ok(());
+        let reader;
+        let driver;
+        {
+            let mut conn = self.conn.state.lock("RecvStream::stop");
+            if self.is_0rtt && conn.check_0rtt().is_err() {
+                return Ok(());
+            }
+            conn.inner.recv_stream(self.stream).stop(error_code)?;
+            driver = conn.take_driver_waker();
+            self.all_data_read = true;
+            // A cancelled read may leave an arbitrary waker to retire.
+            reader = conn.blocked_readers.remove(&self.stream);
         }
-        conn.inner.recv_stream(self.stream).stop(error_code)?;
-        conn.wake();
-        self.all_data_read = true;
-        // Clean up shared state that might be left over from a cancalled read
-        // operation, so `drop` doesn't have to
-        conn.blocked_readers.remove(&self.stream);
+        drop(reader);
+        if let Some(driver) = driver { driver.wake(); }
         Ok(())
     }
 

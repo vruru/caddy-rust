@@ -1458,7 +1458,11 @@ the added Incoming layout, but does not bound every channel, packet buffer or
 provider allocation. No synthetic receive stream or detached cleanup task is
 created. The opt-in Quinn receive-stop operation and generic RecvStream
 destructor release the connection mutex before invoking or destroying removed
-reader/driver wakers. Other Quinn polling and waker paths are not claimed to
+reader/driver wakers. Explicit receive-stream stop and generic send-stream
+destruction also release the connection guard before retiring operation
+wakers or waking its driver. Real pending read/write operations and a parked
+connection driver verify reentry, the original peer stop code, buffered send
+completion and continued progress on another stream. Other Quinn polling and waker paths are not claimed to
 have been converted by this change.
 
 Ordinary TLS scalar placeholders
