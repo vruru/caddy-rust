@@ -2,6 +2,8 @@
 //! replaced. Exact-wire certificate validation remains the caller's verifier.
 mod io;
 mod managed_request;
+mod owned_client;
+pub use owned_client::OwnedClientStream;
 mod managed_client;
 pub use managed_client::{ClientCredential,ClientCertificateRequest,ClientIdentityResolver,ManagedClientConfig,ManagedStream};
 mod raw;
@@ -394,6 +396,9 @@ pub struct ClientConfig {
     verifier: Arc<dyn ServerCertVerifier>,
     scope: Arc<VerificationScope>,
 }
+enum ClientSuites { Modern, GoDefault, CbcOnly }
+const CLIENT_AEAD: &str = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
+const CLIENT_CBC: &str = "ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA";
 impl ClientConfig {
     /// The supplied hook validates exact-wire certificates, path, name and time.
     /// OpenSSL authenticates handshake signatures with the explicit scheme list.
@@ -406,9 +411,38 @@ impl ClientConfig {
         groups: &str,
         identity: Option<(&[CertificateDer<'_>], &[u8])>,
     ) -> Result<Self, ErrorStack> {
+        Self::with_suites(verifier, policy, alpn, groups, identity, ClientSuites::Modern)
+    }
+    /// Go-default ECDHE suites, with AEAD preferred over its four CBC suites.
+    /// Does not enable static RSA exchange, CBC_SHA256, RC4 or 3DES.
+    pub fn go_compatible(
+        verifier: Arc<dyn ServerCertVerifier>, policy: Renegotiation,
+        alpn: &[Vec<u8>], groups: &str,
+        identity: Option<(&[CertificateDer<'_>], &[u8])>,
+    ) -> Result<Self, ErrorStack> {
+        Self::with_suites(verifier, policy, alpn, groups, identity, ClientSuites::GoDefault)
+    }
+    /// A TLS1.2-only compatibility candidate. Callers must fence retry before
+    /// any successful TLS negotiation or application request transmission.
+    pub fn cbc_fallback(
+        verifier: Arc<dyn ServerCertVerifier>, alpn: &[Vec<u8>], groups: &str,
+        identity: Option<(&[CertificateDer<'_>], &[u8])>,
+    ) -> Result<Self, ErrorStack> {
+        Self::with_suites(verifier, Renegotiation::Never, alpn, groups, identity, ClientSuites::CbcOnly)
+    }
+    fn with_suites(
+        verifier: Arc<dyn ServerCertVerifier>, policy: Renegotiation,
+        alpn: &[Vec<u8>], groups: &str,
+        identity: Option<(&[CertificateDer<'_>], &[u8])>, suites: ClientSuites,
+    ) -> Result<Self, ErrorStack> {
         guard_index()?;
         let mut b = SslContextBuilder::new(SslMethod::tls_client())?;
         b.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+        if matches!(suites, ClientSuites::CbcOnly) {
+            b.set_max_proto_version(Some(SslVersion::TLS1_2))?;
+            // A modern peer must be able to reject a forced protocol fallback.
+            b.set_mode(openssl::ssl::SslMode::SEND_FALLBACK_SCSV);
+        }
         // OpenSSL's public SSL_CTX_set_max_cert_list macro (control 51),
         // set before any connection can reassemble a Certificate message.
         unsafe {
@@ -418,7 +452,11 @@ impl ClientConfig {
         // Context-local level1 permits the Go-valid 1024-bit RSA case. Protocols,
         // suites/signatures and the existing native chain/name verifier stay explicit.
         b.set_security_level(1);
-        b.set_cipher_list("ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305")?;
+        match suites {
+            ClientSuites::Modern => b.set_cipher_list(CLIENT_AEAD)?,
+            ClientSuites::GoDefault => b.set_cipher_list(&format!("{CLIENT_AEAD}:{CLIENT_CBC}"))?,
+            ClientSuites::CbcOnly => b.set_cipher_list(CLIENT_CBC)?,
+        }
         b.set_sigalgs_list("ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384:ecdsa_secp521r1_sha512:rsa_pss_rsae_sha256:rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha256:rsa_pkcs1_sha384:rsa_pkcs1_sha512:ed25519")?;
         b.set_groups_list(groups)?;
         b.set_session_cache_mode(SslSessionCacheMode::OFF);
