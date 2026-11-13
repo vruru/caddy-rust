@@ -838,7 +838,7 @@ fn hex(c: u8) -> Option<u8> {
     }
 }
 
-fn cookie_value<'a>(headers: &'a HeaderMap, name: &[u8]) -> Option<&'a [u8]> {
+pub(super) fn cookie_value<'a>(headers: &'a HeaderMap, name: &[u8]) -> Option<&'a [u8]> {
     for field in headers.get_all(header::COOKIE).iter() {
         for pair in field.as_bytes().split(|&b| b == b';') {
             let pair = pair.trim_ascii();

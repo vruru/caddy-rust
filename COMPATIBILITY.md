@@ -1241,3 +1241,23 @@ capability. A default dual-family challenge lease reuses the actual IPv6
 listener and acquires a separate IPv4 listener, retaining/releasing each real
 descriptor independently, including listeners initially bound with port zero.
 This addition does not claim hostname, Unix or file-descriptor HTTP listeners.
+
+Template HTTP header accessors
+------------------------------
+
+`http.Header.Clone` is exposed on request headers, trailers, response headers
+and the Caddy response-header wrapper. It copies the current field table and
+values, retains the `http.Header` type and nil-map semantics, and does not add a
+Clone method to the separate `textproto.MIMEHeader` adapter. Copies prepay
+through the existing template-tree allowance before allocating; retained table
+capacity is included and resource failures remain errors. Control callbacks
+and budget admission run outside the header mutex. This named copy allowance
+is not a claim about total allocator or process memory.
+
+UserAgent and Referer accessors retain the actual wire bytes, including strings
+that are not UTF-8. Cookie lookup reuses the existing byte-oriented selection
+parser: an invalid cookie pair does not discard a later valid pair in the same
+header field. Nil typed maps use `type(nil)` for sharp Go formatting. Direct
+request-header Set/Add/Del calls remain rejected by templates, as in the
+baseline whose methods have zero return values; the Caddy RespHeader wrapper's
+supported mutation methods remain available.

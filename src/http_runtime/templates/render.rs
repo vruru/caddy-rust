@@ -194,7 +194,7 @@ impl Frame {
         fields.insert("Req".into(),self.request.value(false,&self.control)?);
         fields.insert("OriginalReq".into(),self.request.value(true,&self.control)?);
         fields.insert("Args".into(),Value::Slice(self.args.clone()));
-        fields.insert("RespHeader".into(),data::response_header(self.headers.clone()));
+        fields.insert("RespHeader".into(),data::response_header(self.headers.clone(),&self.control)?);
         let mut methods=BTreeMap::<Arc<str>,ValueFunc>::new();
         for name in ["Cookie","Host","RemoteIP","ClientIP"] {
             let request=self.request.clone();methods.insert(name.into(),Arc::new(move|args|request.method(name,args)));

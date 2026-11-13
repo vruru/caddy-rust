@@ -534,6 +534,7 @@ fn format_value_inner(out:&mut dyn FormatBuffer,arg:&Value,verb:char,mut spec:Fm
         let _map_host=if matches!(arg,Value::Object(o)if o.map_view.is_some()){out.host(arg)?}else{None};
         if let Some(map)=arg.map_snapshot()?{
             let sharp=verb=='v'&&spec.hash&&!erroring;
+            if sharp&&arg.is_go_nil(){out.push_str(arg.type_name());out.push_str("(nil)");return out.check();}
             if sharp{out.push_str(arg.type_name());out.push('{');}else{out.push_str("map[");}
             for(index,(key,value))in map.iter().enumerate(){
                 out.check()?;if index>0{out.push_str(if sharp{", "}else{" "});}

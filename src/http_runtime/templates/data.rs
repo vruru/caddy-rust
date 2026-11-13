@@ -1,4 +1,5 @@
 #[path="tls_values.rs"]mod tls_values;
+#[path="header_clone.rs"]mod header_clone;
 use super::{Fields,RenderResult,arity,error,lock,string,text};
 use gotmpl::{MapView,Object,Value,ValueFunc};
 use http::{HeaderMap,HeaderName,HeaderValue,Method,Uri,Version,header};
@@ -84,14 +85,12 @@ impl RequestData {
     pub(super) fn method(&self,name:&str,args:&[Value])->RenderResult<Value>{
         if name=="Cookie"{
             arity(args,1,1)?;let name=text(args,0)?;
-            for line in self.headers.get_all(header::COOKIE).iter(){
-                if let Ok(line)=line.to_str(){for part in line.split(';'){
-                    if let Some((key,value))=part.trim().split_once('='){
-                        if key.trim()==name {let value=value.trim();let value=value.strip_prefix('"').and_then(|s|s.strip_suffix('"')).unwrap_or(value);return Ok(string(value));}
-                    }
-                }}
-            }
-            return Ok(string(""));
+            // Invalid bytes invalidate only their cookie pair, not every
+            // later cookie in the same wire field. Reuse proxy selection's
+            // byte parser rather than converting an entire field to UTF-8.
+            let valid=!name.is_empty()&&name.bytes().all(|b|b.is_ascii_alphanumeric()||b"!#$%&'*+-.^_`|~".contains(&b));
+            let value=if valid{crate::http_runtime::proxy_policy::cookie_value(&self.headers,name.as_bytes())}else{None};
+            return Ok(Value::from_go_bytes(value.unwrap_or_default()));
         }
         arity(args,0,0)?;
         if name=="RemoteIP"{return Ok(Value::from_go_bytes(self.remote_ip.clone()));}
@@ -115,8 +114,8 @@ impl RequestData {
         let (major,minor,proto)=if original{(0,0,"")}else{match self.version{Version::HTTP_10=>(1,0,"HTTP/1.0"),Version::HTTP_2=>(2,0,"HTTP/2.0"),Version::HTTP_3=>(3,0,"HTTP/3.0"),_=>(1,1,"HTTP/1.1")}};
         let mut fields=Fields::from([
             ("Method".into(),string(method.as_str())),("URL".into(),request_url::cached(uri,self.url_origin.as_ref(),self.url_origin_form,control,url_cache,original,if original{None}else{self.rewrite.as_ref()})?),
-            ("Header".into(),header_with_protocol(Arc::new(Mutex::new(headers.clone())),false,if original{None}else{self.h2_protocol.clone()})),
-            ("Trailer".into(),header_value(Arc::new(Mutex::new(HeaderMap::new())),false)),
+            ("Header".into(),header_clone::value(Arc::new(Mutex::new(headers.clone())),false,if original{None}else{self.h2_protocol.clone()},original,control)?),
+            ("Trailer".into(),header_clone::value(Arc::new(Mutex::new(HeaderMap::new())),false,None,true,control)?),
             ("Host".into(),string(if original{""}else{&self.host})),("RemoteAddr".into(),Value::from_go_bytes(self.remote.clone())),
             ("RequestURI".into(),Value::from_go_bytes(request_uri.as_slice())),("Proto".into(),string(proto)),
             ("ProtoMajor".into(),Value::Int(major)),("ProtoMinor".into(),Value::Int(minor)),
@@ -131,7 +130,7 @@ impl RequestData {
         if !original{self.form.set_query_source(request_url::query_source(url_cache,control)?);}
         let mut methods=if original{BTreeMap::new()}else{self.form.methods()};let mut method_signatures=if original{BTreeMap::new()}else{super::forms::Form::signatures()};
         if !original{
-            for(name,field)in [("UserAgent",header::USER_AGENT),("Referer",header::REFERER)]{let headers=headers.clone();methods.insert(name.into(),Arc::new(move|args:&[Value]|{arity(args,0,0)?;Ok(string(headers.get(&field).and_then(|v|v.to_str().ok()).unwrap_or_default()))}));}
+            for(name,field)in [("UserAgent",header::USER_AGENT),("Referer",header::REFERER)]{let headers=headers.clone();methods.insert(name.into(),Arc::new(move|args:&[Value]|{arity(args,0,0)?;Ok(Value::from_go_bytes(headers.get(&field).map_or(b"".as_slice(),|v|v.as_bytes())))}));}
             methods.insert("ProtoAtLeast".into(),Arc::new(move|args:&[Value]|{arity(args,2,2)?;let want_major=args[0].as_int().ok_or_else(||error("expected int"))?;let want_minor=args[1].as_int().ok_or_else(||error("expected int"))?;Ok(Value::Bool(major>want_major||(major==want_major&&minor>=want_minor)))}));
             method_signatures.insert("ProtoAtLeast".into(),gotmpl::Signature::new(vec![gotmpl::ArgKind::Int,gotmpl::ArgKind::Int],None));
             methods.insert("PathValue".into(),Arc::new(|args:&[Value]|{arity(args,1,1)?;let _=text(args,0)?;Ok(string(""))}));
@@ -142,11 +141,11 @@ impl RequestData {
 }
 fn object(fields:Fields,methods:BTreeMap<Arc<str>,ValueFunc>)->Value{Value::Object(Arc::new(Object{fields,methods,..Object::default()}))}
 fn canonical(name:&str)->String{let mut upper=true;name.chars().map(|c|{let out=if upper{c.to_ascii_uppercase()}else{c.to_ascii_lowercase()};upper=c=='-';out}).collect()}
-pub(super) fn response_header(headers:Arc<Mutex<HeaderMap>>)->Value{
-    let header=header_value(headers.clone(),false);
-    let wrapped=header_value(headers,true);
-    let Value::Object(inner)=&wrapped else{return Value::Nil;};
-    object(Fields::from([("Header".into(),header)]),inner.methods.clone())
+pub(super) fn response_header(headers:Arc<Mutex<HeaderMap>>,control:&Arc<super::Control>)->RenderResult<Value>{
+    let header=header_clone::value(headers.clone(),false,None,false,control)?;
+    let wrapped=header_clone::value(headers,true,None,false,control)?;
+    let Value::Object(inner)=&wrapped else{return Err(error("response header value missing"));};
+    Ok(object(Fields::from([("Header".into(),header)]),inner.methods.clone()))
 }
 struct HeaderData{headers:Arc<Mutex<HeaderMap>>,protocol:Option<Arc<str>>}
 pub(super) fn header_format_cost(value:&Value)->RenderResult<Option<usize>>{
