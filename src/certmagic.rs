@@ -380,6 +380,7 @@ fn inspect_certificate(id: &str, cert: &[u8], key: &[u8], meta: &[u8]) -> Result
             tag == "CERTIFICATE",
             "storage item {id}: unsupported certificate PEM label"
         );
+        crate::cert_uri_san::check_der(der)?;
         let (rest, _) = x509_parser::parse_x509_certificate(der)
             .map_err(|_| issue(id, "invalid X.509 certificate"))?;
         ensure!(

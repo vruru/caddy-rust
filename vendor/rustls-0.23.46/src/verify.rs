@@ -282,6 +282,17 @@ pub trait ClientCertVerifier: Debug + Send + Sync {
     /// This should be in priority order, with the most preferred first.
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme>;
 
+    /// Check only certificate syntax saved in a resumed client-auth session.
+    /// This does not reverify trust, time, or a verified-chain observation. The
+    /// default retains existing behavior; rejection declines this resumption so
+    /// the peer must complete a fresh handshake. No session-store lock is held.
+    fn check_resumed_client_certificate_syntax(
+        &self,
+        _peer: &[CertificateDer<'_>],
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Returns whether this verifier requires raw public keys as defined
     /// in [RFC 7250](https://tools.ietf.org/html/rfc7250).
     fn requires_raw_public_keys(&self) -> bool {

@@ -59,5 +59,6 @@ pub mod net_address;
 pub(crate) mod proxy_protocol;
 
 mod cert_transient;
+mod cert_uri_san;
 
 mod cert_json_shape;

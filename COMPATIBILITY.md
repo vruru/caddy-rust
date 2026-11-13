@@ -1353,10 +1353,13 @@ string bytes and RawPath/RawFragment remain distinct, including escaped invalid
 UTF-8 path bytes. Construction and copying are prepaid on the existing render
 Control; no separate allowance or general host-value provenance bypass is added.
 
-This host-method change does not equate certificate parsing stages: some invalid
-URI SANs are rejected by the Go TLS certificate parser while the current native
-transport can reach a failing template projection. No authenticated facts are
-relaxed by this view adapter, and full PKIX equivalence is not established here.
+A shared [certificate URI SAN admission guard](docs/URI-SAN-ADMISSION.md) now
+rejects invalid URI syntax during material and peer-certificate admission rather
+than waiting for template projection. It preserves the existing verifier and raw
+DER, including strict/skip-trust distinctions and source-specific root-bundle
+contracts. Client-authenticated session resumption remains independently disabled
+by native server policy; the syntax hook does not enable it. Full PKIX equivalence
+is not established by this finite guard.
 
 ### Explicit native TLS in HTTP CA fetching
 

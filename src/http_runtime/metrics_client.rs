@@ -84,7 +84,7 @@ fn tls(
         let mut valid = 0;
         for cert in rustls_pemfile::certs(&mut std::io::Cursor::new(ca)) {
             if let Ok(cert) = cert
-                && roots.add(cert).is_ok()
+                && crate::cert_uri_san::add_root(&mut roots, cert)?
             {
                 valid += 1;
             }
@@ -92,7 +92,7 @@ fn tls(
         anyhow::ensure!(valid > 0, "OTLP trust roots unavailable");
         roots
     } else {
-        super::upstream_tls::native_roots().clone()
+        super::upstream_tls::native_roots()?.clone()
     };
     let builder = rustls::ClientConfig::builder_with_provider(crate::crypto::client_provider())
         .with_safe_default_protocol_versions()?
@@ -100,6 +100,7 @@ fn tls(
     let mut config = if let Some((cert, key)) = identity {
         let certs = rustls_pemfile::certs(&mut std::io::Cursor::new(cert))
             .collect::<std::io::Result<Vec<_>>>()?;
+        crate::cert_uri_san::check_chain(&certs)?;
         let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(key))?
             .ok_or_else(|| anyhow::anyhow!("OTLP client key missing"))?;
         builder.with_client_auth_cert(certs, key)?
@@ -111,7 +112,7 @@ fn tls(
     } else {
         vec![b"h2".to_vec(), b"http/1.1".to_vec()]
     };
-    Ok(config)
+    Ok(crate::cert_uri_san::guarded_config(config)?)
 }
 impl Connector {
     pub(crate) fn with_cancel(&self, cancel: CancellationToken) -> Self {

@@ -44,6 +44,7 @@ impl<'a> Deref for Parsed<'a> {
 pub(crate) fn parse_certificate(der: &[u8]) -> Result<(&[u8], Parsed<'_>)> {
     let cost = chain_deep_shape::full_cost(der)?;
     let memory = reserve(cost)?;
+    crate::cert_uri_san::check_der(der)?;
     let (rest, value) = x509_parser::parse_x509_certificate(der)
         .map_err(|_| anyhow!("malformed X509 certificate DER"))?;
     Ok((

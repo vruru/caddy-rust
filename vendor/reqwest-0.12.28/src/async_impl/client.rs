@@ -157,6 +157,11 @@ impl Service<hyper::Request<crate::async_impl::body::Body>> for HyperService {
     }
 }
 
+#[cfg(feature = "__rustls")]
+type CertificateVerifierWrapper = fn(
+    Arc<dyn rustls::client::danger::ServerCertVerifier>,
+) -> std::result::Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, rustls::Error>;
+
 struct Config {
     // NOTE: When adding a new field, update `fmt::Debug for ClientBuilder`
     accepts: Accepts,
@@ -169,6 +174,8 @@ struct Config {
     tls_sni: bool,
     #[cfg(feature = "__rustls")]
     tls_crypto_provider: Option<Arc<rustls::crypto::CryptoProvider>>,
+    #[cfg(feature = "__rustls")]
+    certificate_verifier_wrapper: Option<CertificateVerifierWrapper>,
     #[cfg(feature="native-ssl")]
     openssl_tls: Option<Arc<native_ssl_tls::ClientConfig>>,
     #[cfg(feature = "__rustls")]
@@ -306,6 +313,8 @@ impl ClientBuilder {
                 tls_sni: true,
                 #[cfg(feature = "__rustls")]
                 tls_crypto_provider: None,
+                #[cfg(feature = "__rustls")]
+                certificate_verifier_wrapper: None,
                 #[cfg(feature="native-ssl")]
                 openssl_tls: None,
                 #[cfg(feature = "__rustls")]
@@ -426,6 +435,12 @@ impl ClientBuilder {
     /// cannot load the system configuration.
     pub fn build(self) -> crate::Result<Client> {
         let config = self.config;
+        #[cfg(feature = "__rustls")]
+        if config.certificate_verifier_wrapper.is_some()
+            && !matches!(&config.tls, TlsBackend::Rustls | TlsBackend::BuiltRustls(_))
+        {
+            return Err(crate::error::builder("Rustls verifier wrapper requires a Rustls backend"));
+        }
 
         if let Some(err) = config.error {
             return Err(err);
@@ -660,6 +675,12 @@ impl ClientBuilder {
                 ),
                 #[cfg(feature = "__rustls")]
                 TlsBackend::BuiltRustls(conn) => {
+                    let mut conn = conn;
+                    if let Some(wrap) = config.certificate_verifier_wrapper {
+                        let original = conn.dangerous().certificate_verifier();
+                        let wrapped = wrap(original).map_err(crate::error::builder)?;
+                        conn.dangerous().set_certificate_verifier(wrapped);
+                    }
                     #[cfg(feature = "http3")]
                     {
                         h3_connector = build_h3_connector(
@@ -861,6 +882,12 @@ impl ClientBuilder {
                                 "http/1.1".into(),
                             ];
                         }
+                    }
+
+                    if let Some(wrap) = config.certificate_verifier_wrapper {
+                        let original = tls.dangerous().certificate_verifier();
+                        let wrapped = wrap(original).map_err(crate::error::builder)?;
+                        tls.dangerous().set_certificate_verifier(wrapped);
                     }
 
                     #[cfg(feature = "http3")]
@@ -2060,6 +2087,20 @@ impl ClientBuilder {
         self.config.tls_crypto_provider = Some(provider);
         self
     }
+    /// Wrap the exact Rustls verifier after roots, identity, CRLs and TLS policy
+    /// are configured, before any connector or HTTP/3 config is cloned. The
+    /// fixed fallible function runs once at construction without internal locks.
+    /// Unset preserves the original backend and verifier without an extra Arc.
+    #[cfg(feature = "__rustls")]
+    pub fn rustls_certificate_verifier_wrapper(
+        mut self,
+        wrapper: fn(Arc<dyn rustls::client::danger::ServerCertVerifier>)
+            -> std::result::Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, rustls::Error>,
+    ) -> ClientBuilder {
+        self.config.certificate_verifier_wrapper = Some(wrapper);
+        self
+    }
+
     /// Install an explicitly prepared OpenSSL TLS policy for origin and HTTPS
     /// proxy connections. Each TLS layer retains its own destination name.
     #[cfg(feature="native-ssl")]
@@ -2948,6 +2989,10 @@ impl Config {
             }
 
             f.field("tls_sni", &self.tls_sni);
+            #[cfg(feature = "__rustls")]
+            if self.certificate_verifier_wrapper.is_some() {
+                f.field("rustls_certificate_verifier_wrapper", &true);
+            }
             #[cfg(feature="__rustls")]
             {f.field("tls_server_name_override",&self.tls_server_name_override.is_some());f.field("tls_handshake_timeout",&self.tls_handshake_timeout);}
 

@@ -27,6 +27,7 @@ impl OcspTransport {
         );
         let mut builder = Client::builder()
             .tls_crypto_provider(crate::crypto::client_provider())
+            .rustls_certificate_verifier_wrapper(crate::cert_uri_san::wrap_server_verifier)
             .connect_timeout(timeout.min(Duration::from_secs(10)))
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none());
@@ -35,6 +36,7 @@ impl OcspTransport {
                 .proxy(reqwest::Proxy::all(proxy).map_err(|_| anyhow!("invalid OCSP proxy"))?);
         }
         for ca in extra_ca_pem {
+            crate::cert_uri_san::check_pem_roots(ca)?;
             builder = builder.add_root_certificate(reqwest::Certificate::from_pem(ca)?);
         }
         Ok(Self {

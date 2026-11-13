@@ -185,13 +185,15 @@ async fn fetch_http(
         let (tls, proxy) = crate::cert_cpu::run(resources.cpu_slots(), cancel.clone(), move || {
             let proxy = super::permission::external_proxy(&url)?;
             let mut roots = rustls::RootCertStore::empty();
-            let _ = roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+            for cert in rustls_native_certs::load_native_certs().certs {
+                let _ = crate::cert_uri_san::add_root(&mut roots, cert)?;
+            }
             let mut tls = rustls::ClientConfig::builder_with_provider(crate::crypto::client_provider())
                 .with_safe_default_protocol_versions()?
                 .with_root_certificates(roots)
                 .with_no_client_auth();
             tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-            Ok((tls, proxy))
+            Ok((crate::cert_uri_san::guarded_config(tls)?, proxy))
         })
         .await?;
         let mut builder = reqwest::Client::builder()

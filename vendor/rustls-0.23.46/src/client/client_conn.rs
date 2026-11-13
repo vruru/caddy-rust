@@ -585,6 +585,12 @@ pub(super) mod danger {
     }
 
     impl DangerousClientConfig<'_> {
+        /// Clone the currently installed verifier without changing configuration.
+        /// Native callers may wrap its original policy before publishing this config.
+        pub fn certificate_verifier(&self) -> Arc<dyn ServerCertVerifier> {
+            self.cfg.verifier.clone()
+        }
+
         /// Overrides the default `ServerCertVerifier` with something else.
         pub fn set_certificate_verifier(&mut self, verifier: Arc<dyn ServerCertVerifier>) {
             self.cfg.verifier = verifier;

@@ -49,16 +49,22 @@ pub(super) fn diagnostics() -> NativeTrustDiagnostics {
         rejected_root_blocks: REJECTED_ROOTS.load(Ordering::Relaxed),
     }
 }
-pub(super) fn native_roots() -> &'static rustls::RootCertStore {
-    NATIVE_ROOTS.get_or_init(|| {
+pub(super) fn native_roots() -> Result<&'static rustls::RootCertStore> {
+    if let Some(roots) = NATIVE_ROOTS.get() { return Ok(roots); }
+    let roots = (|| -> Result<rustls::RootCertStore> {
         NATIVE_LOADS.fetch_add(1, Ordering::Relaxed);
         let native = rustls_native_certs::load_native_certs();
         NATIVE_ERRORS.fetch_add(native.errors.len() as u64, Ordering::Relaxed);
         let mut roots = rustls::RootCertStore::empty();
-        let (_, ignored) = roots.add_parsable_certificates(native.certs);
-        REJECTED_ROOTS.fetch_add(ignored as u64, Ordering::Relaxed);
-        roots
-    })
+        let mut ignored = 0u64;
+        for cert in native.certs {
+            if !crate::cert_uri_san::add_root(&mut roots, cert)? { ignored += 1; }
+        }
+        REJECTED_ROOTS.fetch_add(ignored, Ordering::Relaxed);
+        Ok(roots)
+    })()?;
+    let _ = NATIVE_ROOTS.set(roots);
+    Ok(NATIVE_ROOTS.get().expect("successful root initialization"))
 }
 
 /// Prepared off the reactor before a candidate generation is published.
@@ -189,6 +195,7 @@ fn certificates(bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
         !certs.is_empty(),
         "upstream TLS PEM contains no certificates"
     );
+    crate::cert_uri_san::check_chain(&certs)?;
     Ok(certs)
 }
 /// CA provider modules share file/inline decoding with server client auth.
@@ -200,6 +207,7 @@ fn provider_roots(raw:&serde_json::Value,depth:usize,budget:&mut u64,count:&mut 
     let mut add=|cert:CertificateDer<'static>|->Result<()>{
         *count=count.checked_add(1).ok_or(crate::cert_transient::ResourceDenied)?;
         ensure!(*count<=4096,"upstream CA certificate count exceeds bounds");
+        crate::cert_uri_san::check_der(cert.as_ref())?;
         roots.add(cert).map_err(|_|anyhow::anyhow!("invalid upstream root CA certificate"))?;Ok(())
     };
     match obj.get("provider").and_then(serde_json::Value::as_str){
@@ -230,7 +238,7 @@ fn provider_roots(raw:&serde_json::Value,depth:usize,budget:&mut u64,count:&mut 
         Some("system")=>{
             deny_unknown(obj,&["provider"],"upstream system CA pool")?;
             ensure!(depth==0,"system pool cannot export certificates to combined pool");
-            *roots=native_roots().clone();
+            *roots=native_roots()?.clone();
         },
         Some("combined")=>{
             deny_unknown(obj,&["provider","sources"],"upstream combined CA pool")?;
@@ -255,7 +263,7 @@ fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool,
         ensure!(tls.root_ca_pool.is_empty()&&tls.root_ca_pem_files.is_empty(),"conflicting upstream Root CA pool configuration");
         provider_roots(module,0,&mut budget,&mut 0,&mut roots)?;
     } else if tls.root_ca_pool.is_empty() && tls.root_ca_pem_files.is_empty() {
-        roots = native_roots().clone();
+        roots = native_roots()?.clone();
     } else {
         for encoded in &tls.root_ca_pool {
             // Go StdEncoding ignores CR/LF and does not require zero pad bits.
@@ -276,6 +284,7 @@ fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool,
                 "upstream TLS material size limit exceeded"
             );
             budget -= bytes.len() as u64;
+            crate::cert_uri_san::check_der(&bytes)?;
             roots
                 .add(CertificateDer::from(bytes))
                 .map_err(|_| anyhow::anyhow!("invalid upstream root CA certificate"))?;
@@ -285,9 +294,10 @@ fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool,
             // Go AppendCertsFromPEM skips unusable blocks but retains valid
             // anchors, including valid blocks after a malformed base64 block.
             for result in rustls_pemfile::certs(&mut std::io::Cursor::new(bytes)) {
-                let valid = result
-                    .ok()
-                    .is_some_and(|certificate| roots.add(certificate).is_ok());
+                let valid = match result {
+                    Ok(cert) => crate::cert_uri_san::add_root(&mut roots, cert)?,
+                    Err(_) => false,
+                };
                 if !valid {
                     REJECTED_ROOTS.fetch_add(1, Ordering::Relaxed);
                 }
@@ -313,6 +323,7 @@ fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool,
     let verifier:Arc<dyn ServerCertVerifier>=if tls.insecure_skip_verify||roots.is_empty(){
         Arc::new(InsecureVerifier{provider:provider.clone(),skip_chain:tls.insecure_skip_verify})
     }else{rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots),provider.clone()).build()?};
+    let verifier = crate::cert_uri_san::wrap_server_verifier(verifier)?;
     let builder=ClientConfig::builder_with_provider(provider.clone()).with_safe_default_protocol_versions()?.dangerous().with_custom_certificate_verifier(verifier.clone());
     let identity=if let(Some(cert),Some(key))=(&tls.client_certificate_file,&tls.client_certificate_key_file){
         let certs=certificates(&read_material(cert,&mut budget)?)?;

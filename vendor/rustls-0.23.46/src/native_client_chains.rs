@@ -400,6 +400,11 @@ fn checked_add(a: usize, b: usize) -> Option<usize> {
 pub(crate) fn resumption_allowed(verifier: &dyn crate::verify::ClientCertVerifier,
     session: &crate::msgs::persist::ServerSessionValue) -> bool {
     if session.client_cert_chain.as_ref().is_none_or(|chain| chain.is_empty()) { return true; }
+    if let Some(chain) = session.client_cert_chain.as_ref() {
+        if verifier.check_resumed_client_certificate_syntax(chain).is_err() {
+            return false;
+        }
+    }
     if verifier.resume_requires_verified_chains() {
         return matches!(&session.native_client_chains, ClientChainObservation::Verified(set)
             if Some(set.binding()) == verifier.chain_binding());

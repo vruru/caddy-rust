@@ -241,6 +241,7 @@ impl AcmeWire {
         let client = crate::cert_cpu::run(cpu.clone(),cancel.clone(),move || {
         let mut builder = reqwest::Client::builder()
             .tls_crypto_provider(crate::crypto::client_provider())
+            .rustls_certificate_verifier_wrapper(crate::cert_uri_san::wrap_server_verifier)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(options.request_timeout)
@@ -248,10 +249,7 @@ impl AcmeWire {
         if let Some(proxy)=options.network_proxy {builder=proxy.apply(builder)?;}
         for pem in options.extra_ca_pem {
             ensure!(pem.len() <= 1024 * 1024, "ACME trust root exceeds bounds");
-            builder = builder.add_root_certificate(
-                reqwest::Certificate::from_pem(&pem)
-                    .map_err(|_| anyhow!("invalid ACME trust root"))?,
-            );
+            builder = append_trusted_root_pem(builder, &pem)?;
         }
         builder
             .build()
@@ -1132,4 +1130,21 @@ fn uncertain(status: StatusCode, kind: &str) -> anyhow::Error {
         retry_after: None,
     }
     .into()
+}
+
+/// Go ACME issuer's per-file AppendCertsFromPEM contract. Keep the original
+/// client builder/provider/proxy, append only usable anchors, reject all-bad.
+pub(crate) fn append_trusted_root_pem(mut builder:reqwest::ClientBuilder,pem:&[u8])->Result<reqwest::ClientBuilder> {
+    let bytes=pem.len().checked_mul(8).and_then(|n|n.checked_add(65536))
+        .ok_or(chain_memory::MemoryDenied)?;
+    let _scratch=chain_memory::try_scratch(bytes)?;
+    let certs=crate::tls_policy::source_append_certificates(pem)?;
+    let mut valid=0usize;
+    for cert in certs {
+        if webpki::anchor_from_trusted_cert(&cert).is_err(){continue;}
+        builder=builder.add_root_certificate(reqwest::Certificate::from_der(cert.as_ref())?);
+        valid+=1;
+    }
+    ensure!(valid>0,"ACME trust root PEM contains no usable certificates");
+    Ok(builder)
 }

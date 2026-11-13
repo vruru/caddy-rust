@@ -337,3 +337,46 @@ pub(crate) fn push_target_bytes(raw:&[u8],wanted:&str,parent:&str)->Result<Strin
 pub(crate) fn valid_path_escapes(raw:&[u8])->bool{
     let mut i=0;while i<raw.len(){if raw[i]==b'%'{if raw.len()-i<3||nibble(raw[i+1]).is_err()||nibble(raw[i+2]).is_err(){return false}i+=3;}else{i+=1;}}true
 }
+
+/// Go crypto/x509 URI SAN admission: IA5, url.Parse, then full Host domain gate.
+/// This deliberately does not validate/normalize DNS identity or rewrite bytes.
+pub(crate) fn validate_san_uri(raw: &[u8]) -> Result<(), ()> {
+    if !raw.is_ascii() { return Err(()); }
+    let (raw, fragment) = match raw.iter().position(|&b| b == b'#') {
+        Some(i) => (&raw[..i], &raw[i + 1..]), None => (raw, &b""[..]),
+    };
+    // url.Parse splits the fragment before parse checks CTLs. Fragment CTLs
+    // are accepted by setFragment and escaped on output, never used as Host.
+    unescape(fragment, 0)?;
+    if raw.iter().any(|&b| b < 32 || b == 127) { return Err(()); }
+    let mut rest = raw;
+    let mut scheme = Vec::new();
+    for (index, byte) in raw.iter().copied().enumerate() {
+        if byte == b':' {
+            if index == 0 { return Err(()); }
+            scheme = raw[..index].iter().map(u8::to_ascii_lowercase).collect();
+            rest = &raw[index + 1..];
+            break;
+        }
+        if !(byte.is_ascii_alphabetic()
+            || index > 0 && (byte.is_ascii_digit() || b"+-.".contains(&byte))) { break; }
+    }
+    // RawQuery is not percent-decoded by url.Parse. Opaque is not decoded either.
+    let mut path = rest.split(|&b| b == b'?').next().ok_or(())?;
+    if !path.starts_with(b"/") {
+        if !scheme.is_empty() { return Ok(()); }
+        if path.split(|&b| b == b'/').next().is_some_and(|p| p.contains(&b':')) { return Err(()); }
+    }
+    if path.starts_with(b"//") && (!scheme.is_empty() || !path.starts_with(b"///")) {
+        let after = &path[2..];
+        let end = after.iter().position(|&b| b == b'/').unwrap_or(after.len());
+        let (host, _) = authority(&after[..end], &scheme)?;
+        // Go's domainNameValid(fullHost,false), including any port/zone.
+        if !host.is_empty() && (host.ends_with(b".")
+            || host.iter().any(|&b| !(33..=126).contains(&b))
+            || host.split(|&b| b == b'.').any(|label| label.is_empty())) { return Err(()); }
+        path = &after[end..];
+    }
+    unescape(path, 0)?;
+    Ok(())
+}

@@ -120,13 +120,14 @@ impl ServerCertVerifier for ProofVerifier {
             .supported_schemes()
     }
 }
-fn tls_config(scope: Arc<Scope>) -> rustls::ClientConfig {
-    rustls::ClientConfig::builder_with_provider(crate::crypto::provider())
+fn tls_config(scope: Arc<Scope>) -> Result<rustls::ClientConfig> {
+    let config = rustls::ClientConfig::builder_with_provider(crate::crypto::provider())
         .with_safe_default_protocol_versions()
         .expect("TLS12/13 available")
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(ProofVerifier { scope }))
-        .with_no_client_auth()
+        .with_no_client_auth();
+    Ok(crate::cert_uri_san::guarded_config(config)?)
 }
 struct AddressJob {
     host: String,
@@ -201,7 +202,7 @@ pub(super) async fn validate(
             }
         }
         "http-01" => {
-            let tls = tls_config(scope.clone());
+            let tls = tls_config(scope.clone())?;
             let cancel = resources.cancel.clone();
             let token = scope.cancel.clone();
             let remaining = scope.remaining()?;
@@ -282,7 +283,7 @@ pub(super) async fn validate(
                 }
                 let stream =
                     connection.ok_or_else(|| anyhow!("challenge connection unavailable"))?;
-                let mut config = tls_config(scope.clone());
+                let mut config = tls_config(scope.clone())?;
                 config.alpn_protocols = vec![b"acme-tls/1".to_vec()];
                 let server_name = server_name(&value)?;
                 let stream = tokio_rustls::TlsConnector::from(Arc::new(config))

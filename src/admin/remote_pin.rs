@@ -14,6 +14,7 @@ fn purpose() -> rustls::Error {
     rustls::Error::InvalidCertificate(rustls::CertificateError::InvalidPurpose)
 }
 pub(super) fn is_end_entity(der: &CertificateDer<'_>) -> Result<bool, rustls::Error> {
+    crate::cert_uri_san::check_der(der.as_ref()).map_err(crate::cert_uri_san::tls_error)?;
     let (rest, cert) = x509_parser::parse_x509_certificate(der.as_ref()).map_err(|_| bad())?;
     if !rest.is_empty() {
         return Err(bad());
@@ -25,6 +26,7 @@ pub(super) fn is_end_entity(der: &CertificateDer<'_>) -> Result<bool, rustls::Er
         .is_some_and(|b| b.value.ca))
 }
 pub(super) fn validate(der: &CertificateDer<'_>, now: UnixTime) -> Result<(), rustls::Error> {
+    crate::cert_uri_san::check_der(der.as_ref()).map_err(crate::cert_uri_san::tls_error)?;
     let (rest, cert) = x509_parser::parse_x509_certificate(der.as_ref()).map_err(|_| bad())?;
     if !rest.is_empty() {
         return Err(bad());
@@ -127,6 +129,9 @@ impl Verifier {
 }
 
 impl ClientCertVerifier for Verifier {
+    fn check_resumed_client_certificate_syntax(&self, peer: &[CertificateDer<'_>]) -> Result<(), rustls::Error> {
+        crate::cert_uri_san::check_chain_tls(peer)
+    }
     fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
         self.signatures.root_hint_subjects()
     }
@@ -136,6 +141,8 @@ impl ClientCertVerifier for Verifier {
         chain: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
+        crate::cert_uri_san::check_der(ee.as_ref()).map_err(crate::cert_uri_san::tls_error)?;
+        crate::cert_uri_san::check_chain_tls(chain)?;
         if self.pins.iter().any(|pin| pin.as_ref() == ee.as_ref()) {
             validate(ee, now)?;
             return Ok(ClientCertVerified::assertion());

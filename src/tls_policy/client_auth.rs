@@ -304,6 +304,7 @@ fn decode(raw: &str, budget: &mut Budget) -> Result<CertificateDer<'static>> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PemSource {
     Ca,
+    AppendCa,
     DeprecatedCa,
     LeafFile,
     InlineLeaf,
@@ -354,6 +355,10 @@ pub(crate) fn source_inline(raw:&str)->Result<CertificateDer<'static>>{
 }
 pub(crate) fn source_certificates(data:&[u8])->Result<Vec<CertificateDer<'static>>>{
     parse_pem(data,PemSource::Ca,&mut Budget{count:0,bytes:0})
+}
+/// Only callers with an AppendCertsFromPEM contract may skip bad certificates.
+pub(crate) fn source_append_certificates(data:&[u8])->Result<Vec<CertificateDer<'static>>>{
+    parse_pem(data,PemSource::AppendCa,&mut Budget{count:0,bytes:0})
 }
 fn parse_pem(
     data: &[u8],
@@ -410,14 +415,23 @@ fn parse_pem(
             continue;
         }
         if label != b"CERTIFICATE" {
-            if source == PemSource::Ca {
+            if matches!(source, PemSource::Ca | PemSource::AppendCa) {
                 continue;
             }
             bail!("unexpected PEM block in client trust input");
         }
         match source {
-            PemSource::Ca | PemSource::DeprecatedCa => {
-                budget.accept(&der)?;
+            PemSource::Ca | PemSource::AppendCa | PemSource::DeprecatedCa => {
+                if source == PemSource::AppendCa {
+                    match parse_certificate(&der) {
+                        Ok(()) => {},
+                        Err(error) if crate::cert_transient::is_resource(&error) => return Err(error),
+                        Err(_) => continue,
+                    }
+                    budget.charge(der.len())?;
+                } else {
+                    budget.accept(&der)?;
+                }
                 result.push(CertificateDer::from(std::mem::take(&mut *der)));
             }
             PemSource::LeafFile | PemSource::InlineLeaf => {
@@ -426,7 +440,7 @@ fn parse_pem(
         }
     }
     match source {
-        PemSource::Ca => return Ok(result),
+        PemSource::Ca | PemSource::AppendCa => return Ok(result),
         PemSource::DeprecatedCa => {}
         PemSource::LeafFile => {
             // Go's leaf file loader calls ParseCertificates on concatenated DER.
@@ -436,6 +450,7 @@ fn parse_pem(
                     .map_err(|_| anyhow::anyhow!("invalid client certificate DER"))?;
                 let size = pending.len() - rest.len();
                 ensure!(size != 0, "empty client certificate DER");
+                crate::cert_uri_san::check_der(&pending[..size])?;
                 budget.charge(size)?;
                 result.push(CertificateDer::from(pending[..size].to_vec()));
                 pending = rest;
@@ -558,6 +573,9 @@ impl ClientCertVerifier for Verifier {
         &self.hints
     }
     fn resume_requires_verified_chains(&self) -> bool { self.verify_chain }
+    fn check_resumed_client_certificate_syntax(&self, peer: &[CertificateDer<'_>]) -> Result<(), Error> {
+        crate::cert_uri_san::check_chain_tls(peer)
+    }
     fn chain_binding(&self) -> Option<[u8;32]> { Some(self.binding) }
 
     fn verify_client_cert(

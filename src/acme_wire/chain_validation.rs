@@ -80,6 +80,7 @@ pub(crate) fn decode(pem: &[u8]) -> Result<Vec<Vec<u8>>> {
     Ok(blocks)
 }
 fn parser(der: &[u8]) -> Result<x509_parser::certificate::X509Certificate<'_>> {
+    crate::cert_uri_san::check_der(der)?;
     let (rest, cert) = X509CertificateParser::new()
         .with_deep_parse_extensions(false)
         .parse(der)

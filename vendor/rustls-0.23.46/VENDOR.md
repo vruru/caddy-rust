@@ -29,3 +29,10 @@ and classical-first share/secret layout follow RFC 10024. This adds the group
 to ALL_KX_GROUPS but does not change DEFAULT_KX_GROUPS. Native outgoing client
 profiles select the complete pinned-Go capability set independently of server
 and QUIC defaults.
+
+Certificate URI admission adds a read-only `DangerousClientConfig` verifier Arc
+getter and an optional, default-success client-certificate syntax hook for saved
+nonempty client chains. The latter declines resumption on rejection before the
+existing chain-binding checks; it neither changes the generic certificate codec
+nor creates a verified-chain observation. The original raw-public-key contract is
+unchanged.

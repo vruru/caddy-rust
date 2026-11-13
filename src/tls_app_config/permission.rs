@@ -210,7 +210,7 @@ fn permission_client(cache: &Mutex<Option<CachedClient>>, url: &Url) -> Result<r
         return Ok(previous.client.clone());
     }
     let mut trust = rustls::RootCertStore::empty();
-    let _ = trust.add_parsable_certificates(roots);
+    for cert in roots { let _ = crate::cert_uri_san::add_root(&mut trust, cert)?; }
     let mut tls = rustls::ClientConfig::builder_with_provider(crate::crypto::client_provider())
         .with_safe_default_protocol_versions()
         .map_err(|_| PermissionFailure::Transport)?
@@ -226,7 +226,7 @@ fn permission_client(cache: &Mutex<Option<CachedClient>>, url: &Url) -> Result<r
         .no_brotli()
         .no_deflate()
         .no_zstd()
-        .use_preconfigured_tls(tls)
+        .use_preconfigured_tls(crate::cert_uri_san::guarded_config(tls)?)
         .timeout(TIMEOUT)
         .connect_timeout(TIMEOUT)
         .redirect(reqwest::redirect::Policy::none());

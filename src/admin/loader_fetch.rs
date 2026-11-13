@@ -65,12 +65,14 @@ fn tls(
             let bytes = read_file(path)?;
             // Go AppendCertsFromPEM keeps valid entries and skips bad ones.
             for cert in rustls_pemfile::certs(&mut bytes.as_slice()).flatten() {
-                let _ = roots.add(cert);
+                let _ = crate::cert_uri_san::add_root(&mut roots, cert)
+                    .map_err(|_| error("config_loader_root_admission_failed"))?;
             }
         }
     } else {
         for cert in rustls_native_certs::load_native_certs().certs {
-            let _ = roots.add(cert);
+            let _ = crate::cert_uri_san::add_root(&mut roots, cert)
+                    .map_err(|_| error("config_loader_root_admission_failed"))?;
         }
     }
     if roots.is_empty() {
@@ -81,9 +83,9 @@ fn tls(
         .map_err(|_| error("config_loader_tls_configuration_failed"))?
         .with_root_certificates(roots);
     if tls.is_some_and(|t| t.use_server_identity) {
-        return Ok(builder.with_client_cert_resolver(
+        return crate::cert_uri_san::guarded_config(builder.with_client_cert_resolver(
             identity.ok_or_else(|| error("config_loader_identity_unavailable"))?,
-        ));
+        )).map_err(|_| error("config_loader_tls_configuration_failed"));
     }
     if let Some(t) = tls.filter(|t| {
         !t.client_certificate_file.is_empty() && !t.client_certificate_key_file.is_empty()
@@ -93,14 +95,18 @@ fn tls(
         let chain = rustls_pemfile::certs(&mut certs.as_slice())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| error("config_loader_invalid_client_certificate"))?;
+        crate::cert_uri_san::check_chain(&chain)
+            .map_err(|_| error("config_loader_invalid_client_certificate"))?;
         let key = rustls_pemfile::private_key(&mut key.as_slice())
             .map_err(|_| error("config_loader_invalid_client_key"))?
             .ok_or_else(|| error("config_loader_invalid_client_key"))?;
         let certified = CertifiedKey::from_der(chain, key, &provider)
             .map_err(|_| error("config_loader_client_key_mismatch"))?;
-        return Ok(builder.with_client_cert_resolver(Arc::new(Identity(Arc::new(certified)))));
+        return crate::cert_uri_san::guarded_config(builder.with_client_cert_resolver(Arc::new(Identity(Arc::new(certified)))))
+            .map_err(|_| error("config_loader_tls_configuration_failed"));
     }
-    Ok(builder.with_no_client_auth())
+    crate::cert_uri_san::guarded_config(builder.with_no_client_auth())
+        .map_err(|_| error("config_loader_tls_configuration_failed"))
 }
 fn env(name: &str) -> Option<String> {
     std::env::var(name)
