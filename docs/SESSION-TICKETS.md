@@ -75,8 +75,10 @@ QUIC or between copies of the same seed in different storage directories, and
 resume after a certificate replacement. Native mode isolates these cases and
 performs a full handshake. The original also accepted QUIC 0-RTT, which native
 mode does not accept. Clients can still reconnect and send requests once the
-handshake completes. The original could select an IP-SAN certificate for a
-client that sent no SNI; the native resolver currently requires a DNS SNI.
+handshake completes. Native TCP can select an exact local IP-SAN certificate
+when SNI is absent.
+Its no-SNI session namespace is bound to the actual local address and remains
+separate from DNS-named handshakes.
 
 References: [Caddy session service](https://github.com/caddyserver/caddy/blob/v2.11.7/modules/caddytls/sessiontickets.go),
 [distributed provider](https://github.com/caddyserver/caddy/blob/v2.11.7/modules/caddytls/distributedstek/distributedstek.go),
