@@ -80,6 +80,7 @@ pub struct PrepareContext {
 #[derive(Clone)]
 pub struct RetainedCertificates {
     issuer_values:Option<Arc<super::issuer_values::Retained>>,
+    subjects:Arc<super::subject_values::Retained>,
     digest: [u8; 32],
     material: Vec<RetainedMaterial>,
     permission: Option<PermissionSetting>,
@@ -114,6 +115,13 @@ enum GroupIssuer {
         ca: String,
         options: InternalIssuerOptions,
     },
+}
+// New normalized automate bridge: allocation first, admission last on drop.
+// The actual blocking worker/result owns this allowance through transfer into
+// the existing literal-name lifecycle; it is not producer credit for that graph.
+struct PreparedBusinessNames {
+    names: Vec<Vec<String>>,
+    _memory: crate::acme_wire::chain_memory::Scratch,
 }
 struct Group {
     key: String,
@@ -250,6 +258,7 @@ pub struct CertificateServices {
     identity_ready: OnceCell<()>,
     client_automate_names:std::sync::OnceLock<Vec<String>>,
     prepared: OnceCell<()>,
+    explicit_subjects: OnceCell<Arc<super::subject_values::ExplicitSubjects>>,
     ensure_gate: AsyncMutex<()>,
     staged_publication: AsyncMutex<()>,
     state: AsyncMutex<State>,
@@ -343,6 +352,7 @@ impl CertificateServices {
             identity_ready: OnceCell::new(),
             client_automate_names:std::sync::OnceLock::new(),
             prepared: OnceCell::new(),
+            explicit_subjects: OnceCell::new(),
             ensure_gate: AsyncMutex::new(()),
             staged_publication: AsyncMutex::new(()),
             state: AsyncMutex::new(State {
@@ -446,6 +456,9 @@ impl CertificateServices {
             "certificate services are not prepared"
         );
         Ok(self.manual_inventory.load_full().as_ref().clone())
+    }
+    pub(crate) fn prepared_explicit_subjects(&self) -> Result<Arc<super::subject_values::ExplicitSubjects>> {
+        self.explicit_subjects.get().cloned().ok_or_else(|| anyhow!("certificate subjects are not prepared"))
     }
     pub fn plan(&self) -> &CertificatePlan {
         &self.plan
@@ -601,6 +614,7 @@ impl CertificateServices {
         let state = self.state.lock().await;
         Ok(RetainedCertificates {
             issuer_values:super::issuer_values::retain(&self.plan,&self.context.resources.issuer_values)?,
+            subjects:super::subject_values::retain(&self.plan,&self.context.resources.issuer_values)?,
             digest: self.context.configuration_digest,
             material: state
                 .material
@@ -624,25 +638,18 @@ impl CertificateServices {
                     legacy: false,
                 }),
             business_names: state.planned.clone().unwrap_or_default(),
-            on_demand_names: state
-                .planned
-                .as_ref()
-                .into_iter()
-                .flatten()
-                .filter(|names| self.policy(&names[0]).on_demand)
-                .map(|names| (names.clone(), names[0].clone()))
-                .chain(
-                    state
-                        .material
-                        .iter()
-                        .filter_map(|item| {
-                            item.managed_names
-                                .as_ref()
-                                .map(|names| (names.clone(), item.origin.clone()))
-                        })
-                        .filter(|(_, origin)| self.policy(origin).on_demand),
-                )
-                .collect(),
+            on_demand_names: {
+                let mut values=Vec::new();
+                for names in state.planned.as_ref().into_iter().flatten() {
+                    if self.policy(&names[0])?.on_demand { values.push((names.clone(),names[0].clone())); }
+                }
+                for item in &state.material {
+                    if let Some(names)=&item.managed_names {
+                        if self.policy(&item.origin)?.on_demand { values.push((names.clone(),item.origin.clone())); }
+                    }
+                }
+                values
+            },
             capacity_displaced: self.on_demand.displaced_groups()?,
         })
     }
@@ -702,11 +709,21 @@ impl CertificateServices {
         .await
     }
     async fn prepare_inner(&self, cancel: CancellationToken) -> Result<()> {
-        if let Some(retained)=&self.restore {
-            super::issuer_values::restore(&self.plan,retained.issuer_values.as_deref())?;
-        } else {
-            super::issuer_values::prepare_all(&self.plan,self.context.resources.cpu.clone(),self.context.resources.issuer_values.clone(),cancel.clone()).await?;
-        }
+        // Later manual/permission preparation can fail and be retried on this
+        // service. Reuse its completed values instead of rereading providers
+        // or rejecting the second prepare as an already-populated index.
+        self.explicit_subjects.get_or_try_init(|| async {
+            let explicit = if let Some(retained)=&self.restore {
+                super::subject_values::restore(&self.plan,&retained.subjects)?;
+                super::issuer_values::restore(&self.plan,retained.issuer_values.as_deref())?;
+                super::subject_values::explicit(self.plan.clone(),self.context.resources.cpu.clone(),self.context.resources.issuer_values.clone(),cancel.clone()).await?
+            } else {
+                let explicit=super::subject_values::prepare_all(self.plan.clone(),self.context.resources.cpu.clone(),self.context.resources.issuer_values.clone(),cancel.clone()).await?;
+                super::issuer_values::prepare_all(&self.plan,self.context.resources.cpu.clone(),self.context.resources.issuer_values.clone(),cancel.clone()).await?;
+                explicit
+            };
+            Ok::<_,anyhow::Error>(explicit)
+        }).await?;
         self.prepare_permission(cancel.clone()).await?;
         if let Some(retained) = &self.restore {
             self.context.leaf_guard.key_deny().require_loaded()?;
@@ -880,10 +897,13 @@ impl CertificateServices {
     }
     async fn ensure_business_inner(
         &self,
-        names: Vec<Vec<String>>,
+        mut input: PreparedBusinessNames,
         bound: Vec<StagedAddress>,
         cancel: CancellationToken,
     ) -> Result<()> {
+        // Keep actual result credit until this invocation finishes, including
+        // cancellation/errors. No raw value is detached from a queued worker.
+        let names=std::mem::take(&mut input.names);
         let _ensure = self
             .ensure_gate
             .try_lock()
@@ -920,10 +940,19 @@ impl CertificateServices {
                 return Ok(());
             }
         }
-        self.implicit_tailscale.get_or_init(|| names.iter().flat_map(|group|group.iter())
-            .filter(|name|name.to_ascii_lowercase().ends_with(".ts.net")
-                && !self.plan.policies.iter().any(|policy|policy.subjects.iter().any(|subject|subject==*name)))
-            .cloned().collect());
+        if self.implicit_tailscale.get().is_none() {
+            let mut implicit=std::collections::HashSet::new();
+            for name in names.iter().flatten() {
+                if name.to_ascii_lowercase().ends_with(".ts.net") {
+                    let mut explicit=false;
+                    for policy in &self.plan.policies {
+                        explicit |= policy.subjects.get()?.names().iter().any(|subject|subject==name);
+                    }
+                    if !explicit { implicit.insert(name.clone()); }
+                }
+            }
+            self.implicit_tailscale.set(implicit).map_err(|_|anyhow!("implicit Tailscale subjects already prepared"))?;
+        }
         self.prepare_resident_cache(&names, cancel.clone()).await?;
         if self.restore.is_some() {
             self.validate_retained_groups(&names, false).await?;
@@ -931,7 +960,7 @@ impl CertificateServices {
             self.provision_authorities(cancel.clone()).await?;
             let groups = stream::iter(names.iter().cloned())
                 .map(|names| async {
-                    if self.policy(&names[0]).on_demand {
+                    if self.policy(&names[0])?.on_demand {
                         return Ok(None);
                     }
                     self.group(names, false, &bound, cancel.clone())
@@ -985,17 +1014,14 @@ impl CertificateServices {
         let mut aliases = std::collections::HashSet::new();
         for group in names {
             let normalized = cert_automation::normalize_managed_names(&group)?;
-            let first = self.policy_index(&normalized[0]);
-            ensure!(
-                normalized
-                    .iter()
-                    .all(|name| self.policy_index(name) == first),
-                "SAN group crosses automation policies"
-            );
+            let first = self.policy_index(&normalized[0])?;
+            for name in &normalized {
+                ensure!(self.policy_index(name)? == first,"SAN group crosses automation policies");
+            }
             // Internal issuers support IP and wildcard subjects. Do not run
             // their groups through the ACME-only DNS preflight; each ACME leg
             // still rejects unsupported subject types before creating orders.
-            if !self.policy(&normalized[0]).issuers.iter()
+            if !self.policy(&normalized[0])?.issuers.iter()
                 .any(|issuer| matches!(issuer, Issuer::Internal { .. })) {
                 cert_automation::normalize_names(&normalized)?;
             }
@@ -1009,41 +1035,39 @@ impl CertificateServices {
         }
         Ok(result)
     }
-    fn policy_index(&self, name: &str) -> Option<usize> {
-        self.plan.policies.iter().position(|policy| {
-            policy.subjects.is_empty()
-                || policy
-                    .subjects
-                    .iter()
-                    .any(|subject| matches_subject(name, subject))
-        })
+    fn policy_index(&self, name: &str) -> Result<Option<usize>> {
+        ensure!(self.explicit_subjects.initialized(), "certificate subjects are not prepared");
+        for (index, policy) in self.plan.policies.iter().enumerate() {
+            let subjects=policy.subjects.get()?.names();
+            if subjects.is_empty() || subjects.iter().any(|subject|matches_subject(name,subject)) {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
     }
-    fn policy(&self, name: &str) -> Policy {
-        let mut policy=self.policy_index(name)
+    fn policy(&self, name: &str) -> Result<Policy> {
+        let mut policy=self.policy_index(name)?
             .map(|index| self.plan.policies[index].clone()).unwrap_or_default();
         if let Some(subject)=self.implicit_tailscale.get()
             .and_then(|names|names.get(name).or_else(||names.iter().find(|subject|subject.contains('*') && matches_subject(name,subject)))) {
-            policy.subjects=vec![subject.clone()];
+            policy.subjects=super::subject_values::Input::literal(subject,&self.context.resources.issuer_values)?;
             policy.issuers.clear();
             policy.managers.push(super::external::Manager::Tailscale);
             policy.on_demand=true;
         } else if policy.on_demand && policy.managers.is_empty() {
-            // HTTP's on-demand convenience manager is tried before the real
-            // permission endpoint. For other suffixes it performs no IO.
             policy.managers.push(super::external::Manager::Tailscale);
         }
-        policy
+        Ok(policy)
     }
-    fn policy_for_origin(&self, origin: &str) -> Policy {
+    fn policy_for_origin(&self, origin: &str) -> Result<Policy> {
         self.policy(origin)
     }
-    // Management jobs use the current policy; physical cache entries are
-    // separately identified by the complete chain, never by this key.
-    fn management_key(&self, names: &[String], identity: bool, origin: &str) -> String {
-        let key = group_key(names, identity);
-        if !identity && self.policy_for_origin(origin).on_demand {
-            format!("{key}:on-demand:{:?}", self.policy_index(origin))
-        } else { key }
+    // Physical cache entries remain identified separately by complete chain.
+    fn management_key(&self, names: &[String], identity: bool, origin: &str) -> Result<String> {
+        let key=group_key(names,identity);
+        if !identity && self.policy_for_origin(origin)?.on_demand {
+            Ok(format!("{key}:on-demand:{:?}",self.policy_index(origin)?))
+        } else { Ok(key) }
     }
     async fn validate_retained_groups(&self, names: &[Vec<String>], identity: bool) -> Result<()> {
         let material = self.state.lock().await.material.clone();
@@ -1054,15 +1078,15 @@ impl CertificateServices {
             let Some(retained) = retained else {
                 // The opaque, digest-bound snapshot records which subjects
                 // really were registered under its old on-demand policy.
-                if !identity
-                    && self.restore.as_ref().is_some_and(|retained| {
-                        retained.capacity_displaced.contains(names)
-                            || retained.on_demand_names.iter().any(|(n, origin)| {
-                                n == names && self.policy_for_origin(origin).on_demand
-                            })
-                    })
-                {
-                    continue;
+                if !identity {
+                    if let Some(snapshot)=&self.restore {
+                        if snapshot.capacity_displaced.contains(names) { continue; }
+                        let mut retained_on_demand=false;
+                        for (n,origin) in &snapshot.on_demand_names {
+                            if n==names && self.policy_for_origin(origin)?.on_demand { retained_on_demand=true; break; }
+                        }
+                        if retained_on_demand { continue; }
+                    }
                 }
                 return Err(anyhow!(
                     "retained managed certificate missing for required group"

@@ -62,7 +62,7 @@ impl CertificateServices {
         // Administrative identity keeps its independent default configuration.
         // Business status uses actual certificate Name0 in the current plan.
         let policy = if administrative { Policy::default() }
-            else { self.policy(&name0) };
+            else { self.policy(&name0)? };
         if policy.disable_ocsp { return Ok(None); }
         let root = if administrative { self.context.paths.default_storage.clone() } else {
             policy.storage.as_ref().or(self.plan.storage.as_ref())

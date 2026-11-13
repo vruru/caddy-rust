@@ -180,7 +180,7 @@ impl CertificateServices {
         origin: Option<String>,
     ) -> Result<Arc<Group>> {
         let origin = origin.unwrap_or_else(|| names[0].clone());
-        let key = self.management_key(&names, identity, &origin);
+        let key = self.management_key(&names, identity, &origin)?;
         let restoring = seed.is_some() && !background;
         let background = background || seed.is_some();
         let (retired, retired_ocsp) = {
@@ -255,7 +255,7 @@ impl CertificateServices {
             existing
         };
         if let Some(group) = existing {
-            if !identity && self.policy_index(&group.origin) != self.policy_index(&origin) {
+            if !identity && self.policy_index(&group.origin)? != self.policy_index(&origin)? {
                 return Err(anyhow!(
                     "certificate group origin changed; authorized replacement required"
                 ));
@@ -293,7 +293,7 @@ impl CertificateServices {
         );
         if !identity
             && !Arc::ptr_eq(&group, &candidate)
-            && self.policy_index(&group.origin) != self.policy_index(&origin)
+            && self.policy_index(&group.origin)? != self.policy_index(&origin)?
         {
             return Err(anyhow!(
                 "certificate group origin changed; authorized replacement required"
@@ -349,11 +349,11 @@ impl CertificateServices {
                 ..Policy::default()
             }
         } else {
-            self.policy_for_origin(&origin)
+            self.policy_for_origin(&origin)?
         };
 
         if policy.issuers.is_empty() {
-            if !identity && self.policy_index(&origin).is_none() && internal_name(&names[0]) {
+            if !identity && self.policy_index(&origin)?.is_none() && internal_name(&names[0]) {
                 policy.issuers.push(Issuer::Internal {
                     ca: "local".into(),
                     options: InternalIssuerOptions::default(),
@@ -503,7 +503,7 @@ impl CertificateServices {
             self.on_demand.imported_binding(&names, seed_identity)
         };
         let group = Arc::new(Group {
-            key: self.management_key(&names, identity, &origin),
+            key: self.management_key(&names, identity, &origin)?,
             names,
             origin: origin.clone(),
             policy,

@@ -239,6 +239,8 @@ impl NativeBackend {
             events.set_logging(logging.clone());
             services.prepare(root.candidates.child_token()).await
                 .map_err(|error|storage_preparation_failed(&logging,&error))?;
+            prepared.http.explicit_tls_subjects=services.prepared_explicit_subjects()
+                .map_err(|_| failed("certificate_subject_preparation_failed"))?;
             prepared.http=services.prepare_client_pools(prepared.http,root.candidates.child_token()).await
                 .map_err(|error|client_pool_preparation_failed(&logging,&error))?;
             drop(logging);
@@ -423,6 +425,8 @@ impl Root {
             events.set_logging(logging.clone());
             services.prepare(self.candidates.child_token()).await
                 .map_err(|error|storage_preparation_failed(&logging,&error))?;
+            prepared.http.explicit_tls_subjects=services.prepared_explicit_subjects()
+                .map_err(|_| failed("certificate_subject_preparation_failed"))?;
             prepared.http=services.prepare_client_pools(prepared.http,self.candidates.child_token()).await
                 .map_err(|error|client_pool_preparation_failed(&logging,&error))?;
             // Manual loading is Provision-time; configured subscriptions become
@@ -931,7 +935,6 @@ fn prepare(raw: Value) -> Result<Prepared, AdminError> {
     let mut http = http_config::validate_json(&Value::Object(document))
         .map_err(|_| failed("invalid_http_application"))?;
     certificates.http_application_ports(http.http_port,http.https_port);
-    http.explicit_tls_subjects=certificates.explicit_subjects();
     let digest = Sha256::digest(
         crate::admin_json::encoded_typed(&raw)
             .map_err(|_| failed("invalid_configuration_encoding"))?,

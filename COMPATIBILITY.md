@@ -229,6 +229,49 @@ waits for actual lookup owners, including retained errors. This is not a
 per-issuer physical-retirement receipt and does not enable timeout failover.
 Standalone unscoped clients and non-Unix targets keep their prior DNS path.
 
+TLS automation subject values
+-----------------------------
+
+Raw `automation.policies[].subjects` and `certificates.automate` values remain
+unchanged in JSON exports and configuration identity. Provisioning resolves
+their existing global providers on the bounded certificate CPU lane and keeps
+the completed values for that generation. Policy patterns use minimal Punycode,
+without URL/UTS46, NFC or fullwidth-dot mapping; automate identifiers use the
+existing strict managed-name normalization before selecting a policy. An
+expanded empty policy element remains an element (`[""]`), not an empty-list
+catch-all. Empty automate identifiers fail. Correct wider Punycode arithmetic
+is retained for bounded literal policy patterns, independently checked against
+Python's integer encoder; an oversized unmatched pattern is not thereby admitted
+as a managed DNS identifier.
+
+File providers retain the existing regular-file checks, read at most the first
+1MiB and remove at most one trailing LF followed by one CR. Failed opens/reads
+yield a recognized empty value; non-UTF8 bytes within the selected range fail
+with a static diagnostic, while bytes beyond that range are not read. The new
+bounded Unix environment reader synchronously scans/copies `getenv` only under
+the sealed CLI contract that all process-wide environment mutation finishes
+before threads and foreign libraries start. It is not safer than `std::env` and
+does not make concurrent foreign environment mutation valid. The new bounded
+environment path explicitly rejects non-Unix targets.
+
+Prepared values share the existing 8MiB issuer-values pool. Each field is
+limited to 1MiB, with additional Unicode conversion limits and a separate
+16MiB+16KiB temporary worker reservation. Actual workers, completed output Arcs
+and retained snapshots keep their loans through their own destruction. These
+bounds do not cover opaque provider/runtime heaps, process RSS, or rewrite the
+existing normalized-name group/cache allocation graph. HTTP validation and
+staging both consume the prepared exact explicit-subject index, and permission
+requirements are checked again after expansion.
+
+Restore-only transactions match raw kind, identity and order, then reuse the
+accepted prepared Arcs without rereading files/environment. A retry on the same
+services instance after later manual preparation fails also reuses its completed
+values. Actual macOS Controller compensation after a post-publication mode-commit
+failure retains the old values, certificates and routes even when the provider
+file has changed or disappeared. macOS, plus ARM Linux with all available CPUs
+and with a one-CPU quota, have development checks; these do not waive the
+remaining combined release and production gates.
+
 
 ACME directory and configured global values
 ------------------------------------------

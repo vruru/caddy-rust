@@ -38,7 +38,7 @@ pub(super) struct PermissionSetting {
 
 #[derive(Clone)]
 pub(super) struct Policy {
-    pub subjects: Vec<String>,
+    pub subjects: std::sync::Arc<super::subject_values::Input>,
     pub issuers: Vec<Issuer>,
     pub storage: Option<PathBuf>,
     pub renewal_ratio: f64,
@@ -54,7 +54,7 @@ pub(super) struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            subjects: Vec::new(),
+            subjects: super::subject_values::Input::empty(super::subject_values::Kind::Policy),
             issuers: Vec::new(),
             storage: None,
             renewal_ratio: 1.0 / 3.0,
@@ -112,7 +112,7 @@ pub struct CertificatePlan {
     pub(super) authorities: BTreeMap<String, Authority>,
     pub(super) identity: Option<Identity>,
     pub(super) manual: Vec<ManualSource>,
-    pub(super) automate: Vec<String>,
+    pub(super) automate: std::sync::Arc<super::subject_values::Input>,
     pub(super) disable_ocsp: bool,
     pub(super) disable_storage_check: bool,
     pub(super) disable_storage_clean: bool,
@@ -135,7 +135,7 @@ impl Default for CertificatePlan {
             authorities: BTreeMap::new(),
             identity: None,
             manual: Vec::new(),
-            automate: Vec::new(),
+            automate: super::subject_values::Input::empty(super::subject_values::Kind::Automate),
             disable_ocsp: false,
             disable_storage_check: false,
             disable_storage_clean: false,
@@ -149,9 +149,6 @@ impl Default for CertificatePlan {
 }
 
 impl CertificatePlan {
-    pub(crate) fn explicit_subjects(&self)->std::collections::BTreeSet<String>{
-        self.policies.iter().flat_map(|policy|policy.subjects.iter().cloned()).collect()
-    }
     pub(crate) fn http_application_ports(&mut self,http:u16,https:u16){
         self.http_challenge_port=Some(http);self.alpn_challenge_port=Some(https);
     }
@@ -168,7 +165,7 @@ impl CertificatePlan {
     }
 
     pub fn automated_names(&self) -> &[String] {
-        &self.automate
+        self.automate.raw()
     }
     pub fn policy_count(&self) -> usize {
         self.policies.len()

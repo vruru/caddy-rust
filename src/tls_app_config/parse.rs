@@ -58,11 +58,11 @@ pub(super) fn parse(views: CertificateViews<'_>) -> Result<CertificatePlan> {
         ObjectKind::Certificates,
         &tls.at("certificates"),
     )?;
-    plan.automate = certificates
+    plan.automate = super::subject_values::Input::new(super::subject_values::Kind::Automate, certificates
         .strings("automate")?
         .into_iter()
         .map(Into::into)
-        .collect();
+        .collect()).map_err(|_| ConfigError::invalid(certificates.at("automate")))?;
     for field in ["load_files", "load_pem"] {
         for (index, value) in certificates.array(field)?.iter().enumerate() {
             let path = pointer(&certificates.at(field), &index.to_string());
@@ -229,7 +229,7 @@ pub(super) fn parse(views: CertificateViews<'_>) -> Result<CertificatePlan> {
     if plan.policies.len() > 1024
         || plan.authorities.len() > 256
         || plan.manual.len() > crate::tls_resolver::MAX_CERTIFICATES
-        || plan.automate.len() > 65536
+        || plan.automate.raw().len() > 65536
     {
         return Err(ConfigError::invalid("/apps/tls".into()));
     }
@@ -237,7 +237,7 @@ pub(super) fn parse(views: CertificateViews<'_>) -> Result<CertificatePlan> {
         if policy.on_demand
             && policy.managers.is_empty()
             && plan.permission.is_none()
-            && (policy.subjects.is_empty() || policy.subjects.iter().any(|name| name.contains('*')))
+            && (policy.subjects.raw().is_empty() || policy.subjects.raw().iter().any(|name| name.contains('*')))
             && !(!policy.issuers.is_empty()
                 && policy
                     .issuers
@@ -277,11 +277,11 @@ fn policy(value: &Value, path: &str) -> Result<Policy> {
         _ => return Err(ConfigError::invalid(object.at("key_type"))),
     };
     let mut policy = Policy {
-        subjects: object
+        subjects: super::subject_values::Input::new(super::subject_values::Kind::Policy, object
             .strings("subjects")?
             .into_iter()
             .map(Into::into)
-            .collect(),
+            .collect()).map_err(|_| ConfigError::invalid(object.at("subjects")))?,
         issuers: parse_issuers(&object)?,
         storage: pki_parse::parse_storage(object.value("storage"), &object.at("storage"))?,
         key_type,

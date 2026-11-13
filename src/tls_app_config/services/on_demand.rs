@@ -378,12 +378,12 @@ impl ScopedCertificateProvider for Provider {
     }
     fn can_acquire_quic_name(&self, name: &str) -> bool {
         self.service.upgrade().is_some_and(|service| {
-            service.policy(name).on_demand
+            service.policy(name).is_ok_and(|policy| policy.on_demand)
         })
     }
     fn should_probe_before_fallback(&self, name: &str) -> bool {
         self.service.upgrade().is_none_or(|service| {
-            service.policy(name).on_demand || self.state.almost_full(service.plan.cache_capacity)
+            service.policy(name).map_or(true, |policy| policy.on_demand) || self.state.almost_full(service.plan.cache_capacity)
         })
     }
     fn cached_name(&self, name: &str) -> bool {
@@ -392,9 +392,10 @@ impl ScopedCertificateProvider for Provider {
     fn maintenance_due(&self, name: &str) -> bool {
         let Some(service) = self.service.upgrade() else { return false; };
         let Ok(at) = now() else { return false; };
+        let policy=match service.policy(name) { Ok(policy)=>policy, Err(_)=>return true };
         if !self.state.active.load(Ordering::Acquire)
             || service.context.cancel.is_cancelled()
-            || !service.policy(name).on_demand
+            || !policy.on_demand
             || self.state.manual(name, at)
         {
             return false;
@@ -409,9 +410,10 @@ impl ScopedCertificateProvider for Provider {
         let Some(cached) = &request.cached else { return self.maintenance_due(&request.subject); };
         let Some(service) = self.service.upgrade() else { return false; };
         let Ok(at) = now() else { return false; };
+        let policy=match service.policy_for_origin(&request.origin) { Ok(policy)=>policy, Err(_)=>return true };
         self.state.active.load(Ordering::Acquire)
             && !service.context.cancel.is_cancelled()
-            && service.policy_for_origin(&request.origin).on_demand
+            && policy.on_demand
             && self.state.resident_receipt(cached).is_some_and(|resident|
                 resident.usable(at) && (service.current_maintenance_at(&request.origin, &resident)
                     .is_ok_and(|due| due <= at) || resident.leaf.needs_renewal()))
@@ -456,9 +458,9 @@ impl Drop for Waiter {
 
 impl CertificateServices {
     fn current_maintenance_at(&self, origin: &str, resident: &Resident) -> Result<i64> {
-        let policy = self.policy_for_origin(origin);
+        let policy = self.policy_for_origin(origin)?;
         let scheduled = resident.next_check.load(Ordering::Acquire);
-        if self.policy_index(origin) == self.policy_index(&resident.origin)
+        if self.policy_index(origin)? == self.policy_index(&resident.origin)?
             && resident.kind!=cert_automation::ManagedKind::Internal
         { return Ok(scheduled); }
         let ordinary = self.current_renewal_time(&resident.material, &policy,resident.kind)?;
@@ -957,7 +959,7 @@ impl CertificateServices {
             }
             SharedImport::Pending(kind) => {
                 if self.restore.is_none()
-                    && (!self.policy_for_origin(&origin).on_demand
+                    && (!self.policy_for_origin(&origin)?.on_demand
                         || matches!(kind, PendingKind::Withdrawn))
                 {
                     let mut queue = self
@@ -1177,7 +1179,7 @@ impl CertificateServices {
                 .await?;
                 return Ok(());
             }
-            if self.policy_for_origin(&entry.origin).on_demand {
+            if self.policy_for_origin(&entry.origin)?.on_demand {
                 return Ok(());
             }
             if let PendingKind::Future(not_before) = kind {
@@ -1392,9 +1394,9 @@ impl CertificateServices {
             !name.contains('*'),
             "wildcard is not a TLS client server name"
         );
-        let policy = self.policy_for_origin(&origin);
+        let policy = self.policy_for_origin(&origin)?;
         let typed = origin.is_empty() || name.parse::<std::net::IpAddr>().is_ok();
-        let typed_allowed = self.policy_index(&origin).is_some()
+        let typed_allowed = self.policy_index(&origin)?.is_some()
             && policy.on_demand
             && policy.issuers.iter().any(|issuer|matches!(issuer,Issuer::Internal{..}));
         let at = now()?;
@@ -1447,8 +1449,9 @@ impl CertificateServices {
             let hello = hello.ok_or_else(|| anyhow!("external certificate manager requires ClientHello"))?;
             if let Some(certificate) = self.acquire_external(policy.clone(), name.clone(), hello,
                 selection.clone(), caller.clone()).await? { return Ok(Some(certificate)); }
-            let tailscale_only=!policy.subjects.is_empty() && policy.issuers.is_empty()
-                && policy.subjects.iter().all(|name|name.to_ascii_lowercase().ends_with(".ts.net"))
+            let subjects=policy.subjects.get()?.names();
+            let tailscale_only=!subjects.is_empty() && policy.issuers.is_empty()
+                && subjects.iter().all(|name|name.to_ascii_lowercase().ends_with(".ts.net"))
                 && policy.managers.iter().any(|manager|matches!(manager,super::super::external::Manager::Tailscale));
             ensure!(!tailscale_only,"Tailscale manager yielded no certificate and this policy has no issuer");
         }
@@ -1520,7 +1523,7 @@ impl CertificateServices {
             !*_admission && !self.context.cancel.is_cancelled(),
             "certificate services stopped"
         );
-        let policy = self.policy_index(&origin);
+        let policy = self.policy_index(&origin)?;
         let mut flights = self
             .on_demand
             .flights
@@ -1738,7 +1741,7 @@ impl CertificateServices {
         {
             return Ok(ActionOutcome { maintain: false, acquired: Some(acquired) });
         }
-        let policy = self.policy_for_origin(origin);
+        let policy = self.policy_for_origin(origin)?;
         if !policy.on_demand {
             ensure!(
                 matches!(action, Action::Miss)
@@ -1771,7 +1774,7 @@ impl CertificateServices {
         }
         if matches!(action, Action::Maintenance)
             && let Some(resident) = &resident
-            && self.policy_index(&resident.origin) == self.policy_index(origin)
+            && self.policy_index(&resident.origin)? == self.policy_index(origin)?
             && resident.group.get().is_none_or(|group|
                 group.publication.lock().is_ok_and(|receipt| receipt.as_ref()
                     .is_some_and(|receipt| receipt.same_instance(&resident.receipt))))
@@ -2470,7 +2473,10 @@ impl RegistrationInput {
         let mut count=0usize;let mut text=0usize;let mut longest_name=0usize;
         for name in input.names.iter().flatten(){count=count.checked_add(1).ok_or(crate::cert_transient::ResourceDenied)?;
             text=text.checked_add(name.len()).ok_or(crate::cert_transient::ResourceDenied)?;longest_name=longest_name.max(name.len());}
-        let longest_pattern=input.plan.policies.iter().flat_map(|p|&p.subjects).map(String::len).max().unwrap_or(0);
+        let mut longest_pattern=0usize;
+        for policy in &input.plan.policies {
+            longest_pattern=longest_pattern.max(policy.subjects.get()?.names().iter().map(String::len).max().unwrap_or(0));
+        }
         let _matcher=crate::cert_transient::reserve(longest_name.checked_add(longest_pattern)
             .and_then(|n|n.checked_mul(32)).and_then(|n|n.checked_add(16384)).ok_or(crate::cert_transient::ResourceDenied)?)?;
         let bytes=count.checked_next_power_of_two().unwrap_or(1).max(4)
@@ -2480,8 +2486,11 @@ impl RegistrationInput {
         let mut map=HashMap::new();map.try_reserve(count).map_err(|_|crate::cert_transient::ResourceDenied)?;
         for (i,name) in input.names.iter().flatten().enumerate(){
             if i%128==0{ensure!(!input.cancel.is_cancelled(),"certificate registration cancelled");}
-            let index=input.plan.policies.iter().position(|policy|policy.subjects.is_empty()
-                ||policy.subjects.iter().any(|pattern|matches_subject(name,pattern)));
+            let mut index=None;
+            for (i,policy) in input.plan.policies.iter().enumerate() {
+                let subjects=policy.subjects.get()?.names();
+                if subjects.is_empty() || subjects.iter().any(|pattern|matches_subject(name,pattern)) { index=Some(i); break; }
+            }
             let set=if let Some(index)=index{sets[index].clone()}
                 else if super::group::internal_name(name){internal.clone()}else{public.clone()};
             map.insert(name.clone(),set);

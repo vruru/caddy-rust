@@ -29,7 +29,7 @@ pub struct PreparedConfig {
     pub(crate) events: Option<Arc<crate::events::EventsApp>>,
     pub(crate) http_port: u16,
     pub(crate) https_port: u16,
-    pub(crate) explicit_tls_subjects: std::collections::BTreeSet<String>,
+    pub(crate) explicit_tls_subjects: std::sync::Arc<crate::tls_app_config::ExplicitSubjects>,
     pub(crate) servers: Vec<Arc<ServerConfig>>,
     pub(crate) certificates: Vec<FileCertificate>,
     shutdown_policy: HttpShutdownPolicy,
