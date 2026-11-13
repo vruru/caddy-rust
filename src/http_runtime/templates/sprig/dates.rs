@@ -98,6 +98,7 @@ static DURATION_SIG: gotmpl::Signature = gotmpl::Signature::from_static(
 static TIME_TYPE: gotmpl::HostType = gotmpl::HostType {
     methods: &[
         gotmpl::HostMethod { name: "String", invoke: |o, a| time_call("String", o, a), signature: None },
+        gotmpl::HostMethod { name: "MarshalText", invoke: |o, a| time_call("MarshalText", o, a), signature: None },
         gotmpl::HostMethod { name: "Unix", invoke: |o, a| time_call("Unix", o, a), signature: None },
         gotmpl::HostMethod { name: "UnixMilli", invoke: |o, a| time_call("UnixMilli", o, a), signature: None },
         gotmpl::HostMethod { name: "UnixMicro", invoke: |o, a| time_call("UnixMicro", o, a), signature: None },
@@ -203,6 +204,24 @@ fn time_call(name: &str, object: &gotmpl::Object, a: &[V]) -> R {
             arity(a, 0, 0)?;
             match name {
                 "String" => output(display.to_owned()),
+                "MarshalText" => {
+                    let (offset, zone) = zone_info(&time.zone, time.stamp.seconds);
+                    let components = time_components::at(time.stamp, offset, zone)
+                        .map_err(|e| err(e.to_string()))?;
+                    if !(0..=9999).contains(&components.year) {
+                        return Err(err("Time.MarshalText: year outside of range [0,9999]"));
+                    }
+                    if !(-86_399..=86_399).contains(&offset) {
+                        return Err(err("Time.MarshalText: timezone hour outside of range [0,23]"));
+                    }
+                    // A validated RFC3339Nano value has at most 35 bytes. Keep
+                    // Go's []uint8 result rather than a string or JSON quotes.
+                    let text = format(time, "2006-01-02T15:04:05.999999999Z07:00")?;
+                    if text.len() > 35 {
+                        return Err(err("time text exceeds RFC3339 capacity"));
+                    }
+                    Ok(V::Slice(gotmpl::TypedSlice::bytes(Some(Arc::from(text.into_bytes())))))
+                },
                 "Unix" => Ok(V::Int64(time.stamp.seconds)),
                 "UnixNano" => Ok(V::Int64(time_components::unix_nano(time.stamp))),
                 "UnixMilli" => Ok(V::Int64(

@@ -1833,3 +1833,13 @@ shutdown while thread pressure remains held have isolated acceptance, alongside
 normal macOS and Linux TLS/reload regression. This
 is not a claim of recovery from arbitrary allocator failure or full production
 acceptance; see vendor/tokio-1.54.1/PATCH-NOTES.md.
+
+
+Readonly template time text
+---------------------------
+
+The `time.Time.MarshalText` receiver returns a typed `[]uint8` containing
+RFC3339Nano text, preserving the time's offset and nanoseconds and omitting
+trailing fractional zeros. Years outside 0..9999 and offsets whose absolute
+hour reaches 24 return the corresponding method error. This adds that readonly
+receiver; other missing time receivers remain separate compatibility work.
