@@ -1121,3 +1121,16 @@ cannot return to ready after stopping begins. See
 [PROCESS-NOTIFY.md](docs/PROCESS-NOTIFY.md) for scope and failure behavior. Final
 acceptance under the target machine's real service manager remains a deployment
 gate, separate from datagram/credential validation.
+
+
+Numeric TCP listener ranges
+---------------------------
+
+JSON HTTP listeners now expand inclusive numeric-IP TCP port ranges through
+the existing staged socket ownership, reload and failed-candidate rollback
+path. Bare numeric IPs and omitted ports retain the reference's ephemeral-port
+semantics. IPv4, IPv6, wildcard addresses and the optional TCP network prefix
+are supported. The existing per-server limit applies to expanded endpoints:
+at most 1024, checked before allocating the expanded range. Unknown listener
+networks, unresolved hostnames and Unix HTTP listeners remain explicit gaps;
+this does not claim every NetworkAddress or Caddyfile site-address combination.

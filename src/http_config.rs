@@ -1,5 +1,7 @@
 //! Strictly compiled HTTP configuration. Known but incomplete capabilities fail
 //! before activation. The raw configuration may contain secrets; do not Debug it.
+#[path = "http_config/listeners.rs"]
+mod listeners;
 #[path = "http_config/helpers.rs"]
 pub(crate) mod helpers;
 #[path = "http_config/proxy_ext.rs"]
@@ -412,16 +414,7 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
     let mut listen = Vec::new();
     for raw in strings(required(m, "listen")?, path)? {
         let raw = helpers::replace(&raw, true, helpers::global_lookup)?;
-        let raw = raw.strip_prefix("tcp/").unwrap_or(&raw);
-        let raw = if raw.starts_with(':') {
-            format!("[::]{raw}")
-        } else {
-            raw.to_owned()
-        };
-        listen.push(
-            raw.parse::<SocketAddr>()
-                .map_err(|_| unsupported("/apps/http/servers/*/listen/network_or_hostname"))?,
-        );
+        listeners::append(&raw,&mut listen)?;
     }
     ensure!(
         !listen.is_empty() && listen.len() <= 1024,
