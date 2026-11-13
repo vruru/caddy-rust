@@ -254,6 +254,8 @@ struct ManagerInner {
     events: broadcast::Sender<AutomationEvent>,
     recovered: OnceCell<RecoveryReport>,
     recovery_announced: AtomicBool,
+    // Last: configured-value copies and escaped Wire owners retain this loan.
+    issuer_values_credit:Option<Arc<crate::acme_wire::chain_memory::Lease>>,
 }
 /// Prepare a real listener only for the selected pending authorization. The
 /// owner must retain its listener lease through ensure and release it on every
@@ -812,8 +814,15 @@ impl CertificateManager {
                 events,
                 recovered: OnceCell::new(),
                 recovery_announced: AtomicBool::new(false),
+                issuer_values_credit:None,
             }),
         })
+    }
+    /// Root pre-reserves this allowance before constructing/copying options.
+    /// Public constructors preserve their existing uncredited caller contract.
+    pub(crate) fn with_issuer_values_credit(mut self,credit:Option<Arc<crate::acme_wire::chain_memory::Lease>>)->Result<Self>{
+        Arc::get_mut(&mut self.inner).ok_or_else(||anyhow!("certificate manager already shared"))?.issuer_values_credit=credit;
+        Ok(self)
     }
     /// The generation retains this event app; later reloads cannot replace it.
     pub fn with_events(mut self, events: Option<Arc<crate::events::EventsApp>>) -> Result<Self> {
@@ -967,7 +976,7 @@ impl CertificateManager {
                     );
                     let wire = issuer
                         .wire
-                        .get_or_try_init(|| {
+                        .get_or_try_init(|| async {
                             AcmeWire::connect_with_client_tls_scope(
                                 issuer.config.wire.clone(),
                                 self.inner.local.clone(),
@@ -975,7 +984,7 @@ impl CertificateManager {
                                 #[cfg(feature="native-run")]
                                 self.inner.outgoing_tls.clone(),
                                 &cancel,
-                            )
+                            ).await?.with_issuer_values_credit(self.inner.issuer_values_credit.clone())
                         })
                         .await?;
                     let session = wire.restore(
@@ -1228,7 +1237,7 @@ impl CertificateManager {
             }
             let wire = match issuer
                 .wire
-                .get_or_try_init(|| {
+                .get_or_try_init(|| async {
                     AcmeWire::connect_with_client_tls_scope(
                         issuer.config.wire.clone(),
                         self.inner.local.clone(),
@@ -1236,7 +1245,7 @@ impl CertificateManager {
                                 #[cfg(feature="native-run")]
                                 self.inner.outgoing_tls.clone(),
                         &cancel,
-                    )
+                    ).await?.with_issuer_values_credit(self.inner.issuer_values_credit.clone())
                 })
                 .await
             {
@@ -1768,7 +1777,7 @@ impl CertificateManager {
                     }
                     let wire = issuer
                         .wire
-                        .get_or_try_init(|| {
+                        .get_or_try_init(|| async {
                             AcmeWire::connect_with_client_tls_scope(
                                 issuer.config.wire.clone(),
                                 self.inner.local.clone(),
@@ -1776,7 +1785,7 @@ impl CertificateManager {
                                 #[cfg(feature="native-run")]
                                 self.inner.outgoing_tls.clone(),
                                 cancel,
-                            )
+                            ).await?.with_issuer_values_credit(self.inner.issuer_values_credit.clone())
                         })
                         .await?;
                     if let Some(cert_id) = certificate_id.as_deref() {
@@ -2347,7 +2356,7 @@ impl CertificateManager {
         let (replacement, reservation, attempt_id) = cycle;
         let wire = issuer
             .wire
-            .get_or_try_init(|| {
+            .get_or_try_init(|| async {
                 AcmeWire::connect_with_client_tls_scope(
                     issuer.config.wire.clone(),
                     self.inner.local.clone(),
@@ -2355,7 +2364,7 @@ impl CertificateManager {
                                 #[cfg(feature="native-run")]
                                 self.inner.outgoing_tls.clone(),
                     cancel,
-                )
+                ).await?.with_issuer_values_credit(self.inner.issuer_values_credit.clone())
             })
             .await?;
         let issuer_name = issuer_key(wire.directory_url())?;

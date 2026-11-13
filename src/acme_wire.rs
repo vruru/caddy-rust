@@ -5,6 +5,7 @@
 #[path = "acme_wire/signer.rs"]
 mod signer;
 mod network_proxy;
+pub(crate) mod directory_url;
 mod order_parameters;
 mod chain_preference;
 mod certificate_links;
@@ -191,7 +192,10 @@ struct WireInner {
     directory: Directory,
     trusted: HashSet<String>,
     allow_loopback: bool,
+    allowed_http_origin: Option<String>,
     nonces: Mutex<Vec<String>>,
+    // Last owner: no early refund when an AccountSession outlives its manager.
+    issuer_values_credit:Option<Arc<chain_memory::Lease>>,
 }
 
 pub struct AccountSession {
@@ -239,8 +243,8 @@ impl AcmeWire {
             options.extra_ca_pem.len() <= 32 && options.trusted_ca_origins.len() <= 32,
             "ACME trust configuration exceeds bounds"
         );
-        let directory_url =
-            Url::parse(&options.directory).map_err(|_| anyhow!("invalid ACME directory URL"))?;
+        let directory_url = directory_url::normalize(&options.directory)?;
+        let allowed_http_origin = directory_url::allowed_http_origin(&directory_url);
         let mut trusted = HashSet::from([directory_url.origin().ascii_serialization()]);
         for raw in &options.trusted_ca_origins {
             let url = Url::parse(raw).map_err(|_| anyhow!("invalid ACME trusted origin"))?;
@@ -252,10 +256,11 @@ impl AcmeWire {
                 &url,
                 &HashSet::from([url.origin().ascii_serialization()]),
                 options.allow_insecure_loopback,
+                allowed_http_origin.as_deref(),
             )?;
             trusted.insert(url.origin().ascii_serialization());
         }
-        validate_url(&directory_url, &trusted, options.allow_insecure_loopback)?;
+        validate_url(&directory_url, &trusted, options.allow_insecure_loopback, allowed_http_origin.as_deref())?;
         if let Some(proxy)=&options.network_proxy {proxy.validate()?;}
         let client = crate::cert_cpu::run(cpu.clone(),cancel.clone(),move || {
         let mut builder = reqwest::Client::builder()
@@ -294,6 +299,7 @@ impl AcmeWire {
                 &Url::parse(endpoint).map_err(|_| anyhow!("invalid ACME directory endpoint"))?,
                 &trusted,
                 options.allow_insecure_loopback,
+                allowed_http_origin.as_deref(),
             )?;
         }
         Ok(Self {
@@ -305,9 +311,16 @@ impl AcmeWire {
                 directory,
                 trusted,
                 allow_loopback: options.allow_insecure_loopback,
+                allowed_http_origin,
                 nonces: Mutex::new(Vec::new()),
+                issuer_values_credit:None,
             }),
         })
+    }
+
+    pub(crate) fn with_issuer_values_credit(mut self,credit:Option<Arc<chain_memory::Lease>>)->Result<Self>{
+        Arc::get_mut(&mut self.inner).ok_or_else(||anyhow!("ACME wire already shared"))?.issuer_values_credit=credit;
+        Ok(self)
     }
 
     /// Original Caddy's ZeroSSL convenience registration, scoped to its fixed
@@ -448,7 +461,7 @@ impl AcmeWire {
 
     fn endpoint(&self, raw: &str) -> Result<Url> {
         let url = Url::parse(raw).map_err(|_| anyhow!("invalid ACME resource URL"))?;
-        validate_url(&url, &self.inner.trusted, self.inner.allow_loopback)?;
+        validate_url(&url, &self.inner.trusted, self.inner.allow_loopback, self.inner.allowed_http_origin.as_deref())?;
         Ok(url)
     }
 
@@ -882,11 +895,12 @@ impl AccountSession {
     }
 }
 
-fn validate_url(url: &Url, trusted: &HashSet<String>, allow_loopback: bool) -> Result<()> {
+fn validate_url(url: &Url, trusted: &HashSet<String>, allow_loopback: bool, allowed_http_origin: Option<&str>) -> Result<()> {
     let loopback = matches!(url.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback())
         || matches!(url.host(), Some(url::Host::Ipv6(ip)) if ip.is_loopback());
     ensure!(
-        (url.scheme() == "https" || (allow_loopback && url.scheme() == "http" && loopback))
+        (url.scheme() == "https" || (url.scheme() == "http" && ((allow_loopback && loopback)
+            || allowed_http_origin == Some(url.origin().ascii_serialization().as_str()))))
             && trusted.contains(&url.origin().ascii_serialization())
             && url.username().is_empty()
             && url.password().is_none()
@@ -1055,7 +1069,7 @@ async fn send_with_memory(client:&reqwest::Client,method:Method,url:Url,body:Opt
     let mut response = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(cancelled_request(ProtocolError{status:0,kind:"cancelled".to_owned(),uncertain:is_post,retry_after:None})),
-        response = request.send() => response.map_err(|error| anyhow::Error::new(error).context(ProtocolError {status:0,kind:"transport".to_owned(),uncertain:is_post,retry_after:None}))?,
+        response = request.send() => response.map_err(|error| anyhow::Error::new(error.without_url()).context(ProtocolError {status:0,kind:"transport".to_owned(),uncertain:is_post,retry_after:None}))?,
     };
     if response
         .content_length()
@@ -1073,7 +1087,7 @@ async fn send_with_memory(client:&reqwest::Client,method:Method,url:Url,body:Opt
     let headers = response.headers().clone();
     let mut body = chain_memory::Collector::new(memory,body_credit,response.content_length().map(|n|n as usize))?;
     loop {
-        let chunk = tokio::select! { biased; _=cancel.cancelled()=>return Err(cancelled_request(ProtocolError{status:status.as_u16(),kind:"cancelled".to_owned(),uncertain:is_post,retry_after:None})), chunk=response.chunk()=>chunk.map_err(|error| anyhow::Error::new(error).context(ProtocolError{status:status.as_u16(),kind:"responseTransport".to_owned(),uncertain:is_post,retry_after:None}))? };
+        let chunk = tokio::select! { biased; _=cancel.cancelled()=>return Err(cancelled_request(ProtocolError{status:status.as_u16(),kind:"cancelled".to_owned(),uncertain:is_post,retry_after:None})), chunk=response.chunk()=>chunk.map_err(|error| anyhow::Error::new(error.without_url()).context(ProtocolError{status:status.as_u16(),kind:"responseTransport".to_owned(),uncertain:is_post,retry_after:None}))? };
         let Some(chunk) = chunk else { break };
         if body.len() + chunk.len() > MAX_BODY {
             return Err(ProtocolError {

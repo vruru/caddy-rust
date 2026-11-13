@@ -10,6 +10,8 @@ pub(super) struct SolverBroker {
     staged: Vec<StagedAddress>,
     provider: Option<Arc<dyn ChallengeListenerProvider>>,
     leases: AsyncMutex<Vec<Box<dyn ChallengeListenerLease>>>,
+    // Binding directory strings can outlive the manager during group drop.
+    _issuer_values_credit:Option<Arc<crate::acme_wire::chain_memory::Lease>>,
 }
 struct BindingSettings {
     directory: String,
@@ -50,7 +52,12 @@ impl SolverBroker {
             staged,
             provider,
             leases: AsyncMutex::new(Vec::new()),
+            _issuer_values_credit:None,
         }))
+    }
+    pub(super) fn with_issuer_values_credit(mut self:Arc<Self>,credit:Option<Arc<crate::acme_wire::chain_memory::Lease>>)->Result<Arc<Self>>{
+        Arc::get_mut(&mut self).ok_or_else(||anyhow!("challenge broker already shared"))?._issuer_values_credit=credit;
+        Ok(self)
     }
     pub(super) fn callback(self: &Arc<Self>) -> SolverPreparation {
         let this = self.clone();

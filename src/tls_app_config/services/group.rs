@@ -291,6 +291,7 @@ impl CertificateServices {
                 // admin.go defaults to one ACME module; it does not call the
                 // business email-based DefaultIssuers factory.
                 policy.issuers = vec![Issuer::Acme(Box::new(AcmeSettings {
+                    values:None,
                     config: AcmeIssuerConfig::lets_encrypt(),
                     account_key: None,
                     roots: Vec::new(),
@@ -335,6 +336,11 @@ impl CertificateServices {
         };
         let mut solver = None;
         let group_tasks=TaskTracker::new();
+        let copy_bytes=policy.issuers.iter().try_fold(0usize,|sum,issuer|{
+            let bytes=match issuer {Issuer::Acme(settings)=>settings.values.as_ref().map(|v|v.get().and_then(|p|p.copy_upper())).transpose()?.unwrap_or(0),_=>0};
+            sum.checked_add(bytes).ok_or_else(||anyhow!("ACME configured value copy budget overflow"))
+        })?;
+        let issuer_values_credit=if copy_bytes==0{None}else{Some(Arc::new(self.context.resources.issuer_values.reserve(copy_bytes)?))};
         let issuer = if policy
             .issuers
             .iter()
@@ -347,6 +353,7 @@ impl CertificateServices {
                     unreachable!()
                 };
                 let mut issuer = settings.config.clone();
+                if let Some(values)=&settings.values {values.get()?.apply(&mut issuer);}
                 if let Some(input) = &settings.account_key {
                     issuer.account_key = Some(input.prepare(self.context.resources.cpu.clone(),cancel.clone()).await?);
                 }
@@ -366,22 +373,18 @@ impl CertificateServices {
                 }
                 issuers.push(issuer);
             }
-            let settings = policy
-                .issuers
-                .iter()
-                .filter_map(|issuer| {
-                    if let Issuer::Acme(settings) = issuer {
-                        Some(settings.as_ref().clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            let settings = policy.issuers.iter().map(|issuer| {
+                if let Issuer::Acme(settings)=issuer {
+                    let mut settings=settings.as_ref().clone();
+                    if let Some(values)=&settings.values {settings.config.wire.directory=values.get()?.directory.clone();}
+                    Ok(Some(settings))
+                } else {Ok(None)}
+            }).collect::<Result<Vec<_>>>()?.into_iter().flatten().collect();
             let broker = solver::SolverBroker::new(
                 settings,
                 bound.to_vec(),
                 self.context.listener_provider.clone(),
-            )?;
+            )?.with_issuer_values_credit(issuer_values_credit.clone())?;
             let (max_concurrent, max_concurrent_per_ca) = self.context.resources.issuance.limits();
             let options = AutomationOptions {
                 issuers,
@@ -399,6 +402,7 @@ impl CertificateServices {
                 self.context.resources.issuance.clone(),
                 Some(broker.callback()),
             )?
+            .with_issuer_values_credit(issuer_values_credit)?
             // Caddy admin identity uses a separate certmagic.Config without
             // tlsApp.onEvent; only business certificates join the TLS app.
             .with_events((!identity).then(|| self.context.events.clone()).flatten())?;

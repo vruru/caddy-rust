@@ -15,11 +15,11 @@ const CONCURRENCY:usize=4;
 
 struct Endpoint{url:Url,require_https:bool}
 impl Endpoint{
-    fn declared(base:&Url,raw:&str,require_https:bool,allow_loopback:bool)->Result<Self>{
+    fn declared(base:&Url,raw:&str,require_https:bool,allow_loopback:bool,allowed_http_origin:Option<&str>)->Result<Self>{
         ensure!(raw.len()<=8192,"ACME certificate URL exceeds bounds");
         let url=base.join(raw).map_err(|_|anyhow!("invalid ACME certificate link"))?;
         ensure!(url.as_str().len()<=8192,"ACME resolved certificate URL exceeds bounds");
-        validate_url(&url,&HashSet::from([url.origin().ascii_serialization()]),allow_loopback&&!require_https)?;
+        validate_url(&url,&HashSet::from([url.origin().ascii_serialization()]),allow_loopback&&!require_https,allowed_http_origin)?;
         ensure!(!require_https||url.scheme()=="https","ACME certificate link downgrades HTTPS");
         Ok(Self{require_https:require_https||url.scheme()=="https",url})
     }
@@ -181,7 +181,7 @@ impl AccountSession{
         ensure!(order.value.status=="valid","certificate chain order is not valid");
         let base=self.wire.endpoint(order_url)?;
         let raw=order.value.certificate.as_deref().ok_or_else(||anyhow!("valid order has no certificate URL"))?;
-        let endpoint=Endpoint::declared(&base,raw,base.scheme()=="https",self.wire.inner.allow_loopback)?;
+        let endpoint=Endpoint::declared(&base,raw,base.scheme()=="https",self.wire.inner.allow_loopback,self.wire.inner.allowed_http_origin.as_deref())?;
         let context=Arc::new(Context{wire:self.wire.clone(),signer:self.signer.clone(),location:Arc::from(self.location.as_str()),want_names,
             cancel:cancel.child_token(),http_slots:Arc::new(Semaphore::new(CONCURRENCY)),progress:Arc::new(Progress{active:Mutex::new(0),notify:Notify::new()})});
         let owner=Owner{context,cache:Mutex::new(HashMap::new()),tasks:Mutex::new(JoinSet::new()),visits:AtomicUsize::new(0),cleanup,runtime:Handle::current(),_registration:registration};
@@ -209,7 +209,7 @@ impl AccountSession{
         else{
             let mut targets=HashSet::new();
             let endpoints=node.links.iter().filter(|link|link.up).filter_map(|link|
-                Endpoint::declared(&endpoint.url,&link.target,endpoint.require_https,self.wire.inner.allow_loopback).ok())
+                Endpoint::declared(&endpoint.url,&link.target,endpoint.require_https,self.wire.inner.allow_loopback,self.wire.inner.allowed_http_origin.as_deref()).ok())
                 .filter(|endpoint|targets.insert(endpoint.url.to_string())).collect::<Vec<_>>();
             let parents=stream::iter(endpoints).map(|issuer|self.fetch_chains(issuer,owner,path.clone(),depth+1,want_alternates)).buffered(CONCURRENCY);
             tokio::pin!(parents);
@@ -235,7 +235,7 @@ impl AccountSession{
         if (want_alternates||chains.is_empty())&&chains.len()<MAX_CHAINS{
             let mut targets=HashSet::new();
             let endpoints=node.links.iter().filter(|link|link.alternate).filter_map(|link|
-                Endpoint::declared(&endpoint.url,&link.target,endpoint.require_https,self.wire.inner.allow_loopback).ok())
+                Endpoint::declared(&endpoint.url,&link.target,endpoint.require_https,self.wire.inner.allow_loopback,self.wire.inner.allowed_http_origin.as_deref()).ok())
                 .filter(|endpoint|targets.insert(endpoint.url.to_string())).collect::<Vec<_>>();
             let alternates=stream::iter(endpoints).map(|alternate|self.fetch_chains(alternate,owner,path.clone(),depth+1,want_alternates)).buffered(CONCURRENCY);
             tokio::pin!(alternates);

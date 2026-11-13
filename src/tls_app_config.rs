@@ -9,6 +9,8 @@ mod error;
 mod external;
 #[path = "tls_app_config/issuer_account_key.rs"]
 mod issuer_account_key;
+#[path = "tls_app_config/issuer_values.rs"]
+mod issuer_values;
 #[path = "tls_app_config/issuer_parse.rs"]
 mod issuer_parse;
 #[path = "tls_app_config/loaders.rs"]

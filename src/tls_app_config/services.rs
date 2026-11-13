@@ -79,6 +79,7 @@ pub struct PrepareContext {
 /// Opaque, in-memory rollback capability; never constructible from JSON.
 #[derive(Clone)]
 pub struct RetainedCertificates {
+    issuer_values:Option<Arc<super::issuer_values::Retained>>,
     digest: [u8; 32],
     material: Vec<RetainedMaterial>,
     permission: Option<PermissionSetting>,
@@ -568,6 +569,7 @@ impl CertificateServices {
         );
         let state = self.state.lock().await;
         Ok(RetainedCertificates {
+            issuer_values:super::issuer_values::retain(&self.plan,&self.context.resources.issuer_values)?,
             digest: self.context.configuration_digest,
             material: state
                 .material
@@ -669,6 +671,11 @@ impl CertificateServices {
         .await
     }
     async fn prepare_inner(&self, cancel: CancellationToken) -> Result<()> {
+        if let Some(retained)=&self.restore {
+            super::issuer_values::restore(&self.plan,retained.issuer_values.as_deref())?;
+        } else {
+            super::issuer_values::prepare_all(&self.plan,self.context.resources.cpu.clone(),self.context.resources.issuer_values.clone(),cancel.clone()).await?;
+        }
         self.prepare_permission(cancel.clone()).await?;
         if let Some(retained) = &self.restore {
             self.context.leaf_guard.key_deny().require_loaded()?;

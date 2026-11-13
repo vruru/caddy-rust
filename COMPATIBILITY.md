@@ -200,6 +200,43 @@ Explicit proxy policy remains effective when the HTTP app fills in ACME challeng
 Proxy URL global placeholders are resolved once, on the existing bounded CPU lane, when each independent ACME HTTP client is constructed. Business-request placeholders have no ACME request context. The expanded URL must retain a valid host; errors cannot silently select a direct connection. URLs are limited to 64 KiB, shared across cloned issuer configurations, and credentials are not included in proxy validation diagnostics. Existing ACME request/body limits, CA concurrency budgets, storage leases, certificate/key revocation gates and generation cancellation continue to apply. Proxy routing covers account, order, authorization, certificate and ARI requests, plus the same client's automatic ZeroSSL EAB request; it does not replace the separate OCSP transport policy.
 
 
+ACME directory and configured global values
+------------------------------------------
+
+A directory without a scheme uses HTTPS. An explicitly configured HTTP
+ACME directory is permitted only for a literal private/loopback/link-local
+address or an internal hostname (`localhost`, `.localhost`, `.local`,
+`.internal` or `.home.arpa`). This permission covers only that directory's
+own origin; directory responses, order locations and certificate links cannot
+expand it to another HTTP origin. An HTTPS directory gains no HTTP permission from this internal-origin grant;
+the existing standalone explicit loopback option retains its prior contract.
+Redirect, user-info, fragment and declared-origin
+checks remain active. Host classification does not depend on DNS resolving a
+public hostname to a private address. Native does not copy the baseline's
+accidentally broad IPv6 `::1/7` classification.
+
+Nonempty CA, email and external-account key-ID/MAC fields resolve global
+placeholders during bounded certificate preparation, once per configuration
+generation. Unknown or empty placeholder results reject the candidate, without
+including the values or EAB secrets in diagnostics. A raw empty email remains
+valid. Profile names and trust-root file names retain their existing literal
+contracts; account-key and network-proxy preparation keep their own lifetimes.
+Retained rollback state reuses the accepted generation's prepared values rather
+than rereading current environment or file contents.
+
+Expanded fields have a one-MiB limit. Their temporary preparation, resident
+values and actual configured-string copies use separate allowances. A shared
+eight-MiB issuer-control pool spans generations; copies remain charged through
+manager, challenge broker, wire and escaped account-session owners. Exhaustion
+rejects preparation or group admission instead of silently using an unexpanded
+value or a different CA. This controls configured values and their bounded
+copies, not all ACME/TLS allocations or process RSS. Transport sources retain
+the original reqwest error kind, flags and underlying cause, but clear its URL
+before it escapes; a retained failure cannot retain configured URL bytes after
+the issuer allowance retires or disclose that URL through the source error. `test_ca`, the independent
+ZeroSSL API issuer and RFC 8738 IP-subject issuance remain separate work.
+
+
 ACME requested validity and profiles
 -----------------------------------
 

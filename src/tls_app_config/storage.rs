@@ -32,6 +32,8 @@ pub(super) struct Store {
 /// Root shares one resource object across policies and configuration generations.
 /// Storage and issuance pools are bounded independently of the runtime CPU count.
 pub struct CertificateResources {
+    /// Expanded issuer control strings, shared across generations; no foreign wake on retirement.
+    pub(super) issuer_values: Arc<crate::acme_wire::chain_memory::Pool>,
     #[cfg(feature="native-run")]
     pub(crate) client_tls:crate::outgoing_tls::Resources,
     pub(crate) acme_server:Arc<crate::acme_server::Shared>,
@@ -65,6 +67,7 @@ impl CertificateResources {
         #[cfg(feature="native-run")]
         let client_tls=crate::outgoing_tls::Resources::new(external_bytes.clone())?;
         Ok(Self {
+            issuer_values:crate::acme_wire::chain_memory::Pool::new(8*1024*1024),
             #[cfg(feature="native-run")]
             client_tls,
             acme_server:crate::acme_server::Shared::new(),

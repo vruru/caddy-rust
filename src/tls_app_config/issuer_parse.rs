@@ -57,8 +57,9 @@ fn acme(value: &Value, path: &str) -> Result<Issuer> {
     let mut config = AcmeIssuerConfig::lets_encrypt();
     let ca = object.string("ca")?;
     if !ca.is_empty() {
-        validate_directory(ca, &object.at("ca"))?;
-        config.wire.directory = ca.into();
+        config.wire.directory = if ca.contains('{') {ca.into()} else {
+            crate::acme_wire::directory_url::normalize(ca).map_err(|_|ConfigError::invalid(object.at("ca")))?.to_string()
+        };
     }
     config.email = object.string("email")?.into();
     for (field, feature) in [
@@ -131,7 +132,9 @@ fn acme(value: &Value, path: &str) -> Result<Issuer> {
         .into_iter()
         .map(Into::into)
         .collect();
+    let values=super::issuer_values::Input::take(&mut config).map_err(|_|ConfigError::invalid(path.into()))?;
     let mut settings = AcmeSettings {
+        values,
         config,
         account_key,
         roots,
@@ -188,17 +191,4 @@ fn acme(value: &Value, path: &str) -> Result<Issuer> {
     }
     settings.config.challenge_types = enabled;
     Ok(Issuer::Acme(Box::new(settings)))
-}
-
-fn validate_directory(value: &str, path: &str) -> Result<()> {
-    let url = url::Url::parse(value).map_err(|_| ConfigError::invalid(path.into()))?;
-    if url.scheme() != "https"
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(ConfigError::invalid(path.into()));
-    }
-    Ok(())
 }
