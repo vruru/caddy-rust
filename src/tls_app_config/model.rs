@@ -5,7 +5,6 @@ use crate::{
     stek::TicketMode,
 };
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
-use zeroize::Zeroizing;
 
 /// Material and issuer configuration deliberately have no Debug implementation.
 #[derive(Clone)]
@@ -19,6 +18,8 @@ pub(super) enum Issuer {
 
 #[derive(Clone)]
 pub(super) struct AcmeSettings {
+    // None preserves old standalone construction; Some(empty) uses the Caddy default.
+    pub test_ca: Option<String>,
     pub values: Option<std::sync::Arc<super::issuer_values::Input>>,
     pub config: AcmeIssuerConfig,
     pub account_key: Option<std::sync::Arc<super::issuer_account_key::Input>>,
@@ -69,25 +70,6 @@ impl Default for Policy {
     }
 }
 
-#[derive(Clone)]
-pub(super) enum ManualSource {
-    Files {
-        certificate: PathBuf,
-        key: PathBuf,
-        tags: Vec<String>,
-    },
-    Pem {
-        certificate: Vec<u8>,
-        key: Zeroizing<Vec<u8>>,
-        tags: Vec<String>,
-    },
-    Folder(PathBuf),
-    Storage {
-        certificate: String,
-        key: String,
-        tags: Vec<String>,
-    },
-}
 
 #[derive(Clone)]
 pub(super) struct Authority {
@@ -111,7 +93,7 @@ pub struct CertificatePlan {
     pub(super) policies: Vec<Policy>,
     pub(super) authorities: BTreeMap<String, Authority>,
     pub(super) identity: Option<Identity>,
-    pub(super) manual: Vec<ManualSource>,
+    pub(super) manual: super::manual_values::Sources,
     pub(super) automate: std::sync::Arc<super::subject_values::Input>,
     pub(super) disable_ocsp: bool,
     pub(super) disable_storage_check: bool,
@@ -134,7 +116,7 @@ impl Default for CertificatePlan {
             policies: Vec::new(),
             authorities: BTreeMap::new(),
             identity: None,
-            manual: Vec::new(),
+            manual: super::manual_values::Sources::default(),
             automate: super::subject_values::Input::empty(super::subject_values::Kind::Automate),
             disable_ocsp: false,
             disable_storage_check: false,

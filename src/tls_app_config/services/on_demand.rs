@@ -1625,6 +1625,9 @@ impl CertificateServices {
                 _ = &mut prior_quiet => Ok(()),
             };
             let started = waited.is_ok();
+            // One operation belongs to this actual Flight, not its resident
+            // cache history. Its elapsed time includes all waits and retries.
+            let mut retry_operation=cert_automation::retry_operation::RetryOperation::default();
             let result: Result<ActionOutcome> = match waited {
                 Err(error) => Err(error),
                 Ok(()) => {
@@ -1637,6 +1640,7 @@ impl CertificateServices {
                         worker.target.as_ref(),
                         worker.selection.as_ref(),
                         worker.cancel.clone(),
+                        matches!(action,Action::Maintenance).then_some(&mut retry_operation),
                     ))
                     .catch_unwind();
                     tokio::pin!(operation);
@@ -1660,6 +1664,12 @@ impl CertificateServices {
                     }
                 }
             };
+            if result.is_err()&&!retry_operation.wait().is_zero()
+                &&let Some(target)=&worker.target {
+                let seconds=retry_operation.wait().as_secs().saturating_add(1);
+                target.retry_after.fetch_max(now().unwrap_or(i64::MAX)
+                    .saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX)),Ordering::AcqRel);
+            }
             let maintain = result.as_ref().is_ok_and(|outcome| outcome.maintain);
             let maintain_target = result.as_ref().ok()
                 .and_then(|outcome| outcome.acquired.as_ref())
@@ -1721,6 +1731,7 @@ impl CertificateServices {
         target: Option<&Arc<Resident>>,
         selection: Option<&crate::http_runtime::WarmSelection>,
         cancel: CancellationToken,
+        retry_operation:Option<&mut cert_automation::retry_operation::RetryOperation>,
     ) -> Result<ActionOutcome> {
         let resident = if let Some(resident) = target {
             ensure!(resident.binding.slot.live(), super::super::resident_cache::CacheChanged);
@@ -1869,20 +1880,16 @@ impl CertificateServices {
                 seed,
             )
             .await?;
-        if let Err(error) = self
-            .ensure_group_target(
-                group.clone(),
-                matches!(action, Action::Miss) && !seeded,
-                if matches!(action, Action::Maintenance) {
-                    resident.as_ref().map(|resident| RenewalTarget {
-                        material: resident.material.clone(), receipt: resident.receipt.clone(),
-                        binding: resident.binding.clone(), leaf: resident.leaf.clone(),
-                        selection: selection.cloned(),
-                    })
-                } else { None },
-                cancel.clone(),
-            )
-            .await
+        let target=if matches!(action,Action::Maintenance){
+            resident.as_ref().map(|resident|RenewalTarget{material:resident.material.clone(),receipt:resident.receipt.clone(),
+                binding:resident.binding.clone(),leaf:resident.leaf.clone(),selection:selection.cloned()})
+        }else{None};
+        let acquired=if let Some(operation)=retry_operation {
+            self.ensure_group_target_with_operation(group.clone(),false,target,cancel.clone(),operation).await
+        }else{
+            self.ensure_group_target(group.clone(),matches!(action,Action::Miss)&&!seeded,target,cancel.clone()).await
+        };
+        if let Err(error)=acquired
         {
             if seeded {
                 self.discard_failed_restore(group).await?;

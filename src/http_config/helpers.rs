@@ -75,18 +75,28 @@ pub(crate) fn replace(
 }
 
 fn append_replacement(
-    output: &mut Vec<u8>,
+    output: &mut zeroize::Zeroizing<Vec<u8>>,
     text: &[u8],
     charge: &mut impl FnMut(usize) -> Result<()>,
+    limit: usize,
 ) -> Result<()> {
-    let length = output.len().checked_add(text.len()).ok_or_else(|| anyhow::anyhow!("replacement length overflow"))?;
-    ensure!(length <= 4 * 1024 * 1024, "replacement output exceeds limit");
+    let length = output
+        .len()
+        .checked_add(text.len())
+        .ok_or_else(|| anyhow::anyhow!("replacement length overflow"))?;
+    ensure!(length <= limit, "replacement output exceeds limit");
     if length > output.capacity() {
-        let capacity = output.capacity().saturating_mul(2).max(length).min(4 * 1024 * 1024);
+        let capacity = output.capacity().saturating_mul(2).max(length).min(limit);
         // The old and new buffers may coexist during a reallocation. Reserve
         // twice the requested capacity before growth and retain that credit.
         charge(capacity * 2)?;
-        output.try_reserve_exact(capacity - output.len()).map_err(|_| anyhow::anyhow!("replacement allocation unavailable"))?;
+        // Never realloc a sensitive allocation: that may return its old bytes
+        // to the allocator without wiping them. Both allocations are prepaid.
+        let mut replacement=zeroize::Zeroizing::new(Vec::new());
+        replacement.try_reserve_exact(capacity).map_err(|_|anyhow::anyhow!("replacement allocation unavailable"))?;
+        replacement.extend_from_slice(output);
+        let previous=std::mem::replace(output,replacement);
+        drop(previous);
     }
     output.extend_from_slice(text);
     Ok(())
@@ -98,30 +108,70 @@ pub(crate) fn replace_accounted(
     lookup: impl Fn(&str) -> Option<String>,
     charge: impl FnMut(usize) -> Result<()>,
 ) -> Result<String> {
-    let bytes=replace_bytes_accounted(input,unknown_empty,|name|lookup(name).map(String::into_bytes),charge)?;
-    String::from_utf8(bytes).map_err(|_|anyhow::anyhow!("invalid UTF-8 replacement"))
+    let bytes = replace_bytes_accounted(
+        input,
+        unknown_empty,
+        |name| lookup(name).map(String::into_bytes),
+        charge,
+    )?;
+    String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("invalid UTF-8 replacement"))
 }
 
 /// Byte-valued network addresses retain their original bytes in Go strings.
 /// Both entry points use the same scanner, escaping rules and allocation bounds.
-pub(crate) fn replace_bytes(input:&str,unknown_empty:bool,lookup:impl Fn(&str)->Option<Vec<u8>>)->Result<Vec<u8>>{
-    replace_bytes_accounted(input,unknown_empty,lookup,|_|Ok(()))
+pub(crate) fn replace_bytes(
+    input: &str,
+    unknown_empty: bool,
+    lookup: impl Fn(&str) -> Option<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    replace_bytes_accounted(input, unknown_empty, lookup, |_| Ok(()))
 }
-pub(crate) fn replace_bytes_accounted(input:&str,unknown_empty:bool,lookup:impl Fn(&str)->Option<Vec<u8>>,mut charge:impl FnMut(usize)->Result<()>)->Result<Vec<u8>>{
+pub(crate) fn replace_bytes_accounted(
+    input: &str,
+    unknown_empty: bool,
+    lookup: impl Fn(&str) -> Option<Vec<u8>>,
+    charge: impl FnMut(usize) -> Result<()>,
+) -> Result<Vec<u8>> {
+    let mut output = replace_secret_bytes_accounted(
+        input,
+        unknown_empty,
+        1024 * 1024,
+        4 * 1024 * 1024,
+        |name|Ok(lookup(name)),
+        charge,
+    )?;
+    Ok(std::mem::take(&mut *output))
+}
+/// Same scanner; guarded destination and provider owners survive all failures.
+/// Limits are explicit for provision-time PEM fields; old callers keep theirs.
+pub(crate) fn replace_secret_bytes_accounted<B: AsRef<[u8]>>(
+    input: &str,
+    unknown_empty: bool,
+    input_limit: usize,
+    output_limit: usize,
+    lookup: impl Fn(&str) -> Result<Option<B>>,
+    mut charge: impl FnMut(usize) -> Result<()>,
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
     ensure!(
-        input.len() <= 1024 * 1024,
+        input.len() <= input_limit,
         "replacement input exceeds limit"
     );
     let bytes = input.as_bytes();
-    charge(input.len().checked_mul(2).ok_or_else(|| anyhow::anyhow!("replacement capacity overflow"))?)?;
-    let mut out = Vec::new();
-    out.try_reserve_exact(input.len()).map_err(|_| anyhow::anyhow!("replacement allocation unavailable"))?;
+    charge(
+        input
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("replacement capacity overflow"))?,
+    )?;
+    let mut out = zeroize::Zeroizing::new(Vec::new());
+    out.try_reserve_exact(input.len())
+        .map_err(|_| anyhow::anyhow!("replacement allocation unavailable"))?;
     let mut cursor = 0;
     let mut i = 0;
     let mut unclosed = 0;
     while i < bytes.len() {
         if i > 0 && bytes[i - 1] == b'\\' && matches!(bytes[i], b'{' | b'}') {
-            append_replacement(&mut out, &bytes[cursor..i - 1], &mut charge)?;
+            append_replacement(&mut out, &bytes[cursor..i - 1], &mut charge, output_limit)?;
             cursor = i;
             i += 1;
             continue;
@@ -142,9 +192,9 @@ pub(crate) fn replace_bytes_accounted(input:&str,unknown_empty:bool,lookup:impl 
             i += 1;
             continue;
         }
-        append_replacement(&mut out, &bytes[cursor..i], &mut charge)?;
-        match lookup(&input[i + 1..end]) {
-            Some(value) => append_replacement(&mut out, &value, &mut charge)?,
+        append_replacement(&mut out, &bytes[cursor..i], &mut charge, output_limit)?;
+        match lookup(&input[i + 1..end])? {
+            Some(value) => append_replacement(&mut out, value.as_ref(), &mut charge, output_limit)?,
             None if !unknown_empty => {
                 cursor = i;
                 i += 1;
@@ -155,7 +205,7 @@ pub(crate) fn replace_bytes_accounted(input:&str,unknown_empty:bool,lookup:impl 
         i = end + 1;
         cursor = i;
     }
-    append_replacement(&mut out, &bytes[cursor..], &mut charge)?;
+    append_replacement(&mut out, &bytes[cursor..], &mut charge, output_limit)?;
     Ok(out)
 }
 

@@ -62,3 +62,16 @@ Linux 和 macOS 的进程 CPU、RSS、虚拟内存、启动时间、FD 数及限
 Console 使用专属同 binary Rust writer 子进程持有 stdout 写入。native CLI 在任何配置或 runtime 初始化前识别严格内部协议入口；普通库嵌入若未明确注册同 binary helper 能力，console 准备阶段会拒绝，而不会执行未知宿主。每批只有一个固定 helper 参数，编码实体经有界 stdin 协议发送，最多 64 MiB，helper 仅用 16 KiB 栈暂存。进程内所有配置代共用一个有界 writer 准入，先准入再收集，不在 collection worker 上等待 stdout。父进程保留编码实体和额度至子进程真实退出；满管道、调用取消、停止或绝对期限会终止该专属 writer 并等待回收，不更改主进程 stdout flags，也不终止业务进程。取消可能留下已写入管道的部分 JSON；成功完成的记录为完整 JSON。
 
 Console 编码直接借用本批 SDK snapshot，保留它直到编码完成；属性排序仅存放引用，排序缓冲及编码增长都包含在发送前已付的工作区中，不建立完整 JSON DOM。输出字节另随实际 writer 持有其额度。
+
+
+## 推送导出的 CPU 与 I/O 生命周期
+
+普通 OTLP HTTP/protobuf、gRPC 和 console 推送使用封闭的驻留状态机。快照、SDK 的同步 protobuf/压缩编码、已完成 future 和取消后的大数据析构在原 collection CPU lane 上执行；等待网络、重试计时器或 console 子进程时归还 running permit。已接收批次、等待队列、console 的 try 准入、每代 actor 次序、最终一次收集及原配置的绝对超时保持原语义；没有新增批次并行，也没有为满足测试缩短 flush 时间。
+
+Trace 与 Metrics 只共享具体状态机、字节读者和 unary 编码代码。两者各自持有 registry、退休线程、外部 owner 和原本的 running semaphore；交接检查实际 owner identity、数据域和 running semaphore 的 Arc 身份，不能以同域另一个 owner 的额度或 CPU lane 替代。Metrics 控制元数据、所有最后 Weak 控制块以及一条 requested stack 为 2 MiB 的退休线程，预付到原 Process 的 64 MiB request-state 空间，并同时受其 8 MiB subtype 限额约束。这是同一物理布局的两层准入，不是额外增加 8 MiB 总配额；通常约 2 MiB 常驻、最多 8 MiB 的真实竞争不会扣用 labels、快照 scratch 或编码 output 的额度。线程启动失败使准备失败，不在接收大批次后悄悄改走反应器。
+
+物理 BatchMemory 与控制原 IO 完成、created 时间、deadline 和重试 strong-count 的逻辑 Credit 分离。实际 Bytes 的读者共享不可变 backing；最后读者先释放自己的 backing 引用，再发布 reader0，registry 随后在匹配 CPU permit 下销毁最后大数据并退款。pin 不延长已完成批次的逻辑计时器；真实 DATA 尚被持有时，原 NoReplay 判据仍阻止同批重试。快照升级的 Registry 只在 CPU 临界段暂时持有，驻留 future 和字节 backing 不强持 Registry 或 Process，最后外部 owner Drop 只围栏并唤醒退休线程。
+
+最终 Process 关闭先围栏 Trace 与 Metrics 两域，再并发执行每域自己的 preparation 收据、数据退休、实际 OS join 与 CPU tracker 等待；一域被持住不能延迟另一域自己的关闭和回收。公共连接的最终 shutdown 仍在各代导出 actor flush/关闭之后。显式正常 shutdown 的 stack 信用保留到实际 join 返回；没有可用 runtime 的最后 owner Drop 只证明业务数据退休和线程函数退出，不声称此时 OS 的 stack/TLS/TCB mapping 已回收。
+
+此边界不扩展到公开同步 `Registry::snapshot`、pull scrape 输出的所有析构，也不修复 SDK Processor 在 queue-full/closed 时直接丢弃原 SpanData 的旧边界；不承诺第三方 provider 全 heap 或整个进程 RSS 上限。本轮实际平台验收是 macOS 与 Linux，不能据此宣称其他平台的系统 DNS 物理退休已经验证。

@@ -15,6 +15,7 @@ const FIELD: usize = 1 << 20;
 const SCRATCH: usize = 16 * FIELD + 16384;
 
 struct Raw {
+    test_ca: Option<Zeroizing<String>>,
     directory: Zeroizing<String>,
     email: Zeroizing<String>,
     eab: Option<(Zeroizing<String>, Zeroizing<String>)>,
@@ -25,6 +26,7 @@ pub(super) struct Input {
     ready: OnceCell<Arc<Prepared>>,
 }
 pub(super) struct Prepared {
+    pub test_ca: Option<String>,
     pub directory: String,
     pub email: String,
     pub eab: Option<ExternalAccountBinding>,
@@ -50,7 +52,7 @@ impl Prepared {
     /// Peak includes the manager's three simultaneous config copies, later WireOptions
     /// and parsed/request URL copies. It covers Caddy-owned configured strings,
     /// not remote bodies or third-party provider/TLS heaps.
-    pub(super) fn copy_upper(&self) -> Result<usize> {
+    pub(super) fn copy_upper(&self,client_inputs:usize) -> Result<usize> {
         let bytes = self
             .directory
             .len()
@@ -63,10 +65,29 @@ impl Prepared {
                 )
             })
             .ok_or(crate::acme_wire::chain_memory::MemoryDenied)?;
-        bytes
-            .checked_mul(12)
-            .and_then(|n| n.checked_add(8192))
-            .ok_or_else(|| crate::acme_wire::chain_memory::MemoryDenied.into())
+        let primary=bytes.checked_mul(12).and_then(|n|n.checked_add(8192))
+            .ok_or(crate::acme_wire::chain_memory::MemoryDenied)?;
+        let Some(test)=crate::cert_automation::test_ca::directory(&self.directory,self.test_ca.as_deref()) else{return Ok(primary)};
+        // Additional endpoint family, independently retained from the primary:
+        // settings snapshot + Group vector + auxiliary config/BackendId (4),
+        // broker normalized binding and parser (2), constructor normalization
+        // and temporary Url (2), Wire build/input Url (2), Wire origin/grant (2).
+        // The two configured credential families are auxiliary config and its
+        // account setup. Account responses and per-request URI loans keep their
+        // existing separate dynamic ownership; they are not free extra clones.
+        let credentials=self.email.len().checked_add(self.eab.as_ref()
+            .map_or(0,|e|e.kid.len()+e.hmac_key.len()))
+            .ok_or(crate::acme_wire::chain_memory::MemoryDenied)?;
+        let extra=if test==self.directory {
+            test.len().checked_mul(4).and_then(|n|n.checked_add(2048))
+        }else{
+            // Six non-builder endpoint slots cover auxiliary config/id,
+            // broker binding and the current/persistent URL/origin family.
+            // Keep the established floor while deriving any wider future lane.
+            test.len().checked_mul(client_inputs.checked_add(6).ok_or(crate::acme_wire::chain_memory::MemoryDenied)?.max(12)).and_then(|n|credentials.checked_mul(2).and_then(|c|n.checked_add(c)))
+                .and_then(|n|n.checked_add(8192))
+        }.ok_or(crate::acme_wire::chain_memory::MemoryDenied)?;
+        primary.checked_add(extra).ok_or_else(||crate::acme_wire::chain_memory::MemoryDenied.into())
     }
 }
 fn expand(raw: &str, field: &'static str) -> Result<String> {
@@ -103,16 +124,22 @@ fn expand(raw: &str, field: &'static str) -> Result<String> {
 }
 impl Input {
     pub(super) fn take(config: &mut AcmeIssuerConfig) -> Result<Option<Arc<Self>>> {
-        let dynamic = config.wire.directory.contains('{')
+        Self::take_with_test(config,&mut None)
+    }
+    pub(super) fn take_with_test(config:&mut AcmeIssuerConfig,test_ca:&mut Option<String>)->Result<Option<Arc<Self>>>{
+        let dynamic = test_ca.as_ref().is_some_and(|value|value.contains('{'))
+            || config.wire.directory.contains('{')
             || config.email.contains('{')
             || config
                 .eab
                 .as_ref()
                 .is_some_and(|e| e.kid.contains('{') || e.hmac_key.contains('{'));
-        if !dynamic {
-            return Ok(None);
-        }
+        // Literal test endpoints/default LE staging also need the once-only
+        // prepared producer owner; public standalone Input::take keeps None.
+        let has_test=crate::cert_automation::test_ca::directory(&config.wire.directory,test_ca.as_deref()).is_some();
+        if !dynamic&&!has_test {return Ok(None)}
         let raw = Raw {
+            test_ca:test_ca.take().map(Zeroizing::new),
             directory: Zeroizing::new(std::mem::take(&mut config.wire.directory)),
             email: Zeroizing::new(std::mem::take(&mut config.email)),
             eab: config.eab.take().map(|mut e| {
@@ -123,7 +150,8 @@ impl Input {
             }),
         };
         let mut hash = Sha256::new();
-        hash.update(b"acme-configured-fields-v1");
+        hash.update(if raw.test_ca.is_some(){&b"acme-configured-fields-v2"[..]}else{&b"acme-configured-fields-v1"[..]});
+        if let Some(value)=&raw.test_ca {hash.update(value.len().to_be_bytes());hash.update(value.as_bytes());}
         for value in [&*raw.directory, &*raw.email] {
             hash.update(value.len().to_be_bytes());
             hash.update(value.as_bytes());
@@ -158,6 +186,13 @@ impl Input {
                     let directory =
                         crate::acme_wire::directory_url::normalize(&directory)?.to_string();
                     ensure!(directory.len() <= FIELD, "ACME configured CA exceeds limit");
+                    let test_ca=raw.test_ca.as_ref().map(|raw| {
+                        let value=expand(raw,"test CA")?;
+                        if value.is_empty(){Ok::<_,anyhow::Error>(value)}else{
+                            let value=crate::acme_wire::directory_url::normalize(&value)?.to_string();
+                            ensure!(value.len()<=FIELD,"ACME configured test CA exceeds limit");Ok(value)
+                        }
+                    }).transpose()?;
                     let email = expand(&raw.email, "email")?;
                     let eab = raw
                         .eab
@@ -172,6 +207,7 @@ impl Input {
                     let bytes = directory
                         .capacity()
                         .checked_add(email.capacity())
+                        .and_then(|n|n.checked_add(test_ca.as_ref().map_or(0,String::capacity)))
                         .and_then(|n| {
                             n.checked_add(
                                 eab.as_ref()
@@ -182,6 +218,7 @@ impl Input {
                         .ok_or(crate::acme_wire::chain_memory::MemoryDenied)?;
                     let memory = pool.reserve(bytes)?;
                     Ok(Arc::new(Prepared {
+                        test_ca,
                         directory,
                         email,
                         eab,

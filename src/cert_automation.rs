@@ -7,6 +7,12 @@
 mod job_codec;
 mod attempt;
 mod backend;
+mod acme_candidate;
+mod acme_probe;
+mod acme_journal;
+mod test_ca_driver;
+pub(crate) mod retry_operation;
+pub(crate) mod test_ca;
 mod internal;
 pub(crate) use backend::{PreparedBackend,BackendSelection};
 mod account_key;
@@ -257,6 +263,7 @@ struct ManagerInner {
     local: Arc<Semaphore>,
     solver: Option<SolverPreparation>,
     issuers: Vec<IssuerState>,
+    test_policies:Vec<test_ca::TestPolicy>,
     backends: Vec<backend::Backend>,
     unified_key: Option<KeyType>,
     gates: Mutex<HashMap<String, Weak<Mutex<()>>>>,
@@ -290,12 +297,16 @@ pub struct AutomationResources {
     global: Arc<Semaphore>,
     permission_global: Arc<Semaphore>,
     local: Arc<Semaphore>,
+    local_capacity:usize,
     cas: std::sync::Mutex<HashMap<String, Weak<Semaphore>>>,
     cooldowns: std::sync::Mutex<HashMap<[u8; 32], Arc<AtomicI64>>>,
     max_concurrent: usize,
     max_per_ca: usize,
 }
 impl AutomationResources {
+    /// Actual initialized certificate CPU width plus the one current init held
+    /// by a Caddy Group's fixed-name gate. Not a public multi-name API bound.
+    pub(crate) fn client_build_input_upper(&self)->usize{self.local_capacity.saturating_add(1)}
     pub(crate) fn cpu_slots(&self) -> Arc<Semaphore> {
         self.local.clone()
     }
@@ -307,15 +318,13 @@ impl AutomationResources {
             (1..=128).contains(&max_concurrent) && (1..=32).contains(&max_per_ca),
             "ACME concurrency outside bounds"
         );
+        let local_capacity=std::thread::available_parallelism().map_or(1,usize::from).min(4);
         Ok(Self {
             chain_memory:crate::acme_wire::shared_chain_memory(),
             global: Arc::new(Semaphore::new(max_concurrent)),
             permission_global: Arc::new(Semaphore::new(max_concurrent)),
-            local: Arc::new(Semaphore::new(
-                std::thread::available_parallelism()
-                    .map_or(1, usize::from)
-                    .min(4),
-            )),
+            local: Arc::new(Semaphore::new(local_capacity)),
+            local_capacity,
             cas: std::sync::Mutex::new(HashMap::new()),
             cooldowns: std::sync::Mutex::new(HashMap::new()),
             max_concurrent,
@@ -609,7 +618,30 @@ struct Attempt {
     #[serde(default)] input_id:Option<String>,
     #[serde(default)] current_backend:Option<attempt::BackendId>,
     #[serde(default)] current_input:Option<attempt::InputBinding>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    acme_phase:Option<acme_probe::PhaseBinding>,
+    #[serde(skip)] _phase_memory:Option<crate::acme_wire::chain_memory::Scratch>,
     #[serde(skip)] _memory:Option<crate::acme_wire::chain_memory::Scratch>,
+}
+impl Attempt {
+    fn unified(&self)->bool {matches!(self.version,2|3)}
+    fn validate_protocol(&self)->Result<()> {
+        ensure!([1,2,3].contains(&self.version),"unsupported certificate attempt protocol");
+        if let Some(phase)=&self.acme_phase {
+            ensure!(self.version==3,"probe state requires the dedicated attempt protocol");
+            phase.validate()?;
+            ensure!(self.winner.is_none()&&self.current_backend.as_ref()==Some(&phase.owner)
+                &&self.current_input.as_ref()==Some(&phase.input),"ACME phase active binding changed");
+            match phase.step {
+                acme_probe::PhaseStep::Probe=>ensure!(self.current_job_id.as_deref()==Some(phase.probe_job_id.as_str()),"active probe journal missing"),
+                acme_probe::PhaseStep::PendingPrimary=>ensure!(self.current_job_id.is_none(),"pending primary retained a probe job pointer"),
+            }
+        }else{
+            ensure!(!self.current_job_id.as_deref().is_some_and(acme_probe::is_probe_id),"probe pointer lacks its protocol binding");
+        }
+        if let Some(winner)=&self.winner {ensure!(!acme_probe::is_probe_id(&winner.job_id),"probe cannot be a production winner");}
+        Ok(())
+    }
 }
 #[derive(Serialize, Deserialize)]
 struct Winner {
@@ -889,6 +921,7 @@ impl CertificateManager {
                 solver,
                 options,
                 issuers,
+                test_policies:Vec::new(),
                 backends,
                 unified_key,
                 gates: Mutex::new(HashMap::new()),
@@ -1111,9 +1144,12 @@ impl CertificateManager {
         names: &[String],
         cancel: CancellationToken,
     ) -> Result<ManagedCertificate> {
-        let names = self.normalize_subjects(names)?;
+        self.ensure_for_round(names,cancel,retry_operation::AcmeRound::default()).await
+    }
+    pub(crate) async fn ensure_for_round(&self,names:&[String],cancel:CancellationToken,round:retry_operation::AcmeRound<'_>)->Result<ManagedCertificate> {
+        let names=self.normalize_subjects(names)?;
         self.startup_recovery(cancel.clone()).await?;
-        self.ensure_inner(names, cancel.child_token()).await
+        self.ensure_inner(names,cancel.child_token(),round).await
     }
 
     async fn name_gate(&self, names: &[String]) -> Result<Arc<Mutex<()>>> {
@@ -1241,13 +1277,14 @@ impl CertificateManager {
         &self,
         names: Vec<String>,
         cancel: CancellationToken,
+        round:retry_operation::AcmeRound<'_>,
     ) -> Result<ManagedCertificate> {
         let gate = self.name_gate(&names).await?;
         let _gate = tokio::select! {biased;_=cancel.cancelled()=>return Err(anyhow!("ACME operation cancelled")),guard=gate.lock()=>guard};
         // Only per-name queueing is outside the execution deadline. Network
         // queues are issuer-scoped first, so a busy issuer cannot occupy the
         // global budget while its requests merely wait for that issuer.
-        let operation = self.ensure_active(names, cancel.clone());
+        let operation = self.ensure_active(names,cancel.clone(),round);
         tokio::pin!(operation);
         tokio::select! {
             result=&mut operation=>result,
@@ -1260,8 +1297,9 @@ impl CertificateManager {
         &self,
         names: Vec<String>,
         cancel: CancellationToken,
+        round:retry_operation::AcmeRound<'_>,
     ) -> Result<ManagedCertificate> {
-        if self.inner.unified_key.is_some(){return self.ensure_unified(names,cancel).await;}
+        if self.inner.unified_key.is_some(){return self.ensure_unified(names,cancel,round).await;}
         let lease = self
             .inner
             .store
@@ -1270,10 +1308,11 @@ impl CertificateManager {
         let initial = async {
             // Recover a previously completed local leg before deciding that any
             // network request is necessary. Keep registration/domain lock order.
-            let (ready, previous) = self.load_state(&names, &lease, &cancel).await?;
+            let (ready, previous) = self.load_state_for_round(&names,&lease,&cancel,round).await?;
             if ready.is_some() {
                 return Ok((ready, previous, None, None, None));
             }
+            round.enter();
             // One abortable event precedes new attempt/key/account/order work,
             // including issuer fallback; already ready material emits nothing.
             let lifecycle=self.emit_obtaining(&names, previous.as_ref(), &cancel).await?;
@@ -1295,7 +1334,7 @@ impl CertificateManager {
                 base_leaf: previous.as_ref().map(|p| p.previous_leaf.clone()),
                 base_backend:None,
                 winner: None,
-                backend_sequence:Vec::new(),configured_sequence:Vec::new(),input_id:None,current_backend:None,current_input:None,_memory:None,
+                backend_sequence:Vec::new(),configured_sequence:Vec::new(),input_id:None,current_backend:None,current_input:None,acme_phase:None,_phase_memory:None,_memory:None,
             };
             self.store_checkpoint(
                 &attempt_key(&names)?,
@@ -1441,6 +1480,7 @@ impl CertificateManager {
                         &leg_cancel,
                         None,
                         None,
+                        round.ordinal,
                     )
                     .await
                 };
@@ -1538,9 +1578,13 @@ impl CertificateManager {
         lease: &StorageLease,
         cancel: &CancellationToken,
     ) -> Result<(Option<ManagedCertificate>, Option<Replacement>)> {
+        self.load_state_for_round(names,lease,cancel,retry_operation::AcmeRound::default()).await
+    }
+    async fn load_state_for_round(&self,names:&[String],lease:&StorageLease,cancel:&CancellationToken,round:retry_operation::AcmeRound<'_>)->Result<(Option<ManagedCertificate>,Option<Replacement>)>{
         if self.inner.unified_key.is_some() {
             if let Some(state)=self.load_attempt(names).await? {
-                if state.version==2 {
+                if !state.retired&&state.winner.is_none()&&(state.current_job_id.is_some()||state.acme_phase.is_some()){round.enter();}
+                if state.unified() {
                     if !state.retired && let Err(error)=self.recover_unified(names,&state,lease,cancel).await {
                         if error.is::<ExpiredStoredCandidate>() {
                             self.retire_expired_attempt(names,&state,lease,cancel).await?;
@@ -1563,7 +1607,9 @@ impl CertificateManager {
             return self.load_existing(names,Some(lease),cancel,LoadMode::Online).await
                 .map(|(ready,previous,_)|(ready,previous));
         }
-        if let Some(attempt) = self.load_attempt(names).await?
+        let legacy=self.load_attempt(names).await?;
+        if legacy.as_ref().is_some_and(|attempt|!attempt.retired&&attempt.winner.is_none()&&attempt.current_job_id.is_some()){round.enter();}
+        if let Some(attempt) = legacy
             && let Some(job_id) = attempt.current_job_id.as_ref()
             && let Some(directory) = self.load_job_directory(job_id).await?
             && let Some(issuer) = self
@@ -2507,7 +2553,33 @@ impl CertificateManager {
         cancel: &CancellationToken,
         input:Option<&Arc<attempt::RuntimeInput>>,
         produced:Option<&std::sync::atomic::AtomicBool>,
+        effective_ordinal:u32,
     ) -> Result<ManagedCertificate> {
+        let using_test_endpoint=self.inner.issuers.iter().position(|actual|std::ptr::eq(actual,issuer))
+            .is_some_and(|index|self.same_test_endpoint(index));
+        let candidate=self.issue_candidate(names,issuer,account,lease,cycle,initial_reuse,cancel,input,
+            acme_journal::AcmeJournal::Primary{effective_ordinal,using_test_endpoint}).await?;
+        self.commit_primary_candidate(names,issuer,lease,cycle.2,lifecycle,cancel,input,produced,candidate).await
+    }
+
+    async fn issue_candidate(
+        &self,
+        names: &[String],
+        issuer: &IssuerState,
+        account: &AccountSession,
+        lease: &StorageLease,
+        cycle: (Option<&Replacement>, Option<&Reservation>, &str),
+        initial_reuse:Option<&ReusableKey>,
+        cancel: &CancellationToken,
+        input:Option<&Arc<attempt::RuntimeInput>>,
+        journal:acme_journal::AcmeJournal<'_>,
+    ) -> Result<acme_candidate::AcmeCandidate> {
+        let purpose=journal.purpose();
+        if let acme_journal::AcmeJournal::Probe(binding)=journal {
+            self.validate_probe_binding(issuer,binding)?;
+            ensure!(input.is_some_and(|input|input.binding==binding.input)&&cycle.1.is_none(),"probe input/reservation changed");
+        }
+        let candidate_memory=crate::cert_transient::reserve(std::mem::size_of::<acme_candidate::AcmeCandidate>().checked_add(256).ok_or(crate::cert_transient::ResourceDenied)?)?;
         let (replacement, reservation, attempt_id) = cycle;
         let wire = issuer
             .wire
@@ -2524,7 +2596,7 @@ impl CertificateManager {
             })
             .await?;
         let issuer_name = issuer_key(wire.directory_url())?;
-        let initial=self.initial_key(&issuer_name,&names_key(names)?,cancel).await?;
+        let initial=match journal {acme_journal::AcmeJournal::Primary{..}=>self.initial_key(&issuer_name,&names_key(names)?,cancel).await?,acme_journal::AcmeJournal::Probe(_)=>None};
         let initial_hash=initial.as_ref().map(|(snapshot,_)|snapshot.digest().to_owned());
         if let Some((snapshot,key))=&initial && key.state.banned() {
             let archived=self.inner.store.archive_initial_private_key(&issuer_name,&names_key(names)?,snapshot,
@@ -2535,15 +2607,19 @@ impl CertificateManager {
         }
 
 
-        let renewal_names = replacement.filter(|r| r.directory == wire.directory_url())
-            .and_then(|r| r.renewal_names.clone());
+        let renewal_names=match journal {
+            acme_journal::AcmeJournal::Primary{..}=>replacement.filter(|r|r.directory==wire.directory_url()).and_then(|r|r.renewal_names.clone()),
+            acme_journal::AcmeJournal::Probe(_)=>input.filter(|input|input.record.names!=names).map(|input|input.record.names.clone()),
+        };
         let replaces = replacement
+            .filter(|_|!journal.suppress_replaces())
             .filter(|r| {
                 r.directory == wire.directory_url()
                     && r.account == account.location()
                     && wire.directory().renewal_info.is_some()
             })
             .and_then(|r| r.certificate_id.as_deref());
+        let computed_id=if let acme_journal::AcmeJournal::Probe(binding)=journal {binding.probe_job_id.clone()}else{
         let mut order_identity = format!(
                 "order\0{}\0{}\0{:?}\0{}\0{}",
                 wire.directory_url(),
@@ -2566,10 +2642,10 @@ impl CertificateManager {
             let attempt::BackendId::Acme{config_identity,..}=self.issuer_identity(issuer)? else{bail!("ACME backend identity mismatch")};
             order_identity.push(':');order_identity.push_str(&config_identity);
         }
-        let computed_id=digest(order_identity.as_bytes());
+        digest(order_identity.as_bytes())};
         let id = reservation.map(|r| r.job_id.clone()).unwrap_or(computed_id);
         let mut _job_key_reservation: Option<Arc<crate::key_compromise::KeyState>>=None;
-        let mut job = if let Some(job) = self.load_job(&id).await? {
+        let mut job = if let Some(job) = journal.load(self,&id).await? {
             ensure!(
                 job.version == 1
                     && job.directory == wire.directory_url()
@@ -2621,17 +2697,27 @@ impl CertificateManager {
                 certificate_url: None,
                 downloaded_pem: None,
                 stored_leaf_sha256: None,
-                replaces_disabled: false,
+                replaces_disabled: journal.suppress_replaces(),
                 poll_after_unix: 0,
                 restored_memory:None,
             };
-            self.save_job(&id, &job, lease).await?;
+            journal.save(self,&id,&job,lease).await?;
             job
         };
+        if matches!(journal,acme_journal::AcmeJournal::Probe(_)) {
+            let input=input.ok_or_else(||anyhow!("probe shared input missing"))?;
+            ensure!(digest(&job.csr_der)==input.record.csr_hash
+                &&job.private_key_pem.as_bytes()==input.record.private_key_pem.as_bytes()
+                &&job.renewal_names.as_ref().unwrap_or(&job.names)==&input.record.names,
+                "probe checkpoint input changed");
+        }
         if job.phase!="stored" && job.initial_key_hash.is_some() {
             ensure!(job.initial_key_hash==initial_hash,"initial certificate private key checkpoint scope changed");
         }
-        self.validate_job_renewal_scope(&job).await?;
+        match journal {
+            acme_journal::AcmeJournal::Primary{..}=>self.validate_job_renewal_scope(&job).await?,
+            acme_journal::AcmeJournal::Probe(binding)=>self.validate_probe_renewal_scope(&job,binding).await?,
+        }
         if job.phase != "stored" {
             match self.check_job_key(job.private_key_pem.as_bytes(), cancel).await {
                 Ok(key) => _job_key_reservation=Some(key),
@@ -2649,21 +2735,23 @@ impl CertificateManager {
                     job.renewal_names = renewal_names.clone();
                     job.csr_der = csr; job.initial_key_hash=initial_hash.clone();job.phase = "prepared".to_owned();
                     job.order_url = None; job.certificate_url = None; job.downloaded_pem = None;
-                    job.stored_leaf_sha256 = None; job.poll_after_unix = 0; job.replaces_disabled = false;
-                    self.save_job(&id, &job, lease).await?;
+                    job.stored_leaf_sha256 = None; job.poll_after_unix = 0; job.replaces_disabled = journal.suppress_replaces();
+                    journal.save(self,&id,&job,lease).await?;
                 },
                 Err(error) => return Err(error),
             }
         }
-        if let Some(input)=input {
+        if let acme_journal::AcmeJournal::Probe(binding)=journal {self.activate_probe(names,attempt_id,binding,lease).await?;}
+        else if let Some(input)=input {
             self.activate_backend(names,attempt_id,&id,self.issuer_identity(issuer)?.clone(),input.binding.clone(),lease).await?;
-        }else{self.activate_leg(names, attempt_id, &id, lease).await?;}
+        }else{self.activate_leg(names,attempt_id,&id,lease).await?;}
         if !input.is_some_and(|input|matches!(input.binding,attempt::InputBinding::LegacyJob{..})) {
             job.attempt_id = attempt_id.to_owned();
         }
         job.abandoned = false;
-        self.save_job(&id, &job, lease).await?;
+        journal.save(self,&id,&job,lease).await?;
         if job.phase == "stored" {
+            ensure!(purpose==acme_candidate::AcmePurpose::Primary,"probe contains production stored state");
             let current = self.read_issuer_certificate(&issuer_name,&names_key(names)?,cancel).await?;
             if let Some(bundle) = current {
                 let info = self.inspect_material(&bundle, names, cancel).await?;
@@ -2680,20 +2768,9 @@ impl CertificateManager {
                     && self.material_revocation(&info)?.is_none()
                     && self.inner.resolver.leaf_guard().key_deny().check_spki_der(&info.spki_der).is_ok()
                 {
-                    ensure!(
-                        self.claim_winner(
-                            names,
-                            attempt_id,
-                            &id,
-                            &issuer_name,
-                            &info.leaf_sha256,
-                            lease
-                        )
-                        .await?,
-                        "certificate attempt lost publication CAS"
-                    );
-                    self.publish(names, &bundle, cancel).await?;
-                    return self.managed(names, &issuer_name, &bundle, info, false);
+                    return Ok(acme_candidate::AcmeCandidate::Stored {
+                        purpose,bundle,info:Some(info),id,issuer_name,_input:input.cloned(),_key:_job_key_reservation,_memory:candidate_memory,
+                    });
                 }
             }
             // This journal is terminal, never an uncertain CA request. A missing,
@@ -2718,8 +2795,8 @@ impl CertificateManager {
             job.downloaded_pem = None;
             job.stored_leaf_sha256 = None;
             job.poll_after_unix = 0;
-            job.replaces_disabled = false;
-            self.save_job(&id, &job, lease).await?;
+            job.replaces_disabled = journal.suppress_replaces();
+            journal.save(self,&id,&job,lease).await?;
         }
         let issuance_names = job.renewal_names.clone().unwrap_or_else(|| names.to_vec());
         if job.poll_after_unix > now() {
@@ -2743,7 +2820,7 @@ impl CertificateManager {
                 Ok(Some(url)) => {
                     job.order_url = Some(url);
                     job.phase = "order_recovered".to_owned();
-                    self.save_job(&id, &job, lease).await?;
+                    journal.save(self,&id,&job,lease).await?;
                 }
                 _ => return Err(AmbiguousOrder.into()),
             }
@@ -2762,7 +2839,7 @@ impl CertificateManager {
             account.validate_order_parameters(&parameters)?;
             job.requested_not_after = parameters.not_after.clone();
             job.phase = "new_order_intent".to_owned();
-            self.save_job(&id, &job, lease).await?;
+            journal.save(self,&id,&job,lease).await?;
             let identifiers = issuance_names
                 .iter()
                 .map(|name| Identifier {
@@ -2796,11 +2873,11 @@ impl CertificateManager {
                             })
                         {
                             job.replaces_disabled = true;
-                            self.save_job(&id, &job, lease).await?;
+                            journal.save(self,&id,&job,lease).await?;
                             // The rejected replacement did not create an order.
                             // Retry without `replaces` once, retaining key/CSR.
                             job.phase = "new_order_intent".to_owned();
-                            self.save_job(&id, &job, lease).await?;
+                            journal.save(self,&id,&job,lease).await?;
                             match account.new_order_with_parameters(&identifiers, None, &parameters, cancel).await {
                                 Ok(order) => order,
                                 Err(error) => {
@@ -2810,7 +2887,7 @@ impl CertificateManager {
                                             && p.kind() != "unknown"
                                     }) {
                                         job.phase = "prepared".to_owned();
-                                        self.save_job(&id, &job, lease).await?;
+                                        journal.save(self,&id,&job,lease).await?;
                                         return Err(error);
                                     } else {
                                         return Err(anyhow::Error::new(AmbiguousOrder)
@@ -2819,7 +2896,7 @@ impl CertificateManager {
                                 }
                             }
                         } else {
-                            self.save_job(&id, &job, lease).await?;
+                            journal.save(self,&id,&job,lease).await?;
                             return Err(error);
                         }
                     } else {
@@ -2832,7 +2909,7 @@ impl CertificateManager {
                     .context("ACME newOrder has no recoverable location")
             })?);
             job.phase = "order_created".to_owned();
-            self.save_job(&id, &job, lease).await?;
+            journal.save(self,&id,&job,lease).await?;
         }
         let url = job
             .order_url
@@ -2848,7 +2925,7 @@ impl CertificateManager {
                 // private key/CSR, but a later bounded scheduler attempt may
                 // create a new order rather than polling this URL forever.
                 job.phase="prepared".to_owned();job.order_url=None;job.certificate_url=None;job.downloaded_pem=None;
-                self.save_job(&id,&job,lease).await?;
+                journal.save(self,&id,&job,lease).await?;
                 bail!("ACME order is definitively invalid or expired; retry required")
             }
             validate_order(&resource.value,&issuance_names)?;
@@ -2868,25 +2945,25 @@ impl CertificateManager {
                         ChallengeType::Http01=>self.inner.registry.register_http(&id,&authorization.identifier.value,token,&authorization_value,ttl)?,
                         ChallengeType::TlsAlpn01=>self.inner.registry.register_tls_with_events(&id,&authorization.identifier.value,&authorization_value,ttl,self.inner.lifecycle_events.clone(),cancel.child_token())?,
                     };proofs.push(proof);
-                    job.phase="authorizing".to_owned();self.save_job(&id,&job,lease).await?;
+                    job.phase="authorizing".to_owned();journal.save(self,&id,&job,lease).await?;
                     lease.check().await?;let response=account.respond(&challenge.1.url,cancel).await?;resource.retry_after=resource.retry_after.max(response.retry_after);
                 }
                 for _ in 0..240 {
                     if resource.value.status!="pending" {break}
-                    self.wait_poll(&id,&mut job,lease,resource.retry_after,cancel).await?;
+                    self.wait_poll_scoped(&id,&mut job,lease,resource.retry_after,cancel,journal).await?;
                     resource=account.order(&url,cancel).await?;validate_order(&resource.value,&issuance_names)?;lease.check().await?;
                 }
             }
             if resource.value.status=="ready" {
                 let _finalize_key_reservation=self.check_job_key(job.private_key_pem.as_bytes(),cancel).await?;
-                job.phase="finalize_intent".to_owned();self.save_job(&id,&job,lease).await?;
+                job.phase="finalize_intent".to_owned();journal.save(self,&id,&job,lease).await?;
                 resource=account.finalize(&resource.value.finalize,&job.csr_der,cancel).await?;
-                job.phase="finalized".to_owned();self.save_job(&id,&job,lease).await?;
+                job.phase="finalized".to_owned();journal.save(self,&id,&job,lease).await?;
             }
             for _ in 0..240 {
                 if resource.value.status=="valid" {break}
                 ensure!(resource.value.status=="processing" || resource.value.status=="ready","ACME order failed to finalize");
-                self.wait_poll(&id,&mut job,lease,resource.retry_after,cancel).await?;
+                self.wait_poll_scoped(&id,&mut job,lease,resource.retry_after,cancel,journal).await?;
                 resource=account.order(&url,cancel).await?;validate_order(&resource.value,&issuance_names)?;lease.check().await?;
             }
             ensure!(resource.value.status=="valid","ACME certificate polling deadline exceeded");
@@ -2899,33 +2976,24 @@ impl CertificateManager {
                 job.certificate_url=Some(selected.url);
                 let certificate=selected.chain_pem;
                 job.downloaded_pem=Some(certificate);
-                job.phase="downloaded".to_owned();self.save_job(&id,&job,lease).await?;
+                job.phase="downloaded".to_owned();journal.save(self,&id,&job,lease).await?;
             }
-            let mut bundle=DownloadedBundle::new(job.downloaded_pem.as_ref().ok_or_else(||anyhow!("ACME certificate missing"))?.as_slice(),job.private_key_pem.as_bytes(),&issuance_names,job.certificate_url.as_deref(),wire.directory_url(),account.location())?;
+            let bundle=DownloadedBundle::new(job.downloaded_pem.as_ref().ok_or_else(||anyhow!("ACME certificate missing"))?.as_slice(),job.private_key_pem.as_bytes(),&issuance_names,job.certificate_url.as_deref(),wire.directory_url(),account.location())?;
             let info=self.inspect_material(&bundle,names,cancel).await?;
             self.inner.resolver.leaf_guard().key_deny().check_spki_der(&info.spki_der)?;
             ensure!(info.not_before<=now() && info.not_after>now(),"issued certificate is not currently valid");
-            if let Some(produced)=produced{produced.store(true,Ordering::Release);}
-            if let Some(cert_id)=self.certificate_id(&bundle.chain_pem,cancel).await? && let Ok(Some(ari))=wire.renewal_info(&cert_id,cancel).await {bundle.update_ari(&ari,&info,self.inner.options.renewal_window_ratio)?;}
-            job.stored_leaf_sha256=Some(info.leaf_sha256.clone());job.phase="store_intent".to_owned();self.save_job(&id,&job,lease).await?;
-            if let Some(input)=input {self.require_active_backend(names,attempt_id,&id,
-                self.issuer_identity(issuer)?,&input.binding,lease).await?;}
-            lease.check().await?;self.save_issued_certificate(&issuer_name,&names_key(names)?,&bundle,lease,job.initial_key_hash.as_deref()).await?;
-            lifecycle.obtained(self.inner.lifecycle_events.as_ref(),&issuer_name,names,&job.csr_der,cancel).await;
-            job.phase="stored".to_owned();job.private_key_pem.zeroize();job.downloaded_pem=None;job.csr_der.clear();self.save_job(&id,&job,lease).await?;
-            // Once persisted, publication errors retain this candidate. A later
-            // ensure loads it instead of creating or paying for another order.
-            ensure!(self.claim_winner(names,attempt_id,&id,&issuer_name,&info.leaf_sha256,lease).await?,"certificate attempt lost publication CAS");
-            self.publish(names,&bundle,cancel).await?;
-            self.managed(names,&issuer_name,&bundle,info,true)
-        }.await;
-        drop(proofs);
-        operation.map_err(|error| {
-            if job.order_url.is_some() {
-                ActiveOrderError(error).into()
-            } else {
-                error
+            if purpose==acme_candidate::AcmePurpose::Probe {
+                let input=input.ok_or_else(||anyhow!("probe validated input missing"))?;
+                ensure!(info.spki_der.as_ref()==input.record.spki_der.as_slice(),"probe downloaded SPKI differs from input");
+                self.verify_probe_signature_links(job.downloaded_pem.as_ref().ok_or_else(||anyhow!("probe downloaded chain missing"))?.clone(),cancel).await?;
             }
+            Ok::<_,anyhow::Error>((bundle,info))
+        }.await;
+        let (bundle,info)=operation.map_err(|error| {
+            if job.order_url.is_some() { ActiveOrderError(error).into() } else { error }
+        })?;
+        Ok(acme_candidate::AcmeCandidate::Downloaded {
+            purpose,bundle,info:Some(info),job,id,issuer_name,_proofs:proofs,_input:input.cloned(),_key:_job_key_reservation,_memory:candidate_memory,
         })
     }
 
@@ -2937,16 +3005,20 @@ impl CertificateManager {
         retry: Option<Duration>,
         cancel: &CancellationToken,
     ) -> Result<()> {
+        self.wait_poll_scoped(id,job,lease,retry,cancel,acme_journal::AcmeJournal::Primary{effective_ordinal:0,using_test_endpoint:false}).await
+    }
+    async fn wait_poll_scoped(&self,id:&str,job:&mut Job,lease:&StorageLease,retry:Option<Duration>,cancel:&CancellationToken,journal:acme_journal::AcmeJournal<'_>)->Result<()> {
         let delay = retry
             .unwrap_or(Duration::from_secs(1))
             .max(Duration::from_secs(1));
         job.poll_after_unix = now() + delay.as_secs() as i64;
-        self.save_job(id, job, lease).await?;
+        journal.save(self,id,job,lease).await?;
         sleep_cancel(delay, cancel).await?;
         job.poll_after_unix = 0;
         Ok(())
     }
     async fn load_job_directory(&self,id:&str)->Result<Option<crate::cert_transient::Text>> {
+        ensure!(!acme_probe::is_probe_id(id),"probe journal is not a production job");
         #[derive(Deserialize)]struct Header {#[serde(deserialize_with="job_codec::text")] directory:String}
         self.inner.store.journal_decode_admitted(id,|raw|{
             let _credit=job_codec::decode_credit(raw.len())?;
@@ -2955,11 +3027,13 @@ impl CertificateManager {
         }).await
     }
     async fn load_job(&self,id:&str)->Result<Option<Job>> {
+        ensure!(!acme_probe::is_probe_id(id),"probe journal is not a production job");
         self.inner.store.journal_decode_admitted(id,|raw|{
             job_codec::decode(raw)
         }).await
     }
     async fn save_job(&self, id: &str, job: &Job, lease: &StorageLease) -> Result<()> {
+        ensure!(!acme_probe::is_probe_id(id),"probe journal cannot use a production checkpoint");
         let operation = async {
             let snapshot=job_codec::snapshot(job,lease.name()).await?;
             let encoded=self.cpu(&CancellationToken::new(),move||job_codec::encode(snapshot)).await?;
@@ -3009,7 +3083,8 @@ impl CertificateManager {
         self.inner.store.journal_decode_admitted(&id,move|raw| {
             let credit=job_codec::decode_credit(raw.len())?;
             let mut attempt:Attempt=serde_json::from_slice(raw).map_err(|_|anyhow!("invalid certificate attempt"))?;
-            ensure!([1,2].contains(&attempt.version)&&attempt.names==names,"certificate attempt scope changed");
+            attempt.validate_protocol()?;
+            ensure!(attempt.names==names,"certificate attempt scope changed");
             ensure!(attempt.backend_sequence.len()<=16&&attempt.issuer_sequence.len()<=16,"certificate attempt issuer limit");
             attempt._memory=Some(credit);Ok(attempt)
         }).await
@@ -3042,6 +3117,7 @@ impl CertificateManager {
         leaf: &str,
         lease: &StorageLease,
     ) -> Result<bool> {
+        ensure!(!acme_probe::is_probe_id(job_id),"probe journal cannot claim a production winner");
         let Some(mut attempt) = self.load_attempt(names).await? else {
             return Ok(false);
         };
@@ -3059,7 +3135,7 @@ impl CertificateManager {
             leaf_sha256: leaf.to_owned(),
             backend:attempt.current_backend.clone(),input:attempt.current_input.clone(),
         });
-        if attempt.version==2 {
+        if attempt.unified() {
             self.save_attempt(attempt,lease).await?;
             let committed=self.load_attempt(names).await?.ok_or_else(||anyhow!("winner checkpoint missing"))?;
             self.retire_input(&committed,lease).await?;
@@ -3080,6 +3156,7 @@ impl CertificateManager {
         if attempt.attempt_id != attempt_id || attempt.winner.is_some() {
             return Ok(());
         }
+        if attempt.acme_phase.is_some(){return self.abandon_probe_phase(names,attempt_id,lease).await;}
         if let Some(id) = attempt.current_job_id
             && let Some(mut job) = self.load_job(&id).await?
         {
@@ -3223,17 +3300,26 @@ impl CertificateManager {
             let token = cancel.child_token();
             jobs.spawn(async move {
                 let mut failures = 0u32;
+                let mut retry=retry_operation::RetryOperation::default();
                 loop {
                     if token.is_cancelled() {
                         break;
                     }
-                    let delay = match manager.ensure(&names, token.clone()).await {
+                    let entered=std::sync::atomic::AtomicBool::new(false);
+                    let result=match retry.round(manager.inner.options.poll_interval,&entered){
+                        Ok(Some(round))=>manager.ensure_for_round(&names,token.clone(),round).await,
+                        Ok(None)=>{if sleep_cancel(retry.wait().max(Duration::from_secs(1)),&token).await.is_err(){break}continue},
+                        Err(error)=>Err(error),
+                    };
+                    let delay = match result {
                         Ok(cert) => {
+                            retry.close();
                             failures = 0;
                             Duration::from_secs((cert.renew_at_unix - now()).max(1) as u64)
                                 .min(manager.inner.options.poll_interval)
                         }
                         Err(error) => {
+                            retry.failed(entered.load(Ordering::Acquire),&error,manager.inner.options.poll_interval);
                             let _ = manager.inner.events.send(AutomationEvent {
                                 names: names.clone(),
                                 kind: "issuance_failed",
@@ -3241,7 +3327,7 @@ impl CertificateManager {
                             });
                             failures = failures.saturating_add(1);
                             let suggested = error_retry_delay(&error);
-                            retry_backoff(failures, &names).max(suggested)
+                            retry_backoff(failures,&names).max(suggested).max(retry.wait())
                         }
                     };
                     if sleep_cancel(delay, &token).await.is_err() {

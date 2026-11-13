@@ -85,17 +85,29 @@ impl Transport {
             }
         }
         let cancel = CancellationToken::new();
-        let (connector, scope) = self.connector.epoch(cancel.clone())
+        let (connector, scope) = self
+            .connector
+            .epoch(cancel.clone())
             .map_err(|e| e.reallocate_into_boxed_dyn_error_without_backtrace())?;
         let tasks = TaskTracker::new();
         let client = HyperClient::builder(Executor {
-            tasks: tasks.clone(), handle: tokio::runtime::Handle::current(),
-        }).http2_only(self.h2).pool_idle_timeout(self.timeout).build(connector);
-        let candidate = Arc::new(Epoch { client: Mutex::new(Some(client)), cancel, tasks, scope });
+            tasks: tasks.clone(),
+            handle: tokio::runtime::Handle::current(),
+        })
+        .http2_only(self.h2)
+        .pool_idle_timeout(self.timeout)
+        .build(connector);
+        let candidate = Arc::new(Epoch {
+            client: Mutex::new(Some(client)),
+            cancel,
+            tasks,
+            scope,
+        });
         let (selected, previous) = {
             let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
-            if self.cancel.is_cancelled() { (None, None) }
-            else if let Some(epoch) = current.as_ref().filter(|e| !e.cancel.is_cancelled()) {
+            if self.cancel.is_cancelled() {
+                (None, None)
+            } else if let Some(epoch) = current.as_ref().filter(|e| !e.cancel.is_cancelled()) {
                 (Some(epoch.clone()), None)
             } else {
                 (Some(candidate.clone()), current.replace(candidate.clone()))
@@ -184,7 +196,7 @@ impl Drop for Transport {
 pub(super) struct Credit {
     _scratch: Option<OwnedSemaphorePermit>,
     pub(super) _metadata: Arc<super::budget::Metadata>,
-    memory: Option<Arc<BatchMemory>>,
+    memory: Option<Memory>,
     pub(super) created: tokio::time::Instant,
     pub(super) done: tokio_util::sync::CancellationToken,
     pub(super) deadline_started: std::sync::atomic::AtomicBool,
@@ -197,13 +209,55 @@ pub(super) struct Credit {
 pub(super) struct BatchMemory {
     _scratch: OwnedSemaphorePermit,
     _metadata: Arc<super::budget::Metadata>,
+    _owner: super::export_retirement::WeakOwner,
     _control: Arc<super::distributed_trace::processor::Credit>,
 }
+/// Memory is physically retained independently from logical deadline Credit.
+#[derive(Clone, Debug)]
+pub(super) enum Memory {
+    Trace(Arc<BatchMemory>),
+    Metrics(Arc<MetricsBatchMemory>),
+}
+impl Memory {
+    pub(in crate::metrics) fn belongs_to(
+        &self,
+        owner: &super::export_retirement::WeakOwner,
+    ) -> bool {
+        match self {
+            Self::Trace(v) => v._owner.same_owner(owner),
+            Self::Metrics(v) => v._owner.same_owner(owner),
+        }
+    }
+
+    pub(in crate::metrics) fn domain(&self) -> super::export_retirement::Domain {
+        match self {
+            Self::Trace(_) => super::export_retirement::Domain::Trace,
+            Self::Metrics(_) => super::export_retirement::Domain::Metrics,
+        }
+    }
+}
+#[derive(Debug)]
+pub(super) struct MetricsBatchMemory {
+    _scratch: OwnedSemaphorePermit,
+    _metadata: Arc<super::budget::Metadata>,
+    _owner: super::export_retirement::WeakOwner,
+    _control: super::export_retirement::ControlCredit,
+}
 impl Credit {
-    pub(super) fn new(scratch: OwnedSemaphorePermit, metadata: Arc<super::budget::Metadata>, timer: OwnedSemaphorePermit) -> Self {
-        Self { _scratch: Some(scratch), _metadata: metadata, memory: None,
-            created: tokio::time::Instant::now(), done: CancellationToken::new(),
-            deadline_started: Default::default(), timer_credit: Mutex::new(Some(timer)) }
+    pub(super) fn new(
+        scratch: OwnedSemaphorePermit,
+        metadata: Arc<super::budget::Metadata>,
+        timer: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            _scratch: Some(scratch),
+            _metadata: metadata,
+            memory: None,
+            created: tokio::time::Instant::now(),
+            done: CancellationToken::new(),
+            deadline_started: Default::default(),
+            timer_credit: Mutex::new(Some(timer)),
+        }
     }
     /// Native trace CPU producers only; layout is paid before the extra Arc.
     pub(super) fn trace(
@@ -212,19 +266,67 @@ impl Credit {
         timer: OwnedSemaphorePermit,
         source: &Arc<super::distributed_trace::processor::Process>,
         created: tokio::time::Instant,
+        owner: super::export_retirement::WeakOwner,
     ) -> anyhow::Result<Self> {
         let layout = std::mem::size_of::<BatchMemory>()
-            .checked_add(std::mem::size_of::<super::distributed_trace::processor::Credit>())
+            .checked_add(std::mem::size_of::<
+                super::distributed_trace::processor::Credit,
+            >())
             .and_then(|n| n.checked_add(4 * std::mem::size_of::<usize>()))
             .ok_or_else(|| anyhow::anyhow!("trace batch memory layout overflow"))?;
         let control = source.metadata(layout)?;
-        let memory = Arc::new(BatchMemory { _scratch: scratch, _metadata: metadata.clone(), _control: control });
-        Ok(Self { _scratch: None, _metadata: metadata, memory: Some(memory),
-            created, done: CancellationToken::new(),
-            deadline_started: Default::default(), timer_credit: Mutex::new(Some(timer)) })
+        let memory = Arc::new(BatchMemory {
+            _scratch: scratch,
+            _metadata: metadata.clone(),
+            _owner: owner,
+            _control: control,
+        });
+        Ok(Self {
+            _scratch: None,
+            _metadata: metadata,
+            memory: Some(Memory::Trace(memory)),
+            created,
+            done: CancellationToken::new(),
+            deadline_started: Default::default(),
+            timer_credit: Mutex::new(Some(timer)),
+        })
     }
-    pub(super) fn memory(&self) -> anyhow::Result<Arc<BatchMemory>> {
-        self.memory.clone().ok_or_else(|| anyhow::anyhow!("trace batch memory unavailable"))
+    pub(super) fn metrics_owned(
+        scratch: OwnedSemaphorePermit,
+        metadata: Arc<super::budget::Metadata>,
+        timer: OwnedSemaphorePermit,
+        admission: &super::export_retirement::Admission,
+        created: tokio::time::Instant,
+        owner: super::export_retirement::WeakOwner,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            admission.domain() == super::export_retirement::Domain::Metrics,
+            "metrics memory domain mismatch"
+        );
+        let layout = std::mem::size_of::<MetricsBatchMemory>()
+            .checked_add(4 * std::mem::size_of::<usize>())
+            .ok_or_else(|| anyhow::anyhow!("metrics batch memory layout overflow"))?;
+        let control = admission.reserve(layout)?;
+        let memory = Arc::new(MetricsBatchMemory {
+            _scratch: scratch,
+            _metadata: metadata.clone(),
+            _owner: owner,
+            _control: control,
+        });
+        Ok(Self {
+            _scratch: None,
+            _metadata: metadata,
+            memory: Some(Memory::Metrics(memory)),
+            created,
+            done: CancellationToken::new(),
+            deadline_started: Default::default(),
+            timer_credit: Mutex::new(Some(timer)),
+        })
+    }
+    pub(super) fn memory(&self) -> anyhow::Result<Memory> {
+        self.memory
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("trace batch memory unavailable"))
     }
 }
 

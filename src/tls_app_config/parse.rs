@@ -4,7 +4,7 @@ use super::{
     error::{ConfigError, pointer},
     issuer_parse,
     model::{
-        Authority, CertificatePlan, Identity, Issuer, ManualSource, PermissionSetting, Policy,
+        Authority, CertificatePlan, Identity, Issuer, PermissionSetting, Policy,
     },
     pki_parse,
     schema::ObjectKind,
@@ -15,7 +15,7 @@ use crate::{
 };
 use serde_json::Value;
 use std::{collections::BTreeMap, time::Duration};
-use zeroize::Zeroizing;
+use super::manual_values::{Builder,Input,Kind};
 
 pub(super) fn parse(views: CertificateViews<'_>) -> Result<CertificatePlan> {
     let mut plan = CertificatePlan {
@@ -63,45 +63,56 @@ pub(super) fn parse(views: CertificateViews<'_>) -> Result<CertificatePlan> {
         .into_iter()
         .map(Into::into)
         .collect()).map_err(|_| ConfigError::invalid(certificates.at("automate")))?;
+    let mut manual =
+        Builder::new().map_err(|_| ConfigError::invalid(certificates.at("load_files")))?;
     for field in ["load_files", "load_pem"] {
         for (index, value) in certificates.array(field)?.iter().enumerate() {
             let path = pointer(&certificates.at(field), &index.to_string());
-            let kind = if field == "load_files" {
-                ObjectKind::FilePair
-            } else {
-                ObjectKind::PemPair
-            };
-            let pair = Object::new(Some(value), kind, &path)?;
-            let certificate = pair.string("certificate")?;
-            let key = pair.string("key")?;
-            let tags = pair.strings("tags")?.into_iter().map(Into::into).collect();
-            if certificate.is_empty() || key.is_empty() {
-                return Err(ConfigError::invalid(path));
-            }
-            if field == "load_files" {
-                if !matches!(pair.string("format")?, "" | "pem") {
-                    return Err(ConfigError::invalid(pair.at("format")));
-                }
-                plan.manual.push(ManualSource::Files {
-                    certificate: certificate.into(),
-                    key: key.into(),
-                    tags,
-                });
-            } else {
-                plan.manual.push(ManualSource::Pem {
-                    certificate: certificate.as_bytes().to_vec(),
-                    key: Zeroizing::new(key.as_bytes().to_vec()),
-                    tags,
-                });
-            }
+            let pair = Object::new(
+                Some(value),
+                if field == "load_files" {
+                    ObjectKind::FilePair
+                } else {
+                    ObjectKind::PemPair
+                },
+                &path,
+            )?;
+            let source = Input::new(
+                if field == "load_files" {
+                    Kind::Files
+                } else {
+                    Kind::Pem
+                },
+                pair.string("certificate")?,
+                pair.string("key")?,
+                if field == "load_files" {
+                    pair.string("format")?
+                } else {
+                    ""
+                },
+                pair.array("tags")?,
+            )
+            .map_err(|_| ConfigError::invalid(path.clone()))?;
+            manual
+                .push(source)
+                .map_err(|_| ConfigError::invalid(path))?;
         }
     }
-    plan.manual.extend(
-        certificates
-            .strings("load_folders")?
-            .into_iter()
-            .map(|path| ManualSource::Folder(path.into())),
-    );
+    for (index, path) in certificates.array("load_folders")?.iter().enumerate() {
+        let pointer = pointer(&certificates.at("load_folders"), &index.to_string());
+        let source = Input::new(
+            Kind::Folder,
+            path.as_str()
+                .ok_or_else(|| ConfigError::invalid(pointer.clone()))?,
+            "",
+            "",
+            &[],
+        )
+        .map_err(|_| ConfigError::invalid(pointer.clone()))?;
+        manual
+            .push(source)
+            .map_err(|_| ConfigError::invalid(pointer))?;
+    }
     if let Some(storage) = certificates.value("load_storage") {
         let storage = Object::new(
             Some(storage),
@@ -111,22 +122,22 @@ pub(super) fn parse(views: CertificateViews<'_>) -> Result<CertificatePlan> {
         for (index, value) in storage.array("pairs")?.iter().enumerate() {
             let path = pointer(&storage.at("pairs"), &index.to_string());
             let pair = Object::new(Some(value), ObjectKind::FilePair, &path)?;
-            let certificate = pair.string("certificate")?;
-            let key = pair.string("key")?;
-            if certificate.is_empty() || key.is_empty() {
-                return Err(ConfigError::invalid(path));
-            }
-            if !matches!(pair.string("format")?, "" | "pem") {
-                return Err(ConfigError::invalid(pair.at("format")));
-            }
-            let tags = pair.strings("tags")?.into_iter().map(Into::into).collect();
-            plan.manual.push(ManualSource::Storage {
-                certificate: certificate.into(),
-                key: key.into(),
-                tags,
-            });
+            let source = Input::new(
+                Kind::Storage,
+                pair.string("certificate")?,
+                pair.string("key")?,
+                pair.string("format")?,
+                pair.array("tags")?,
+            )
+            .map_err(|_| ConfigError::invalid(path.clone()))?;
+            manual
+                .push(source)
+                .map_err(|_| ConfigError::invalid(path))?;
         }
     }
+    plan.manual = manual
+        .finish()
+        .map_err(|_| ConfigError::invalid(certificates.at("load_files")))?;
     let automation = Object::new(
         tls.value("automation"),
         ObjectKind::Automation,

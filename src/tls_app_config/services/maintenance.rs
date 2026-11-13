@@ -262,6 +262,7 @@ impl CertificateServices {
     async fn run_group(self: Arc<Self>, group: Arc<Group>) {
         let cancel = group.cancel.clone();
         let mut failures = 0u32;
+        let mut retry=cert_automation::retry_operation::RetryOperation::default();
         let mut key_changes = self.context.leaf_guard.key_deny().subscribe();
         let key_pending = || group.spki.lock().map(|spki| spki.as_ref().is_some_and(|spki|
             self.context.leaf_guard.key_deny().check_spki_der(spki).is_err())).unwrap_or(true);
@@ -295,6 +296,7 @@ impl CertificateServices {
                 .lock()
                 .map(|leaf| leaf.as_ref().is_some_and(|leaf| leaf.needs_renewal()))
                 .unwrap_or(true) || key_pending();
+            let entered=std::sync::atomic::AtomicBool::new(false);
             let result = if let Err(error) = refreshed {
                 Err(error)
             } else if pending && !group.identity
@@ -307,17 +309,20 @@ impl CertificateServices {
             } else if cached_deadline > now().unwrap_or(i64::MAX) && !pending {
                 Ok(cached_deadline)
             } else {
-                std::panic::AssertUnwindSafe(Box::pin(self.ensure_group(
-                    group.clone(),
-                    false,
-                    cancel.clone(),
-                )))
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|_| Err(anyhow!("certificate maintenance worker panicked")))
+                match retry.round(self.plan.renew_interval,&entered){
+                    Ok(Some(round))=>std::panic::AssertUnwindSafe(Box::pin(self.ensure_group_target_for_round(
+                        group.clone(),false,None,cancel.clone(),round,
+                    ))).catch_unwind().await.unwrap_or_else(|_|Err(anyhow!("certificate maintenance worker panicked"))),
+                    Ok(None)=>{
+                        tokio::select!{biased;_=cancel.cancelled()=>return,_=tokio::time::sleep(retry.wait().max(Duration::from_secs(1)))=>{}}
+                        continue
+                    },
+                    Err(error)=>Err(error),
+                }
             };
             let delay = match result {
                 Ok(renew_at) => {
+                    retry.close();
                     failures = 0;
                     Duration::from_secs(
                         renew_at.saturating_sub(now().unwrap_or(renew_at)).max(1) as u64
@@ -325,13 +330,14 @@ impl CertificateServices {
                     .min(self.plan.renew_interval)
                 }
                 Err(error) => {
+                    retry.failed(entered.load(Ordering::Acquire),&error,self.plan.renew_interval);
                     failures = failures.saturating_add(1);
                     let _ = self.events.send(CertificateEvent {
                         kind: "certificate_maintenance_failed",
                         names: group.names.clone(),
                     });
                     cert_automation::retry_backoff(failures, &group.names)
-                        .max(cert_automation::error_retry_delay(&error))
+                        .max(cert_automation::error_retry_delay(&error)).max(retry.wait())
                 }
             };
             let deadline = tokio::time::Instant::now() + delay;
@@ -339,7 +345,7 @@ impl CertificateServices {
                 tokio::select! { biased;
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep_until(deadline) => break,
-                    _ = key_changes.changed() => { if key_pending() { break; } },
+                    _ = key_changes.changed() => { if key_pending() { retry.close();break; } },
                     _ = &mut changed => {
                         let pending = group.leaf_state.lock().map(|state| state.as_ref().is_some_and(|leaf| leaf.needs_renewal())).unwrap_or(true);
                         if pending { break; }

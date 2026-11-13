@@ -45,7 +45,7 @@ impl CertificateManager {
     }
     pub(super) async fn archive_compromised_attempt(&self,state:Attempt,lease:&StorageLease,
         cancel:&CancellationToken)->Result<()> {
-        ensure!(state.version==2&&state.winner.is_none(),"cannot retire committed attempt");
+        ensure!(state.unified()&&state.winner.is_none(),"cannot retire committed attempt");
         let id=format!("retired-input-attempt-v2-{}",state.attempt_id);let name=lease.name().to_owned();
         let encoded=self.cpu(cancel,move||job_codec::encode_record(&state,&name)).await?;
         self.inner.store.journal_store_encoded_fenced(&id,encoded,lease).await
@@ -81,8 +81,13 @@ impl CertificateManager {
         backend:attempt::BackendId,input:attempt::InputBinding,lease:&StorageLease)->Result<()> {
         lease.check().await?;
         let mut state=self.load_attempt(names).await?.ok_or_else(||anyhow!("certificate attempt missing"))?;
-        ensure!(state.version==2&&state.attempt_id==attempt_id&&state.winner.is_none()
+        ensure!(state.unified()&&state.attempt_id==attempt_id&&state.winner.is_none()
             &&state.backend_sequence.contains(&backend),"certificate attempt was superseded");
+        if let Some(phase)=&state.acme_phase {
+            ensure!(phase.step==acme_probe::PhaseStep::PendingPrimary&&phase.owner==backend&&phase.input==input,
+                "active probe cannot become an unrelated primary");
+            state.acme_phase=None;state._phase_memory=None;
+        }
         state.current_job_id=Some(job_id.to_owned());state.current_backend=Some(backend);state.current_input=Some(input);
         self.save_attempt(state,lease).await
     }
@@ -90,7 +95,7 @@ impl CertificateManager {
         backend:&attempt::BackendId,input:&attempt::InputBinding,lease:&StorageLease)->Result<()> {
         lease.check().await?;
         let state=self.load_attempt(names).await?.ok_or_else(||anyhow!("certificate attempt missing"))?;
-        ensure!(state.version==2&&state.attempt_id==attempt_id&&state.current_job_id.as_deref()==Some(job_id)
+        ensure!(state.unified()&&state.attempt_id==attempt_id&&state.current_job_id.as_deref()==Some(job_id)
             &&state.current_backend.as_ref()==Some(backend)&&state.current_input.as_ref()==Some(input)
             &&state.winner.is_none(),"certificate attempt changed before commit");Ok(())
     }
@@ -132,7 +137,7 @@ impl CertificateManager {
     /// Winner is durable first. Replacing the same journal atomically retires
     /// its secret; recovery repeats this step if interrupted after the CAS.
     pub(super) async fn retire_input(&self,state:&Attempt,lease:&StorageLease)->Result<()> {
-        if state.version!=2||(state.winner.is_none()&&!state.retired){return Ok(())}
+        if !state.unified()||(state.winner.is_none()&&!state.retired){return Ok(())}
         if state.retired {self.expired_archive(state).await?;}
         let id=state.input_id.as_deref().ok_or_else(||anyhow!("winner input missing"))?;
         let value=self.inner.store.journal_decode_admitted(id,|raw|{
@@ -152,6 +157,7 @@ impl CertificateManager {
         self.inner.store.journal_store_encoded_fenced(id,encoded,lease).await
     }
     pub(super) async fn save_attempt(&self,attempt:Attempt,lease:&StorageLease)->Result<()> {
+        attempt.validate_protocol()?;
         let id=attempt_key(&attempt.names)?;let name=lease.name().to_owned();
         let encoded=self.cpu(&CancellationToken::new(),move||job_codec::encode_record(&attempt,&name)).await?;
         self.inner.store.journal_store_encoded_fenced(&id,encoded,lease).await
@@ -240,6 +246,10 @@ impl CertificateManager {
     }
     pub(super) async fn recover_unified(&self,names:&[String],state:&Attempt,lease:&StorageLease,
         cancel:&CancellationToken)->Result<()> {
+        state.validate_protocol()?;
+        if state.acme_phase.is_some() {
+            return self.recover_test_ca_phase(names,state,lease,cancel).await;
+        }
         if state.winner.is_some(){return Ok(())}
         let Some(id)=state.current_job_id.as_deref()else{return Ok(())};
         let Some(selected)=state.current_backend.as_ref()else{return Ok(())};
@@ -336,7 +346,7 @@ impl CertificateManager {
             let old:Attempt=serde_json::from_slice(raw).map_err(|_|anyhow!("invalid expired attempt archive"))?;
             ensure!(!old.retired&&old.winner.is_none()&&old.names==expected_names&&old.attempt_id==expected_id
                 &&old.input_id==input&&old.current_job_id.is_some(),"expired attempt archive binding changed");
-            ensure!(old.version==1||(old.version==2&&old.current_backend.is_some()&&old.current_input.is_some()),
+            ensure!(old.version==1||(old.unified()&&old.current_backend.is_some()&&old.current_input.is_some()),
                 "expired archive has no original leg binding");
             Ok(())
         }).await?.ok_or_else(||anyhow!("expired attempt archive missing"))

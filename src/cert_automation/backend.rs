@@ -222,16 +222,17 @@ impl CertificateManager {
                 issuer_sequence:manager.inner.issuers.iter().map(|i|i.config.wire.directory.clone()).collect(),
                 current_job_id:None,base_leaf,base_backend:base_backend.map(|b|b.id.clone()),winner:None,
                 backend_sequence:ordered,configured_sequence:manager.inner.backends.iter().map(|b|b.id.clone()).collect(),
-                input_id:Some(format!("input-v2-{id}")),current_backend:None,current_input:None,_memory:Some(memory)})
+                input_id:Some(format!("input-v2-{id}")),current_backend:None,current_input:None,acme_phase:None,_phase_memory:None,_memory:Some(memory)})
         }).await
     }
-    pub(super) async fn ensure_unified(&self,names:Vec<String>,cancel:CancellationToken)->Result<ManagedCertificate> {
+    pub(super) async fn ensure_unified(&self,names:Vec<String>,cancel:CancellationToken,round:retry_operation::AcmeRound<'_>)->Result<ManagedCertificate> {
         let lease=self.inner.store.lock(&format!("issue_cert_{}",names[0]),cancel.clone()).await?;
         let initial=async {
-            let (ready,previous)=self.load_state(&names,&lease,&cancel).await?;
+            let (ready,previous)=self.load_state_for_round(&names,&lease,&cancel,round).await?;
             if let Some(ready)=ready{return Ok((Some(ready),previous,None,None,None))}
+            round.enter();
             let old=self.load_attempt(&names).await?;
-            if let Some(old)=old.filter(|a|a.version==2&&!a.retired&&a.winner.is_none()) {
+            if let Some(old)=old.filter(|a|a.unified()&&!a.retired&&a.winner.is_none()) {
                 ensure!(old.configured_sequence.iter().eq(self.inner.backends.iter().map(|b|&b.id)),
                     "active certificate issuer sequence changed; resume the original policy");
                 let id=old.input_id.as_deref().ok_or_else(||anyhow!("active attempt input missing"))?;
@@ -276,12 +277,13 @@ impl CertificateManager {
             if rank>0{sleep_cancel(Duration::from_millis(250u64<<rank.min(5)),&cancel).await?}
             entered=rank+1;
             let mut account=None;let mut reservation=None;
+            let test_driver=match backend.kind{BackendKind::Acme(index)=>self.uses_test_driver(index,&state),_=>false};
             if let Some(issuer)=backend.acme(&self.inner.issuers) {
                 // Subject incompatibility is one issuer's PreCheck, not loss of
                 // the already authorized Internal capability or ask decision.
                 if normalize_names(&input.record.names).is_err(){last=Some(anyhow!("ACME issuer does not support these authorized identifier types"));continue}
                 let allowed=issuer.ca.next_allowed_unix.load(Ordering::Acquire);
-                if allowed>now(){last=Some(RetryAfterError(allowed).into());continue}
+                if !test_driver&&allowed>now(){last=Some(RetryAfterError(allowed).into());continue}
                 if let Some(key)=&issuer.config.account_key {
                     match key.signer(){Ok(_)=>{},
                         Err(error)if error.is::<super::account_key::CredentialUnavailable>()=>{
@@ -290,6 +292,7 @@ impl CertificateManager {
                         Err(error)=>return Err(error),
                     }
                 }
+                if !test_driver {
                 let network=self.net_permit(issuer,&cancel).await?;
                 let setup=async {
                     let wire=issuer.wire.get_or_try_init(||async {
@@ -306,6 +309,7 @@ impl CertificateManager {
                 match setup {Ok((session,marker))=>{account=Some(session);reservation=marker},
                     Err(error) if unavailable(&error,&cancel)=>{record_issuer_error(issuer,&error);last=Some(error);continue},
                     Err(error)=>return Err(error),}
+                }
             }
             let lease=self.inner.store.lock(&format!("issue_cert_{}",names[0]),cancel.clone()).await?;
             let work=cancel.child_token();let lost=lease.lost();
@@ -323,6 +327,9 @@ impl CertificateManager {
                         let issuer=&self.inner.issuers[*index];
                         self.inner.store.recover_certificate_with_lease(&backend.storage_key,&names_key(&names)?,&lease).await?;
                         let _=self.read_issuer_certificate(&backend.storage_key,&names_key(&names)?,&work).await?;
+                        if test_driver {
+                            return self.issue_test_ca_leg(*index,&names,&attempt_id,&input,previous.as_ref(),&lease,&lifecycle,&work,round,&produced).await;
+                        }
                         let current=self.read_reservation(&names,issuer).await?;
                         ensure!(current.as_ref().map(|v|v.job_id.as_str())==reservation.as_ref().map(|v|v.job_id.as_str()),
                             "issuer reservation changed during account preparation");
@@ -336,7 +343,7 @@ impl CertificateManager {
                         let allowed=issuer.ca.next_allowed_unix.load(Ordering::Acquire);
                         if allowed>now(){return Err(RetryAfterError(allowed).into())}
                         self.issue(&names,issuer,session,&lease,(previous.as_ref(),current.as_ref(),&attempt_id),
-                            None,&lifecycle,&work,Some(&leg_input),Some(&produced)).await
+                            None,&lifecycle,&work,Some(&leg_input),Some(&produced),round.ordinal).await
                     },
                 }
             };
@@ -361,8 +368,9 @@ impl CertificateManager {
             let release=lease.release().await;release?;
             match result {
                 Ok(value)=>return Ok(value),
+                Err(error) if error.is::<test_ca_driver::RetiredProbe>()=>{last=Some(error.context(retry_operation::NoRetry));},
                 Err(error) if unavailable(&error,&cancel)||error.is::<RetryAfterError>()=>{
-                    if let Some(issuer)=backend.acme(&self.inner.issuers){record_issuer_error(issuer,&error)}last=Some(error)
+                    if !error.is::<test_ca_driver::TestEndpoint>()&&let Some(issuer)=backend.acme(&self.inner.issuers){record_issuer_error(issuer,&error)}last=Some(error)
                 },
                 Err(error)=>return Err(error),
             }

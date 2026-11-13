@@ -34,12 +34,14 @@ pub(super) async fn prepare(
     if !server.tls {
         return Ok(Vec::new());
     }
-    let mut manual_tags = HashMap::<[u8; 32], Vec<String>>::new();
+    let tag_refs=manual.certificates.iter().try_fold(0usize,|n,c|n.checked_add(c.tags.len()).ok_or_else(||anyhow::anyhow!("manual tag index overflow")))?;
+    let _tag_memory=crate::cert_transient::reserve(tag_refs.checked_mul(64).and_then(|n|n.checked_add(manual.certificates.len()*256+1024)).ok_or_else(||anyhow::anyhow!("manual tag index overflow"))?)?;
+    let mut manual_tags = HashMap::<[u8; 32], Vec<&str>>::new();
     for certificate in manual.certificates.iter() {
         manual_tags
             .entry(certificate.identity)
             .or_default()
-            .extend(certificate.tags.iter().cloned());
+            .extend(certificate.tags.iter().map(String::as_str));
     }
     for tags in manual_tags.values_mut() {
         tags.sort_unstable();
@@ -54,7 +56,7 @@ pub(super) async fn prepare(
             .filter(|(_, tags)| {
                 selection
                     .as_ref()
-                    .is_none_or(|filter| filter.allows_tags(tags.as_slice()))
+                    .is_none_or(|filter| filter.allows_tag_names(tags.iter().copied()))
             })
             .map(|(identity, _)| *identity)
             .collect();

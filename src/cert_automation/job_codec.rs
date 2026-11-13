@@ -89,6 +89,10 @@ impl AsRef<[u8]> for Encoded {
         &self.bytes
     }
 }
+impl Snapshot {
+    pub(super) fn job(&self)->&Job {&self.job}
+    pub(super) fn lease_name(&self)->&str {&self.lease_name}
+}
 impl Encoded {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -360,9 +364,7 @@ pub(super) fn decode(raw:&[u8])->Result<Job>{
             anyhow::Error::from(crate::cert_transient::ResourceDenied)
         }else{anyhow!(error).context("invalid ACME recovery checkpoint")}
     })?;
-    let memory=chain_memory::shared().payload.reserve(clone_bytes(&job)?)
-        .map_err(|_|crate::cert_transient::ResourceDenied)?;
-    job.restored_memory=Some(Arc::new(memory));
+    admit_restored(&mut job)?;
     drop(scratch);Ok(job)
 }
 
@@ -376,4 +378,11 @@ pub(super) fn encode_record(value:&impl Serialize,lease_name:&str)->Result<Encod
     let mut writer=Writer{bytes,limit:count.0};serde_json::to_writer(&mut writer,&record)?;
     ensure!(writer.bytes.len()==count.0,"journal record encoding changed");
     Ok(Encoded{bytes:writer.bytes,_credit:credit})
+}
+
+/// Shared decoded-Job owner admission for the closed probe envelope as well.
+pub(super) fn admit_restored(job:&mut Job)->Result<()> {
+    let memory=chain_memory::shared().payload.reserve(clone_bytes(job)?)
+        .map_err(|_|crate::cert_transient::ResourceDenied)?;
+    job.restored_memory=Some(Arc::new(memory));Ok(())
 }

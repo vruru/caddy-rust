@@ -780,6 +780,7 @@ impl CertificateServices {
             .storage
             .as_ref()
             .unwrap_or(&self.context.paths.default_storage);
+        super::manual_values::prepare_all(&self.plan.manual,&self.context,cancel.clone()).await?;
         let materials =
             super::loaders::load_manual(&self.plan.manual, storage, &self.context, cancel.clone())
                 .await?;

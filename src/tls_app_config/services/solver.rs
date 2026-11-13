@@ -16,6 +16,7 @@ pub(super) struct SolverBroker {
 }
 struct BindingSettings {
     directory: String,
+    test_directory: Option<String>,
     bind_host: String,
     bind_address: Option<std::net::SocketAddr>,
     http_port: u16,
@@ -30,6 +31,8 @@ impl SolverBroker {
         ensure!(settings.len()<=16,"challenge issuer binding limit");
         let bytes=settings.iter().try_fold(8192usize,|n,s|{
             let text=s.config.wire.directory.len().checked_mul(3).and_then(|a|s.bind_host.len().checked_mul(2).and_then(|b|a.checked_add(b))).ok_or(crate::cert_transient::ResourceDenied)?;
+            let test=crate::cert_automation::test_ca::directory(&s.config.wire.directory,s.test_ca.as_deref()).map_or(0,str::len);
+            let text=text.checked_add(test.checked_mul(3).ok_or(crate::cert_transient::ResourceDenied)?).ok_or(crate::cert_transient::ResourceDenied)?;
             n.checked_add(text).and_then(|n|n.checked_add(std::mem::size_of::<BindingSettings>()+2048)).ok_or(crate::cert_transient::ResourceDenied)
         })?.checked_add(staged.len().checked_mul(std::mem::size_of::<StagedAddress>()).ok_or(crate::cert_transient::ResourceDenied)?)
             .ok_or(crate::cert_transient::ResourceDenied)?;
@@ -40,9 +43,11 @@ impl SolverBroker {
                 let directory = url::Url::parse(&settings.config.wire.directory)
                     .map_err(|_| anyhow!("invalid challenge issuer directory"))?
                     .to_string();
+                let test_directory=crate::cert_automation::test_ca::directory(&directory,settings.test_ca.as_deref())
+                    .filter(|test|*test!=directory).map(|test|crate::acme_wire::directory_url::normalize(test).map(|url|url.to_string())).transpose()?;
                 let bind_address=if let Some(provider)=&provider {provider.resolve_bind_host(&settings.bind_host)?}else{crate::http_runtime::listener_lease::numeric_bind_host(&settings.bind_host)?};
                 Ok(BindingSettings {
-                    directory,
+                    directory,test_directory,
                     bind_host: settings.bind_host,
                     bind_address,
                     http_port: settings.http_port.unwrap_or(80),
@@ -67,6 +72,18 @@ impl SolverBroker {
         // Constructor prepaid this bounded vector/callback metadata. Every
         // callback and invoked future keeps the concrete producer alive.
         (0..self.settings.len()).map(|index|self.callback_for(index)).collect()
+    }
+    pub(super) fn test_callbacks(self:&Arc<Self>)->Result<Vec<Option<SolverPreparation>>>{
+        (0..self.settings.len()).map(|index|{
+            if self.settings[index].test_directory.is_none(){return Ok(None)}
+            let this=self.clone();
+            let callback:SolverPreparation=Arc::new(move|directory:String,kind,cancel|{
+                let this=this.clone();Box::pin(async move {
+                    ensure!(this.settings[index].test_directory.as_deref()==Some(directory.as_str()),"test CA proof binding changed");
+                    this.prepare_index(index,kind,cancel).await
+                })
+            });Ok(Some(callback))
+        }).collect()
     }
     pub(super) fn callback_for(self:&Arc<Self>,index:usize)->Result<SolverPreparation>{
         ensure!(index<self.settings.len(),"issuer proof binding index out of range");

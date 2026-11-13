@@ -4,11 +4,28 @@ use crate::cert_automation::AcmeIssuerConfig;
 use crate::local_pki::CaConfig;
 
 
+/// A concrete large acquisition future retires before its prepayment, including
+/// caller abort. Only its pointer enters the outer Flight/SNI future layout.
+struct AcquisitionFrame<F>{future:std::pin::Pin<Box<F>>,_memory:crate::acme_wire::chain_memory::Scratch}
+impl<F:std::future::Future> std::future::Future for AcquisitionFrame<F>{
+    type Output=F::Output;
+    fn poll(self:std::pin::Pin<&mut Self>,cx:&mut std::task::Context<'_>)->std::task::Poll<Self::Output>{
+        self.get_mut().future.as_mut().poll(cx)
+    }
+}
+fn acquisition_frame<F:std::future::Future>(future:F)->Result<AcquisitionFrame<F>>{
+    let bytes=std::mem::size_of_val(&future).checked_add(std::mem::align_of_val(&future))
+        .and_then(|n|n.checked_add(2*std::mem::size_of::<usize>()+64)).ok_or(crate::cert_transient::ResourceDenied)?;
+    let memory=crate::cert_transient::reserve(bytes)?;
+    Ok(AcquisitionFrame{future:Box::pin(future),_memory:memory})
+}
+
 /// Additional concrete constructor copies/hash scratch. Original expanded-value
 /// producer credit is separate and must accompany the input/result as well.
 struct ManagerConstructionOwner {
     _memory:crate::acme_wire::chain_memory::Scratch,
     _root_inputs:Vec<crate::acme_wire::chain_memory::Scratch>,
+    _test_inputs:crate::acme_wire::chain_memory::Scratch,
     _root_input_metadata:crate::acme_wire::chain_memory::Scratch,
     // Keep producer credit through the actual queued worker and retained error
     // or unconsumed manager; constructor admission does not replace this loan.
@@ -27,6 +44,8 @@ struct ManagerBuildInput {
     resources:Arc<cert_automation::AutomationResources>,
     prepared:Vec<cert_automation::PreparedBackend>,
     solvers:Vec<cert_automation::SolverPreparation>,
+    test_directories:Vec<Option<String>>,
+    test_solvers:Vec<Option<cert_automation::SolverPreparation>>,
     events:Option<Arc<crate::events::EventsApp>>,
     key_type:crate::acme_wire::KeyType,
     must_staple:bool,
@@ -39,8 +58,9 @@ struct ManagerBuildInput {
     owner:Arc<ManagerConstructionOwner>,
 }
 impl ManagerBuildInput {
-    fn copy_cost(prepared:&[cert_automation::PreparedBackend])->Result<usize>{
-        let mut bytes=65536usize;
+    fn copy_cost(prepared:&[cert_automation::PreparedBackend],test_directories:&[Option<String>],client_inputs:usize)->Result<usize>{
+        let mut acme_index=0usize;
+        let mut bytes=65536usize.checked_add(cert_automation::test_ca::plan_metadata_cost(test_directories.len())?).ok_or(crate::cert_transient::ResourceDenied)?;
         for item in prepared {
             match item {
                 cert_automation::PreparedBackend::Internal{ca,..}=>{bytes=bytes.checked_add(ca.len().checked_mul(4).ok_or(crate::cert_transient::ResourceDenied)?).ok_or(crate::cert_transient::ResourceDenied)?;},
@@ -49,24 +69,32 @@ impl ManagerBuildInput {
                     for value in &config.wire.extra_ca_pem {text=text.checked_add(value.len()).ok_or(crate::cert_transient::ResourceDenied)?;}
                     for value in &config.wire.trusted_ca_origins {text=text.checked_add(value.len()).ok_or(crate::cert_transient::ResourceDenied)?;}
                     if let Some(eab)=&config.eab{text=text.checked_add(eab.kid.len()).and_then(|n|n.checked_add(eab.hmac_key.len())).ok_or(crate::cert_transient::ResourceDenied)?;}
+                    let test=test_directories.get(acme_index).ok_or_else(||anyhow!("test CA index count changed"))?;
+                    acme_index+=1;
+                    bytes=bytes.checked_add(cert_automation::test_ca::copy_cost(config,test.as_deref(),client_inputs)?).ok_or(crate::cert_transient::ResourceDenied)?;
                     bytes=bytes.checked_add(text.checked_mul(4).and_then(|n|n.checked_add(16384)).ok_or(crate::cert_transient::ResourceDenied)?).ok_or(crate::cert_transient::ResourceDenied)?;
                 },
             }
         }
+        ensure!(acme_index==test_directories.len(),"test CA index count changed");
         Ok(bytes)
     }
     fn execute(self)->Result<CertificateManager>{
         let owner=self.owner.clone();
         match self.construct(){
-            Ok(manager)=>manager.with_construction_owner(owner),
+            Ok(manager)=>Ok(manager),
             Err(error)=>Err(crate::cert_cpu::retained_error(error,owner)),
         }
     }
     fn construct(self)->Result<CertificateManager>{
         let issuer_values_credit=self.owner.issuer_values_credit.clone();
+        let resources=self.resources.clone();
         let manager=CertificateManager::with_ordered_backends(self.store,self.registry,self.resolver,
             self.options,self.resources,None,self.prepared,self.key_type)?
+            .with_construction_owner(self.owner.clone())?
             .with_issuer_values_credit(issuer_values_credit)?
+            .with_prepared_test_cas(self.test_directories,&resources)?
+            .with_test_ca_solvers(self.test_solvers)?
             .with_issuer_solvers(self.solvers)?.with_events(self.events)?;
         #[cfg(feature="native-run")]
         let manager=manager.with_client_tls_scope(self.scope)?;
@@ -362,6 +390,7 @@ impl CertificateServices {
                 // admin.go defaults to one ACME module; it does not call the
                 // business email-based DefaultIssuers factory.
                 policy.issuers = vec![Issuer::Acme(Box::new(AcmeSettings {
+                    test_ca:Some(String::new()),
                     values:None,
                     config: AcmeIssuerConfig::lets_encrypt(),
                     account_key: None,
@@ -408,10 +437,24 @@ impl CertificateServices {
         let mut solver = None;
         let group_tasks=TaskTracker::new();
         let copy_bytes=policy.issuers.iter().try_fold(0usize,|sum,issuer|{
-            let bytes=match issuer {Issuer::Acme(settings)=>settings.values.as_ref().map(|v|v.get().and_then(|p|p.copy_upper())).transpose()?.unwrap_or(0),_=>0};
+            let bytes=match issuer {Issuer::Acme(settings)=>settings.values.as_ref().map(|v|v.get().and_then(|p|p.copy_upper(self.context.resources.issuance.client_build_input_upper()))).transpose()?.unwrap_or(0),_=>0};
             sum.checked_add(bytes).ok_or_else(||anyhow!("ACME configured value copy budget overflow"))
         })?;
         let issuer_values_credit=if copy_bytes==0{None}else{Some(Arc::new(self.context.resources.issuer_values.reserve(copy_bytes)?))};
+        // Temporary endpoint vector is admitted before any String clone and
+        // survives the real constructor worker/error/output, not just its await.
+        let test_bytes=policy.issuers.iter().try_fold(1024usize,|n,issuer|{
+            let Issuer::Acme(settings)=issuer else{return Ok::<_,anyhow::Error>(n)};
+            let value=if let Some(values)=&settings.values {values.get()?.test_ca.as_deref()}else{settings.test_ca.as_deref()};
+            n.checked_add(value.map_or(0,str::len)).and_then(|n|n.checked_add(std::mem::size_of::<Option<String>>()+64))
+                .ok_or_else(||crate::cert_transient::ResourceDenied.into())
+        })?;
+        let test_inputs=crate::cert_transient::reserve(test_bytes)?;
+        let test_directories=policy.issuers.iter().filter_map(|issuer|match issuer {
+            Issuer::Acme(settings)=>Some((||{
+                Ok(if let Some(values)=&settings.values {values.get()?.test_ca.clone()}else{settings.test_ca.clone()})
+            })()),_=>None,
+        }).collect::<Result<Vec<_>>>()?;
         let root_count=policy.issuers.iter().try_fold(0usize,|sum,issuer|{
             let Issuer::Acme(settings)=issuer else{return Ok::<_,anyhow::Error>(sum)};
             let count=settings.roots.len();
@@ -454,7 +497,7 @@ impl CertificateServices {
         let settings=policy.issuers.iter().filter_map(|i|match i {
             Issuer::Acme(settings)=>Some((||{
                 let mut settings=settings.as_ref().clone();
-                if let Some(values)=&settings.values {settings.config.wire.directory=values.get()?.directory.clone();}
+                if let Some(values)=&settings.values {let values=values.get()?;settings.config.wire.directory=values.directory.clone();settings.test_ca=values.test_ca.clone();}
                 Ok(settings)
             })()),_=>None,
         }).collect::<Result<Vec<_>>>()?;
@@ -463,12 +506,13 @@ impl CertificateServices {
         let(max_concurrent,max_concurrent_per_ca)=self.context.resources.issuance.limits();
         let options=AutomationOptions{issuers:Vec::new(),renewal_window_ratio:policy.renewal_ratio,
             max_concurrent,max_concurrent_per_ca,poll_interval:self.plan.renew_interval,job_timeout:timeout};
-        let bytes=ManagerBuildInput::copy_cost(&prepared)?;
+        let bytes=ManagerBuildInput::copy_cost(&prepared,&test_directories,self.context.resources.issuance.client_build_input_upper())?;
         let owner=Arc::new(ManagerConstructionOwner{_memory:crate::cert_transient::reserve(bytes)?,
-            _root_inputs:root_inputs,_root_input_metadata:root_input_metadata,issuer_values_credit});
+            _root_inputs:root_inputs,_test_inputs:test_inputs,_root_input_metadata:root_input_metadata,issuer_values_credit});
         let input=ManagerBuildInput{store:store.fs.clone(),registry:self.context.challenges.clone(),resolver:resolver.clone(),
             options,resources:self.context.resources.issuance.clone(),prepared,
             solvers:solver.as_ref().map(|b|b.callbacks()).transpose()?.unwrap_or_default(),
+            test_solvers:solver.as_ref().map(|b|b.test_callbacks()).transpose()?.unwrap_or_default(),test_directories,
             events:(!identity).then(||self.context.events.clone()).flatten(),key_type:policy.key_type,
             must_staple:policy.must_staple,reuse_private_keys:policy.reuse_private_keys,tasks:group_tasks.clone(),
             #[cfg(feature="native-run")] scope:self.outgoing_tls.clone(),owner};
@@ -772,6 +816,15 @@ impl CertificateServices {
         target: Option<RenewalTarget>,
         cancel: CancellationToken,
     ) -> Result<i64> {
+        self.ensure_group_target_for_round(group,cached_first,target,cancel,cert_automation::retry_operation::AcmeRound::default()).await
+    }
+    pub(super) async fn ensure_group_target_for_round(&self,group:Arc<Group>,cached_first:bool,target:Option<RenewalTarget>,cancel:CancellationToken,round:cert_automation::retry_operation::AcmeRound<'_>)->Result<i64> {
+        self.ensure_group_target_operation(group,cached_first,target,cancel,round,None).await
+    }
+    pub(super) async fn ensure_group_target_with_operation(&self,group:Arc<Group>,cached_first:bool,target:Option<RenewalTarget>,cancel:CancellationToken,operation:&mut cert_automation::retry_operation::RetryOperation)->Result<i64> {
+        self.ensure_group_target_operation(group,cached_first,target,cancel,cert_automation::retry_operation::AcmeRound::default(),Some(operation)).await
+    }
+    async fn ensure_group_target_operation(&self,group:Arc<Group>,cached_first:bool,target:Option<RenewalTarget>,cancel:CancellationToken,round:cert_automation::retry_operation::AcmeRound<'_>,mut retry:Option<&mut cert_automation::retry_operation::RetryOperation>)->Result<i64> {
         let _gate = tokio::select! { biased; _ = cancel.cancelled() => return Err(anyhow!("certificate acquisition cancelled")),_=group.cancel.cancelled()=>return Err(anyhow!("certificate scope retired")), gate = group.gate.lock() => gate };
         ensure!(!group.cancel.is_cancelled(), "certificate scope retired");
         if let Some(target) = &target {
@@ -808,7 +861,48 @@ impl CertificateServices {
                 tokio::select! {biased;_ = binding.slot.retired() => work.cancel(),_ = stop.cancelled() => {}}
             })
         });
-        let result = self.acquire(&group, cached_first, target.as_ref(), work.clone()).await;
+        // A warm Flight owns this retry operation and its existing absolute
+        // deadline. Re-run only the real acquire boundary; authorization and
+        // group/target selection outside this method are not repeated.
+        let result=if let Some(operation)=retry.as_deref_mut(){
+            let mut failures=0u32;
+            loop {
+                if let Some(target)=&target {
+                    match group.resolver.receipt_current(&target.receipt,&target.binding.slot) {
+                        Ok(true)=>{},
+                        Ok(false)=>break Err(super::super::resident_cache::CacheChanged.into()),
+                        Err(error)=>break Err(error),
+                    }
+                }
+                let entered=std::sync::atomic::AtomicBool::new(false);
+                let selected=match operation.round(self.plan.renew_interval,&entered){
+                    Ok(Some(round))=>round,
+                    Ok(None)=>break Err(anyhow!("warm issuance operation ended")),
+                    Err(error)=>break Err(error),
+                };
+                let outcome=match acquisition_frame(self.acquire(&group,cached_first,target.as_ref(),work.clone(),selected)){
+                    Ok(future)=>future.await,Err(error)=>break Err(error),
+                };
+                let Err(error)=&outcome else{operation.close();break outcome};
+                if work.is_cancelled()||group.cancel.is_cancelled()
+                    ||error.is::<super::super::resident_cache::CacheChanged>()
+                    ||error.is::<crate::tls_resolver::CertificatePublicationConflict>() {break outcome}
+                operation.failed(entered.load(Ordering::Acquire),error,self.plan.renew_interval);
+                if !operation.wait().is_zero(){break outcome}
+                failures=failures.saturating_add(1);
+                let delay=cert_automation::retry_backoff(failures,&group.names)
+                    .max(cert_automation::error_retry_delay(error));
+                // Proof listeners do not stay occupied through retry sleeps.
+                if let Some(solver)=&group.solver {if solver.release().await.is_err(){break outcome}}
+                tokio::select!{biased;
+                    _=work.cancelled()=>break Err(anyhow!("warm certificate acquisition cancelled")),
+                    _=group.cancel.cancelled()=>break Err(anyhow!("certificate scope retired")),
+                    _=tokio::time::sleep(delay)=>{},
+                }
+            }
+        }else{match acquisition_frame(self.acquire(&group,cached_first,target.as_ref(),work.clone(),round)){
+            Ok(future)=>future.await,Err(error)=>Err(error),
+        }};
         work.cancel();
         stop_watch.cancel();
         let _ = watcher.await;
@@ -1070,6 +1164,7 @@ impl CertificateServices {
         cached_first: bool,
         target: Option<&RenewalTarget>,
         cancel: CancellationToken,
+        round:cert_automation::retry_operation::AcmeRound<'_>,
     ) -> Result<(i64, Arc<Material>)> {
         let intent = if cached_first || group.identity || target.is_some() {
             PublishIntent::Insert
@@ -1113,7 +1208,7 @@ impl CertificateServices {
                 };
                 let info = match loaded {
                     Some(info) => info,
-                    None => manager.ensure(&group.names, cancel.clone()).await?,
+                    None => manager.ensure_for_round(&group.names,cancel.clone(),round).await?,
                 };
                 group.select(manager.selection_for(&info.names,&info.issuer_key,&info.leaf_sha256).await?)?;
                 // Manager released its native lease after producing the

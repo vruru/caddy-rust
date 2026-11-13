@@ -21,7 +21,8 @@ pub(super) struct AdminSeries {
 }
 pub struct Process {
     connections: super::connection::Connections,
-    trace_retirement: Mutex<TraceRetirementState>,
+    trace_retirement: RetirementSlot,
+    metrics_retirement: RetirementSlot,
     pub(super) traces: Arc<super::distributed_trace::processor::Process>,
     pub(super) trace_workspace: Arc<Semaphore>,
     pub(super) trace_output: Arc<Semaphore>,
@@ -44,54 +45,164 @@ pub struct Process {
     _fixed_credit: OwnedSemaphorePermit,
 }
 #[derive(Default)]
-struct TraceRetirementState {
+struct RetirementSlot {
+    state: Mutex<RetirementState>,
+    changed: tokio::sync::Notify,
+}
+#[derive(Default)]
+struct RetirementState {
     closed: bool,
-    owner: Option<Arc<super::distributed_trace::export_work::TraceRetirementOwner>>,
+    preparing: bool,
+    owner: Option<Arc<super::export_retirement::RetirementOwner>>,
+}
+impl RetirementSlot {
+    fn fence(&self) -> Option<Arc<super::export_retirement::RetirementOwner>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.closed = true;
+        state.owner.clone()
+    }
+    async fn prepared(&self) -> Option<Arc<super::export_retirement::RetirementOwner>> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if !state.preparing {
+                    return state.owner.clone();
+                }
+            }
+            changed.await;
+        }
+    }
 }
 impl Process {
-    pub(crate) fn trace_retirement(&self) -> anyhow::Result<Arc<super::distributed_trace::export_work::TraceRetirementOwner>> {
-        let mut state = self.trace_retirement.lock().unwrap_or_else(|e| e.into_inner());
-        anyhow::ensure!(!state.closed, "trace retirement stopped");
-        if state.owner.is_none() {
-            state.owner = Some(Arc::new(super::distributed_trace::export_work::TraceRetirementOwner::new(
-                self.traces.clone(), self.trace_cpu.retirement_running(),
-            )?));
+    fn retirement(
+        &self,
+        domain: super::export_retirement::Domain,
+    ) -> anyhow::Result<Arc<super::export_retirement::RetirementOwner>> {
+        use super::export_retirement::{Domain, RetirementOwner};
+        let slot = match domain {
+            Domain::Trace => &self.trace_retirement,
+            Domain::Metrics => &self.metrics_retirement,
+        };
+        {
+            let mut state = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+            anyhow::ensure!(!state.closed, "observability retirement stopped");
+            if let Some(owner) = &state.owner {
+                return Ok(owner.clone());
+            }
+            anyhow::ensure!(
+                !state.preparing,
+                "observability retirement preparation busy"
+            );
+            state.preparing = true;
         }
-        Ok(state.owner.as_ref().expect("prepared retirement owner").clone())
+        // No state fence is held while constructing pools, starting a thread,
+        // refunding rejected credits, or notifying any external waker.
+        let prepared = match domain {
+            Domain::Trace => {
+                RetirementOwner::new(self.traces.clone(), self.trace_cpu.retirement_running())
+            }
+            Domain::Metrics => RetirementOwner::new_metrics(
+                self.request_bytes.clone(),
+                self.collection.retirement_running(),
+            ),
+        }
+        .map(Arc::new);
+        let closing = {
+            let mut state = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.preparing = false;
+            // A close racing preparation still adopts the actual owner. Its
+            // explicit shutdown waits preparation, then joins that same thread.
+            if let Ok(owner) = &prepared {
+                state.owner = Some(owner.clone());
+            }
+            state.closed
+        };
+        slot.changed.notify_waiters();
+        if closing {
+            if let Ok(owner) = &prepared {
+                owner.close();
+            }
+        }
+        let owner = prepared?;
+        anyhow::ensure!(!closing, "observability retirement stopped");
+        Ok(owner)
+    }
+    pub(crate) fn trace_retirement(
+        &self,
+    ) -> anyhow::Result<Arc<super::distributed_trace::export_work::TraceRetirementOwner>> {
+        self.retirement(super::export_retirement::Domain::Trace)
+    }
+    pub(super) fn metrics_retirement(
+        &self,
+    ) -> anyhow::Result<Arc<super::export_retirement::RetirementOwner>> {
+        self.retirement(super::export_retirement::Domain::Metrics)
     }
     pub(crate) fn connection_factory(&self) -> anyhow::Result<crate::outgoing_tls::ScopeFactory> {
         self.connections.factory()
     }
     pub(crate) fn close_connections(&self) {
-        let retirement = {
-            let mut state = self.trace_retirement.lock().unwrap_or_else(|e| e.into_inner());
-            state.closed = true;
-            state.owner.clone()
-        };
-        if let Some(owner) = retirement { owner.close(); }
+        let trace = self.trace_retirement.fence();
+        let metrics = self.metrics_retirement.fence();
+        if let Some(owner) = trace {
+            owner.close();
+        }
+        if let Some(owner) = metrics {
+            owner.close();
+        }
         self.connections.close();
     }
     pub(crate) async fn shutdown_connections(&self) -> anyhow::Result<()> {
-        let retirement = {
-            let mut state = self.trace_retirement.lock().unwrap_or_else(|e| e.into_inner());
-            state.closed = true;
-            state.owner.clone()
-        };
-        if let Some(owner) = retirement { owner.shutdown().await?; }
-        let cpu = self.trace_cpu.tasks();
-        cpu.close();
-        cpu.wait().await;
-        self.connections.shutdown().await
+        // Fence both domains before awaiting either; one held domain cannot
+        // postpone the other's actual close, CPU retirement or OS join.
+        let trace = self.trace_retirement.fence();
+        let metrics = self.metrics_retirement.fence();
+        if let Some(owner) = trace {
+            owner.close();
+        }
+        if let Some(owner) = metrics {
+            owner.close();
+        }
+        let (a, b) = tokio::join!(
+            async {
+                let result = if let Some(owner) = self.trace_retirement.prepared().await {
+                    owner.shutdown().await
+                } else {
+                    Ok(())
+                };
+                let cpu = self.trace_cpu.tasks();
+                cpu.close();
+                cpu.wait().await;
+                result
+            },
+            async {
+                let result = if let Some(owner) = self.metrics_retirement.prepared().await {
+                    owner.shutdown().await
+                } else {
+                    Ok(())
+                };
+                let cpu = self.collection.tasks();
+                cpu.close();
+                cpu.wait().await;
+                result
+            }
+        );
+        let io = self.connections.shutdown().await;
+        a?;
+        b?;
+        io
     }
 
-    pub fn tracing_diagnostics(&self)->super::TracingDiagnostics{
-        super::TracingDiagnostics{
-            retained_source_bytes:self.traces.used(),
-            live_span_owners:self.traces.retained_spans(),
-            workspace_remaining_bytes:self.trace_workspace.available_permits(),
-            encoded_output_remaining_bytes:self.trace_output.available_permits(),
-            observations_dropped:self.traces.dropped.load(Ordering::Relaxed),
-            exports_failed:self.traces.errors.load(Ordering::Relaxed),
+    pub fn tracing_diagnostics(&self) -> super::TracingDiagnostics {
+        super::TracingDiagnostics {
+            retained_source_bytes: self.traces.used(),
+            live_span_owners: self.traces.retained_spans(),
+            workspace_remaining_bytes: self.trace_workspace.available_permits(),
+            encoded_output_remaining_bytes: self.trace_output.available_permits(),
+            observations_dropped: self.traces.dropped.load(Ordering::Relaxed),
+            exports_failed: self.traces.errors.load(Ordering::Relaxed),
         }
     }
     pub fn diagnostics(&self) -> super::Diagnostics {
@@ -175,10 +286,16 @@ impl Process {
         Arc::new(Self {
             connections: Default::default(),
             trace_retirement: Default::default(),
+            metrics_retirement: Default::default(),
             traces: super::distributed_trace::processor::Process::new(),
-            trace_workspace: Arc::new(Semaphore::new(512<<20)),
-            trace_output: Arc::new(Semaphore::new(128<<20)),
-            trace_cpu: crate::http_runtime::resource_budget::BlockingBudget::new(cpu.clamp(1,4),32,std::time::Duration::from_secs(2)).expect("valid trace CPU lane"),
+            trace_workspace: Arc::new(Semaphore::new(512 << 20)),
+            trace_output: Arc::new(Semaphore::new(128 << 20)),
+            trace_cpu: crate::http_runtime::resource_budget::BlockingBudget::new(
+                cpu.clamp(1, 4),
+                32,
+                std::time::Duration::from_secs(2),
+            )
+            .expect("valid trace CPU lane"),
             discarded_bodies: Arc::new(Semaphore::new(cpu.clamp(1, 4))),
             prom_servers: Default::default(),
             prom_listeners: Arc::new(Semaphore::new(16)),

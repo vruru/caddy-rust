@@ -273,6 +273,22 @@ and with a one-CPU quota, have development checks; these do not waive the
 remaining combined release and production gates.
 
 
+Provisioned manual certificate values
+------------------------------------
+
+Files, inline PEM, Storage and Folder source values now prepare their global
+placeholders once per successful source while retaining the original raw JSON.
+Files/Storage validate the expanded format; byte-oriented PEM inputs preserve
+non-UTF8 bytes, while string-only storage keys and tags reject them explicitly.
+Completed sources survive retries after another preparation fails. Restore-only
+compensation reuses accepted Material and shared tag allocations without provider
+or source reads. Guarded expanded bytes and derived Unix paths are wiped before
+their memory credits return, including failed or abandoned worker handoffs.
+Static PEM input limits, Folder symlink policy and storage confinement remain
+separate existing contracts. See [docs/MANUAL-VALUES.md](docs/MANUAL-VALUES.md)
+for the fallible shared-tag inventory API and its resource boundaries.
+
+
 ACME directory and configured global values
 ------------------------------------------
 
@@ -314,8 +330,9 @@ value or a different CA. This controls configured values and their bounded
 copies, not all ACME/TLS allocations or process RSS. Transport sources retain
 the original reqwest error kind, flags and underlying cause, but clear its URL
 before it escapes; a retained failure cannot retain configured URL bytes after
-the issuer allowance retires or disclose that URL through the source error. `test_ca`, the independent
-ZeroSSL API issuer and RFC 8738 IP-subject issuance remain separate work.
+the issuer allowance retires or disclose that URL through the source error. The independent
+ZeroSSL API issuer and RFC 8738 IP-subject issuance remain separate work; test-CA stage
+coverage and its forced-renewal boundary are documented in [TEST-CA.md](TEST-CA.md).
 
 
 Ordered native issuers and durable attempt recovery
@@ -858,8 +875,10 @@ Rust library callers gain `AcmeIssuerConfig::account_key` with type
 field. This is a Rust source interface extension, not a cross-language plugin
 ABI. Signing-key/control input residency is distinct from certificate-chain
 payload pools; this feature does not claim a whole-process heap or RSS bound.
-`test_ca`, the independent ZeroSSL API issuer and DNS solver/resolver/ECH
-options remain explicitly unfinished. HTTP CA sources are described below.
+The independent ZeroSSL API issuer and DNS solver/resolver/ECH options remain
+explicitly unfinished. Test-CA phase/recovery and warm retry behavior are described in
+[TEST-CA.md](TEST-CA.md); physical Name0 forced-renewal retry integration remains pending.
+HTTP CA sources are described below.
 
 Controlled HTTP/2 informational output
 ------------------------------------
@@ -1766,7 +1785,35 @@ source/workspace/output, queue, retry and 30-second drain bounds remain. See
 [docs/TRACING.md](docs/TRACING.md) for the Arc, IO and no-runtime boundaries.
 
 This does not cover the SDK Processor::on_end's original queue-full/closed direct
-SpanData destruction, split ordinary metrics ExportPlan::once's block_on of
-network work, claim whole-provider heap/RSS bounds, or add universal outgoing
+SpanData destruction, claim whole-provider heap/RSS bounds, or add universal outgoing
 TLS/issuer compatibility. Normal shutdown joins the real retirement thread;
 no-runtime last-owner Drop does not claim OS stack/TLS/TCB mappings were joined.
+
+
+Ordinary metrics push-export CPU residence
+----------------------------------------
+
+Ordinary HTTP/protobuf, gRPC and console export now reuse the closed residence,
+reader and pinned-unary mechanisms behind the existing trace facade. Metrics
+has its own retirement owner/thread/registry and original collection running
+semaphore; Trace keeps its independent source pool and lane. Snapshot and SDK
+synchronous encoding, compression and large cancellation/ready destruction run
+on that lane, while network and retry waits return running capacity. Existing
+actor ordering, console try admission, retries, retained-DATA NoReplay, final
+collection and configured absolute timeout remain in force.
+
+Metrics control storage (including last Weak controls and one requested 2 MiB
+thread stack) is prepaid against the existing 64 MiB Process request-state pool
+and an 8 MiB subtype gate over that same allocation, not an additional quota.
+It does not consume labels, snapshot scratch or encoded output credits. Physical
+BatchMemory is separate from logical IO Credit so delayed CPU byte retirement
+cannot prolong a completed batch's deadline or close a subsequent batch's epoch.
+Actual owner identity, memory domain and running-semaphore identity are checked.
+Both Process domains are fenced before independent preparation/retirement/join
+and CPU-tracker waits proceed concurrently; shared IO shutdown remains last.
+
+This does not cover all destruction of public synchronous snapshot/pull output,
+change the trace SDK queue-full/closed on_end boundary, impose a whole-RSS bound,
+or establish untested platform DNS retirement. Explicit shutdown retains stack
+credit through actual OS join; no-runtime abandonment makes the narrower
+business-data/function-exit claim documented in METRICS.md.

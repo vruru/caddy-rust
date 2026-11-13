@@ -10,6 +10,7 @@ pub use console_writer::{native_console_entry, register_native_console_helper};
 pub(crate) mod discarded;
 mod encode;
 mod export;
+mod export_retirement;
 mod facts;
 mod globals;
 mod grpc;

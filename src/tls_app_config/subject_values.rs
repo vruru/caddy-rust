@@ -9,7 +9,7 @@ use std::{cell::RefCell, sync::{Arc, OnceLock}};
 use tokio::sync::{OnceCell, Semaphore};
 use tokio_util::sync::CancellationToken;
 #[path = "subject_values/environment.rs"]
-mod environment;
+pub(super) mod environment;
 const FIELD: usize = 1 << 20;
 const SCRATCH: usize = 16 * FIELD + 16384;
 

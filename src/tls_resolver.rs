@@ -136,7 +136,8 @@ pub struct ManualCertificates {
 pub struct ManualCertificateInfo {
     pub identity: [u8; 32],
     pub names: Vec<String>,
-    pub tags: Vec<String>,
+    /// Shared admitted labels; construct with `CertificateTags::try_from_slice`.
+    pub tags: Arc<crate::certificate_tags::CertificateTags>,
 }
 
 /// Unforgeable local ownership for one certificate-management scope. Clone

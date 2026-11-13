@@ -20,6 +20,8 @@ mod issuer_parse;
 mod loaders;
 #[path = "tls_app_config/material.rs"]
 mod material;
+#[path = "tls_app_config/manual_values.rs"]
+mod manual_values;
 #[path = "tls_app_config/model.rs"]
 mod model;
 #[path = "tls_app_config/parse.rs"]

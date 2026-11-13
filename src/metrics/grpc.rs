@@ -82,6 +82,27 @@ impl Grpc {
         data: &opentelemetry_sdk::metrics::data::ResourceMetrics,
         credit: Arc<Credit>,
     ) -> anyhow::Result<()> {
+        self.export_metrics_inner(data, credit, None).await
+    }
+    pub(super) async fn export_with_context(
+        &self,
+        data: &opentelemetry_sdk::metrics::data::ResourceMetrics,
+        credit: Arc<Credit>,
+        context: Arc<super::export_retirement::ExportContext>,
+        budget: crate::http_runtime::resource_budget::BlockingBudget,
+    ) -> anyhow::Result<()> {
+        self.export_metrics_inner(data, credit, Some((context, budget)))
+            .await
+    }
+    async fn export_metrics_inner(
+        &self,
+        data: &opentelemetry_sdk::metrics::data::ResourceMetrics,
+        credit: Arc<Credit>,
+        context: Option<(
+            Arc<super::export_retirement::ExportContext>,
+            crate::http_runtime::resource_budget::BlockingBudget,
+        )>,
+    ) -> anyhow::Result<()> {
         use opentelemetry_proto::tonic::collector::metrics::v1::{
             ExportMetricsServiceRequest, metrics_service_client::MetricsServiceClient,
         };
@@ -94,7 +115,7 @@ impl Grpc {
             let service = Service {
                 transport: self.transport.clone(),
                 credit: credit.clone(),
-                trace: None,
+                trace: context.clone(),
             };
             let mut client = MetricsServiceClient::with_origin(service, self.origin.clone())
                 .max_encoding_message_size(32 << 20);
@@ -117,6 +138,11 @@ impl Grpc {
                 Ok(_) => return Ok(()),
                 Err(error) => error,
             };
+            if let Some((context, _)) = &context {
+                if !context.finish_body_if_idle().await {
+                    return Err(error.into());
+                }
+            }
             let hint = error.get_details_retry_info().and_then(|v| v.retry_delay);
             let retry = match error.code() {
                 tonic::Code::ResourceExhausted => hint.is_some(),
@@ -157,118 +183,124 @@ impl Grpc {
         unreachable!("bounded retry loop returns on its final attempt")
     }
 
-pub(super) async fn export_traces(
-    &self,
-    data: &[opentelemetry_sdk::trace::SpanData],
-    resource: &opentelemetry_sdk::Resource,
-    credit: Arc<Credit>,
-) -> anyhow::Result<()> {
-    self.export_traces_inner(data, resource, credit, None).await
-}
-pub(super) async fn export_traces_with_context(
-    &self,
-    data: &[opentelemetry_sdk::trace::SpanData],
-    resource: &opentelemetry_sdk::Resource,
-    credit: Arc<Credit>,
-    context: Arc<super::distributed_trace::export_work::TraceContext>,
-    budget: crate::http_runtime::resource_budget::BlockingBudget,
-) -> anyhow::Result<()> {
-    self.export_traces_inner(data, resource, credit, Some((context, budget))).await
-}
-async fn export_traces_inner(
-    &self,
-    data: &[opentelemetry_sdk::trace::SpanData],
-    resource: &opentelemetry_sdk::Resource,
-    credit: Arc<Credit>,
-    trace: Option<(Arc<super::distributed_trace::export_work::TraceContext>, crate::http_runtime::resource_budget::BlockingBudget)>,
-) -> anyhow::Result<()> {
-    use opentelemetry_proto::tonic::collector::trace::v1::{
-        ExportTraceServiceRequest, trace_service_client::TraceServiceClient,
-    };
-    use opentelemetry_proto::transform::common::tonic::ResourceAttributesWithSchema;
-    use opentelemetry_proto::transform::trace::tonic::group_spans_by_resource_and_scope;
-    use prost::Message;
-    use tonic_types::StatusExt;
-    let owners = Arc::strong_count(&credit);
-    let mut delay = std::time::Duration::from_millis(100);
-    let mut cap = std::time::Duration::from_millis(1600);
-    for attempt in 0..4 {
-        let service = Service {
-            transport: self.transport.clone(),
-            credit: credit.clone(),
-            trace: trace.clone(),
-        };
-        let mut client = TraceServiceClient::with_origin(service, self.origin.clone())
-            .max_encoding_message_size(32 << 20);
-        if self.gzip {
-            client = client
-                .send_compressed(tonic::codec::CompressionEncoding::Gzip)
-                .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
-        }
-        let message = ExportTraceServiceRequest {
-            resource_spans: group_spans_by_resource_and_scope(
-                data.to_vec(),
-                &ResourceAttributesWithSchema::from(resource),
-            ),
-        };
-        anyhow::ensure!(
-            message.encoded_len() <= 32 << 20,
-            "OTLP protobuf message exceeds 32 MiB"
-        );
-        let mut request = tonic::Request::new(message);
-        *request.metadata_mut() = self.headers.clone();
-        request.set_timeout(self.timeout);
-        let result = client.export(request).await;
-        drop(client);
-        let error = match result {
-            Ok(_) => return Ok(()),
-            Err(error) => error,
-        };
-        if let Some((context, _)) = &trace {
-            // Finished reader0 needs its actual local CPU retirement before
-            // comparing the original credit count. Live DATA is not waited
-            // away to authorize a retry.
-            if !context.finish_body_if_idle().await { return Err(error.into()); }
-        }
-        let hint = error.get_details_retry_info().and_then(|v| v.retry_delay);
-        let retry = match error.code() {
-            tonic::Code::ResourceExhausted => hint.is_some(),
-            tonic::Code::Unavailable
-            | tonic::Code::Cancelled
-            | tonic::Code::DeadlineExceeded
-            | tonic::Code::Aborted
-            | tonic::Code::OutOfRange
-            | tonic::Code::DataLoss => true,
-            _ => false,
-        };
-        // A peer may finish the control response while its request DATA is
-        // still queued. Do not accumulate retries behind that real owner.
-        if !retry || attempt == 3 || Arc::strong_count(&credit) > owners {
-            return Err(error.into());
-        }
-        if let Some(hint) = hint {
-            let hint = hint.min(std::time::Duration::from_secs(30));
-            if hint > cap {
-                cap = std::time::Duration::from_secs(30);
-            }
-            delay = delay.max(hint);
-        }
-        let jitter = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as u64
-            % 101;
-        let sleep = delay
-            .saturating_add(std::time::Duration::from_millis(jitter))
-            .min(cap);
-        if sleep >= self.timeout.saturating_sub(credit.created.elapsed()) {
-            return Err(error.into());
-        }
-        tokio::time::sleep(sleep).await;
-        delay = delay.saturating_mul(2).min(cap);
+    pub(super) async fn export_traces(
+        &self,
+        data: &[opentelemetry_sdk::trace::SpanData],
+        resource: &opentelemetry_sdk::Resource,
+        credit: Arc<Credit>,
+    ) -> anyhow::Result<()> {
+        self.export_traces_inner(data, resource, credit, None).await
     }
-    unreachable!("bounded retry loop returns on its final attempt")
-}
+    pub(super) async fn export_traces_with_context(
+        &self,
+        data: &[opentelemetry_sdk::trace::SpanData],
+        resource: &opentelemetry_sdk::Resource,
+        credit: Arc<Credit>,
+        context: Arc<super::distributed_trace::export_work::TraceContext>,
+        budget: crate::http_runtime::resource_budget::BlockingBudget,
+    ) -> anyhow::Result<()> {
+        self.export_traces_inner(data, resource, credit, Some((context, budget)))
+            .await
+    }
+    async fn export_traces_inner(
+        &self,
+        data: &[opentelemetry_sdk::trace::SpanData],
+        resource: &opentelemetry_sdk::Resource,
+        credit: Arc<Credit>,
+        trace: Option<(
+            Arc<super::distributed_trace::export_work::TraceContext>,
+            crate::http_runtime::resource_budget::BlockingBudget,
+        )>,
+    ) -> anyhow::Result<()> {
+        use opentelemetry_proto::tonic::collector::trace::v1::{
+            ExportTraceServiceRequest, trace_service_client::TraceServiceClient,
+        };
+        use opentelemetry_proto::transform::common::tonic::ResourceAttributesWithSchema;
+        use opentelemetry_proto::transform::trace::tonic::group_spans_by_resource_and_scope;
+        use prost::Message;
+        use tonic_types::StatusExt;
+        let owners = Arc::strong_count(&credit);
+        let mut delay = std::time::Duration::from_millis(100);
+        let mut cap = std::time::Duration::from_millis(1600);
+        for attempt in 0..4 {
+            let service = Service {
+                transport: self.transport.clone(),
+                credit: credit.clone(),
+                trace: trace.clone(),
+            };
+            let mut client = TraceServiceClient::with_origin(service, self.origin.clone())
+                .max_encoding_message_size(32 << 20);
+            if self.gzip {
+                client = client
+                    .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+                    .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+            }
+            let message = ExportTraceServiceRequest {
+                resource_spans: group_spans_by_resource_and_scope(
+                    data.to_vec(),
+                    &ResourceAttributesWithSchema::from(resource),
+                ),
+            };
+            anyhow::ensure!(
+                message.encoded_len() <= 32 << 20,
+                "OTLP protobuf message exceeds 32 MiB"
+            );
+            let mut request = tonic::Request::new(message);
+            *request.metadata_mut() = self.headers.clone();
+            request.set_timeout(self.timeout);
+            let result = client.export(request).await;
+            drop(client);
+            let error = match result {
+                Ok(_) => return Ok(()),
+                Err(error) => error,
+            };
+            if let Some((context, _)) = &trace {
+                // Finished reader0 needs its actual local CPU retirement before
+                // comparing the original credit count. Live DATA is not waited
+                // away to authorize a retry.
+                if !context.finish_body_if_idle().await {
+                    return Err(error.into());
+                }
+            }
+            let hint = error.get_details_retry_info().and_then(|v| v.retry_delay);
+            let retry = match error.code() {
+                tonic::Code::ResourceExhausted => hint.is_some(),
+                tonic::Code::Unavailable
+                | tonic::Code::Cancelled
+                | tonic::Code::DeadlineExceeded
+                | tonic::Code::Aborted
+                | tonic::Code::OutOfRange
+                | tonic::Code::DataLoss => true,
+                _ => false,
+            };
+            // A peer may finish the control response while its request DATA is
+            // still queued. Do not accumulate retries behind that real owner.
+            if !retry || attempt == 3 || Arc::strong_count(&credit) > owners {
+                return Err(error.into());
+            }
+            if let Some(hint) = hint {
+                let hint = hint.min(std::time::Duration::from_secs(30));
+                if hint > cap {
+                    cap = std::time::Duration::from_secs(30);
+                }
+                delay = delay.max(hint);
+            }
+            let jitter = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as u64
+                % 101;
+            let sleep = delay
+                .saturating_add(std::time::Duration::from_millis(jitter))
+                .min(cap);
+            if sleep >= self.timeout.saturating_sub(credit.created.elapsed()) {
+                return Err(error.into());
+            }
+            tokio::time::sleep(sleep).await;
+            delay = delay.saturating_mul(2).min(cap);
+        }
+        unreachable!("bounded retry loop returns on its final attempt")
+    }
 
     pub(super) async fn shutdown(&self) {
         self.transport.shutdown().await;
@@ -278,7 +310,10 @@ async fn export_traces_inner(
 struct Service {
     transport: Arc<Transport>,
     credit: Arc<Credit>,
-    trace: Option<(Arc<super::distributed_trace::export_work::TraceContext>, crate::http_runtime::resource_budget::BlockingBudget)>,
+    trace: Option<(
+        Arc<super::distributed_trace::export_work::TraceContext>,
+        crate::http_runtime::resource_budget::BlockingBudget,
+    )>,
 }
 impl tower_service::Service<http::Request<tonic::body::Body>> for Service {
     type Response = http::Response<hyper::body::Incoming>;
@@ -298,10 +333,17 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for Service {
         let trace = self.trace.clone();
         Box::pin(async move {
             let request = if let Some((context, budget)) = trace {
-                context.prepare_unary(request,
-                    credit.memory().map_err(|e| e.into_boxed_dyn_error())?, budget).await
+                context
+                    .prepare_unary(
+                        request,
+                        credit.memory().map_err(|e| e.into_boxed_dyn_error())?,
+                        budget,
+                    )
+                    .await
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
-            } else { request };
+            } else {
+                request
+            };
             transport.send(request, credit).await
         })
     }

@@ -173,6 +173,13 @@ impl CertificateFilter {
         !self.any_tag.is_empty() || !self.all_tags.is_empty()
     }
 
+    pub(crate) fn allows_tag_names<'a>(&self, tags: impl Clone + Iterator<Item = &'a str>) -> bool {
+        (self.any_tag.is_empty() || tags.clone().any(|tag| self.any_tag.contains(tag)))
+            && self
+                .all_tags
+                .iter()
+                .all(|tag| tags.clone().any(|value| value == tag))
+    }
     pub(crate) fn allows_tags(&self, tags: &[String]) -> bool {
         (self.any_tag.is_empty() || tags.iter().any(|tag| self.any_tag.contains(tag)))
             && self.all_tags.iter().all(|tag| tags.contains(tag))

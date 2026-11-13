@@ -21,6 +21,7 @@ pub mod key_compromise;
 pub mod stek;
 pub mod surface;
 pub mod tls_resolver;
+pub mod certificate_tags;
 
 pub mod duration;
 

@@ -62,14 +62,6 @@ fn acme(value: &Value, path: &str) -> Result<Issuer> {
         };
     }
     config.email = object.string("email")?.into();
-    for (field, feature) in [
-        ("test_ca", "acme_test_ca_retry"),
-
-    ] {
-        if !object.string(field)?.is_empty() {
-            return Err(ConfigError::unsupported(object.at(field), feature));
-        }
-    }
     if let Some(binding) = object.value("external_account") {
         let binding = Object::new(
             Some(binding),
@@ -132,8 +124,10 @@ fn acme(value: &Value, path: &str) -> Result<Issuer> {
         .into_iter()
         .map(Into::into)
         .collect();
-    let values=super::issuer_values::Input::take(&mut config).map_err(|_|ConfigError::invalid(path.into()))?;
+    let mut test_ca=Some(object.string("test_ca")?.to_owned());
+    let values=super::issuer_values::Input::take_with_test(&mut config,&mut test_ca).map_err(|_|ConfigError::invalid(path.into()))?;
     let mut settings = AcmeSettings {
+        test_ca,
         values,
         config,
         account_key,

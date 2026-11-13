@@ -1,81 +1,119 @@
-//! Private subject-provider environment reader for the sealed native CLI.
-//!
-//! This does NOT make environment access safer than std::env. Unix correctness
-//! requires the CLI's process-wide contract: all environment set/remove calls
-//! complete before threads/foreign libraries start; no code may mutate it later.
-//! A local lock would not establish this contract for foreign setenv/putenv.
+//! Private bounded getenv reader for the sealed native CLI. All environment
+//! mutation must finish before threads/foreign libraries start. A local mutex
+//! cannot establish this process-wide contract for foreign setenv/putenv.
+use crate::{
+    acme_wire::chain_memory::Scratch,
+    cert_transient::{self, ResourceDenied},
+};
 use anyhow::{Result, ensure};
-use crate::acme_wire::chain_memory::Scratch;
-use crate::cert_transient::{self, ResourceDenied};
-
+use zeroize::Zeroizing;
 const FIELD: usize = 1 << 20;
-
-// The returned configured bytes retire before their owned admission.
+pub(in crate::tls_app_config) struct ProviderValue {
+    pub(in crate::tls_app_config) bytes: Zeroizing<Vec<u8>>,
+    pub(in crate::tls_app_config) memory: Scratch,
+}
+impl AsRef<[u8]> for ProviderValue {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+impl ProviderValue {
+    pub(in crate::tls_app_config) fn empty() -> Result<Self> {
+        Ok(Self {
+            bytes: Zeroizing::new(Vec::new()),
+            memory: cert_transient::reserve(0)?,
+        })
+    }
+}
 pub(super) struct EnvironmentValue {
-    text: String,
+    text: Zeroizing<String>,
     _memory: Scratch,
 }
 impl EnvironmentValue {
-    pub(super) fn as_str(&self) -> &str { &self.text }
-    fn empty() -> Result<Self> {
-        Ok(Self { text: String::new(), _memory: cert_transient::reserve(0)? })
+    pub(super) fn as_str(&self) -> &str {
+        &self.text
     }
 }
-
-/// Synchronous only: the borrowed libc pointer is never stored or returned.
-/// Unknown/unset/empty/non-UTF8 values are recognized-empty, matching the
-/// native global provider's current ReplaceAll semantics. Oversized names or
-/// values fail with a static error which contains neither key nor value.
+/// Byte-valued sibling entry point retains Go strings without leaking getenv
+/// borrows. The 1MiB scan/copy bound applies before allocating the value.
 #[cfg(unix)]
-pub(super) fn bounded_environment(key: &str) -> Result<EnvironmentValue> {
-    ensure!(key.len() <= FIELD, "certificate subject environment exceeds limit");
+fn read_environment(key: &str, utf8_only: bool) -> Result<ProviderValue> {
+    ensure!(
+        key.len() <= FIELD,
+        "certificate subject environment exceeds limit"
+    );
     if key.is_empty() || key.as_bytes().contains(&0) || key.as_bytes().contains(&b'=') {
-        return EnvironmentValue::empty();
+        return ProviderValue::empty();
     }
-    let key_len = key.len().checked_add(1).ok_or(ResourceDenied)?;
-    let key_allowance = key_len.checked_mul(2).and_then(|n| n.checked_add(64))
-        .ok_or(ResourceDenied)?;
-    // Key payload plus terminator are prepaid before Vec/CString construction.
-    let _key_memory = cert_transient::reserve(key_allowance)?;
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(key_len).map_err(|_| ResourceDenied)?;
-    ensure!(bytes.capacity() <= key_allowance, "certificate subject memory limit");
+    let _key_memory = cert_transient::reserve(
+        key.len()
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(65))
+            .ok_or(ResourceDenied)?,
+    )?;
+    let mut bytes = Zeroizing::new(Vec::new());
+    bytes.try_reserve_exact(key.len() + 1)?;
     bytes.extend_from_slice(key.as_bytes());
     bytes.push(0);
-    let key = std::ffi::CString::from_vec_with_nul(bytes)
+    let key = std::ffi::CStr::from_bytes_with_nul(&bytes)
         .map_err(|_| anyhow::anyhow!("certificate subject environment failed"))?;
-    // SAFETY: key is NUL-terminated. The closed CLI guarantees process-wide
-    // immutable environment after startup, including foreign code. Therefore a
-    // non-null getenv result remains a valid NUL-terminated C string throughout
-    // this synchronous scan/validation/copy. No await, cache or escaped borrow.
-    let ptr = unsafe { libc::getenv(key.as_ptr()) };
-    if ptr.is_null() { return EnvironmentValue::empty(); }
+    // SAFETY: startup-sealed CLI environment remains immutable, including foreign
+    // code. This synchronous bounded scan/copy contains no await or escaped borrow.
+    let pointer = unsafe { libc::getenv(key.as_ptr()) };
+    if pointer.is_null() {
+        return ProviderValue::empty();
+    }
     let mut len = 0usize;
     loop {
-        // SAFETY: immutable getenv string remains valid; only bytes through its
-        // terminating NUL are visited. At most FIELD+1 bytes are inspected.
-        let byte = unsafe { ptr.add(len).read() };
-        if byte == 0 { break; }
+        let byte = unsafe { pointer.add(len).read() };
+        if byte == 0 {
+            break;
+        }
         ensure!(len < FIELD, "certificate subject environment exceeds limit");
         len += 1;
     }
-    // SAFETY: scan established that exactly len bytes before NUL are readable.
-    let borrowed = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
-    let Ok(value) = std::str::from_utf8(borrowed) else {
-        return EnvironmentValue::empty();
-    };
-    let allowance = len.checked_mul(2).and_then(|n| n.checked_add(64))
-        .ok_or(ResourceDenied)?;
-    // Admission precedes value copy; returned value owns it until actual drop.
-    let memory = cert_transient::reserve(allowance)?;
-    let mut text = String::new();
-    text.try_reserve_exact(len).map_err(|_| ResourceDenied)?;
-    ensure!(text.capacity() <= allowance, "certificate subject memory limit");
-    text.push_str(value);
-    Ok(EnvironmentValue { text, _memory: memory })
+    let borrowed = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), len) };
+    if utf8_only && std::str::from_utf8(borrowed).is_err() {
+        return ProviderValue::empty();
+    }
+    let memory = cert_transient::reserve(
+        len.checked_mul(2)
+            .and_then(|n| n.checked_add(64))
+            .ok_or(ResourceDenied)?,
+    )?;
+    let mut bytes = Zeroizing::new(Vec::new());
+    bytes.try_reserve_exact(len)?;
+    bytes.extend_from_slice(borrowed);
+    Ok(ProviderValue { bytes, memory })
 }
-
+#[cfg(unix)]
+pub(in crate::tls_app_config) fn bounded_bytes(key: &str) -> Result<ProviderValue> {
+    read_environment(key, false)
+}
 #[cfg(not(unix))]
-pub(super) fn bounded_environment(_key: &str) -> Result<EnvironmentValue> {
+fn read_environment(_key: &str, _utf8_only: bool) -> Result<ProviderValue> {
     anyhow::bail!("certificate subject environment provider unavailable")
+}
+#[cfg(not(unix))]
+pub(in crate::tls_app_config) fn bounded_bytes(_key: &str) -> Result<ProviderValue> {
+    anyhow::bail!("certificate subject environment provider unavailable")
+}
+pub(super) fn bounded_environment(key: &str) -> Result<EnvironmentValue> {
+    let value = read_environment(key, true)?;
+    if std::str::from_utf8(&value.bytes).is_err() {
+        let empty = ProviderValue::empty()?;
+        return Ok(EnvironmentValue {
+            text: Zeroizing::new(String::new()),
+            _memory: empty.memory,
+        });
+    }
+    let ProviderValue { mut bytes, memory } = value;
+    let text = String::from_utf8(std::mem::take(&mut *bytes)).map_err(|e| {
+        let _wipe = Zeroizing::new(e.into_bytes());
+        anyhow::anyhow!("certificate subject environment failed")
+    })?;
+    Ok(EnvironmentValue {
+        text: Zeroizing::new(text),
+        _memory: memory,
+    })
 }

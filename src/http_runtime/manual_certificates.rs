@@ -77,7 +77,7 @@ pub(super) async fn load(
                 certificates.push(ManualCertificateInfo {
                     identity: crate::tls_resolver::certificate_chain_identity(&chain),
                     names: material.names.clone(),
-                    tags: material.tags.clone(),
+                    tags: crate::certificate_tags::CertificateTags::copy(material.tags.len(),material.tags.iter().map(String::as_str),&crate::acme_wire::chain_memory::shared().payload)?,
                 });
             }
             let inputs = materials

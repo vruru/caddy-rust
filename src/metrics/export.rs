@@ -22,6 +22,7 @@ enum Sink {
         MetricExporter,
         Arc<std::sync::Mutex<Option<Arc<super::transport::Credit>>>>,
         Arc<super::transport::Transport>,
+        TraceActive,
     ),
     Grpc(super::grpc::Grpc),
     Console(Arc<super::console_writer::Writer>),
@@ -154,6 +155,11 @@ impl Plan {
             matches!(name.as_str(), "otlp" | "console" | "prometheus"),
             "unsupported metrics exporter {name}"
         );
+        // Start the one concrete retirement thread during preparation, before
+        // this generation accepts snapshot data. Failure is a prepare error.
+        if name != "prometheus" {
+            process_state.metrics_retirement()?;
+        }
         let source = match env("OTEL_METRICS_PRODUCERS") {
             None => Source::Context,
             Some(value) => {
@@ -224,6 +230,7 @@ impl Plan {
                     )?;
                     let transport = super::transport::Transport::new(connector, timeout, false);
                     let active = Arc::new(std::sync::Mutex::new(None));
+                    let context = Arc::new(std::sync::Mutex::new(None));
                     Sink::Otlp(
                         builder
                             .with_http()
@@ -233,12 +240,13 @@ impl Plan {
                                 transport: transport.clone(),
                                 active: active.clone(),
                                 previous: Default::default(),
-                                trace_context: None,
+                                trace_context: Some(context.clone()),
                             })
                             .with_max_request_body_size(32 << 20)
                             .build()?,
                         active,
                         transport,
+                        context,
                     )
                 }
                 "grpc" => {
@@ -308,10 +316,17 @@ impl Plan {
         })))
     }
     async fn once(self: &Arc<Self>, registry: &Arc<Registry>) -> Result<()> {
+        use super::export_retirement::{Command, Step};
         let serial = match &self.sink {
             Sink::Console(writer) => Some(writer.admit()?),
             _ => None,
         };
+        let retirement = registry.process.metrics_retirement()?;
+        let cell = retirement.register()?;
+        let mut guard = cell.worker_batch_guard();
+        if let Some(driver) = registry.export_driver.get() {
+            cell.attach_token(driver.tasks.token())?;
+        }
         let scratch = registry
             .process
             .scratch
@@ -323,62 +338,52 @@ impl Plan {
             .request_bytes
             .clone()
             .try_acquire_many_owned(1024)?;
-        let credit = Arc::new(super::transport::Credit::new(scratch, self._credit.clone(), timer));
-        let plan = self.clone();
-        let owner = registry.clone();
-        let handle = tokio::runtime::Handle::current();
-        let batch = registry
-            .process
-            .collection
-            .run(move || {
-                let data = if let Some(process) = &plan.process {
-                    process.reader.snapshot()?
-                } else {
-                    owner.snapshot()?
-                };
-                if let Sink::Console(_) = &plan.sink {
-                    let output = owner
-                        .process
-                        .output
-                        .clone()
-                        .try_acquire_many_owned(64 << 20)?;
-                    let bytes = super::encode::console(&data)?;
-                    return Ok(Some(super::console_writer::Batch {
-                        bytes: bytes.into(),
-                        output: Some(output),
-                        credit,
-                        serial: serial.expect("console admitted"),
-                    }));
-                }
-                handle.block_on(async {
-                    match &plan.sink {
-                        Sink::Otlp(exporter, active, _) => {
-                            *active.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some(credit.clone());
-                            let _active = Active(active.clone());
-                            tokio::time::timeout(plan.timeout, exporter.export(&data)).await??;
-                        }
-                        Sink::Grpc(exporter) => {
-                            tokio::time::timeout(
-                                plan.timeout,
-                                exporter.export(&data, credit.clone()),
-                            )
-                            .await??
-                        }
-                        Sink::Console(_) => {
-                            unreachable!("console encoding handled outside async transport")
-                        }
-                        Sink::Prometheus(_) => {}
+        let created = tokio::time::Instant::now();
+        let deadline = created
+            .checked_add(self.timeout)
+            .ok_or_else(|| anyhow::anyhow!("OTLP deadline overflow"))?;
+        let inputs = MetricInputs {
+            plan: Arc::downgrade(self),
+            registry: Arc::downgrade(registry),
+            scratch,
+            timer,
+            serial,
+            created,
+        };
+        let result = async {
+            let mut step = cell
+                .execute(&registry.process.collection, Command::Metrics(inputs))
+                .await
+                .map_err(|_| anyhow::anyhow!("OTLP collection worker unavailable"))?;
+            loop {
+                match step {
+                    Step::Complete(true) => return Ok(()),
+                    Step::Complete(false) => return Err(anyhow::anyhow!("OTLP export failed")),
+                    Step::Started => {}
+                    Step::Pending => {
+                        anyhow::ensure!(
+                            cell.wait_wake(deadline).await,
+                            "OTLP export deadline exceeded"
+                        );
                     }
-                    Ok::<_, anyhow::Error>(None)
-                })
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("OTLP collection worker unavailable"))??;
-        if let (Some(batch), Sink::Console(writer)) = (batch, &self.sink) {
-            writer.send(batch, self.timeout).await?;
+                    Step::Console { .. } => {
+                        return Err(anyhow::anyhow!("unexpected metrics export step"));
+                    }
+                }
+                anyhow::ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "OTLP export deadline exceeded"
+                );
+                step = cell
+                    .poll_export(&registry.process.collection)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("OTLP collection worker unavailable"))?;
+            }
         }
-        Ok(())
+        .await;
+        cell.finish_batch().await;
+        guard.disarm();
+        result
     }
 }
 struct Active(Arc<std::sync::Mutex<Option<Arc<super::transport::Credit>>>>);
@@ -388,16 +393,30 @@ impl Drop for Active {
         drop(credit);
     }
 }
-pub(super) fn native_client(transport: Arc<super::transport::Transport>, active: Arc<std::sync::Mutex<Option<Arc<super::transport::Credit>>>>) -> impl opentelemetry_http::HttpClient {
-    Client { transport, active, previous: Default::default(), trace_context: None }
+pub(super) fn native_client(
+    transport: Arc<super::transport::Transport>,
+    active: Arc<std::sync::Mutex<Option<Arc<super::transport::Credit>>>>,
+) -> impl opentelemetry_http::HttpClient {
+    Client {
+        transport,
+        active,
+        previous: Default::default(),
+        trace_context: None,
+    }
 }
-pub(super) type TraceActive = Arc<std::sync::Mutex<Option<Arc<super::distributed_trace::export_work::TraceContext>>>>;
+pub(super) type TraceActive =
+    Arc<std::sync::Mutex<Option<Arc<super::distributed_trace::export_work::TraceContext>>>>;
 pub(super) fn native_trace_client(
     transport: Arc<super::transport::Transport>,
     active: Arc<std::sync::Mutex<Option<Arc<super::transport::Credit>>>>,
     context: TraceActive,
 ) -> impl opentelemetry_http::HttpClient {
-    Client { transport, active, previous: Default::default(), trace_context: Some(context) }
+    Client {
+        transport,
+        active,
+        previous: Default::default(),
+        trace_context: Some(context),
+    }
 }
 struct Client {
     transport: Arc<super::transport::Transport>,
@@ -441,12 +460,22 @@ impl opentelemetry_http::HttpClient for Client {
         let (mut parts, body) = request.into_parts();
         // Keep the original attempt guard on actual DATA only. A backing pin
         // owns immutable bytes/credit, never this attempt token.
-        let trace_context = self.trace_context.as_ref().and_then(|active| active.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        let trace_context = self
+            .trace_context
+            .as_ref()
+            .and_then(|active| active.lock().unwrap_or_else(|e| e.into_inner()).clone());
         let body = if let Some(context) = trace_context {
-            context.pin_bytes(super::distributed_trace::export_work::ByteKind::Http, body,
-                credit.memory().map_err(|e| e.into_boxed_dyn_error())?)
-                .await.map_err(|e| e.into_boxed_dyn_error())?
-        } else { body };
+            context
+                .pin_bytes(
+                    super::distributed_trace::export_work::ByteKind::Http,
+                    body,
+                    credit.memory().map_err(|e| e.into_boxed_dyn_error())?,
+                )
+                .await
+                .map_err(|e| e.into_boxed_dyn_error())?
+        } else {
+            body
+        };
         if let Some(auth) = self.transport.proxy_authorization() {
             parts
                 .headers
@@ -527,7 +556,7 @@ impl Registry {
                     }
                     if stopping {
                         match &plan.sink {
-                            Sink::Otlp(exporter, _, transport) => {
+                            Sink::Otlp(exporter, _, transport, _) => {
                                 let _ = exporter.force_flush();
                                 let _ = exporter.shutdown();
                                 transport.shutdown().await;
@@ -593,5 +622,114 @@ impl Registry {
             )),
             Source::None => Ok(None),
         }
+    }
+}
+
+/// Closed input contains only small handles and pre-existing permits.
+pub(in crate::metrics) struct MetricInputs {
+    plan: std::sync::Weak<Plan>,
+    registry: std::sync::Weak<Registry>,
+    scratch: tokio::sync::OwnedSemaphorePermit,
+    timer: tokio::sync::OwnedSemaphorePermit,
+    serial: Option<tokio::sync::OwnedSemaphorePermit>,
+    created: tokio::time::Instant,
+}
+pub(in crate::metrics) fn apply_command(
+    data: &mut super::export_retirement::resident::MetricResident,
+    reference: &super::export_retirement::CellRef,
+    cpu: &crate::http_runtime::resource_budget::BlockingBudget,
+    inputs: MetricInputs,
+) -> std::result::Result<super::export_retirement::Step, super::export_retirement::WorkError> {
+    use super::export_retirement::{ByteKind, PinInput, Step, WorkError};
+    let shared = reference.shared.upgrade().ok_or(WorkError::Stopped)?;
+    let plan = inputs.plan.upgrade().ok_or(WorkError::Stopped)?;
+    let registry = inputs.registry.upgrade().ok_or(WorkError::Stopped)?;
+    let snapshot = if let Some(process) = &plan.process {
+        process.reader.snapshot().map_err(anyhow::Error::from)
+    } else {
+        registry.snapshot()
+    }
+    .map_err(|_| WorkError::Worker)?;
+    let output = registry.process.output.clone();
+    // A temporary last Registry/Process owner is dropped here on this real CPU
+    // thread, after snapshot's collection lock has been released; never in State.
+    drop(registry);
+    let credit = Arc::new(
+        super::transport::Credit::metrics_owned(
+            inputs.scratch,
+            plan._credit.clone(),
+            inputs.timer,
+            &shared.source,
+            inputs.created,
+            reference.shared.clone(),
+        )
+        .map_err(|_| WorkError::Workspace)?,
+    );
+    data.memory = Some(credit.memory().map_err(|_| WorkError::Workspace)?);
+    let context = reference.context().map_err(|_| WorkError::Busy)?;
+    let cpu = cpu.clone();
+    let future = async move {
+        match &plan.sink {
+            Sink::Otlp(exporter, active, _, slot) => {
+                let previous_context = slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .replace(context);
+                let previous_credit = active
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .replace(credit);
+                drop(previous_context);
+                drop(previous_credit);
+                let _active = Active(active.clone());
+                let _context = ContextActive(slot.clone());
+                tokio::time::timeout(plan.timeout, exporter.export(&snapshot)).await??;
+            }
+            Sink::Grpc(exporter) => {
+                tokio::time::timeout(
+                    plan.timeout,
+                    exporter.export_with_context(&snapshot, credit, context, cpu),
+                )
+                .await??;
+            }
+            Sink::Console(writer) => {
+                let output = output.try_acquire_many_owned(64 << 20)?;
+                let bytes = super::encode::console(&snapshot)?;
+                let input = PinInput {
+                    data: bytes.into(),
+                    output: Some(output),
+                    memory: credit.memory()?,
+                };
+                let bytes = context.pin_input(ByteKind::Console, input).await?;
+                writer
+                    .send(
+                        super::console_writer::Batch {
+                            bytes,
+                            output: None,
+                            credit,
+                            serial: inputs
+                                .serial
+                                .ok_or_else(|| anyhow::anyhow!("console admission missing"))?,
+                        },
+                        plan.timeout,
+                    )
+                    .await?;
+            }
+            Sink::Prometheus(_) => {}
+        }
+        Ok(())
+    };
+    let layout = std::mem::size_of_val(&future)
+        .checked_add(6 * std::mem::size_of::<usize>())
+        .ok_or(WorkError::Busy)?;
+    data.future_credit = Some(shared.source.reserve(layout).map_err(|_| WorkError::Busy)?);
+    data.future = Some(Box::pin(future));
+    Ok(Step::Started)
+}
+struct ContextActive(TraceActive);
+impl Drop for ContextActive {
+    fn drop(&mut self) {
+        let old = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(old);
     }
 }
