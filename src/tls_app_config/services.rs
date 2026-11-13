@@ -235,7 +235,9 @@ pub struct CertificateServices {
 }
 
 impl CertificateServices {
-    /// Pure construction; the only spawned task sleeps until an explicit commit.
+    /// Construction requires a current Tokio executor. The only spawned task
+    /// sleeps until an explicit commit; absence of an executor is a Result
+    /// error before service task ownership is created.
     /// Keep this handle until preparation is aborted or its generation is stopped.
     pub fn new(
         plan: CertificatePlan,
@@ -262,6 +264,8 @@ impl CertificateServices {
                 Some(retained)
             }
         };
+        let executor=tokio::runtime::Handle::try_current()
+            .map_err(|_|anyhow!("certificate services require a current Tokio executor"))?;
         let identity_resolver = Arc::new(HotCertificateResolver::with_managed_leaf_guard(
             context.challenges.clone(),
             context.leaf_guard.clone(),
@@ -318,13 +322,13 @@ impl CertificateServices {
             implicit_tailscale: std::sync::OnceLock::new(),
         });
         let weak = Arc::downgrade(&this);
-        tasks.spawn(async move {
+        executor.spawn(tasks.track_future(async move {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {},
                 result = committed => if result.is_ok() && let Some(this) = weak.upgrade() { this.maintenance().await; },
             }
-        });
+        }));
         Ok(this)
     }
     /// Read/provision public authority data under this generation's ownership.
@@ -601,6 +605,8 @@ impl CertificateServices {
         + Send
         + 'static,
     ) -> Result<T> {
+        let executor=tokio::runtime::Handle::try_current()
+            .map_err(|_|anyhow!("certificate operations require a current Tokio executor"))?;
         let (sender, mut receiver) = oneshot::channel();
         let (token,task) = {
             let _admission = self
@@ -622,7 +628,7 @@ impl CertificateServices {
         };
         // Tracking is admitted under the fence; runtime-side synchronous drop
         // and payload destruction happen only after the gate is released.
-        tokio::spawn(task);
+        executor.spawn(task);
         let guard = token.clone().drop_guard();
         let result = tokio::select! {
             biased;

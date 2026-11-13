@@ -1270,3 +1270,14 @@ remove a field. The allowance includes per-field metadata as well as name and
 value bytes. It is enforced during mutation rather than relying on an initial
 header check or emitting an oversized error response. This is an explicit
 resource boundary; ordinary within-limit wrapper behavior is unchanged.
+
+Certificate-service executor admission
+--------------------------------------
+
+Service construction and owned preparation require a current Tokio executor.
+They return an explicit error before creating/admitting task ownership when no
+executor is present, rather than panicking during task submission. An owned
+preparation rejected at that boundary does not initialize inventory or poison
+the service; preparation on a live executor remains available. Task registration
+and possible executor-side synchronous payload destruction remain separated
+from service admission locks.
