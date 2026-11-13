@@ -193,6 +193,23 @@ impl Drop for RetirementTaskGuard {
         }
     }
 }
+struct StopTaskGuard {
+    inner: Weak<Inner>,
+    control: Weak<Lifecycle>,
+    signal: HttpRetirement,
+    armed: bool,
+}
+impl Drop for StopTaskGuard {
+    fn drop(&mut self) {
+        if !self.armed { return; }
+        // A destroyed executor must not strand either retirement receipt.
+        // This guard is submitted only after releasing lifecycle admission.
+        if let (Some(inner),Some(control))=(self.inner.upgrade(),self.control.upgrade()) {
+            HttpRuntime { inner, control }.force_shutdown();
+        }
+        self.signal.complete(RetirementOutcome::Forced);
+    }
+}
 async fn retire_generation(
     inner: Weak<Inner>,
     control: Weak<Lifecycle>,
@@ -840,24 +857,35 @@ impl HttpRuntime {
     /// that final generation's policy. The receipt's from id is the stop fence,
     /// not a promise that an already reserved candidate cannot still commit.
     pub fn begin_shutdown(&self) -> Result<HttpRetirement> {
-        let mut state = self.control.lock();
-        if let Some(stop) = &state.stop {
-            return Ok(stop.clone());
-        }
-        let signal = HttpRetirement::staged(state.generation, None);
-        if state.phase == Phase::Forced {
-            signal.complete(RetirementOutcome::Forced);
+        let (signal,handle,task) = {
+            let mut state = self.control.lock();
+            if let Some(stop) = &state.stop {
+                return Ok(stop.clone());
+            }
+            let signal = HttpRetirement::staged(state.generation, None);
+            if state.phase == Phase::Forced {
+                signal.complete(RetirementOutcome::Forced);
+                state.stop = Some(signal.clone());
+                return Ok(signal);
+            }
+            let handle=tokio::runtime::Handle::try_current()
+                .map_err(|_|anyhow::anyhow!("HTTP shutdown executor unavailable"))?;
+            state.phase = Phase::StopRequested;
             state.stop = Some(signal.clone());
-            return Ok(signal);
-        }
-        state.phase = Phase::StopRequested;
-        state.stop = Some(signal.clone());
-        let inner = self.inner.clone();
-        let control = self.control.clone();
-        let receipt = signal.clone();
-        self.inner.tasks.spawn(async move {
-            stop_runtime(inner, control, receipt).await;
-        });
+            let inner = self.inner.clone();
+            let control = self.control.clone();
+            let receipt = signal.clone();
+            let guard=StopTaskGuard {inner:Arc::downgrade(&inner),control:Arc::downgrade(&control),signal:receipt.clone(),armed:true};
+            let task=self.inner.tasks.track_future(async move {
+                let mut guard=guard;
+                stop_runtime(inner, control, receipt).await;
+                guard.armed=false;
+            });
+            (signal,handle,task)
+        };
+        // A closed runtime may synchronously destroy an unpolled task and
+        // re-enter force_shutdown. Never submit it under the control mutex.
+        handle.spawn(task);
         Ok(signal)
     }
     async fn drain_owned_work(&self) -> Result<()> {

@@ -1203,3 +1203,11 @@ supervised owners and join phase; a business-drained receipt alone does not
 claim those workers have retired. These dependencies do not serialize ordinary
 requests, separate generations or independent authority jobs, and do not add
 an artificial timeout to an unlimited grace period.
+
+Shutdown receipts also terminate when their owning executor disappears before
+the stop actor runs. Task registration occurs under lifecycle admission, while
+executor submission and possible synchronous payload destruction run outside
+that mutex. An aborted stop actor fences the runtime and completes both the
+admission and business-drain receipts as forced. Starting a new stop without
+an executor returns an error without publishing a half-started stop; existing
+receipts remain readable without an executor.
