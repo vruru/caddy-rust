@@ -63,5 +63,4 @@ mod cert_uri_san;
 
 mod cert_json_shape;
 
-#[cfg(feature="native-run")]
 pub(crate) mod outgoing_tls;

@@ -64,7 +64,7 @@ impl Inputs{
  }
 }
 impl Plan {
- pub fn prepare(settings:&Settings,input:&Inputs,metadata:Arc<metrics::Metadata>,resource:&opentelemetry_sdk::Resource)->Result<Arc<Self>>{
+ pub fn prepare(settings:&Settings,input:&Inputs,metadata:Arc<metrics::Metadata>,resource:&opentelemetry_sdk::Resource,process:&metrics::Process)->Result<Arc<Self>>{
   let env=&input.env;let timeout=input.timeout;let(ca,cert,key)=(&input.ca,&input.cert,&input.key);
   let sink=if settings.disabled||settings.exporters.is_empty(){Sink::None}
    else if settings.exporters[0]==Exporter::Console{Sink::Console(metrics::console_writer::Writer::prepare()?)}
@@ -72,7 +72,7 @@ impl Plan {
     match env.signal("PROTOCOL").unwrap_or("http/protobuf"){
      "http/protobuf"=>{
       let endpoint=env.signal("ENDPOINT").unwrap_or("http://localhost:4318").parse().map_err(|_|anyhow::anyhow!("invalid trace HTTP endpoint"))?;
-      let connector=crate::http_runtime::metrics_client::Connector::prepare(endpoint,ca.as_deref(),cert.as_deref().zip(key.as_deref()),timeout,CancellationToken::new(),metadata,false)?;
+      let connector=crate::http_runtime::metrics_client::Connector::prepare(endpoint,ca.as_deref(),cert.as_deref().zip(key.as_deref()),timeout,CancellationToken::new(),metadata,false,process)?;
       let transport=metrics::transport::Transport::new(connector,timeout,false);
       let active=Arc::new(Mutex::new(None));
       let mut exporter=SpanExporter::builder().with_http().with_protocol(Protocol::HttpBinary).with_timeout(timeout)
@@ -83,7 +83,7 @@ impl Plan {
      "grpc"=>{
       let raw=env.signal("ENDPOINT").unwrap_or("http://localhost:4317");
       let endpoint=if raw.starts_with("http://")||raw.starts_with("https://"){raw.to_owned()}else{format!("{}://{raw}",if env.signal("INSECURE")==Some("true"){"http"}else{"https"})};
-      Sink::Grpc(metrics::grpc::Grpc::prepare(endpoint,env.signal("HEADERS").map(str::to_owned),env.signal("COMPRESSION").map(str::to_owned),ca.as_deref(),cert.as_deref().zip(key.as_deref()),timeout,metadata)?,resource.clone())
+      Sink::Grpc(metrics::grpc::Grpc::prepare(endpoint,env.signal("HEADERS").map(str::to_owned),env.signal("COMPRESSION").map(str::to_owned),ca.as_deref(),cert.as_deref().zip(key.as_deref()),timeout,metadata,process)?,resource.clone())
      }
      _=>anyhow::bail!("unsupported trace OTLP protocol"),
     }

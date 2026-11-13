@@ -36,7 +36,7 @@ impl Provider{
   let resource=metrics::export::resource();
   let count=if settings.disabled||settings.exporters.is_empty(){1}else{std::thread::available_parallelism().map_or(1,usize::from).clamp(1,4)};
   let mut plans=Vec::with_capacity(count);
-  for _ in 0..count{plans.push(export::Plan::prepare(&settings,&inputs,metadata.clone(),&resource)?);}
+  for _ in 0..count{plans.push(export::Plan::prepare(&settings,&inputs,metadata.clone(),&resource,&metric_process)?);}
   let(shared,receiver)=processor::Shared::new(process.clone(),settings.queue)?;
   let default=opentelemetry_sdk::trace::Config::default();
   ensure!(default.span_limits.max_attributes_per_span<=65536&&default.span_limits.max_events_per_span<=65536&&default.span_limits.max_links_per_span<=65536,"trace SDK counts exceed native resource boundary");

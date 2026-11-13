@@ -130,6 +130,7 @@ impl Family {
 pub(super) struct FamilyResolver {
     inner: hyper_util::client::legacy::connect::dns::GaiResolver,
     family: Family,
+    metrics: Option<crate::outgoing_tls::ConnectionLease>,
     retained:Option<(super::resource_budget::BlockingBudget,std::sync::Arc<super::map_runtime::DialOwner>)>,
 }
 
@@ -138,15 +139,24 @@ impl FamilyResolver {
         Self {
             inner: hyper_util::client::legacy::connect::dns::GaiResolver::new(),
             family,
+            metrics: None,
             retained:None,
         }
     }
+    pub(super) fn with_metrics(family:Family, lease:crate::outgoing_tls::ConnectionLease)->Self {
+        Self { inner:hyper_util::client::legacy::connect::dns::GaiResolver::new(), family, metrics:Some(lease), retained:None }
+    }
     pub(super) fn with_map(family:Family,budget:super::resource_budget::BlockingBudget,owner:std::sync::Arc<super::map_runtime::DialOwner>)->Self{
-        Self{inner:hyper_util::client::legacy::connect::dns::GaiResolver::new(),family,retained:Some((budget,owner))}
+        Self{inner:hyper_util::client::legacy::connect::dns::GaiResolver::new(),family,metrics:None,retained:Some((budget,owner))}
     }
 }
 
-pub(super) struct FamilyAddrs{values:vec::IntoIter<SocketAddr>,_retained:Option<super::resource_budget::RetainedBlockingOutput<io::Result<Vec<SocketAddr>>>>}
+pub(super) struct FamilyAddrs{values:vec::IntoIter<SocketAddr>,_metrics:Option<super::metrics_dns::Resident>,_retained:Option<super::resource_budget::RetainedBlockingOutput<io::Result<Vec<SocketAddr>>>>}
+impl FamilyAddrs {
+    pub(super) fn with_metrics(values:Vec<SocketAddr>,resident:super::metrics_dns::Resident)->Self {
+        Self { values:values.into_iter(), _retained:None, _metrics:Some(resident) }
+    }
+}
 impl Iterator for FamilyAddrs{type Item=SocketAddr;fn next(&mut self)->Option<SocketAddr>{self.values.next()}fn size_hint(&self)->(usize,Option<usize>){self.values.size_hint()}}
 
 impl Service<Name> for FamilyResolver {
@@ -155,11 +165,14 @@ impl Service<Name> for FamilyResolver {
     type Future = Pin<Box<dyn Future<Output = io::Result<Self::Response>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
+        if self.metrics.is_some() { Poll::Ready(Ok(())) } else { self.inner.poll_ready(cx) }
     }
 
     fn call(&mut self, name: Name) -> Self::Future {
         let family=self.family;
+        if let Some(lease) = self.metrics.clone() {
+            return Box::pin(super::metrics_dns::lookup(name, family, lease));
+        }
         if let Some((budget,owner))=&self.retained{
             let task=match owner.dns_work(name.as_str().len()){
                 Ok(task)=>task,Err(error)=>return Box::pin(async move{Err(io::Error::other(error.to_string()))}),
@@ -177,7 +190,7 @@ impl Service<Name> for FamilyResolver {
                 let values=match output.get(){Ok(values)=>values,Err(error)=>return Err(io::Error::new(error.kind(),error.to_string()))};
                 if values.is_empty(){return Err(io::Error::new(io::ErrorKind::AddrNotAvailable,"no addresses admitted"))}
                 crate::cert_cpu::MaterialOwner::reserve(&*task,values.len().saturating_mul(std::mem::size_of::<SocketAddr>()*2).saturating_add(2048)).map_err(|error|io::Error::other(error.to_string()))?;
-                let values=values.clone().into_iter();Ok(FamilyAddrs{values,_retained:Some(output)})
+                let values=values.clone().into_iter();Ok(FamilyAddrs{values,_retained:Some(output),_metrics:None})
             })
         }
         let mut inner = self.inner.clone();
@@ -196,7 +209,7 @@ impl Service<Name> for FamilyResolver {
                     "no addresses admitted",
                 ));
             }
-            Ok(FamilyAddrs{values:result.into_iter(),_retained:None})
+            Ok(FamilyAddrs{values:result.into_iter(),_retained:None,_metrics:None})
         })
     }
 }

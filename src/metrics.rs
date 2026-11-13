@@ -1,5 +1,6 @@
 pub(crate) mod allowed;
 mod budget;
+mod connection;
 pub(crate) use budget::Metadata;
 pub(crate) mod config;
 mod console;

@@ -33,14 +33,17 @@ struct Epoch {
     client: Mutex<Option<Client>>,
     cancel: CancellationToken,
     tasks: TaskTracker,
+    scope: crate::outgoing_tls::ScopeOwner,
 }
 impl Epoch {
     async fn shutdown(&self) {
         self.cancel.cancel();
+        self.scope.close();
         let client = self.client.lock().unwrap_or_else(|e| e.into_inner()).take();
         drop(client);
         self.tasks.close();
         self.tasks.wait().await;
+        self.scope.wait().await;
     }
 }
 impl Drop for Epoch {
@@ -75,26 +78,34 @@ impl Transport {
         if self.cancel.is_cancelled() {
             return Err(std::io::Error::other("OTLP exporter stopped").into());
         }
-        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(epoch) = current.as_ref().filter(|e| !e.cancel.is_cancelled()) {
-            return Ok(epoch.clone());
+        {
+            let current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(epoch) = current.as_ref().filter(|e| !e.cancel.is_cancelled()) {
+                return Ok(epoch.clone());
+            }
         }
         let cancel = CancellationToken::new();
+        let (connector, scope) = self.connector.epoch(cancel.clone())
+            .map_err(|e| e.reallocate_into_boxed_dyn_error_without_backtrace())?;
         let tasks = TaskTracker::new();
         let client = HyperClient::builder(Executor {
-            tasks: tasks.clone(),
-            handle: tokio::runtime::Handle::current(),
-        })
-        .http2_only(self.h2)
-        .pool_idle_timeout(self.timeout)
-        .build(self.connector.with_cancel(cancel.clone()));
-        let epoch = Arc::new(Epoch {
-            client: Mutex::new(Some(client)),
-            cancel,
-            tasks,
-        });
-        *current = Some(epoch.clone());
-        Ok(epoch)
+            tasks: tasks.clone(), handle: tokio::runtime::Handle::current(),
+        }).http2_only(self.h2).pool_idle_timeout(self.timeout).build(connector);
+        let candidate = Arc::new(Epoch { client: Mutex::new(Some(client)), cancel, tasks, scope });
+        let (selected, previous) = {
+            let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+            if self.cancel.is_cancelled() { (None, None) }
+            else if let Some(epoch) = current.as_ref().filter(|e| !e.cancel.is_cancelled()) {
+                (Some(epoch.clone()), None)
+            } else {
+                (Some(candidate.clone()), current.replace(candidate.clone()))
+            }
+        };
+        // A losing/newly retired Epoch cancels IO and may synchronously wake;
+        // its final owner is never destroyed under the current-epoch mutex.
+        drop(previous);
+        drop(candidate);
+        selected.ok_or_else(|| std::io::Error::other("OTLP exporter stopped").into())
     }
     fn deadline(&self, epoch: Arc<Epoch>, credit: &Arc<Credit>) {
         if credit

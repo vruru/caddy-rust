@@ -220,6 +220,7 @@ impl Plan {
                         CancellationToken::new(),
                         credit.clone(),
                         false,
+                        process_state,
                     )?;
                     let transport = super::transport::Transport::new(connector, timeout, false);
                     let active = Arc::new(std::sync::Mutex::new(None));
@@ -263,6 +264,7 @@ impl Plan {
                         cert.as_deref().zip(key.as_deref()),
                         timeout,
                         credit.clone(),
+                        process_state,
                     )?)
                 }
                 _ => anyhow::bail!("unknown OTLP metrics protocol"),

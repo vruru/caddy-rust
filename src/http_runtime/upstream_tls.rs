@@ -584,6 +584,22 @@ pub(crate) fn ca_source_prepared_tls(ca:Option<serde_json::Value>,insecure:bool,
 }
 
 impl FixedDialConnector{
+    #[cfg(not(unix))]
+    pub(super) fn with_metrics_dns(self, _lease:crate::outgoing_tls::ConnectionLease)->Self {
+        // Preserve the existing platform Gai path. Owned raw-NSS retirement is
+        // implemented and validated only for Unix in this layer.
+        self
+    }
+    #[cfg(unix)]
+    pub(super) fn with_metrics_dns(mut self, lease:crate::outgoing_tls::ConnectionLease)->Self {
+        let mut http=HttpConnector::new_with_resolver(super::http_dial::FamilyResolver::with_metrics(self.family,lease));
+        http.enforce_http(false);
+        http.set_connect_timeout((!self.connect_timeout.is_zero()).then_some(self.connect_timeout));
+        http.set_nodelay(true);
+        self.http=http;
+        self
+    }
+
     pub(super) fn with_map_owner(mut self,owner:Arc<super::map_runtime::DialOwner>,budget:super::resource_budget::BlockingBudget)->Self{
         // PreparedTransport configures exactly these TCP options. Only the
         // resolver changes for a Map-derived dial; TLS state is untouched.

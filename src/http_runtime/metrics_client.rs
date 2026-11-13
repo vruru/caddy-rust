@@ -28,6 +28,8 @@ pub(crate) struct Connector {
     auth: Option<http::HeaderValue>,
     proxied: bool,
     credit: Arc<Metadata>,
+    factory: crate::outgoing_tls::ScopeFactory,
+    scope: Option<Arc<crate::outgoing_tls::Scope>>,
 }
 pub(crate) struct Io {
     inner: TokioIo<Box<dyn AsyncIo>>,
@@ -35,6 +37,27 @@ pub(crate) struct Io {
     h2: bool,
     proxied: bool,
     _credit: Arc<Metadata>,
+    lifetime: crate::outgoing_tls::Lifetime,
+}
+fn resolver_configuration_bytes() -> anyhow::Result<usize> {
+    // Pinned hyper-util 0.1.20 HttpConnector::Config, flattened to its 14
+    // fields (Linux's extra timeout included on every platform). Interface is
+    // None in this constructor; no additional String/CString payload exists.
+    // Sixteen maximum-alignment gaps include nested keepalive rounding and
+    // the Arc header. This bounds the private inline layout without relying
+    // on a guessed multiple of the public connector's pointer-sized handle.
+    use std::mem::{align_of, size_of};
+    let alignment = [align_of::<Option<Duration>>(),align_of::<Option<String>>(),
+        align_of::<Option<std::ffi::CString>>(),align_of::<Option<std::net::Ipv4Addr>>(),
+        align_of::<Option<std::net::Ipv6Addr>>(),align_of::<usize>(),align_of::<u32>()]
+        .into_iter().max().unwrap_or(1);
+    let parts = [size_of::<Option<Duration>>().checked_mul(5),size_of::<bool>().checked_mul(3),
+        size_of::<Option<usize>>().checked_mul(2),Some(size_of::<Option<std::net::Ipv4Addr>>()),
+        Some(size_of::<Option<std::net::Ipv6Addr>>()),Some(size_of::<Option<u32>>()),
+        Some(size_of::<Option<String>>().max(size_of::<Option<std::ffi::CString>>())),
+        alignment.checked_mul(16),size_of::<usize>().checked_mul(2)];
+    parts.into_iter().try_fold(0usize,|sum,n|sum.checked_add(n?) )
+        .ok_or_else(||crate::cert_transient::ResourceDenied.into())
 }
 fn bypass(uri: &http::Uri) -> bool {
     let host = uri
@@ -115,10 +138,13 @@ fn tls(
     Ok(crate::cert_uri_san::guarded_config(config)?)
 }
 impl Connector {
-    pub(crate) fn with_cancel(&self, cancel: CancellationToken) -> Self {
+    pub(crate) fn epoch(&self, cancel: CancellationToken) -> anyhow::Result<(Self, crate::outgoing_tls::ScopeOwner)> {
+        let owner = self.factory.scope().map_err(|e|e.context("observability connection metadata admission refused"))?
+            .with_owner_cancel(cancel.clone());
         let mut result = self.clone();
         result.cancel = cancel;
-        result
+        result.scope = Some(owner.scope());
+        Ok((result, owner))
     }
     pub(crate) fn proxy_authorization(&self) -> Option<http::HeaderValue> {
         if self.proxied {
@@ -136,6 +162,7 @@ impl Connector {
         cancel: CancellationToken,
         credit: Arc<Metadata>,
         h2_only: bool,
+        process: &crate::metrics::Process,
     ) -> anyhow::Result<Self> {
         let proxy = if bypass(&uri) {
             None
@@ -186,7 +213,10 @@ impl Connector {
                 proxied = true;
             }
         }
+        let factory = process.connection_factory()?;
         Ok(Self {
+            factory,
+            scope: None,
             inner: super::upstream_tls::PreparedTransport::metrics(dial, dial_tls, timeout),
             cancel,
             credit,
@@ -198,19 +228,23 @@ impl Connector {
         })
     }
 }
-impl Service<http::Uri> for Connector {
-    type Response = Io;
-    type Error = Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Io, Error>> + Send>>;
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        self.inner.poll_ready(cx)
-    }
-    fn call(&mut self, uri: http::Uri) -> Self::Future {
-        let future = self.inner.call(uri);
-        let owner = self.clone();
-        Box::pin(async move {
+struct Call {
+    owner: Connector,
+    uri: Option<http::Uri>,
+    lease: crate::outgoing_tls::ConnectionLease,
+}
+// Payload and completed result precede their last credit/tracker owner.
+impl Drop for Call { fn drop(&mut self) {} }
+impl Call {
+    async fn run(mut self) -> Result<Io, Error> {
+        let cancel = self.owner.cancel.clone();
+        self.owner.inner = self.owner.inner.clone().with_metrics_dns(self.lease.clone());
             let operation = async {
-                let inner = future.await?;
+                let owner = &mut self.owner;
+                std::future::poll_fn(|cx| owner.inner.poll_ready(cx)).await?;
+                // Construct the TLS/keyshare future only after entering this
+                // actual owned worker, on the same service whose ready was polled.
+                let inner = owner.inner.call(self.uri.take().expect("owned metrics URI")).await?;
                 let mut h2 = inner.connected().is_negotiated_h2();
                 let mut stream: Box<dyn AsyncIo> = Box::new(TokioIo::new(inner));
                 if let Some(authority) = owner.tunnel.as_deref() {
@@ -263,16 +297,95 @@ impl Service<http::Uri> for Connector {
                     cancel: Box::pin(owner.cancel.clone().cancelled_owned()),
                     h2,
                     proxied: owner.proxied,
-                    _credit: owner.credit,
+                    _credit: owner.credit.clone(),
+                    lifetime: self.lease.lifetime(),
                 })
             };
-            tokio::select! {biased;_=owner.cancel.cancelled()=>Err(std::io::Error::other("metrics transport stopped").into()),result=operation=>result}
-        })
+        let result = tokio::select! { biased;
+            _=cancel.cancelled()=>Err(std::io::Error::other("metrics transport stopped").into()),
+            result=operation=>result,
+        };
+        result.map_err(|error| self.lease.error(error))
+    }
+}
+impl Service<http::Uri> for Connector {
+    type Response = Io;
+    type Error = Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Io, Error>> + Send>>;
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        // Readiness is polled on the actual owned clone by Call::run.
+        Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, uri: http::Uri) -> Self::Future {
+        let make = || -> anyhow::Result<_> {
+            let scope = self.scope.as_ref().ok_or_else(|| anyhow::anyhow!("OTLP connection epoch unavailable"))?;
+            let proxy_bytes = if let Some(authority) = &self.tunnel {
+                let request = authority.len().checked_mul(2)
+                    .and_then(|n|n.checked_add(self.auth.as_ref().map_or(0, |v|v.as_bytes().len())))
+                    .and_then(|n|n.checked_add(256))
+                    .and_then(usize::checked_next_power_of_two)
+                    .ok_or(crate::cert_transient::ResourceDenied)?;
+                request.checked_add(32768).and_then(|n|n.checked_mul(3))
+                    .ok_or(crate::cert_transient::ResourceDenied)?
+            } else { 0 };
+            // Existing dial/name conversion can copy the physical proxy host
+            // independently of the target URI. Pay its name, SNI and C-string
+            // handoff overlap before cloning/entering the owned service.
+            let dial_names = self.inner.dial.authority().map_or(0, |v|v.as_str().len())
+                .checked_mul(3).ok_or(crate::cert_transient::ResourceDenied)?;
+            let target_name = match self.server_name.as_ref() {
+                Some(rustls::pki_types::ServerName::DnsName(value)) => value.as_ref().len(),
+                _ => 0,
+            }.checked_mul(2).ok_or(crate::cert_transient::ResourceDenied)?;
+            let configuration = resolver_configuration_bytes()?;
+            let bytes = std::mem::size_of::<Call>()
+                .checked_add(std::mem::size_of::<Io>())
+                .and_then(|n| n.checked_add(uri.scheme_str().map_or(0,str::len)))
+                .and_then(|n| n.checked_add(uri.authority().map_or(0,|a|a.as_str().len())))
+                .and_then(|n| n.checked_add(uri.path_and_query().map_or(0,|a|a.as_str().len())))
+                // CONNECT request/headers are independently bounded at 32KiB;
+                // allow old+new Vec growth before their actual allocation.
+                .and_then(|n| n.checked_add(proxy_bytes))
+                .and_then(|n| n.checked_add(dial_names))
+                .and_then(|n| n.checked_add(target_name))
+                .and_then(|n| n.checked_add(configuration))
+                .ok_or(crate::cert_transient::ResourceDenied)?;
+            let lease = scope.connection(bytes)?;
+            Ok((lease, self.factory.executor()))
+        };
+        let (lease, executor) = match make() {
+            Ok(value) => value,
+            Err(error) => return Box::pin(std::future::ready(Err(Box::new(
+                crate::outgoing_tls::ConnectionControl::Admission(error.reallocate_into_boxed_dyn_error_without_backtrace())
+            ) as Error))),
+        };
+        let future = Call { owner: self.clone(), uri: Some(uri), lease: lease.clone() }.run();
+        let worker_size = std::mem::size_of_val(&future);
+        let stop = lease.cancellation();
+        let retained = lease.clone();
+        let outcome = async move {
+            match executor.execute(async move { Ok(future.await) }, stop, None).await {
+                Ok(result) => result,
+                Err(error) => Err(retained.error(Box::new(crate::outgoing_tls::ConnectionControl::Scheduling(
+                    error.reallocate_into_boxed_dyn_error_without_backtrace()
+                )))),
+            }
+        };
+        let bytes = worker_size.checked_add(std::mem::size_of_val(&outcome))
+            .and_then(|n| n.checked_add(std::mem::size_of::<Result<Result<Io,Error>,anyhow::Error>>()))
+            .and_then(|n| n.checked_add(1024)).ok_or(crate::cert_transient::ResourceDenied);
+        if let Err(error) = bytes.map_err(anyhow::Error::new).and_then(|n| lease.grow(n)) {
+            drop(outcome);
+            return Box::pin(std::future::ready(Err(lease.error(Box::new(
+                crate::outgoing_tls::ConnectionControl::Admission(error.reallocate_into_boxed_dyn_error_without_backtrace())
+            )))));
+        }
+        Box::pin(outcome)
     }
 }
 impl Io {
     fn stopped(&mut self, cx: &mut Context<'_>) -> bool {
-        self.cancel.as_mut().poll(cx).is_ready()
+        self.cancel.as_mut().poll(cx).is_ready() || self.lifetime.poll_stopped(cx)
     }
 }
 impl Connection for Io {
@@ -308,6 +421,19 @@ impl Write for Io {
         }
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.stopped(cx) {
+            return Poll::Ready(Err(std::io::Error::other("metrics transport stopped")));
+        }
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         if self.stopped(cx) {
             return Poll::Ready(Err(std::io::Error::other("metrics transport stopped")));
@@ -315,6 +441,9 @@ impl Write for Io {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.stopped(cx) {
+            return Poll::Ready(Err(std::io::Error::other("metrics transport stopped")));
+        }
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }

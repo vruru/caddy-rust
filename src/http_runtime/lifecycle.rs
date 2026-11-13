@@ -925,6 +925,8 @@ impl HttpRuntime {
         let _ = self.begin_shutdown()?;
         self.inner.tasks.wait().await;
         self.inner.upgrades.wait().await;
+        // All current/retired observability flush actors have joined above.
+        self.inner.metrics_process.shutdown_connections().await?;
         self.inner.resources.wait().await;
         if let Some(executor) = self.inner.tls_executor.get() {
             executor.shutdown().await?;
@@ -970,6 +972,7 @@ impl HttpRuntime {
         self.control.changed.notify_waiters();
     }
     fn stop_connections(&self) {
+        self.inner.metrics_process.close_connections();
         // The accept-side snapshot retry must observe stop before a current
         // generation can become drained without a published successor.
         self.inner.stopped.cancel();

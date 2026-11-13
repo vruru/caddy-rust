@@ -12,7 +12,7 @@ The project currently covers a specific subset of functionalities:
 *   **TLS & Certificates**: TLS 1.2/1.3, managed and manual certificate support, on-demand ACME (HTTP-01, TLS-ALPN-01), local PKI, OCSP, session tickets, external certificate retrieval (HTTP, Tailscale), generation-scoped Must-Staple requests and private-key reuse.
 *   **ACME Server**: Native account/order lifecycle, HTTP-01/DNS-01/TLS-ALPN-01 validation, CSR signing, persistent revocation and key rollover with checked Bolt-format state interoperability.
 *   **Explicit CBC Policies**: Complete native SSL record/session processing for configured TLS 1.2 ECDHE AES-CBC suites, retaining the existing resolver, client-authentication and revocation policy.
-*   **Metrics**: Generation-scoped Prometheus/OpenMetrics scraping, HTTP/protobuf and gRPC OTLP, console export, real runtime facts, and bounded observation/export lifetimes.
+*   **Metrics**: Generation-scoped Prometheus/OpenMetrics scraping, HTTP/protobuf and gRPC OTLP, console export, real runtime facts, and bounded observation/export lifetimes, with Process-owned client handshake scheduling and tested macOS/Linux DNS retirement.
 *   **Resource Push & Rewrites**: Native bounded HTTP/2 push, independent child stream lifetimes, and ordered byte-preserving URI/query and upstream rewrites.
 *   **Tracing & Timeouts**: Generation-scoped OpenTelemetry tracing and actual stream/tunnel lifetimes; native server hard deadlines and scoped route progress limits across H1/H2/H3.
 *   **Templates & Logic**: Native Go-template, Goldmark and CEL behavior has differential coverage; remaining host methods and edge cases are tracked explicitly.

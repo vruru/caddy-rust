@@ -18,6 +18,7 @@ impl Grpc {
         identity: Option<(&[u8], &[u8])>,
         timeout: std::time::Duration,
         credit: Arc<super::budget::Metadata>,
+        process: &super::Process,
     ) -> anyhow::Result<Self> {
         let uri: http::Uri = endpoint.parse()?;
         anyhow::ensure!(
@@ -61,6 +62,7 @@ impl Grpc {
             tokio_util::sync::CancellationToken::new(),
             credit,
             true,
+            process,
         )?;
         let origin = http::Uri::builder()
             .scheme(uri.scheme_str().expect("validated scheme"))

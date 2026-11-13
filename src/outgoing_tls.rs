@@ -1,6 +1,7 @@
 //! Root-owned default-client connection scheduling and actual IO lifetimes.
 //! CPU/handshake admission belongs to the existing executor. These loans are
-//! only additional wrapper metadata, also charged to the certificate byte pool.
+//! only additional wrapper metadata. Certificate callers also charge their total
+//! pool; observability has a separate, independent pool.
 use crate::http_runtime::tls_executor::{ClientTlsExecutor, TlsExecutor};
 use anyhow::Result;
 use std::{
@@ -108,12 +109,13 @@ fn master_metadata_bytes() -> Result<usize> {
     metadata_sum(&[
         std::mem::size_of::<Master>(),
         std::mem::size_of::<Resources>(),
+        std::mem::size_of::<ScopeFactory>(),
         MASTER_PRIMITIVES,
         cancellation_children_bytes(nodes)?,
     ])
 }
 struct Loan {
-    total: OwnedSemaphorePermit,
+    total: Option<OwnedSemaphorePermit>,
     local: OwnedSemaphorePermit,
 }
 struct Master {
@@ -121,7 +123,7 @@ struct Master {
     stop: CancellationToken,
     tasks: TaskTracker,
     executor: ClientTlsExecutor,
-    total: Arc<Semaphore>,
+    total: Option<Arc<Semaphore>>,
     local: Arc<Semaphore>,
     _metadata: Loan,
 }
@@ -132,12 +134,20 @@ pub(crate) struct Resources {
 }
 impl Resources {
     pub(crate) fn new(total: Arc<Semaphore>) -> Result<Self> {
+        // Preserve certificate total-pool preadmission before constructing its
+        // local semaphore/Arc. Observability passes its existing Process pool.
         let bytes = master_metadata_bytes()?;
-        let total_credit = total
-            .clone()
-            .try_acquire_many_owned(u32::try_from(bytes)?)
+        let total_credit = total.clone().try_acquire_many_owned(u32::try_from(bytes)?)
             .map_err(|_| crate::cert_transient::ResourceDenied)?;
-        let local = Arc::new(Semaphore::new(WRAPPER_BYTES));
+        Self::new_pool(Some(total), Arc::new(Semaphore::new(WRAPPER_BYTES)), Some(total_credit), bytes)
+    }
+    /// Observability owns an independent pool; it never borrows certificate or
+    /// metric-label credits for a connection's lifetime.
+    pub(crate) fn independent(local: Arc<Semaphore>) -> Result<Self> {
+        let bytes = master_metadata_bytes()?;
+        Self::new_pool(None, local, None, bytes)
+    }
+    fn new_pool(total: Option<Arc<Semaphore>>, local: Arc<Semaphore>, total_credit: Option<OwnedSemaphorePermit>, bytes: usize) -> Result<Self> {
         let local_credit = local
             .clone()
             .try_acquire_many_owned(u32::try_from(bytes)?)
@@ -158,20 +168,14 @@ impl Resources {
         })
     }
     pub(crate) fn scope(&self) -> Result<ScopeOwner> {
-        let loan = self.inner.loan(scope_metadata_bytes()?)?;
-        let scope = Scope {
-            master: self.inner.clone(),
-            closed: Mutex::new(false),
-            stop: self.inner.stop.child_token(),
-            tasks: TaskTracker::new(),
-            _metadata: loan,
-        };
-        if self.inner.stop.is_cancelled() {
-            return Err(io::Error::other("outgoing TLS resources stopped").into());
-        }
-        Ok(ScopeOwner {
-            inner: Arc::new(scope),
-            cancel_on_drop: None,
+        self.inner.scope()
+    }
+    /// Runtime construction is confined to the existing configuration CPU lane.
+    /// The returned factory is not an external resource owner.
+    pub(crate) fn factory(&self) -> Result<ScopeFactory> {
+        Ok(ScopeFactory {
+            inner: self.inner.clone(),
+            executor: self.inner.executor.prepare()?,
         })
     }
     pub(crate) fn close(&self) {
@@ -189,13 +193,27 @@ impl Drop for Resources {
     }
 }
 impl Master {
+    fn scope(self: &Arc<Self>) -> Result<ScopeOwner> {
+        let loan = self.loan(scope_metadata_bytes()?)?;
+        let scope = Scope {
+            master: self.clone(),
+            closed: Mutex::new(false),
+            stop: self.stop.child_token(),
+            tasks: TaskTracker::new(),
+            _metadata: loan,
+        };
+        if self.stop.is_cancelled() {
+            return Err(io::Error::other("outgoing TLS resources stopped").into());
+        }
+        Ok(ScopeOwner { inner: Arc::new(scope), cancel_on_drop: None })
+    }
+
     fn loan(&self, bytes: usize) -> Result<Loan> {
         let bytes = u32::try_from(bytes)?;
-        let total = self
-            .total
-            .clone()
-            .try_acquire_many_owned(bytes)
-            .map_err(|_| crate::cert_transient::ResourceDenied)?;
+        let total = self.total.as_ref().map(|total| {
+            total.clone().try_acquire_many_owned(bytes)
+                .map_err(|_| crate::cert_transient::ResourceDenied)
+        }).transpose()?;
         let local = self
             .local
             .clone()
@@ -213,6 +231,16 @@ impl Master {
             self.executor.close();
         }
     }
+}
+/// Shared runtime and pool handle without external abandonment authority.
+#[derive(Clone)]
+pub(crate) struct ScopeFactory {
+    inner: Arc<Master>,
+    executor: Arc<TlsExecutor>,
+}
+impl ScopeFactory {
+    pub(crate) fn scope(&self) -> Result<ScopeOwner> { self.inner.scope() }
+    pub(crate) fn executor(&self) -> Arc<TlsExecutor> { self.executor.clone() }
 }
 pub(crate) struct ScopeOwner {
     inner: Arc<Scope>,
@@ -266,6 +294,11 @@ impl Scope {
             scope: self.clone(),
             executor,
         })
+    }
+    pub(crate) fn connection(self: &Arc<Self>, bytes: usize) -> Result<ConnectionLease> {
+        // Every scope child pays this checked minimum, including callers that
+        // have not entered the executor queue. Parent Vec bounds rely on it.
+        Ok(ConnectionLease(self.admit(metadata_sum(&[bytes, minimum_connection_loan()?])?)?))
     }
     fn admit(self: &Arc<Self>, bytes: usize) -> Result<Arc<Life>> {
         let loan = self.master.loan(bytes)?;
@@ -323,6 +356,32 @@ impl Life {
         })
     }
 }
+/// Concrete, finite connection credit and task residency. No Process or arbitrary
+/// callback is retained. Clones share the same actual allocation/credit owner.
+#[derive(Clone)]
+pub(crate) struct ConnectionLease(Arc<Life>);
+impl ConnectionLease {
+    pub(crate) fn grow(&self, bytes: usize) -> Result<()> { self.0.grow(bytes) }
+    pub(crate) fn cancellation(&self) -> CancellationToken { self.0.scope.stop.clone() }
+    pub(crate) fn error(&self, error: Error) -> Error { self.0.error(error) }
+    pub(crate) fn lifetime(&self) -> Lifetime { Lifetime::new(self.0.clone()) }
+    pub(crate) fn bytes(&self, bytes: usize) -> Result<ConnectionBytes> {
+        Ok(ConnectionBytes { loan: self.0.scope.master.loan(bytes)?, master: self.0.scope.master.clone() })
+    }
+}
+/// Mutable owned-buffer credit: only an exclusively owned worker grows it.
+/// It shares the existing scope pool and never introduces another quota.
+pub(crate) struct ConnectionBytes { loan: Loan, master: Arc<Master> }
+impl ConnectionBytes {
+    pub(crate) fn grow(&mut self, bytes: usize) -> Result<()> {
+        let added = self.master.loan(bytes)?;
+        self.loan.local.merge(added.local);
+        if let Some(extra) = added.total {
+            self.loan.total.as_mut().expect("same connection pool").merge(extra);
+        }
+        Ok(())
+    }
+}
 struct RetainedError {
     inner: Error,
     _life: Arc<Life>,
@@ -342,7 +401,7 @@ impl std::error::Error for RetainedError {
         Some(self.inner.as_ref())
     }
 }
-struct Lifetime {
+pub(crate) struct Lifetime {
     stopped: Pin<Box<dyn Future<Output = ()> + Send + Sync>>,
     _life: Arc<Life>,
 }
@@ -353,7 +412,7 @@ impl Lifetime {
             _life: life,
         }
     }
-    fn poll_stopped(&mut self, cx: &mut Context<'_>) -> bool {
+    pub(crate) fn poll_stopped(&mut self, cx: &mut Context<'_>) -> bool {
         self.stopped.as_mut().poll(cx).is_ready()
     }
 }

@@ -1428,7 +1428,7 @@ This layer applies to reverse-proxy consumers, including nested routes and healt
 
 The reverse-proxy CBC-only retry sends TLS_FALLBACK_SCSV through the public SSL mode. A TLS1.3-capable peer can therefore reject a forced TLS1.2 fallback; direct modern TLS remains unchanged and a genuine TLS1.2-only CBC peer can still connect. This protects protocol-version fallback, not suite-only selection within TLS1.2, and does not reveal the server's private early-alert reason. The finite Go-default CBC subset remains the explicit legacy-peer compatibility policy.
 
-Default reverse-proxy Rustls client handshakes, with or without a managed identity, use the shared bounded client TLS executor. Provisioning creates that executor on the configuration CPU lane; its runtime derives workers from the CPUs available to the process. Native static/absent and managed identity paths use the complete owned SSL engine. CA-loader, ACME, metrics and other HTTPS callers remain separate work; this does not claim every outgoing TLS handshake is off reactor.
+Default reverse-proxy Rustls client handshakes, with or without a managed identity, use the shared bounded client TLS executor. Provisioning creates that executor on the configuration CPU lane; its runtime derives workers from the CPUs available to the process. Native static/absent and managed identity paths use the complete owned SSL engine. The separate HTTP CA-loader, ACME and observability caller paths are described below; this reverse-proxy entry alone does not claim every outgoing TLS handshake is off reactor.
 
 
 Certificate URI SAN template URL methods
@@ -1596,9 +1596,9 @@ Root-managed HTTP CA loaders and ACME managers run default Rustls connection est
 
 A generation has an independent external scope owner. Actual queued/running futures, completed but unconsumed results, errors and returned connection IO retain concrete scope and metadata owners; IO keeps no handshake running/queue permit. The optional reqwest IO mapping preserves proxy flags, Connection, ALPN/TlsInfo and vectored IO delegation. Idle connections remain cancellable even while they retain the runtime. Services close only their generation after accepted business work drains; final Root drain then joins the shared executor. The last external NativeBackend handle reuses the existing owned graceful stop, including configured delay/grace, with an explicit force fallback when no usable runtime can start that stop. Internal tasks and IO do not retain this external handle.
 
-New connection/scope wrapper layouts borrow from an 8MiB subtype limit and the existing 256MiB certificate external-byte pool simultaneously. These are two limits on the same allocation, not two physical payloads. Full admission explicitly fails new work, existing pooled destinations can continue, and raw CA downloads keep the remaining aggregate budget. Future/result/IO owners hold byte loans and tracker tokens through their actual destruction. Parent cancellation-tree Vec high-water capacity is separately reserved before construction, including old/new growth overlap and temporary grandchild adoption during cancellation, and is not refunded with a destroyed child. Bounds derive from the current layout and minimum prepaid connection frame; current 64-bit examples reserve 100440B per scope and 106616B per master and admit 82 otherwise-empty scopes. These are layout examples, not configured limits or claims about provider heaps, runtime internals in general, TLS backing data, or whole-process RSS.
+New connection/scope wrapper layouts borrow from an 8MiB subtype limit and the existing 256MiB certificate external-byte pool simultaneously. These are two limits on the same allocation, not two physical payloads. Full admission explicitly fails new work, existing pooled destinations can continue, and raw CA downloads keep the remaining aggregate budget. Future/result/IO owners hold byte loans and tracker tokens through their actual destruction. Parent cancellation-tree Vec high-water capacity is separately reserved before construction, including old/new growth overlap and temporary grandchild adoption during cancellation, and is not refunded with a destroyed child. Bounds derive from checked current layouts and the minimum prepaid connection frame, rather than a fixed configured scope count. These are layout examples, not configured limits or claims about provider heaps, runtime internals in general, TLS backing data, or whole-process RSS.
 
-Standalone public CertificateServices::new and AcmeWire constructors preserve their prior unscoped behavior. Metrics/tracing exporters and other HTTPS callers remain separate scheduling work. CBC compatibility in default HTTP CA/ACME clients remains separate caller work. Scope completion includes all its actual IO and cannot serve as a receipt for one issuer leg; an error retaining that scope must not wait on its own generation tracker.
+Standalone public CertificateServices::new and AcmeWire constructors preserve their prior unscoped behavior. Metrics/tracing exporters use the separate Process-owned transport described below; other HTTPS callers retain their stated individual boundaries. CBC compatibility in default HTTP CA/ACME clients remains separate caller work. Scope completion includes all its actual IO and cannot serve as a receipt for one issuer leg; an error retaining that scope must not wait on its own generation tracker.
 
 ACME send and response-chunk failures preserve their real reqwest source beneath the existing ProtocolError context. Only an explicit wire cancellation check/select adds the typed AcmeRequestCancelled context, retaining ProtocolError status, uncertainty and display. A coincident cancellation flag on a signing failure does not receive that marker or discard the original failure. Confirmed local connection admission/stopped/scheduling failures retain typed local control and resource sources. Cancellation evidence alone does not prove actual TLS-worker retirement or authorize issuer fallback: that decision also requires the independent parent/deadline state and a genuine single-leg retirement receipt.
 
@@ -1620,3 +1620,53 @@ In particular, `request` and `require` do not acquire chain trust/time validatio
 just because resumption is disabled. Library-only restoration of parsed
 certificate metadata does not establish new authorization or enable runtime
 resumption. See [`docs/SESSION-TICKETS.md`](docs/SESSION-TICKETS.md).
+
+### Metrics and tracing client handshake ownership
+
+HTTP/protobuf and gRPC exporters for both metrics and tracing share one lazy,
+bounded client TLS executor per metrics Process. Configuration prepares that
+runtime on the existing CPU lane. The actual owned connector clone polls its
+own readiness and runs dial, HTTPS-proxy TLS, CONNECT and origin Rustls TLS on
+that executor once. Existing roots and URI checks, SNI, client identity, ALPN,
+proxy authorization, compression, retry and HTTP/gRPC body semantics remain in
+their existing paths. The original absolute export deadline includes connection
+queueing and handshake time; the connector does not reset it or replay an
+application request.
+
+Each connection epoch has an independent external scope owner. The real future,
+unconsumed result, error and connection IO retain concrete byte/tracker/runtime
+ownership. Idle IO retains no handshake running or queue permit. Graceful stop
+flushes current and retired exporters before closing and joining the Process
+transport; force closes admission and cancels immediately. An IO object never
+owns the Process. Existing Registry/Provider driver cancellation remains the
+independent way to retire their internal actors on abandonment. Vectored IO
+facts are delegated, and pending shutdown polls register the same cancellation
+fences as reads and writes.
+
+New connection/scope wrapper layouts and the owned Unix DNS buffers share an
+independent 8MiB metadata pool. It does not consume the 128MiB metric label
+budget, generation headroom or certificate external-byte pool. Checked layout
+admission precedes new wrapper, physical-host/SNI copies, connector-config and
+proxy scratch allocations. Parent cancellation-tree capacity retains its own
+high-water credit. Full admission refuses a new connection; an already pooled
+connection can continue and admission recovers after its actual owners drop.
+These bounds do not describe original TLS/HTTP backing buffers, provider or
+runtime heaps, or process RSS.
+
+On the tested macOS and Linux paths, system getaddrinfo runs as owned blocking
+work on the existing client runtime. It preserves all admissible addresses in
+source order, including IPv6 scope/flow fields, with an explicit 4096-node
+capacity error. New Rust Vec growth is prepaid while old/new storage overlaps.
+A cancelled waiter cannot retire a running NSS call or release its input,
+output or iterator credit early. C/NSS allocations remain opaque provider
+memory. Non-Unix targets preserve the prior Gai resolver execution path; this
+layer adds neither a new implementation nor a physical DNS retirement proof
+for those platforms. macOS/Linux acceptance is not a Windows or universal
+platform claim.
+
+A scope wait includes retained errors and IO; it is not one issuer leg's
+physical-retirement receipt, and a caller must not wait on its own retained
+error. Standalone public AcmeWire and CertificateServices constructors retain
+their earlier scope boundaries. This observability layer does not add CBC
+compatibility to default CA-loader, ACME or metrics clients, and does not claim
+complete issuer/PKIX or universal outgoing TLS compatibility.

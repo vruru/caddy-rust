@@ -20,6 +20,7 @@ pub(super) struct AdminSeries {
     _credit: OwnedSemaphorePermit,
 }
 pub struct Process {
+    connections: super::connection::Connections,
     pub(super) traces: Arc<super::distributed_trace::processor::Process>,
     pub(super) trace_workspace: Arc<Semaphore>,
     pub(super) trace_output: Arc<Semaphore>,
@@ -42,6 +43,14 @@ pub struct Process {
     _fixed_credit: OwnedSemaphorePermit,
 }
 impl Process {
+    pub(crate) fn connection_factory(&self) -> anyhow::Result<crate::outgoing_tls::ScopeFactory> {
+        self.connections.factory()
+    }
+    pub(crate) fn close_connections(&self) { self.connections.close(); }
+    pub(crate) async fn shutdown_connections(&self) -> anyhow::Result<()> {
+        self.connections.shutdown().await
+    }
+
     pub fn tracing_diagnostics(&self)->super::TracingDiagnostics{
         super::TracingDiagnostics{
             retained_source_bytes:self.traces.used(),
@@ -131,6 +140,7 @@ impl Process {
             .try_acquire_many_owned(GENERATION_HEADROOM as u32)
             .expect("fresh generation headroom");
         Arc::new(Self {
+            connections: Default::default(),
             traces: super::distributed_trace::processor::Process::new(),
             trace_workspace: Arc::new(Semaphore::new(512<<20)),
             trace_output: Arc::new(Semaphore::new(128<<20)),
