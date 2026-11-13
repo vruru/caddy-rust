@@ -60,10 +60,14 @@ impl Shared {
     pub(crate) async fn prepare(
         &self,
         config: Arc<Config>,
+        default_resolvers: Arc<[String]>,
         pki: crate::local_pki::LocalPki,
         root: &Path,
         cancel: CancellationToken,
     ) -> Result<Arc<Controller>> {
+        // Retain the exact configuration bytes, without making another list.
+        // This is configuration lifetime, not an in-flight worker retirement
+        // token. Actual per-query copies are prepaid by their request Scope.
         let path = database_path(root, &config.ca)?;
         let directory = path.parent().expect("database has parent").to_owned();
         let token = cancel.clone();
@@ -92,6 +96,7 @@ impl Shared {
             pki,
             database,
             self.resources.clone(),
+            default_resolvers,
         )))
     }
     pub(crate) async fn shutdown(&self) -> Result<()> {

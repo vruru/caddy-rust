@@ -102,6 +102,7 @@ pub(super) struct Identity {
 
 #[derive(Clone)]
 pub struct CertificatePlan {
+    pub(super) tls_resolvers: std::sync::Arc<[String]>,
     pub(super) storage: Option<PathBuf>,
     pub(super) http_challenge_port: Option<u16>,
     pub(super) alpn_challenge_port: Option<u16>,
@@ -125,6 +126,7 @@ impl Default for CertificatePlan {
     fn default() -> Self {
         Self {
             storage: None,
+            tls_resolvers: std::sync::Arc::from([]),
             http_challenge_port: None,
             alpn_challenge_port: None,
             ticket_mode: TicketMode::RuntimeDefault,
@@ -156,6 +158,12 @@ impl CertificatePlan {
     /// The actual native process activates it only after Root publication.
     pub fn session_tickets(&self) -> &TicketMode {
         &self.ticket_mode
+    }
+
+    /// Global defaults for TLS DNS consumers. Individual handlers may override.
+    /// Address validation belongs to the consuming module, as in Caddy.
+    pub fn dns_resolvers(&self) -> &[String] {
+        &self.tls_resolvers
     }
 
     pub fn automated_names(&self) -> &[String] {

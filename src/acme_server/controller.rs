@@ -25,6 +25,8 @@ pub struct Controller {
     pub(super) pki: crate::local_pki::LocalPki,
     pub(super) database: Arc<DatabaseOwner>,
     pub(super) resources: Arc<Resources>,
+    // A shared configuration owner; no strong edge back to Services or Root.
+    default_resolvers: Arc<[String]>,
 }
 impl Controller {
     pub(super) fn new(
@@ -32,12 +34,14 @@ impl Controller {
         pki: crate::local_pki::LocalPki,
         database: Arc<DatabaseOwner>,
         resources: Arc<Resources>,
+        default_resolvers: Arc<[String]>,
     ) -> Self {
         Self {
             config,
             pki,
             database,
             resources,
+            default_resolvers,
         }
     }
     pub(crate) fn matches(&self, path: &str) -> bool {
@@ -231,7 +235,7 @@ impl ActionJob {
             let action=self.response.value.action.take().expect("action checked");
             match action {
                 super::orders::Action::Validate{authorization,challenge,key_authorization}=>{
-                    let outcome=super::validate::validate(self.controller.resources.clone(),self.scope.clone(),self.controller.config.clone(),&challenge,&key_authorization).await?;
+                    let outcome=super::validate::validate(self.controller.resources.clone(),self.scope.clone(),if self.controller.config.resolvers.is_empty(){self.controller.default_resolvers.clone()}else{self.controller.config.resolvers.clone()},&challenge,&key_authorization).await?;
                     self.scope.check()?;let scope=self.scope.clone();let controller=self.controller.clone();let response=self.response;
                     let output=controller.database.call(scope,move|database,meter|{
                         let mut response=response.value;

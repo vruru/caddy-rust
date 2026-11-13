@@ -352,6 +352,8 @@ impl CertificateServices {
         self.context.resolver.clone()
     }
     pub(crate) fn validate_acme_server_config(&self,config:&crate::acme_server::Config)->Result<()> {
+        let resolvers=if config.resolvers.is_empty(){self.plan.tls_resolvers.as_ref()}else{&config.resolvers};
+        crate::http_runtime::acme_dns::validate_resolvers(resolvers)?;
         let authority=self.plan.authorities.get(&config.ca);
         anyhow::ensure!(authority.is_some()||config.ca=="local","unknown ACME signing authority");
         let custom=authority.is_some_and(|a|a.config.intermediate.is_some());
@@ -378,7 +380,7 @@ impl CertificateServices {
         self.owned(cancel,move|this,token|Box::pin(async move {
             let pki=this.authority(&config.ca,token.clone()).await?;
             let snapshot=pki.provision(&config.ca,token.clone()).await?;drop(snapshot);
-            this.context.resources.acme_server.prepare(config,pki,&this.context.paths.default_storage,token).await
+            this.context.resources.acme_server.prepare(config,this.plan.tls_resolvers.clone(),pki,&this.context.paths.default_storage,token).await
         })).await
     }
     pub fn manual_certificates(&self) -> Result<ManualCertificates> {

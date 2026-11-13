@@ -1,7 +1,6 @@
 //! Real RFC8555/RFC8737 proof requests. Certificate trust is intentionally not
 //! required for self-signed ALPN proofs; private-key possession still is.
 use super::{
-    config::Config,
     records::DbChallenge,
     resources::{Leased, Resources, Scope},
 };
@@ -153,7 +152,7 @@ impl AddressJob {
 pub(super) async fn validate(
     resources: Arc<Resources>,
     scope: Arc<Scope>,
-    config: Arc<Config>,
+    resolvers: Arc<[String]>,
     challenge: &DbChallenge,
     proof: &str,
 ) -> Result<Validation> {
@@ -182,9 +181,10 @@ pub(super) async fn validate(
             let digest = URL_SAFE_NO_PAD
                 .encode(Sha256::digest(proof.as_bytes()))
                 .into_bytes();
+            scope.work(resolvers.len())?;
             let work = crate::http_runtime::acme_dns::matches(
                 format!("_acme-challenge.{value}"),
-                config.resolvers.clone(),
+                resolvers,
                 digest,
                 scope.clone(),
                 resources.cancel.child_token(),

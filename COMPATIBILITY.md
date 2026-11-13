@@ -1106,8 +1106,8 @@ same-descriptor cooperative locking and bounded COW publication; no Go runtime
 or unchecked bbolt-rs backend is used. Existing unknown tables and record fields
 are retained. File/record/operation capacities, retained worker/output credits,
 correctness repairs and the distinction from Smallstep's non-Caddy APIs are
-described in [ACME-SERVER.md](docs/ACME-SERVER.md). This does not establish global
-TLS resolver support, all PKIX edge semantics or full-project acceptance.
+described in [ACME-SERVER.md](docs/ACME-SERVER.md). Global defaults have the separate ACME DNS scope documented below; this does
+not establish every TLS DNS consumer, all PKIX edge semantics or full-project acceptance.
 
 
 Process-manager state
@@ -1173,3 +1173,14 @@ and maintenance-future cancellation. Already accepted work keeps its task and
 queue ownership until the actual worker or payload has retired; abandoning a
 caller does not release capacity early. No trust installation or issuance
 authorization is added by this lifecycle change.
+
+## Global TLS resolver defaults
+
+`apps.tls.resolvers` is retained as configuration and supplies ACME server
+DNS-01 TXT defaults when a handler has no nonempty local list. Unused/shadowed
+defaults are not eagerly dialed; actual lookups reuse the bounded owned DNS
+engine. UDP/TCP, IPv4/IPv6, null/empty fallback and true endpoint selection have
+local differential coverage. Unsupported resolver networks are rejected during
+staging instead of deferred dial failure. This does not enable DNS-provider
+certificate issuance or redirect HTTP/TLS proofs and unrelated clients. See
+[global resolver scope](docs/GLOBAL-TLS-RESOLVERS.md).

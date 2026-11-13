@@ -13,7 +13,7 @@ pub struct Config {
     pub host: String,
     pub path_prefix: String,
     pub sign_with_root: bool,
-    pub resolvers: Vec<String>,
+    pub resolvers: std::sync::Arc<[String]>,
     pub challenges: Vec<Challenge>,
     pub policy: Option<Policy>,
 }
@@ -161,7 +161,7 @@ pub fn parse(json: &Value) -> Result<Config> {
         host,
         path_prefix,
         sign_with_root,
-        resolvers,
+        resolvers: resolvers.into(),
         challenges,
         policy,
     })
@@ -202,6 +202,8 @@ fn extract_string_array(val: &Value) -> Result<Vec<String>> {
             for item in arr {
                 match item {
                     Value::String(s) => out.push(s.clone()),
+                    // encoding/json null into a fresh string preserves its zero value.
+                    Value::Null => out.push(String::new()),
                     _ => return Err(anyhow!("array elements must be strings")),
                 }
             }

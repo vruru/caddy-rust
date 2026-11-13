@@ -28,7 +28,7 @@ key equality and certificate thumbprints; `x5u` is not dereferenced.
 | `host` | Fallback for requests without a Host authority. An explicit request Host takes precedence. Bare IPv6 fallback addresses are normalized. |
 | `path_prefix` | Selects the handler namespace, default `/acme/`. |
 | `sign_with_root` | Selects the authority's root instead of its intermediate as signer. |
-| `resolvers` | Overrides DNS-01 TXT lookup resolvers. It does not override HTTP/TLS challenge or issuer-wide DNS resolution. |
+| `resolvers` | A nonempty list overrides DNS-01 TXT lookup resolvers. Empty, null or absent lists use `apps.tls.resolvers`, then system defaults. It does not override HTTP/TLS challenge or issuer-wide DNS resolution. |
 | `challenges` | Filters the supported `http-01`, `dns-01` and `tls-alpn-01` challenges. |
 | `policy` | Domain/IP allow and deny rules, with deny precedence, and `allow_wildcard_names`. |
 
@@ -109,6 +109,6 @@ Raw route keys retain byte identity; only JSON diagnostics use Go's invalid-UTF8
 replacement convention. Generated values, pointer-independent protocol facts,
 error details and Go PKIX edge behavior are not all claimed byte-identical.
 Differences are retained explicitly, without normalizing failures into passes.
-Separate global TLS resolver configuration and other unsupported modules remain
+Remaining DNS provider issuance and other unsupported modules remain
 tracked in the main compatibility contract. Component acceptance does not
 establish full Caddy compatibility or authorize a production replacement.

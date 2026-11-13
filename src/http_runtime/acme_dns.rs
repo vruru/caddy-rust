@@ -17,7 +17,7 @@ pub(crate) fn validate_resolvers(addresses: &[String]) -> Result<()> {
 
 struct Lookup {
     name: String,
-    resolvers: Vec<String>,
+    resolvers: Arc<[String]>,
     expected: Vec<u8>,
     dns: Arc<DnsShared>,
     metadata: BlockingBudget,
@@ -30,7 +30,7 @@ impl Lookup {
         let result = tokio::select! {biased;
             _=self.cancel.cancelled()=>Err(anyhow!("ACME DNS lookup cancelled")),
             _=tokio::time::sleep(self.timeout)=>Err(anyhow!("ACME DNS lookup deadline exceeded")),
-            result=self.dns.lookup_txt(&self.name,&self.resolvers)=>result.map(|values|values.iter().any(|value|value==&self.expected)),
+            result=self.dns.lookup_txt(&self.name,self.resolvers.clone())=>result.map(|values|values.iter().any(|value|value==&self.expected)),
         };
         // Stop logical transport producers before closing their metadata lane.
         // Accepted blocking work and background futures each hold the same
@@ -51,7 +51,7 @@ impl Drop for Lookup {
 }
 pub(crate) fn matches(
     name: String,
-    resolvers: Vec<String>,
+    resolvers: Arc<[String]>,
     expected: Vec<u8>,
     owner: Arc<dyn crate::cert_cpu::MaterialOwner>,
     cancel: CancellationToken,

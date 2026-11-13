@@ -179,7 +179,7 @@ struct SysState {
 
 #[derive(Clone)]
 struct DnsSpec {
-    addrs: Option<Vec<String>>,
+    addrs: Option<Arc<[String]>>,
     dial_ns: i64,
     fallback_ns: i64,
 }
@@ -242,10 +242,10 @@ impl DnsShared {
     }
     /// Closed ACME TXT consumer; it has independent lookup/background gates and
     /// reuses the exact custom/system resolver, network and search semantics.
-    pub(crate) async fn lookup_txt(self:&Arc<Self>,name:&str,resolvers:&[String])->Result<Vec<Vec<u8>>> {
+    pub(crate) async fn lookup_txt(self:&Arc<Self>,name:&str,resolvers:Arc<[String]>)->Result<Vec<Vec<u8>>> {
         let _queued=self.queue_slots.clone().try_acquire_owned().map_err(|_|anyhow!("ACME DNS queue capacity exceeded"))?;
         let _lookup=self.lookup_slots.acquire().await.map_err(|_|anyhow!(STOPPED))?;
-        let spec=DnsSpec{addrs:(!resolvers.is_empty()).then(||resolvers.to_vec()),dial_ns:30_000_000_000,fallback_ns:300_000_000};
+        let spec=DnsSpec{addrs:(!resolvers.is_empty()).then_some(resolvers),dial_ns:30_000_000_000,fallback_ns:300_000_000};
         let (resolver,sys)=self.resolver_for(&spec,IpVer::Any).await?;
         let lookup=lookup_record(&resolver,&sys,name,RecordType::TXT).await?;
         let owner=self.retained_owner.as_ref().ok_or_else(||anyhow!("ACME TXT material owner unavailable"))?;
@@ -348,6 +348,30 @@ impl DnsShared {
                 parse_net_addr(&v)
             })
             .collect()
+    }
+
+    async fn custom_acme_peer(&self,raw:Arc<[String]>)->Result<NetAddr> {
+        ensure!(!raw.is_empty(),"resolver: at least one address is required");
+        let owner=self.retained_owner.clone().ok_or_else(||anyhow!("ACME DNS material owner unavailable"))?;
+        let global=self.global.clone();
+        self.configuration(move || -> Result<NetAddr> {
+            let index=rnd(raw.len() as u64)? as usize;
+            let mut chosen=None;
+            for (i,address) in raw.iter().enumerate() {
+                owner.reserve(0)?;
+                let value=global(address)?;
+                // The closed expansion has a 4MiB output cap and an existing
+                // prepaid scratch allowance. Prepay host/network parsing,
+                // diagnostics and the retained peer before any such copy.
+                let bytes=value.len().checked_mul(8).and_then(|n|n.checked_add(std::mem::size_of::<NetAddr>()+256))
+                    .ok_or_else(||anyhow!("ACME resolver preparation capacity exceeded"))?;
+                owner.reserve(bytes)?;
+                let parsed=parse_net_addr(&value)?;
+                if i==index {chosen=Some(parsed);}
+                // All unselected values retire here on the actual worker.
+            }
+            chosen.ok_or_else(||anyhow!("ACME resolver selection unavailable"))
+        }).await.map_err(|_|anyhow!("ACME DNS preparation worker unavailable"))?
     }
 
     /// Go `resolverConfig.tryUpdate`: stat at most every 5s, one refresher; no lock during IO.
@@ -546,12 +570,19 @@ impl DnsShared {
             (dial, query) => dial.or(query),
         };
         let operation = async {
-            let addrs = self.custom_addrs(
-                spec.addrs
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("custom DNS addresses unavailable"))?,
-            )?;
-            let chosen = &addrs[rnd(addrs.len() as u64)? as usize];
+            let raw = spec.addrs.as_ref().ok_or_else(|| anyhow!("custom DNS addresses unavailable"))?;
+            // Retained ACME inputs may contain 65k entries. Their parsing,
+            // transient copies and unselected-peer destruction belong to the
+            // existing owned metadata worker, not a DNS producer's async poll.
+            let chosen_peer;
+            let addrs;
+            let chosen = if self.retained_owner.is_some() {
+                chosen_peer = self.custom_acme_peer(raw.clone()).await?;
+                &chosen_peer
+            } else {
+                addrs = self.custom_addrs(raw)?;
+                &addrs[rnd(addrs.len() as u64)? as usize]
+            };
             if let Some(kind) = chosen.unix {
                 return Ok(super::proxy_dns_unix::connect(&chosen.host, kind, "127.0.0.1:53".parse().unwrap()).await?);
             }
@@ -1154,8 +1185,14 @@ fn parse_net_addr(addr: &str) -> Result<NetAddr> {
         }
         None => (rest.trim_matches(['[', ']']).to_owned(), 53),
     };
+    // Go Dial with an empty Internet host dials the wildcard address of
+    // that family (the kernel's local endpoint), without a DNS lookup.
+    // In particular a null []string element decodes to "" and means :53.
+    let host = if host.is_empty() {
+        if family == Some(6) { "::".to_owned() } else { "0.0.0.0".to_owned() }
+    } else { host };
     ensure!(
-        !host.is_empty() && !host.contains(['[', ']', '/']),
+        !host.contains(['[', ']', '/']),
         "resolver address {addr:?}: invalid host"
     );
     ensure!(
@@ -1413,7 +1450,7 @@ impl Leaf {
             refresh_ns,
             grace: pos_dur(grace_ns), // Go: grace only when GracePeriod > 0
             dns: DnsSpec {
-                addrs: dns.resolver_addresses.clone(),
+                addrs: dns.resolver_addresses.clone().map(Arc::from),
                 dial_ns: dns.dial_timeout,
                 fallback_ns: dns.fallback_delay,
             },

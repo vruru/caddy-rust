@@ -34,12 +34,9 @@ pub(super) fn parse(views: CertificateViews<'_>) -> Result<CertificatePlan> {
             return Err(ConfigError::unsupported(tls.at(field), feature));
         }
     }
-    if !tls.strings("resolvers")?.is_empty() {
-        return Err(ConfigError::unsupported(
-            tls.at("resolvers"),
-            "custom_dns_resolvers",
-        ));
-    }
+    // The TLS app stores defaults without eagerly interpreting them. An unused
+    // resolver (or one shadowed by a handler-local setting) is not dialed.
+    plan.tls_resolvers = tls.strings("resolvers")?.into_iter().map(str::to_owned).collect::<Vec<_>>().into();
     if let Some(tickets) = tls.value("session_tickets") {
         plan.ticket_mode = parse_ticket_mode(tickets, &tls.at("session_tickets"))?;
     }
