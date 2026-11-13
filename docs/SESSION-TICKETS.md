@@ -3,6 +3,25 @@
 The native TLS app accepts the standard and filesystem-backed distributed STEK
 configuration for ordinary TCP HTTPS and HTTP/3 without client authentication.
 
+An explicit non-null `client_authentication` object disables session tickets
+and runtime session-cache resumption for TCP TLS 1.2/1.3, the native TLS 1.2
+CBC path, and HTTP/3. This includes an empty object: it does not request a
+client certificate, but still disables resumption. This matches Caddy 2.11.7,
+which disables tickets for every configured client-authentication object to
+prevent authentication privilege escalation across virtual hosts. It is not
+a missing compatibility feature. Omitting the object retains ordinary ticket
+behavior. Any future authenticated-resumption support would be a separate
+native enhancement requiring complete identity and authorization binding.
+
+Full handshakes retain the configured modes: when a certificate is presented,
+`request` and `require` check private-key possession without adding chain trust
+or validity-time checks;
+`verify_if_given` validates a presented chain, and `require_and_verify` also
+requires one. Existing DER/URI syntax checks and configured leaf verifiers
+still apply. Restoring a parsed peer chain alone does not establish trust.
+The defensive library hook for resumed URI syntax does not enable runtime
+client-authentication resumption.
+
 An omitted session ticket service, or explicit disable_rotation, preserves
 same-generation runtime resumption. Reload starts a fresh runtime session cache.
 Explicit standard rotation preserves its process-owned key ring over equivalent
@@ -24,7 +43,7 @@ Each ordinary handshake owns its own ticket wrapper. Its authenticated context
 contains the real negotiated protocol, normalized SNI, complete selected chain,
 and stable configured storage/HTTPS realm. The final certificate and live
 withdrawal guard remain authoritative for both full and resumed handshakes.
-Administrative client authentication and TLS-ALPN certificate proofs do not
+Explicit client-authentication policies and TLS-ALPN certificate proofs do not
 install this wrapper. Early data is disabled, and rotating mode has no
 session-ID fallback. Up to five offered tickets are attempted, with bounded
 untrusted data and no I/O or lazy key-schedule lock on a handshake.
@@ -80,6 +99,7 @@ when SNI is absent.
 Its no-SNI session namespace is bound to the actual local address and remains
 separate from DNS-named handshakes.
 
-References: [Caddy session service](https://github.com/caddyserver/caddy/blob/v2.11.7/modules/caddytls/sessiontickets.go),
+References: [Caddy client-authentication ticket gate](https://github.com/caddyserver/caddy/blob/v2.11.7/modules/caddytls/connpolicy.go),
+[Caddy session service](https://github.com/caddyserver/caddy/blob/v2.11.7/modules/caddytls/sessiontickets.go),
 [distributed provider](https://github.com/caddyserver/caddy/blob/v2.11.7/modules/caddytls/distributedstek/distributedstek.go),
 [Go TLS 1.2 age handling](https://github.com/golang/go/blob/go1.27.3/src/crypto/tls/handshake_server.go).

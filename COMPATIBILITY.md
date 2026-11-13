@@ -1497,3 +1497,22 @@ New connection/scope wrapper layouts borrow from an 8MiB subtype limit and the e
 Standalone public CertificateServices::new and AcmeWire constructors preserve their prior unscoped behavior. Metrics/tracing exporters and other HTTPS callers remain separate scheduling work. CBC compatibility in default HTTP CA/ACME clients remains separate caller work. Scope completion includes all its actual IO and cannot serve as a receipt for one issuer leg; an error retaining that scope must not wait on its own generation tracker.
 
 ACME send and response-chunk failures preserve their real reqwest source beneath the existing ProtocolError context. Only an explicit wire cancellation check/select adds the typed AcmeRequestCancelled context, retaining ProtocolError status, uncertainty and display. A coincident cancellation flag on a signing failure does not receive that marker or discard the original failure. Confirmed local connection admission/stopped/scheduling failures retain typed local control and resource sources. Cancellation evidence alone does not prove actual TLS-worker retirement or authorize issuer fallback: that decision also requires the independent parent/deadline state and a genuine single-leg retirement receipt.
+
+Explicit client authentication and session resumption
+----------------------------------------------------
+
+A non-null `client_authentication` object, including `{}`, disables session
+tickets and runtime session-cache resumption across native TCP Rustls, explicit
+TLS 1.2 CBC and HTTP/3. This matches Caddy 2.11.7's intentional protection
+against authentication privilege escalation across virtual hosts. An empty
+object does not request a client certificate. Omitting the object retains the
+existing ordinary session-ticket behavior. Authenticated resumption is not a
+missing baseline capability; enabling it safely would be a separate native
+enhancement, rather than removing the existing gates.
+
+The existing full-handshake client modes, proof of private-key possession,
+DER/URI syntax checks, configured trust and leaf verifiers remain unchanged.
+In particular, `request` and `require` do not acquire chain trust/time validation
+just because resumption is disabled. Library-only restoration of parsed
+certificate metadata does not establish new authorization or enable runtime
+resumption. See [`docs/SESSION-TICKETS.md`](docs/SESSION-TICKETS.md).
