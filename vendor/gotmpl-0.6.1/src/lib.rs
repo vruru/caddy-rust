@@ -1219,3 +1219,6 @@ pub use budget::{BudgetMeter,BudgetAccount,ByteLease,BudgetedBytes};
 
 /// Parsed, bounded printf flags passed to native host formatters.
 pub use go::FmtSpec as HostFormat;
+
+// Public name for the existing owned Values snapshot returned by TypedSlice.
+pub use go_slice::ValuesView;

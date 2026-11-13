@@ -3,7 +3,7 @@
 use crate::{Result,TemplateError,Value,parse::{Expr,Number}};
 use alloc::{string::String,vec::Vec,borrow::Cow};
 #[derive(Clone)]
-pub enum ArgKind {Any,Int,Int64,NamedInt64(&'static str,fn(i64)->Value),Uint8,Uint16,Uint32,Uint64,Float64,String,Bool,Map,ByteSlice,GoPointer(&'static str)}
+pub enum ArgKind {Any,Int,Int64,NamedInt64(&'static str,fn(i64)->Value),NamedUint64(&'static str,fn(u64)->Value),Uint8,Uint16,Uint32,Uint64,Float64,String,Bool,Map,ByteSlice,GoPointer(&'static str)}
 #[derive(Clone)]
 pub struct Signature {pub params:Cow<'static,[ArgKind]>,pub variadic:Option<ArgKind>}
 impl Signature {
@@ -23,6 +23,7 @@ impl ArgKind {
         Ok(match self{
             Self::Int=>Some(Value::Int(signed().ok_or_else(error)?)),
             Self::NamedInt64(_,make)=>Some(make(signed().ok_or_else(error)?)),
+            Self::NamedUint64(_,make)=>Some(make(unsigned().ok_or_else(error)?)),
             Self::Int64=>Some(Value::Int64(signed().ok_or_else(error)?)),
             Self::Uint8=>Some(Value::Uint8(unsigned().ok_or_else(error)? as u8)),
             Self::Uint16=>Some(Value::Uint16(unsigned().ok_or_else(error)? as u16)),
@@ -33,11 +34,12 @@ impl ArgKind {
         })
     }
     pub(crate) fn validate(&self,value:&Value)->Result<()>{
-        let valid=if let Value::Field(reference)=value {match (self,reference.kind()){(Self::Any,_)|(Self::String,crate::FieldKind::String)|(Self::Bool,crate::FieldKind::Bool)=>true,(Self::GoPointer(name),crate::FieldKind::Pointer(kind))=>*name==kind,_=>false}}else{match self{
+        let valid=if let Value::Field(reference)=value {match (self,reference.kind()){(Self::Any,_)|(Self::String,crate::FieldKind::String)|(Self::Bool,crate::FieldKind::Bool)=>true,(Self::GoPointer(name),crate::FieldKind::Pointer(kind))=>*name==kind,(Self::NamedUint64(name,_),crate::FieldKind::NamedUint(kind))=>*name==kind,_=>false}}else{match self{
             Self::Any=>true,Self::Int=>matches!(value,Value::Int(_)),Self::Int64=>matches!(value,Value::Int64(_)),Self::Uint8=>matches!(value,Value::Uint8(_)),Self::Uint16=>matches!(value,Value::Uint16(_)),Self::Uint32=>matches!(value,Value::Uint32(_)),Self::Uint64=>matches!(value,Value::Uint(_)),Self::Float64=>matches!(value,Value::Float(_)),Self::String=>value.as_go_bytes().is_some(),Self::Bool=>matches!(value,Value::Bool(_)),
             Self::ByteSlice=>matches!(value,Value::Nil)||matches!(value,Value::Slice(slice)if slice.byte_parameter_compatible()),
             Self::GoPointer(name)=>matches!(value,Value::Nil)||matches!(value,Value::Object(object)if object.go_type==Some(*name)),
             Self::NamedInt64(name,_)=>matches!(value,Value::NamedInt64(_,other)if *name==other.name),
+            Self::NamedUint64(name,_)=>matches!(value,Value::NamedInt64(_,other)if *name==other.name && other.kind.starts_with("uint")),
             Self::Map=>matches!(value,Value::Nil|Value::Map(_))||{
                 #[cfg(feature="std")]{matches!(value,Value::SharedMap(_))}
                 #[cfg(not(feature="std"))]{false}

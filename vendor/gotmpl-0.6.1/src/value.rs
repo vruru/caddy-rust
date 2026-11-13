@@ -472,7 +472,7 @@ impl Value {
             let zero=if let Self::Object(object)=self{object.map_view.as_ref().map(|view|view.zero.clone()).unwrap_or(Self::Nil)}else{Self::Nil};
             return Ok(map.get(key).cloned().unwrap_or(zero));
         }
-        if let Self::Slice(s)=self {let i=check_bounds(idx,s.len())?;return s.get(i).ok_or_else(||crate::TemplateError::Exec("slice index out of range".into()));}
+        if let Self::Slice(s)=self {let i=check_bounds(idx,s.len())?;return s.index_value(i);}
         match (self, idx) {
             (Value::List(v), Value::Int(_) | Value::Int64(_) | Value::NamedInt64(_,_) | Value::Uint(_) | Value::Uint32(_) | Value::Uint8(_) | Value::Uint16(_)) => {
                 Ok(v[check_bounds(idx, v.len())?].clone())

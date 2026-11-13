@@ -1012,8 +1012,8 @@ fn public_key(
             key.public_key()
                 .affine_coordinates_gfp(group, &mut x, &mut y, &mut ctx)
                 .map_err(|e| error(e.to_string()))?;
-            fields.insert("X".into(), numbers::integer(factory, &x.to_vec(), false)?);
-            fields.insert("Y".into(), numbers::integer(factory, &y.to_vec(), false)?);
+            fields.insert("X".into(), numbers::coordinate_integer(factory,&x.to_vec(),usize::try_from(group.degree()).map_err(|_|error("curve size overflow"))?.div_ceil(8))?);
+            fields.insert("Y".into(), numbers::coordinate_integer(factory,&y.to_vec(),usize::try_from(group.degree()).map_err(|_|error("curve size overflow"))?.div_ceil(8))?);
             fields.insert("Curve".into(), curve_value(factory, group)?);
             "*ecdsa.PublicKey"
         }
@@ -1207,6 +1207,7 @@ fn curve_value(factory: &Arc<Factory>, group: &openssl::ec::EcGroupRef) -> Rende
             factory,
             &n.to_vec(),
             &CURVE_NUMBER_IDENTITIES[curve_index * 5 + index] as *const u8 as usize,
+            index < 2,
         )?;
         fields.insert(name.into(), value);
     }
@@ -1661,3 +1662,5 @@ pub(super) fn format_display(
         gotmpl::go_sprintf_bytes(spec.as_bytes(), &[value])?,
     )))
 }
+
+pub(super) fn word_reference_factory(value:&Value)->Option<std::sync::Weak<Factory>> { numbers::word_reference_factory(value) }

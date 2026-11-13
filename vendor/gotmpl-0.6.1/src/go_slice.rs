@@ -82,7 +82,6 @@ fn canonical_elem_ok(v: &Value, elem: &str) -> bool {
 // These mutation entry points do not participate in MapContext graph retirement.
 // Admit only payloads with no owned Value graph edges. Fn pointers carry no
 // captured environment; NamedInt64 dyn method closures are deliberately denied.
-#[cfg(feature="std")]
 fn values_payload_has_no_edges(value:&Value)->bool {
     match value {
         Value::Nil|Value::NilError|Value::Bool(_)|Value::Int(_)|Value::Int64(_)|Value::Uint(_)|Value::Uint32(_)|Value::Uint8(_)|Value::Uint16(_)|Value::Float(_)|Value::String(_)|Value::ByteString(_)=>true,
@@ -110,8 +109,14 @@ pub struct SliceType {
 }
 
 #[derive(Clone)]
+struct IndexFields {
+    owner: alloc::sync::Weak<dyn core::any::Any + Send + Sync>,
+    make: fn(&TypedSlice, usize, Arc<dyn core::any::Any + Send + Sync>) -> Result<Value>,
+}
+#[derive(Clone)]
 pub struct TypedSlice {
     go_type: &'static str,
+    index_fields: Option<Arc<IndexFields>>,
     named: Option<&'static SliceType>,
     host_budget: Option<Arc<dyn Fn(usize) -> Result<()> + Send + Sync>>,
     storage: Option<SliceData>,
@@ -121,6 +126,26 @@ pub struct TypedSlice {
 }
 
 impl TypedSlice {
+    /// Opt a closed host slice into addressable index/range values. The
+    /// producer contains only a Weak owner and a static function pointer; it
+    /// cannot strongly retain a Value graph through captured closures. The
+    /// host prepays this descriptor and every produced FieldReference, checks
+    /// ownership/cancellation, and never calls back under a backing lock.
+    pub fn with_index_fields(mut self, owner: alloc::sync::Weak<dyn core::any::Any + Send + Sync>, make: fn(&TypedSlice,usize,Arc<dyn core::any::Any + Send + Sync>)->Result<Value>) -> Self {
+        self.index_fields = Some(Arc::new(IndexFields { owner, make }));
+        self
+    }
+    pub(crate) fn has_index_fields(&self) -> bool { self.index_fields.is_some() }
+    /// Field-aware evaluator access. Ordinary slices retain their existing
+    /// value-copy behavior; `get`/iteration/snapshots remain Interface views.
+    pub fn index_value(&self, index: usize) -> Result<Value> {
+        if index >= self.len { return Err(TemplateError::Exec("slice index out of range".into())); }
+        if let Some(fields) = &self.index_fields {
+            let owner = fields.owner.upgrade().ok_or_else(||TemplateError::Exec("slice field owner retired".into()))?;
+            return (fields.make)(self,index,owner);
+        }
+        self.get(index).ok_or_else(||TemplateError::Exec("slice index out of range".into()))
+    }
     /// Address of the first visible element, as used by Go fmt's %p. This
     /// reads the real backing (including a non-nil empty view); it does not
     /// expose writable pointers or manufacture a cell/zero-sized sentinel.
@@ -150,6 +175,7 @@ impl TypedSlice {
         TypedSlice {
             go_type,
             named: None,
+            index_fields: None,
             host_budget: None,
             storage: None,
             start: 0,
@@ -167,6 +193,7 @@ impl TypedSlice {
         TypedSlice {
             go_type: "[]uint8",
             named: None,
+            index_fields: None,
             host_budget: None,
             storage,
             start: 0,
@@ -176,6 +203,21 @@ impl TypedSlice {
     }
 
     pub fn values(go_type: &'static str, data: Option<Arc<[Value]>>) -> Result<Self> {
+        Self::values_impl(go_type,data,false)
+    }
+
+    /// Construct a flat scalar backing after the host prepays its input and
+    /// metadata. Every actual element must match its Go type and contain no
+    /// owned Value graph edges; Field, Slice, Object, List, Map, Function, and
+    /// named descriptors with captured methods are rejected. There is no flag
+    /// that can waive validation. At most 1,048,576 scalars are accepted.
+    /// This avoids recursive-graph limits for private numeric limb storage;
+    /// evaluator value byte/node limits are unchanged when a slice is exposed.
+    pub fn values_scalars(go_type:&'static str,data:Option<Arc<[Value]>>)->Result<Self> {
+        Self::values_impl(go_type,data,true)
+    }
+
+    fn values_impl(go_type:&'static str,data:Option<Arc<[Value]>>,scalars:bool)->Result<Self> {
         if go_type == "[]uint8" {
             return Err(TemplateError::Exec(
                 "use bytes() for []uint8".into(),
@@ -184,7 +226,12 @@ impl TypedSlice {
         let elem = go_type
             .strip_prefix("[]")
             .ok_or_else(|| TemplateError::Exec("invalid typed slice".into()))?;
-        if let Some(values)=&data{crate::field_reference::check_storage_fields(values)?;}
+        if let Some(values)=&data {
+            if scalars {
+                if values.len()>1<<20 {return Err(TemplateError::Exec("scalar slice input count exceeds limit".into()));}
+                if values.iter().any(|value|!values_payload_has_no_edges(value)) {return Err(TemplateError::Exec("scalar slice accepts edge-free payloads only".into()));}
+            }else{crate::field_reference::check_storage_fields(values)?;}
+        }
         let n = data.as_ref().map_or(0, |d| d.len());
         if let Some(vals) = &data {
             for v in vals.iter() {
@@ -200,6 +247,7 @@ impl TypedSlice {
         Ok(TypedSlice {
             go_type,
             named: None,
+            index_fields: None,
             host_budget: None,
             storage,
             start: 0,
@@ -355,7 +403,7 @@ impl TypedSlice {
         let storage = data.map(|d| SliceData::Values(Arc::new(Mutex::new(d))));
         #[cfg(not(feature = "std"))]
         let storage = data.map(SliceData::Values);
-        Ok(Self { go_type: kind.name, named: Some(kind), host_budget: None, storage, start: 0, len: n, cap: n })
+        Ok(Self { go_type: kind.name, named: Some(kind), index_fields: None, host_budget: None, storage, start: 0, len: n, cap: n })
     }
 
     /// A host factory binds its request-owned budget, usually through a Weak
@@ -394,6 +442,7 @@ impl TypedSlice {
         Ok(TypedSlice {
             go_type: "[]interface {}",
             named: None,
+            index_fields: None,
             host_budget: None,
             storage: Some(storage),
             start: 0,
@@ -460,6 +509,26 @@ impl TypedSlice {
                     let v: &[Value] = vc.as_ref();
                     Some(v[self.start + index].clone())
                 }
+            }
+        }
+    }
+
+    /// Fallible live-slot read for guarded host field sources. A poisoned
+    /// backing is an error; the ordinary legacy `get` recovery is unchanged.
+    pub fn try_get(&self,index:usize)->Result<Option<Value>> {
+        if index>=self.len{return Ok(None);}
+        let Some(storage)=&self.storage else{return Ok(None);};
+        let offset=self.start.checked_add(index).ok_or_else(||TemplateError::Exec("slice index overflow".into()))?;
+        match storage {
+            SliceData::Bytes(cell)=>{
+                #[cfg(feature="std")]let data=cell.lock().map_err(|_|TemplateError::Exec("byte slice lock poisoned".into()))?;
+                #[cfg(not(feature="std"))]let data=cell;
+                Ok(data.get(offset).copied().map(Value::Uint8))
+            }
+            SliceData::Values(cell)=>{
+                #[cfg(feature="std")]let data=cell.lock().map_err(|_|TemplateError::Exec("value slice lock poisoned".into()))?;
+                #[cfg(not(feature="std"))]let data=cell;
+                Ok(data.get(offset).cloned())
             }
         }
     }

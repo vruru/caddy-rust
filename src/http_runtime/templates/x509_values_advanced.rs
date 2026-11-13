@@ -44,50 +44,25 @@ pub(super) fn step(f: &Factory, bits: u64) -> RenderResult<()> {
     )
 }
 fn write(d: &Integer, n: BigInt) -> RenderResult<()> {
-    let mut s = d
-        .number
-        .lock()
-        .map_err(|_| error("big.Int cell poisoned"))?;
-    let e = s
-        .epoch
-        .checked_add(1)
-        .ok_or_else(|| error("big.Int epoch overflow"))?;
-    s.negative_zero = false;
-    s.number = n;
-    s.epoch = e;
-    Ok(())
+    let shape = word_commit::Shape::copy(&n)?;
+    commit_number(d, n, false, shape)
 }
-// Lock all distinct output cells in canonical address order. No budget gate,
-// arithmetic, or fallible epoch calculation occurs after the first assignment.
 fn write_all(writes: Vec<(Arc<Integer>, BigInt)>) -> RenderResult<()> {
-    let mut unique = BTreeMap::new();
-    for (cell, value) in writes {
-        unique.insert(Arc::as_ptr(&cell) as usize, (cell, value));
+    let Some((first, _)) = writes.first() else { return Ok(()); };
+    let factory = owner(first)?;
+    let count = writes.len();
+    factory.reserve(count.checked_mul(std::mem::size_of::<Arc<Integer>>() + std::mem::size_of::<BigInt>() + std::mem::size_of::<word_commit::Change<'_>>()).and_then(|n|n.checked_mul(4)).and_then(|n|n.checked_add(1024)).ok_or_else(||error("big.Int GCD output staging overflow"))?)?;
+    let mut cells = Vec::with_capacity(count);
+    let mut values = Vec::with_capacity(count);
+    for (cell, value) in writes { cells.push(cell); values.push(value); }
+    let mut changes = Vec::with_capacity(count);
+    for (data, number) in cells.iter().zip(values) {
+        let shape = word_commit::Shape::copy(&number)?;
+        changes.push(word_commit::Change { data, number, negative_zero: false, shape, adopt:None });
     }
-    let (cells, values): (Vec<_>, Vec<_>) = unique.into_values().unzip();
-    let mut guards = Vec::with_capacity(cells.len());
-    for cell in &cells {
-        guards.push(
-            cell.number
-                .lock()
-                .map_err(|_| error("big.Int cell poisoned"))?,
-        );
-    }
-    let epochs = guards
-        .iter()
-        .map(|s| {
-            s.epoch
-                .checked_add(1)
-                .ok_or_else(|| error("big.Int epoch overflow"))
-        })
-        .collect::<RenderResult<Vec<_>>>()?;
-    for ((state, value), epoch) in guards.iter_mut().zip(values).zip(epochs) {
-        state.negative_zero = false;
-        state.number = value;
-        state.epoch = epoch;
-    }
-    Ok(())
+    word_commit::commit(&factory, &mut changes)
 }
+
 fn nil(f: &Arc<Factory>) -> RenderResult<Value> {
     f.reserve(512)?;
     Ok(Value::Object(Arc::new(Object {
@@ -96,6 +71,7 @@ fn nil(f: &Arc<Factory>) -> RenderResult<Value> {
         data: Some(Arc::new(Integer {
             number: Mutex::new(State {
                 number: BigInt::from(0),
+                words: words::Words::nil(),
                 negative_zero: false,
                 epoch: 0,
             }),
@@ -173,6 +149,10 @@ pub(super) fn invoke(o: &Object, name: &str, args: &[Value]) -> RenderResult<Val
             _ => 2,
         },
     )?;
+    let mut force_new_result=false;
+    let mut explicit_shape=None;
+    let mut binomial_old=None;
+    let mut binomial_capacity=None;
     let result = match name {
         "MulRange" | "Binomial" => {
             let (Value::Int64(a), Value::Int64(b)) = (&args[0], &args[1]) else {
@@ -202,6 +182,7 @@ pub(super) fn invoke(o: &Object, name: &str, args: &[Value]) -> RenderResult<Val
                         step(&f, r.bits())?;
                         r *= i
                     }
+                    if count>1 && r.bits()<=64 {explicit_shape=Some(word_commit::Shape{requested:2,written:2,force_new:false,preserve_header:false});}
                     if b < 0 && count % 2 == 1 { -r } else { r }
                 }
             } else if b > a || b < 0 {
@@ -214,12 +195,30 @@ pub(super) fn invoke(o: &Object, name: &str, args: &[Value]) -> RenderResult<Val
                         .ok_or_else(|| error("big.Int binomial size overflow"))?,
                 )?;
                 f.work(usize::try_from(k).map_err(|_| error("big.Int binomial work overflow"))?)?;
+                let initial_capacity=word_header(&data)?.1.map_or(0,|span|span.3);
+                let mut capacity=initial_capacity.max(1);
+                let mut original_live=initial_capacity>0;
+                let mut original_written=1;
                 let mut r = BigInt::from(1);
                 for i in 0..k {
                     step(&f, r.bits())?;
+                    let requested=usize::try_from(r.bits().div_ceil(64)).ok().and_then(|n|n.checked_add(1)).ok_or_else(||error("big.Int Binomial Word capacity overflow"))?;
+                    if requested>capacity {
+                        if original_live {
+                            let bytes=usize::try_from(r.bits().div_ceil(8)).map_err(|_|error("big.Int Binomial Word size overflow"))?;
+                            f.reserve(bytes.checked_mul(2).and_then(|n|n.checked_add(128)).ok_or_else(||error("big.Int Binomial Word snapshot overflow"))?)?;
+                            binomial_old=Some((r.clone(),original_written));
+                            original_live=false;
+                        }
+                        capacity=if requested<=1{requested}else{requested.checked_add(4).ok_or_else(||error("big.Int Binomial Word capacity overflow"))?};
+                    }
+                    if original_live{original_written=original_written.max(requested);}
                     r *= a as u64 - i;
                     r /= i + 1
                 }
+                if original_live {
+                    explicit_shape=Some(word_commit::Shape{requested:original_written,written:original_written,force_new:false,preserve_header:false});
+                }else{binomial_capacity=Some(capacity);}
                 r
             }
         }
@@ -249,6 +248,12 @@ pub(super) fn invoke(o: &Object, name: &str, args: &[Value]) -> RenderResult<Val
             } else {
                 abs(stage(&f, &args[2])?)
             };
+            if !(negative_exponent && m.sign()==Sign::NoSign) {
+                let z=word_header(&data)?.1;
+                let Value::Object(xo)=&args[0]else{return Err(error("expected *big.Int"));};
+                let Value::Object(yo)=&args[1]else{return Err(error("expected *big.Int"));};
+                force_new_result=aliases(z,word_header(payload(yo)?)?.1)||(!negative_exponent&&aliases(z,word_header(payload(xo)?)?.1));
+            }
             if y.sign() == Sign::Minus && m.sign() == Sign::NoSign {
                 BigInt::from(1)
             } else {
@@ -372,6 +377,17 @@ pub(super) fn invoke(o: &Object, name: &str, args: &[Value]) -> RenderResult<Val
     f.reserve(512)?;
     f.work(0)?;
     let wrapped = rewrap(o, data.clone(), result.bits())?;
-    write(&data, result)?;
+    let mut shape=match explicit_shape{Some(shape)=>shape,None=>word_commit::Shape::copy(&result)?};
+    shape.force_new=force_new_result;
+    if let Some(capacity)=binomial_capacity {
+        let final_words=words::Words::with_capacity(&f,&result,capacity)?;
+        f.reserve(std::mem::size_of::<word_commit::Change<'_>>()*2+256)?;
+        let mut changes=Vec::with_capacity(2);
+        if let Some((number,written))=binomial_old {
+            changes.push(word_commit::Change{data:&data,number,negative_zero:false,shape:word_commit::Shape{requested:written,written,force_new:false,preserve_header:false},adopt:None});
+        }
+        changes.push(word_commit::Change{data:&data,number:result,negative_zero:false,shape,adopt:Some(final_words)});
+        word_commit::commit(&f,&mut changes)?;
+    }else{commit_number(&data,result,false,shape)?;}
     Ok(wrapped)
 }

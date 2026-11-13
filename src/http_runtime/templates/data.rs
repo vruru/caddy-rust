@@ -424,4 +424,4 @@ fn query_escape_bytes(output: &mut Vec<u8>, value: &[u8]) {
     }
 }
 
-pub(super)fn field_reference_cost(value:&Value,control:&Arc<super::Control>)->RenderResult<Option<usize>>{request_url::field_reference_cost(value,control)}
+pub(super)fn field_reference_cost(value:&Value,control:&Arc<super::Control>)->RenderResult<Option<usize>>{if let Some(cost)=tls_values::word_reference_cost(value,control)?{return Ok(Some(cost));}request_url::field_reference_cost(value,control)}

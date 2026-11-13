@@ -277,7 +277,11 @@ fn expr_name(expr: &Expr) -> &'static str {
 /// that cannot live inside a regular function call.
 macro_rules! range_loop {
     ($self:expr, $w:expr, $branch:expr, $iter:expr) => {
-        for (idx_val, item) in $iter {
+        range_loop!($self,$w,$branch,$iter,|item|Ok::<Value,ExecSignal>(item));
+    };
+    ($self:expr, $w:expr, $branch:expr, $iter:expr, $resolve:expr) => {
+        for (idx_val, raw_item) in $iter {
+            let item = ($resolve)(raw_item)?;
             if $self.range_iters_remaining == 0 {
                 return Err(TemplateError::RangeIterLimit.into());
             }
@@ -547,7 +551,13 @@ impl<'a> Executor<'a> {
             else{range_loop!(self,w,branch,map.iter().map(|(key,value)|(key.clone(),value.clone())));}
             return Ok(());
         }
-        if let Value::Slice(items)=&val{if items.len()==0{if let Some(body)=&branch.else_body{self.walk(w,body,dot)?;}}else{range_loop!(self,w,branch,items.iter().enumerate().map(|(i,v)|(Value::Int(i as i64),v)));}return Ok(());}
+        if let Value::Slice(items)=&val {
+            if items.len()==0 { if let Some(body)=&branch.else_body { self.walk(w,body,dot)?; } }
+            else if items.has_index_fields() {
+                range_loop!(self,w,branch,(0..items.len()).map(|i|(Value::Int(i as i64),i)),|index|self.invoke_callable("slice element",&[],||items.index_value(index)));
+            } else { range_loop!(self,w,branch,items.iter().enumerate().map(|(i,v)|(Value::Int(i as i64),v))); }
+            return Ok(());
+        }
         match &val {
             Value::List(items) if items.is_empty() => {
                 if let Some(ref else_body) = branch.else_body {

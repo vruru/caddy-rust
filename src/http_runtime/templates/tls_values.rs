@@ -40,6 +40,7 @@ pub(super) struct Factory {
     pub(super) control: Weak<Control>,
     certificates: Mutex<BTreeMap<usize, Arc<x509_values::Certificate>>>,
     pub(super) integer_values: Mutex<BTreeMap<usize, Value>>,
+    pub(super) word_values: Mutex<BTreeMap<usize, TypedSlice>>,
 }
 impl Factory {
     pub(super) fn owner(&self) -> RenderResult<Arc<Control>> {
@@ -329,6 +330,7 @@ pub(super) fn value(
                     control: Arc::downgrade(control),
                     certificates: Mutex::new(BTreeMap::new()),
                     integer_values: Mutex::new(BTreeMap::new()),
+                    word_values: Mutex::new(BTreeMap::new()),
                 });
                 *slot = Some((Arc::downgrade(control), factory.clone()));
                 factory
@@ -340,6 +342,7 @@ pub(super) fn value(
                 control: Arc::downgrade(control),
                 certificates: Mutex::new(BTreeMap::new()),
                 integer_values: Mutex::new(BTreeMap::new()),
+                    word_values: Mutex::new(BTreeMap::new()),
             });
             *slot = Some((Arc::downgrade(control), factory.clone()));
             factory
@@ -413,4 +416,12 @@ fn curve(value: u16) -> Value {
         })
     });
     Value::NamedInt64(i64::from(value), TYPE.clone())
+}
+
+pub(super) fn word_reference_cost(value:&Value,control:&Arc<Control>)->RenderResult<Option<usize>> {
+    let Some(source)=x509_values::word_reference_factory(value)else{return Ok(None);};
+    let owner=source.upgrade().ok_or_else(||error("big.Word field owner retired"))?;
+    if !owner.control.ptr_eq(&Arc::downgrade(control)){return Err(error("foreign big.Word field owner"));}
+    control.check()?;
+    Ok(Some(0))
 }

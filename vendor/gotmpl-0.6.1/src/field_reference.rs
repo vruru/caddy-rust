@@ -5,10 +5,10 @@
 use alloc::sync::Arc;
 use crate::{Result,TemplateError,Value};
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub enum FieldKind { String, Bool, Pointer(&'static str) }
+pub enum FieldKind { String, Bool, Pointer(&'static str), NamedUint(&'static str) }
 impl FieldKind {
- pub fn type_name(self)->&'static str {match self{Self::String=>"string",Self::Bool=>"bool",Self::Pointer(name)=>name}}
- fn accepts(self,value:&Value)->bool {match value{Value::Field(reference)=>reference.kind==self,_=>match self{Self::String=>value.as_go_bytes().is_some(),Self::Bool=>matches!(value,Value::Bool(_)),Self::Pointer(name)=>matches!(value,Value::Object(object)if object.go_type==Some(name))}}}
+ pub fn type_name(self)->&'static str {match self{Self::String=>"string",Self::Bool=>"bool",Self::Pointer(name)|Self::NamedUint(name)=>name}}
+ fn accepts(self,value:&Value)->bool {match value{Value::Field(reference)=>reference.kind==self,_=>match self{Self::String=>value.as_go_bytes().is_some(),Self::Bool=>matches!(value,Value::Bool(_)),Self::Pointer(name)=>matches!(value,Value::Object(object)if object.go_type==Some(name)),Self::NamedUint(name)=>matches!(value,Value::NamedInt64(_,kind)if kind.name==name && kind.kind.starts_with("uint"))}}}
 }
 /// A closed host source owns its state, but only weakly owns its render control.
 /// `read_field` must not retain the returned reference or insert it in its state.

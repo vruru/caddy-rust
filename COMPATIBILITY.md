@@ -301,7 +301,10 @@ round trips and modular square roots. Decoder failures preserve the observable
 partial scanner state where the Go API does so; JSON `null` leaves an existing
 integer unchanged. Modular roots use bounded Jacobi, exponentiation and
 Tonelli–Shanks steps rather than an uninterruptible search. This does not add
-the entire Go `math/big` API or complete shared `Bits`/`SetBits` backing semantics.
+the entire Go `math/big` API. Template-private `Bits`/`SetBits` now share actual
+word backings, including addressable index/range views and atomic multi-output
+updates; their resource, capacity and request-isolation boundaries are described
+in [Template integer word views](docs/TEMPLATE-INTEGER-WORDS.md).
 
 `ProbablyPrime` uses the Go-compatible deterministic Miller–Rabin base sequence
 and extra-strong Lucas test. Its local seeded RNG is used only to reproduce

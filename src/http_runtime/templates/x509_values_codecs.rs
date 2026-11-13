@@ -3,19 +3,10 @@
 //! Byte codecs preserve Go's observable partial scanner updates and Gob sign.
 use super::*;
 fn commit(data: &Integer, n: BigInt, negative_zero: bool) -> RenderResult<()> {
-    let mut state = data
-        .number
-        .lock()
-        .map_err(|_| error("big.Int cell poisoned"))?;
-    let next = state
-        .epoch
-        .checked_add(1)
-        .ok_or_else(|| error("big.Int epoch overflow"))?;
-    state.number = n;
-    state.negative_zero = negative_zero;
-    state.epoch = next;
-    Ok(())
+    let shape = word_commit::Shape::copy(&n)?;
+    commit_number(data, n, negative_zero, shape)
 }
+
 fn err(text: String) -> Value {
     super::super::error_value("*errors.errorString", text)
 }

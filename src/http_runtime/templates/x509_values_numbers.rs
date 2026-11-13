@@ -8,6 +8,10 @@ mod arithmetic;
 mod codecs;
 #[path = "x509_values_prime.rs"]
 mod prime;
+#[path = "x509_values_words.rs"]
+mod words;
+#[path = "x509_values_word_commit.rs"]
+mod word_commit;
 use super::{Factory, RenderResult, arity, error};
 use bigdecimal::num_bigint::{BigInt, Sign};
 use gotmpl::{ArgKind, HostFormat, HostMethod, HostType, Object, Signature, Value};
@@ -18,6 +22,7 @@ use std::{
 struct State {
     negative_zero: bool,
     number: BigInt,
+    words: words::Words,
     epoch: u64,
 }
 pub(super) struct Integer {
@@ -27,6 +32,8 @@ pub(super) struct Integer {
 static INT_ARG: Signature = Signature::from_static(&[ArgKind::Int], None);
 static BIG_TYPE: HostType = HostType {
     methods: &[
+        HostMethod { name: "Bits", invoke: bits, signature: None },
+        HostMethod { name: "SetBits", invoke: set_bits, signature: None },
         HostMethod {
             name: "ProbablyPrime",
             invoke: prime::invoke,
@@ -333,7 +340,10 @@ fn radix(n: &BigInt, base: u32) -> String {
     }
     text
 }
-pub(super) fn integer(factory: &Arc<Factory>, bytes: &[u8], signed: bool) -> RenderResult<Value> {
+enum Initial { Bytes, Fixed(usize), Decimal, Hex }
+pub(super) fn integer(factory: &Arc<Factory>, bytes: &[u8], signed: bool) -> RenderResult<Value> { integer_initial(factory,bytes,signed,Initial::Bytes) }
+pub(super) fn coordinate_integer(factory:&Arc<Factory>,bytes:&[u8],width:usize)->RenderResult<Value>{integer_initial(factory,bytes,false,Initial::Fixed(width))}
+fn integer_initial(factory: &Arc<Factory>, bytes: &[u8], signed: bool, initial:Initial) -> RenderResult<Value> {
     factory.reserve(
         bytes
             .len()
@@ -346,9 +356,19 @@ pub(super) fn integer(factory: &Arc<Factory>, bytes: &[u8], signed: bool) -> Ren
     } else {
         BigInt::from_bytes_be(Sign::Plus, bytes)
     };
+    let words = match initial {
+        Initial::Bytes=>words::Words::initial(factory,bytes,signed,&number)?,
+        Initial::Fixed(width)=>{
+            if width<bytes.len() || width>66{return Err(error("invalid elliptic coordinate width"));}
+            words::Words::make(factory,&number,width.div_ceil(8))?
+        }
+        Initial::Decimal=>words::Words::scanned(factory,&number,true)?,
+        Initial::Hex=>words::Words::scanned(factory,&number,false)?,
+    };
     let data = Arc::new(Integer {
         number: Mutex::new(State {
             number,
+            words,
             epoch: 0,
             negative_zero: false,
         }),
@@ -838,34 +858,69 @@ fn read_number(data: &Integer, factory: &Arc<Factory>) -> RenderResult<BigInt> {
     Ok(snapshot_number(data, factory)?.0)
 }
 fn snapshot_number(data: &Integer, factory: &Arc<Factory>) -> RenderResult<(BigInt, bool)> {
+    let source_owner = owner(data)?;
+    source_owner.work(0)?;
     for _ in 0..8 {
-        let (bits, epoch) = {
-            let state = data
-                .number
-                .lock()
-                .map_err(|_| error("big.Int cell poisoned"))?;
-            (state.number.bits(), state.epoch)
+        let (length, epoch) = {
+            let state = data.number.lock().map_err(|_| error("big.Int cell poisoned"))?;
+            (state.words.len(), state.epoch)
         };
-        let bytes =
-            usize::try_from(bits.div_ceil(8)).map_err(|_| error("big.Int size overflow"))?;
-        factory.reserve(
-            bytes
-                .checked_mul(4)
-                .and_then(|n| n.checked_add(1024))
-                .ok_or_else(|| error("big.Int snapshot budget overflow"))?,
-        )?;
-        factory.work(bytes.div_ceil(8) + 1)?;
-        let state = data
-            .number
-            .lock()
-            .map_err(|_| error("big.Int cell poisoned"))?;
-        if state.epoch != epoch {
-            continue;
-        }
-        return Ok((state.number.clone(), state.negative_zero));
+        let bytes = length.checked_mul(8).ok_or_else(|| error("big.Int snapshot size overflow"))?;
+        factory.reserve(bytes.checked_mul(4).and_then(|n|n.checked_add(1024)).ok_or_else(|| error("big.Int snapshot budget overflow"))?)?;
+        factory.work(length.checked_add(1).ok_or_else(|| error("big.Int snapshot work overflow"))?)?;
+        let (snapshot, negative, negative_zero) = {
+            let state = data.number.lock().map_err(|_| error("big.Int cell poisoned"))?;
+            if state.epoch != epoch { continue; }
+            (state.words.snapshot(), state.number.sign() == Sign::Minus, state.negative_zero)
+        };
+        let mut number = match snapshot {
+            Some(snapshot) => words::Words::unsigned(factory, &snapshot)?,
+            None => BigInt::from(0),
+        };
+        let zero = number.sign() == Sign::NoSign;
+        if negative && !zero { number = -number; }
+        return Ok((number, negative_zero || (negative && zero)));
     }
     Err(error("concurrent big.Int change limit exceeded"))
 }
+fn bits(object: &Object, args: &[Value]) -> RenderResult<Value> {
+    arity(args, 0, 0)?;
+    let data = payload(object)?;
+    let factory = owner(data)?;
+    factory.reserve(128)?;
+    factory.work(1)?;
+    let state = data.number.lock().map_err(|_| error("big.Int cell poisoned"))?;
+    Ok(state.words.value())
+}
+fn set_bits(object: &Object, args: &[Value]) -> RenderResult<Value> {
+    arity(args, 1, 1)?;
+    let data = shared_payload(object)?;
+    let factory = owner(&data)?;
+    let words = words::Words::source(&factory, &args[0])?;
+    factory.reserve(words.len().checked_mul(32).and_then(|n|n.checked_add(1536)).ok_or_else(||error("big.Int SetBits size overflow"))?)?;
+    let number = match words.snapshot() { Some(snapshot) => words::Words::unsigned(&factory, &snapshot)?, None => BigInt::from(0) };
+    let wrapped = rewrap(object, data.clone(), number.bits())?;
+    factory.work(words.len().checked_add(1).ok_or_else(||error("big.Int SetBits work overflow"))?)?;
+    let shape=word_commit::Shape::copy(&number)?;
+    word_commit::commit(&factory,&mut [word_commit::Change{data:&data,number,negative_zero:false,shape,adopt:Some(words)}])?;
+
+    Ok(wrapped)
+}
+fn word_header(data: &Integer) -> RenderResult<(usize, Option<(usize,usize,usize,usize)>)> {
+    let state = data.number.lock().map_err(|_|error("big.Int cell poisoned"))?;
+    Ok((state.words.len(), state.words.span()))
+}
+fn aliases(a: Option<(usize,usize,usize,usize)>, b: Option<(usize,usize,usize,usize)>) -> bool {
+    match (a,b) { (Some(a),Some(b)) => a.0 == b.0 && a.3 > 0 && b.3 > 0 && a.1 + a.3 == b.1 + b.3, _ => false }
+}
+fn same_words(a: Option<(usize,usize,usize,usize)>, b: Option<(usize,usize,usize,usize)>) -> bool {
+    match (a,b) { (Some(a),Some(b)) => a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.2 > 0, _ => false }
+}
+fn commit_number(data: &Integer, number: BigInt, negative_zero: bool, shape: word_commit::Shape) -> RenderResult<()> {
+    let factory = owner(data)?;
+    word_commit::commit(&factory, &mut [word_commit::Change { data, number, negative_zero, shape, adopt:None }])
+}
+
 fn json_current(object: &Object) -> RenderResult<Value> {
     let data = payload(object)?;
     let factory = owner(data)?;
@@ -905,7 +960,7 @@ fn rewrap(object: &Object, data: Arc<Integer>, bits: u64) -> RenderResult<Value>
 }
 fn native_uint(value: &Value) -> RenderResult<u64> {
     match value {
-        Value::NamedInt64(n, kind) if kind.name == "uint" && *n >= 0 => Ok(*n as u64),
+        Value::NamedInt64(n, kind) if kind.name == "uint" => Ok(*n as u64),
         _ => Err(error("expected uint")),
     }
 }
@@ -921,18 +976,19 @@ fn uint_value(value: i64) -> Value {
     });
     Value::NamedInt64(value, KIND.clone())
 }
+fn uint_argument(value:u64)->Value{uint_value(value as i64)}
 static RANGE_INT64: Signature = Signature::from_static(&[ArgKind::Int64, ArgKind::Int64], None);
 static SET_INT64: Signature = Signature::from_static(&[ArgKind::Int64], None);
 static SET_UINT64: Signature = Signature::from_static(&[ArgKind::Uint64], None);
 static SHIFT: Signature = Signature::from_static(
-    &[ArgKind::Any, ArgKind::NamedInt64("uint", uint_value)],
+    &[ArgKind::Any, ArgKind::NamedUint64("uint", uint_argument)],
     None,
 );
 static SET_BIT: Signature = Signature::from_static(
     &[
         ArgKind::Any,
         ArgKind::Int,
-        ArgKind::NamedInt64("uint", uint_value),
+        ArgKind::NamedUint64("uint", uint_argument),
     ],
     None,
 );
@@ -947,6 +1003,8 @@ fn mutate(object: &Object, name: &str, args: &[Value]) -> RenderResult<Value> {
     };
     arity(args, count, count)?;
     let mut result_negative_zero = false;
+    let mut selected_shape = None;
+    let mut word_history = Vec::new();
     let result = match name {
         "SetInt64" => {
             let Value::Int64(n) = args[0] else {
@@ -964,6 +1022,8 @@ fn mutate(object: &Object, name: &str, args: &[Value]) -> RenderResult<Value> {
         }
         "SetBytes" => {
             let bytes = byte_argument(&args[0])?;
+            let count = bytes.len().div_ceil(8);
+            selected_shape = Some(word_commit::Shape { requested: count, written: count, force_new: false, preserve_header: false });
             factory.reserve(
                 bytes
                     .len()
@@ -979,7 +1039,11 @@ fn mutate(object: &Object, name: &str, args: &[Value]) -> RenderResult<Value> {
             let Value::Object(input) = &args[0] else {
                 return Err(error("expected *big.Int"));
             };
-            let (x, x_negative_zero) = snapshot_number(payload(input)?, &factory)?;
+            let input_data = payload(input)?;
+            let (x, x_negative_zero) = snapshot_number(input_data, &factory)?;
+            let x_header = word_header(input_data)?;
+            let target_header = word_header(&data)?;
+            let mut y_header = (0usize, None);
             if name == "Set" {
                 result_negative_zero = x_negative_zero
             }
@@ -1004,7 +1068,9 @@ fn mutate(object: &Object, name: &str, args: &[Value]) -> RenderResult<Value> {
                 let Value::Object(input) = &args[1] else {
                     return Err(error("expected *big.Int"));
                 };
-                Some(read_number(payload(input)?, &factory)?)
+                let input_data = payload(input)?;
+                y_header = word_header(input_data)?;
+                Some(read_number(input_data, &factory)?)
             };
             let xb = x.bits();
             let yb = y.as_ref().map_or(0, BigInt::bits);
@@ -1056,29 +1122,127 @@ fn mutate(object: &Object, name: &str, args: &[Value]) -> RenderResult<Value> {
             }
             .ok_or_else(|| error("big.Int work overflow"))?;
             factory.work(work)?;
-            if name == "Set" {
-                x
-            } else {
-                arithmetic::compute(&factory, name, x, y, scalar)?
+            let xlen = usize::try_from(xb.div_ceil(64)).map_err(|_|error("big.Int Word size overflow"))?;
+            let ylen = usize::try_from(yb.div_ceil(64)).map_err(|_|error("big.Int Word size overflow"))?;
+            let mut preserve = false;
+            let mut force = false;
+            // Go's signed shift/set-bit algorithms write abs(x)-1 and their
+            // positive intermediate before adding one. Stage these actual
+            // values, so a later allocation leaves genuine old-view history.
+            if x.sign() == Sign::Minus && matches!(name,"Rsh"|"SetBit") {
+                factory.reserve(bytes.checked_mul(12).and_then(|n|n.checked_add(2048)).ok_or_else(||error("big.Int signed Word staging overflow"))?)?;
+                factory.work(xlen.checked_add(1).ok_or_else(||error("big.Int Word work overflow"))?)?;
+                let first = -x.clone() - BigInt::from(1);
+                let first_len = usize::try_from(first.bits().div_ceil(64)).map_err(|_|error("big.Int Word size overflow"))?;
+                let (second, second_request) = if name == "Rsh" {
+                    let shift = usize::try_from(scalar).map_err(|_|error("big.Int shift overflow"))?;
+                    (if scalar >= first.bits() { BigInt::from(0) } else { &first >> shift },first_len.saturating_sub(shift/64))
+                } else {
+                    let mut second = first.clone();
+                    let bit = !y.as_ref().is_some_and(|n|n.sign()!=Sign::NoSign);
+                    second.set_bit(scalar,bit);
+                    let request = if bit { first_len.max(usize::try_from(scalar/64).ok().and_then(|n|n.checked_add(1)).ok_or_else(||error("big.Int Word size overflow"))?) } else { first_len };
+                    (second,request)
+                };
+                let second_len = usize::try_from(second.bits().div_ceil(64)).map_err(|_|error("big.Int Word size overflow"))?;
+                let final_request = if second_len==0 {1} else {second_len.checked_add(1).ok_or_else(||error("big.Int Word size overflow"))?};
+                word_history.try_reserve_exact(2).map_err(|_|error("big.Int Word history allocation failed"))?;
+                word_history.push((first,word_commit::Shape{requested:xlen,written:xlen,force_new:false,preserve_header:false}));
+                word_history.push((second,word_commit::Shape{requested:second_request,written:second_request,force_new:false,preserve_header:false}));
+                selected_shape = Some(word_commit::Shape{requested:final_request,written:final_request,force_new:false,preserve_header:false});
             }
+            let negative_x=x.sign()==Sign::Minus;
+            let negative_y=y.as_ref().is_some_and(|n|n.sign()==Sign::Minus);
+            let xm=minus_one_words(&x)?;
+            let ym=match &y{Some(y)=>minus_one_words(y)?,None=>0};
+            let mut add_one_request=None;
+            let request = match name {
+                "Set" | "Abs" | "Neg" => {
+                    preserve = std::ptr::eq(input_data, data.as_ref()) && (name == "Set" || x.sign() != Sign::NoSign);
+                    Some(if preserve { 0 } else { xlen })
+                }
+                "Add" | "Sub" => {
+                    if xlen == 0 || ylen == 0 { Some(xlen.max(ylen)) }
+                    else if ((x.sign() == Sign::Minus) == (y.as_ref().is_some_and(|n|n.sign()==Sign::Minus))) == (name == "Add") {
+                        Some(xlen.max(ylen).checked_add(1).ok_or_else(||error("big.Int Word size overflow"))?)
+                    } else { Some(xlen.max(ylen)) }
+                }
+                "Not" => Some(if negative_x { xlen } else if xlen==0 {1} else {xlen.checked_add(1).ok_or_else(||error("big.Int Word size overflow"))?}),
+                "And" | "AndNot" | "Or" | "Xor" => {
+                    let (requested, add_one) = match (name,negative_x,negative_y) {
+                        ("And",false,false)=>(xlen.min(ylen),false),
+                        ("And",true,true)=>(xm.max(ym),true),
+                        ("And",false,true)=>(xlen,false),
+                        ("And",true,false)=>(ylen,false),
+                        ("AndNot",false,false)=>(xlen,false),
+                        ("AndNot",true,true)=>(ym,false),
+                        ("AndNot",true,false)=>(xm.max(ylen),true),
+                        ("AndNot",false,true)=>(xlen.min(ym),false),
+                        ("Or",false,false)=>(xlen.max(ylen),false),
+                        ("Or",true,true)=>(xm.min(ym),true),
+                        ("Or",true,false)=>(xm,true),
+                        ("Or",false,true)=>(ym,true),
+                        ("Xor",false,false)=>(xlen.max(ylen),false),
+                        ("Xor",true,true)=>(xm.max(ym),false),
+                        ("Xor",true,false)=>(xm.max(ylen),true),
+                        ("Xor",false,true)=>(xlen.max(ym),true),
+                        _=>return Err(error("invalid big.Int bitwise operation")),
+                    };
+                    if add_one {add_one_request=Some(requested);None}else{Some(requested)}
+                }
+                "Quo" if ylen==1 => Some(xlen),
+                "Mul" => {
+                    if xlen == 0 || ylen == 0 { Some(0) }
+                    else if xlen.min(ylen) == 1 { Some(xlen.max(ylen).checked_add(1).ok_or_else(||error("big.Int Word size overflow"))?) }
+                    else { force = aliases(target_header.1,x_header.1)||aliases(target_header.1,y_header.1);Some(xlen.checked_add(ylen).ok_or_else(||error("big.Int Word size overflow"))?) }
+                }
+                "Lsh" => {
+                    if xlen == 0 { Some(0) }
+                    else if scalar == 0 && same_words(target_header.1,x_header.1) { preserve=true;Some(0) }
+                    else if scalar == 0 && !aliases(target_header.1,x_header.1) { Some(xlen) }
+                    else { Some(xlen.checked_add(usize::try_from(scalar/64).map_err(|_|error("big.Int Word size overflow"))?).and_then(|n|n.checked_add(1)).ok_or_else(||error("big.Int Word size overflow"))?) }
+                }
+                "Rsh" if x.sign() != Sign::Minus => {
+                    if scalar == 0 && same_words(target_header.1,x_header.1) { preserve=true;Some(0) }
+                    else { Some(xlen.saturating_sub(usize::try_from(scalar/64).map_err(|_|error("big.Int Word size overflow"))?)) }
+                }
+                "SetBit" if x.sign() != Sign::Minus => {
+                    if y.as_ref().is_some_and(|n|n.sign()!=Sign::NoSign) {
+                        Some(xlen.max(usize::try_from(scalar/64).ok().and_then(|n|n.checked_add(1)).ok_or_else(||error("big.Int Word size overflow"))?))
+                    } else { Some(xlen) }
+                }
+                _ => None,
+            };
+            if let Some(requested) = request { selected_shape = Some(word_commit::Shape { requested, written: requested, force_new: force, preserve_header: preserve }); }
+            let result = if name == "Set" { x } else { arithmetic::compute(&factory, name, x, y, scalar)? };
+            if let Some(requested)=add_one_request {
+                factory.reserve(bytes.checked_mul(8).and_then(|n|n.checked_add(1024)).ok_or_else(||error("big.Int bitwise Word staging overflow"))?)?;
+                factory.work(xlen.max(ylen).checked_add(1).ok_or_else(||error("big.Int Word work overflow"))?)?;
+                let prefix = -result.clone() - BigInt::from(1);
+                let len = usize::try_from(prefix.bits().div_ceil(64)).map_err(|_|error("big.Int Word size overflow"))?;
+                let final_request=if len==0{1}else{len.checked_add(1).ok_or_else(||error("big.Int Word size overflow"))?};
+                word_history.try_reserve_exact(1).map_err(|_|error("big.Int Word history allocation failed"))?;
+                word_history.push((prefix,word_commit::Shape{requested,written:requested,force_new:false,preserve_header:false}));
+                selected_shape=Some(word_commit::Shape{requested:final_request,written:final_request,force_new:false,preserve_header:false});
+            }
+            result
         }
     };
     factory.reserve(512)?;
     factory.work(0)?;
     let wrapped = rewrap(object, data.clone(), result.bits())?;
-    {
-        let mut state = data
-            .number
-            .lock()
-            .map_err(|_| error("big.Int cell poisoned"))?;
-        let next = state
-            .epoch
-            .checked_add(1)
-            .ok_or_else(|| error("big.Int epoch overflow"))?;
-        state.negative_zero = result_negative_zero;
-        state.number = result;
-        state.epoch = next;
+    let shape = match selected_shape { Some(shape) => shape, None => word_commit::Shape::copy(&result)? };
+    if word_history.is_empty() {
+        commit_number(&data, result, result_negative_zero, shape)?;
+    } else {
+        factory.reserve((word_history.len()+1).checked_mul(std::mem::size_of::<word_commit::Change<'_>>()).and_then(|n|n.checked_add(256)).ok_or_else(||error("big.Int Word history metadata overflow"))?)?;
+        let mut changes = Vec::new();
+        changes.try_reserve_exact(word_history.len()+1).map_err(|_|error("big.Int Word history allocation failed"))?;
+        for (number,shape) in word_history {changes.push(word_commit::Change{data:&data,number,shape,negative_zero:false,adopt:None});}
+        changes.push(word_commit::Change{data:&data,number:result,shape,negative_zero:result_negative_zero,adopt:None});
+        word_commit::commit(&factory,&mut changes)?;
     }
+
     Ok(wrapped)
 }
 
@@ -1086,6 +1250,7 @@ pub(super) fn singleton_integer(
     factory: &Arc<Factory>,
     bytes: &[u8],
     identity: usize,
+    decimal: bool,
 ) -> RenderResult<Value> {
     if let Some(value) = factory
         .integer_values
@@ -1097,7 +1262,7 @@ pub(super) fn singleton_integer(
         return Ok(value);
     }
     factory.reserve(384)?;
-    let mut value = integer(factory, bytes, false)?;
+    let mut value = integer_initial(factory,bytes,false,if decimal{Initial::Decimal}else{Initial::Hex})?;
     let Value::Object(object) = &mut value else {
         return Err(error("invalid integer cache value"));
     };
@@ -1149,4 +1314,12 @@ pub(super) fn public_magnitude_equal(a: &Value, b: &Value) -> RenderResult<bool>
         return Ok(false);
     }
     Ok(openssl::memcmp::eq(&a, &b))
+}
+
+pub(super) fn word_reference_factory(value:&Value)->Option<Weak<Factory>> { words::reference_factory(value) }
+
+fn minus_one_words(number:&BigInt)->RenderResult<usize> {
+    let bits=number.bits();
+    let len=usize::try_from(bits.div_ceil(64)).map_err(|_|error("big.Int Word size overflow"))?;
+    Ok(if bits>0 && bits%64==1 && number.trailing_zeros()==Some(bits-1){len-1}else{len})
 }

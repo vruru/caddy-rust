@@ -22,9 +22,9 @@ fn error(message: &str) -> TemplateError {
 
 #[cfg(feature = "std")]
 struct Group {
-    cell: ValueCell,
-    original: Arc<[Value]>,
+    original: Option<Arc<[Value]>>,
     replacement: Arc<[Value]>,
+    reuse_scalars: bool,
 }
 #[cfg(feature = "std")]
 struct Stage {
@@ -33,11 +33,12 @@ struct Stage {
     backing_len: usize,
     original: Option<Arc<[Value]>>,
     values: Vec<Value>,
+    reuse_scalars: bool,
 }
 #[cfg(feature = "std")]
 enum Prepared {
     Empty,
-    Writes { groups: Vec<Group> },
+    Writes { cells: Vec<ValueCell>, groups: Vec<Group> },
 }
 
 /// Allocation-free commit failure. Convert to TemplateError only after the
@@ -77,7 +78,8 @@ impl From<ValuesCommitError> for TemplateError {
 /// taking any lock; its conservative capacity was prepaid during preparation.
 /// This safe-Rust exception avoids manufacturing guard lifetimes. Lock, version
 /// validation, and the entire swap sequence allocate nothing and call no host
-/// callback. All old values remain retained until every guard is unlocked.
+/// callback. Graph-bearing old values remain retained until every guard is unlocked.
+/// The opt-in scalar path can retire only edge-free values under the cell lock.
 #[cfg(feature = "std")]
 pub struct PreparedValuesWrites {
     attempted: bool,
@@ -125,6 +127,23 @@ impl TypedSlice {
     /// empty write list is accepted; all nonempty lists explicitly fail.
     #[cfg(feature = "std")]
     pub fn prepare_values_writes(writes: &[ValuesWrite<'_>]) -> Result<PreparedValuesWrites> {
+        Self::prepare_values_writes_impl(writes, false)
+    }
+
+    /// Fully prepay replacement snapshots as in `prepare_values_writes`, but
+    /// permit exclusive, entirely edge-free scalar backings to retain their
+    /// actual allocation address. Exclusivity is rechecked under all cell locks
+    /// at commit, after all versions have been validated. Any external snapshot,
+    /// Weak reference, or old graph payload selects the ordinary COW path.
+    /// Hosts still validate cancellation/owners before their receiver locks and
+    /// drop the ticket after releasing those locks. Work fees are host-owned.
+    #[cfg(feature = "std")]
+    pub fn prepare_values_writes_reusing_exclusive_scalars(writes: &[ValuesWrite<'_>]) -> Result<PreparedValuesWrites> {
+        Self::prepare_values_writes_impl(writes, true)
+    }
+
+    #[cfg(feature = "std")]
+    fn prepare_values_writes_impl(writes: &[ValuesWrite<'_>], reuse_scalars: bool) -> Result<PreparedValuesWrites> {
         if writes.is_empty() {
             return Ok(PreparedValuesWrites {
                 attempted: false,
@@ -204,6 +223,7 @@ impl TypedSlice {
         };
         let unit = core::mem::size_of::<Stage>()
             .checked_add(core::mem::size_of::<Group>())
+            .and_then(|n| n.checked_add(core::mem::size_of::<ValueCell>()))
             .and_then(|n| {
                 n.checked_add(core::mem::size_of::<std::sync::MutexGuard<'_, Arc<[Value]>>>())
             })
@@ -239,6 +259,7 @@ impl TypedSlice {
                 backing_len,
                 original: None,
                 values: Vec::new(),
+                reuse_scalars,
             });
         }
         // Admit every backing before copying any. Conversion Vec -> Arc may
@@ -267,6 +288,7 @@ impl TypedSlice {
                 .map_err(|_| error("atomic Values COW allocation failed"))?;
             for chunk in original.chunks(256) {
                 writes[group.first].slice.reserve_host_bytes(0)?;
+                group.reuse_scalars = group.reuse_scalars && chunk.iter().all(values_payload_has_no_edges);
                 group.values.extend_from_slice(chunk);
             }
             group.original = Some(original);
@@ -300,23 +322,24 @@ impl TypedSlice {
                 target.clone_from_slice(input);
             }
         }
+        stages.sort_unstable_by_key(|stage| Arc::as_ptr(&stage.cell) as usize);
         let mut groups = Vec::new();
-        groups
-            .try_reserve_exact(stages.len())
+        let mut cells = Vec::new();
+        groups.try_reserve_exact(stages.len())
             .map_err(|_| error("atomic Values group allocation failed"))?;
+        cells.try_reserve_exact(stages.len())
+            .map_err(|_| error("atomic Values cell allocation failed"))?;
         for stage in stages {
+            cells.push(stage.cell);
             groups.push(Group {
-                cell: stage.cell,
-                original: stage
-                    .original
-                    .ok_or_else(|| error("missing Values version"))?,
+                original: Some(stage.original.ok_or_else(|| error("missing Values version"))?),
                 replacement: stage.values.into(),
+                reuse_scalars: stage.reuse_scalars,
             });
         }
-        groups.sort_unstable_by_key(|group| Arc::as_ptr(&group.cell) as usize);
         Ok(PreparedValuesWrites {
             attempted: false,
-            prepared: Prepared::Writes { groups },
+            prepared: Prepared::Writes { cells, groups },
         })
     }
 
@@ -328,6 +351,11 @@ impl TypedSlice {
             Err(error("atomic Values writes unavailable without std"))
         }
     }
+    #[cfg(not(feature = "std"))]
+    pub fn prepare_values_writes_reusing_exclusive_scalars(writes: &[ValuesWrite<'_>]) -> Result<PreparedValuesWrites> {
+        Self::prepare_values_writes(writes)
+    }
+
 }
 
 impl PreparedValuesWrites {
@@ -335,14 +363,15 @@ impl PreparedValuesWrites {
     /// this ticket on either result. A changed version or poisoned cell rejects
     /// all writes. The host revalidates owners/cancellation before taking its
     /// receiver locks, updates metadata only on success, releases all those
-    /// locks, and then drops this ticket. No Value destructor runs in commit.
+    /// locks, and then drops this ticket. Default COW retires no old Value in
+    /// commit. The opt-in exclusive scalar path may retire edge-free values.
     #[cfg(feature = "std")]
     pub fn try_commit(&mut self) -> core::result::Result<(), ValuesCommitError> {
         if self.attempted {
             return Err(ValuesCommitError::AlreadyAttempted);
         }
         self.attempted = true;
-        let Prepared::Writes { groups } = &self.prepared else {
+        let Prepared::Writes { cells, groups } = &mut self.prepared else {
             return Ok(());
         };
         // Safe-Rust lifetime scratch exception: reserve before acquiring locks.
@@ -350,19 +379,29 @@ impl PreparedValuesWrites {
         if guards.try_reserve_exact(groups.len()).is_err() {
             return Err(ValuesCommitError::GuardAllocation);
         }
-        for group in groups {
-            let guard = match group.cell.lock() {
+        for cell in cells.iter() {
+            let guard = match cell.lock() {
                 Ok(guard) => guard,
                 Err(_) => return Err(ValuesCommitError::Poisoned),
             };
             guards.push(guard);
         }
-        for (guard, group) in guards.iter().zip(groups) {
-            if !Arc::ptr_eq(guard, &group.original) {
+        for (guard, group) in guards.iter().zip(groups.iter()) {
+            if !group.original.as_ref().is_some_and(|original| Arc::ptr_eq(guard, original)) {
                 return Err(ValuesCommitError::VersionChanged);
             }
         }
-        for (guard, group) in guards.iter_mut().zip(groups) {
+        for (guard, group) in guards.iter_mut().zip(groups.iter_mut()) {
+            // No callback/allocation/fallible work after the first assignment.
+            // All old values in this branch were checked edge-free in prepare.
+            if group.reuse_scalars && Arc::strong_count(guard) == 2 && Arc::weak_count(guard) == 0 {
+                drop(group.original.take());
+                if let Some(values) = Arc::get_mut(&mut **guard) {
+                    values.clone_from_slice(&group.replacement);
+                    continue;
+                }
+                // Safe conservative fallback; never a partial-commit error.
+            }
             **guard = group.replacement.clone();
         }
         drop(guards);
