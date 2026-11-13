@@ -207,7 +207,7 @@ fn space_prefix(input: &[u8]) -> usize {
     }
     0
 }
-fn trim_space(mut input: &[u8]) -> &[u8] {
+pub(crate) fn trim_space(mut input: &[u8]) -> &[u8] {
     loop {
         let n = space_prefix(input);
         if n == 0 {

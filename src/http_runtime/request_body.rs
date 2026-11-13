@@ -77,6 +77,7 @@ fn h1(version: Version) -> bool {
     matches!(version, Version::HTTP_10 | Version::HTTP_11)
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct OriginalFraming {
     pub(super) chunked: bool,
     closing: bool,

@@ -160,8 +160,8 @@ A failed reservation does not reset the parent. Request validation precedes
 child-table allocation, so rejected methods do not leave unreachable reserved
 streams. The existing bounded retirement table retains its first allocation
 credit until the real connection owner retires. These are transport building
-blocks; the native route-level push handler remains a separate implementation
-and acceptance gate.
+blocks used by the native route-level push handler; full combined release
+acceptance remains required.
 
 ## Explicit outgoing SSL transport
 
@@ -194,6 +194,14 @@ owners, while DATA carries its own source ownership. A separate per-connection
 accepted-child activity guard prevents idle-close while reserved pushes are
 still generating responses; RFC concurrent-stream counters omit reserved
 states and cannot replace this guard. Last-child retirement wakes the idle
-poller outside h2 and activity-state locks. Ordinary listeners leave this
-extension disabled. Native route-level push dispatch remains separate and is
-not enabled merely by these transport APIs.
+poller outside h2 and activity-state locks. Listeners without a native push route leave this
+extension disabled. Native route-level dispatch explicitly enables it; generic
+transport consumers retain their existing default behavior.
+
+
+Native ordinary CONNECT body handling adds an opt-in Hyper client request
+extension preserving the actual authority/path target and ordinary response
+framing. Hyper HTTP/2 server and hyper-util automatic-server builders add a
+native opt-in for ordinary CONNECT request DATA; extended CONNECT and generic
+raw upgrades retain their existing default behavior. These changes carry no
+application callbacks and do not add background actors or protocol queues.

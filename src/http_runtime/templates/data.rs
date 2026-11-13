@@ -11,7 +11,8 @@ pub(crate) struct RequestData {
     url_values:OnceLock<request_url::Cache>,
     url_origin:Option<Uri>,url_origin_form:bool,
     h2_protocol:Option<Arc<str>>,
-    pub uri:Uri,pub original_uri:Uri,pub request_uri:String,pub method:Method,pub original_method:Method,
+    rewrite:Option<crate::http_runtime::rewrite_runtime::Projection>,
+    pub uri:Uri,pub original_uri:Uri,pub request_uri:Vec<u8>,pub method:Method,pub original_method:Method,
     pub form:Arc<super::forms::Form>,pub headers:HeaderMap,pub version:Version,pub host:String,pub remote:Vec<u8>,
     pub remote_ip:Vec<u8>,pub client_ip:String,pub tls:bool,pub content_length:i64,pub placeholders:BTreeMap<String,(Vec<u8>,bool)>,
 }
@@ -36,7 +37,8 @@ impl RequestData {
         let url_origin=target.is_none().then(||ctx.original_uri.clone());
         let url_origin_form=matches!(req.version(),Version::HTTP_2|Version::HTTP_3)
             &&(ctx.template_original_method()!=Method::CONNECT||ctx.original_uri.path_and_query().is_some());
-        let request_uri=if target.is_some(){String::new()}else{ctx.original_uri.path_and_query().map_or("/",|v|v.as_str()).to_owned()};
+        let rewrite=target.is_none().then(||crate::http_runtime::rewrite_runtime::projection(req).cloned()).flatten();
+        let request_uri=if let Some(rewrite)=&rewrite{rewrite.request_uri.to_vec()}else if target.is_some(){Vec::new()}else{ctx.original_uri.path_and_query().map_or("/",|v|v.as_str()).as_bytes().to_vec()};
         let form=super::forms::Form::new(req.method().as_str(),uri.query().unwrap_or_default(),req.headers().get(header::CONTENT_TYPE).and_then(|v|v.to_str().ok()).unwrap_or_default());
         // Go's net/http parser promotes the wire Host header into Request.Host
         // and removes it from Request.Header; Hyper retains that wire field.
@@ -49,7 +51,7 @@ impl RequestData {
         }else{None};
         if h2_protocol.as_ref().is_some_and(|p|p.len()>128*1024){return Err(super::super::TemplateFailure(http::StatusCode::INTERNAL_SERVER_ERROR));}
 
-        Ok(Self{tls_snapshot:req.extensions().get::<Arc<crate::http_runtime::ConnectionSnapshot>>().cloned(),tls_values:tls_values::cache(),url_values:OnceLock::new(),dynamic:crate::http_runtime::placeholder_value::Dynamic::capture(ctx),h2_protocol,url_origin,url_origin_form,uri,original_uri,request_uri,form,method:req.method().clone(),original_method:ctx.lookup("http.request.orig_method").and_then(|s|s.parse().ok()).unwrap_or(Method::GET),headers,version:req.version(),host:ctx.authority.clone(),remote:ctx.peer.raw_text().into_owned(),remote_ip:ctx.peer.raw_host().into_owned(),client_ip:ctx.client_ip.map_or_else(String::new,|ip|ip.to_string()),tls:ctx.tls,content_length:if target.is_some(){0}else{ctx.template_content_length()},placeholders})
+        Ok(Self{tls_snapshot:req.extensions().get::<Arc<crate::http_runtime::ConnectionSnapshot>>().cloned(),tls_values:tls_values::cache(),url_values:OnceLock::new(),dynamic:crate::http_runtime::placeholder_value::Dynamic::capture(ctx),h2_protocol,rewrite,url_origin,url_origin_form,uri,original_uri,request_uri,form,method:req.method().clone(),original_method:ctx.lookup("http.request.orig_method").and_then(|s|s.parse().ok()).unwrap_or(Method::GET),headers,version:req.version(),host:ctx.authority.clone(),remote:ctx.peer.raw_text().into_owned(),remote_ip:ctx.peer.raw_host().into_owned(),client_ip:ctx.client_ip.map_or_else(String::new,|ip|ip.to_string()),tls:ctx.tls,content_length:if target.is_some(){0}else{ctx.template_content_length()},placeholders})
     }
     pub(super) fn placeholder(&self,name:&str,control:&Arc<super::Control>)->RenderResult<Value> {
         if let Some(value)=crate::http_config::helpers::global_lookup(name){control.reserve_host_bytes(value.len()+64)?;return Ok(string(value));}
@@ -112,11 +114,11 @@ impl RequestData {
         let request_uri=&self.request_uri;
         let (major,minor,proto)=if original{(0,0,"")}else{match self.version{Version::HTTP_10=>(1,0,"HTTP/1.0"),Version::HTTP_2=>(2,0,"HTTP/2.0"),Version::HTTP_3=>(3,0,"HTTP/3.0"),_=>(1,1,"HTTP/1.1")}};
         let mut fields=Fields::from([
-            ("Method".into(),string(method.as_str())),("URL".into(),request_url::cached(uri,self.url_origin.as_ref(),self.url_origin_form,control,url_cache,original)?),
+            ("Method".into(),string(method.as_str())),("URL".into(),request_url::cached(uri,self.url_origin.as_ref(),self.url_origin_form,control,url_cache,original,if original{None}else{self.rewrite.as_ref()})?),
             ("Header".into(),header_with_protocol(Arc::new(Mutex::new(headers.clone())),false,if original{None}else{self.h2_protocol.clone()})),
             ("Trailer".into(),header_value(Arc::new(Mutex::new(HeaderMap::new())),false)),
             ("Host".into(),string(if original{""}else{&self.host})),("RemoteAddr".into(),Value::from_go_bytes(self.remote.clone())),
-            ("RequestURI".into(),string(request_uri.as_str())),("Proto".into(),string(proto)),
+            ("RequestURI".into(),Value::from_go_bytes(request_uri.as_slice())),("Proto".into(),string(proto)),
             ("ProtoMajor".into(),Value::Int(major)),("ProtoMinor".into(),Value::Int(minor)),
             ("ContentLength".into(),Value::Int64(if original{0}else{self.content_length})),
             ("Close".into(),Value::Bool(!original&&matches!(self.version,Version::HTTP_10|Version::HTTP_11)&&(crate::http_runtime::proxy::header_has_token(&headers,header::CONNECTION,"close")||(self.version==Version::HTTP_10&&!crate::http_runtime::proxy::header_has_token(&headers,header::CONNECTION,"keep-alive"))))),

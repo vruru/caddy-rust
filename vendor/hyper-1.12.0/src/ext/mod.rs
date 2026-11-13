@@ -317,3 +317,14 @@ impl OriginalHeaderOrder {
 /// Shared concrete metadata budget for opt-in server Push.
 #[cfg(all(feature="server",feature="http2"))]
 pub use native_write_policy::Pool as ServerPushPool;
+
+/// Native proxy opt-in for ordinary CONNECT handler responses, as distinct
+/// from a raw tunnel. Generic clients retain their default upgrade behavior.
+/// The target is the actual authority- or path-form request target; it does
+/// not change the connection destination selected by the client connector.
+#[cfg(feature="client")]
+#[derive(Clone,Debug)]
+pub struct NativeConnectBody{
+    /// Validated request-target serialized on the HTTP/1 wire.
+    pub target:http::Uri,
+}

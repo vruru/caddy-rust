@@ -28,6 +28,7 @@ mod filter_query;
 mod filter_regexp;
 #[path = "logging/filter_simple.rs"]
 mod filter_simple;
+pub(crate) use filter_simple::trim_space as trim_go_space_bytes;
 #[path = "logging/float.rs"]
 mod float;
 #[path = "logging/json_encoder.rs"]

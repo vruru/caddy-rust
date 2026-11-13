@@ -433,7 +433,14 @@ impl RequestHost<'_> {
         EvalError::fatal("request matcher failed")
     }
     async fn placeholder(&mut self, name: &str) -> R {
+        if let Some(value)=self.ctx.raw_regex_captures.get(name){let len=value.len();self.tick(1,len.saturating_add(64))?;return Ok(super::cel_native_string::value(bytes::Bytes::from(self.ctx.lookup_bytes(name).unwrap_or_default())))}
         if !self.ctx.values.contains_key(name) {
+            if matches!(name,"http.request.uri"|"http.request.uri.path"|"http.request.uri.query"|"http.request.orig_uri"|"http.request.orig_uri.path"|"http.request.orig_uri.query"){
+                let original=name.starts_with("http.request.orig_uri");let uri=if original{&self.ctx.original_uri}else{self.ctx.replacer_uri()};
+                let len=if name.ends_with(".query"){if original{uri.query().map_or(0,str::len)}else{self.ctx.replacer_query().len()}}else if name.ends_with(".path"){uri.path_and_query().map_or(0,|p|p.raw_path().len())}else{uri.path_and_query().map_or(1,|p|p.as_str().len())};
+                self.tick((len as u64).saturating_mul(4).saturating_add(1),len.saturating_mul(4).saturating_add(512))?;
+                return Ok(super::cel_native_string::value(bytes::Bytes::from(self.ctx.lookup_bytes(name).unwrap_or_default())))
+            }
             if let Some(field)=name.strip_prefix("http.request.header.") {
                 if field.eq_ignore_ascii_case("host"){return Ok(eval::string(""))}
                 let mut count=0usize;let mut length=0usize;
@@ -444,9 +451,9 @@ impl RequestHost<'_> {
                 return Ok(super::cel_native_string::value(bytes::Bytes::from(out)))
             }
             if let Some(key)=name.strip_prefix("http.request.uri.query.") {
-                let len=self.ctx.req().uri().query().map_or(0,str::len);
+                let len=self.ctx.replacer_query().len();
                 self.tick((len as u64).saturating_mul(6).saturating_add(1),len.saturating_mul(4).saturating_add(512))?;
-                return Ok(super::cel_native_string::value(super::cel_native_string::query_value(self.ctx.req().uri().query().unwrap_or_default().as_bytes(),key.as_bytes())))
+                return Ok(super::cel_native_string::value(super::cel_native_string::query_value(self.ctx.replacer_query(),key.as_bytes())))
             }
         }
         if matches!(name, "http.request.body" | "http.request.body_base64") {

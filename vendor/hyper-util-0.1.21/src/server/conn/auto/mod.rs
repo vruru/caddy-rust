@@ -1180,6 +1180,13 @@ impl<E> Http2Builder<'_, E> {
         self
     }
 
+    /// Preserve ordinary CONNECT request DATA as an HTTP body. Extended CONNECT
+    /// and the default generic upgrade behavior remain unchanged.
+    pub fn native_plain_connect_body(&mut self,enabled:bool)->&mut Self{
+        self.inner.http2.native_plain_connect_body(enabled);self
+    }
+
+
     /// Sets the max size of received header frames.
     ///
     /// Default is currently ~16MB, but may change.

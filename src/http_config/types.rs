@@ -1,3 +1,6 @@
+#[path="rewrite_types.rs"]
+mod rewrite_types;
+pub(crate) use rewrite_types::*;
 #[derive(Clone)]
 pub(crate) struct Route {
     pub(crate) metrics: bool,
@@ -80,6 +83,7 @@ pub(crate) struct HeaderOps {
 
 #[derive(Clone)]
 pub(crate) enum Handler {
+    Push(std::sync::Arc<PushConfig>),
     Tracing(std::sync::Arc<crate::metrics::distributed_trace::config::Config>),
     Timeouts(super::route_timeouts::RouteTimeouts),
     Metrics { disable_openmetrics: bool },
@@ -106,12 +110,7 @@ pub(crate) enum Handler {
         errors: Vec<Route>,
         errors_configured: bool,
     },
-    Rewrite {
-        uri: Option<String>,
-        method: Option<String>,
-        strip_path_prefix: Option<String>,
-        strip_path_suffix: Option<String>,
-    },
+    Rewrite(std::sync::Arc<RewritePlan>),
     Vars(Vec<(String, std::sync::Arc<serde_json::Value>)>),
     Map {
         source: String,
@@ -170,6 +169,7 @@ pub(crate) struct Account {
 
 #[derive(Clone)]
 pub(crate) struct ProxyConfig {
+    pub(crate) rewrite: Option<std::sync::Arc<RewritePlan>>,
     pub(crate) ext: std::sync::Arc<super::proxy_ext::ProxyExt>,
     pub(crate) upstreams: Vec<crate::http_runtime::proxy_policy::Upstream>,
     pub(crate) selection: crate::http_runtime::proxy_policy::Selection,
@@ -222,3 +222,8 @@ pub(crate) struct FastCgiConfig {
     pub(crate) explicit_request_buffer: bool,
     pub(crate) capture_stderr: bool,
 }
+
+#[derive(Clone)]
+pub(crate) struct PushConfig{pub(crate) resources:Vec<PushResource>,pub(crate) headers:HeaderOps}
+#[derive(Clone)]
+pub(crate) struct PushResource{pub(crate) method:String,pub(crate) target:String}

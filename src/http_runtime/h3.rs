@@ -933,6 +933,9 @@ async fn serve_connection(
                             std::future::pending::<()>().await;
                         }
                     };
+                    if !crate::go_url_compat::valid_path_escapes(request.uri().path().as_bytes()){
+                        let mut rejected=wire;rejected.stop_stream(::h3::error::Code::H3_MESSAGE_ERROR);return;
+                    }
                     let head=request.method()==Method::HEAD;
                     let Ok(metadata)=trailer_policy::prepare_request(&mut request) else{return;};
                     request.extensions_mut().insert(metadata);

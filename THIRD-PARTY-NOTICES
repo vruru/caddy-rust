@@ -4,6 +4,11 @@ Third-party source notices
 Go standard library behavioral ports
 ------------------------------------
 
+src/go_path_glob.rs follows Go 1.27.3 path/match.go
+(Copyright 2010 The Go Authors). It is shared by request routing, Caddyfile
+imports and template filename selection. src/go_case.rs retains the Go 1.27.3
+Unicode 17 tables previously located under templates/sprig/go_case.rs.
+
 src/http_runtime/mime.rs follows Go mime/type.go (Copyright 2010 The Go Authors).
 src/http_runtime/file_preconditions.rs follows Go 1.27.3 net/http/fs.go
 (Copyright 2009 The Go Authors).

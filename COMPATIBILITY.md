@@ -117,7 +117,8 @@ accepting their module name. Go plugins have no cross-language binary ABI;
 their configuration and behavior require native implementations.
 
 Known development gaps still include remaining listener/address combinations,
-the ACME server handler, HTTP/2 push and remaining template receiver methods,
+the ACME server handler, remaining header-operation/push combinations and
+remaining template receiver methods,
 TLS 1.2 CBC suites, full Go PKIX edge semantics and remaining issuer/trust-loader
 capabilities. This list is not a claim that all other field combinations are
 fully verified. The 135-module baseline is an inventory, not a support registry.
@@ -1024,3 +1025,71 @@ No incoming TLS snapshot or default server/HTTP3 provider is replaced. TLS1.2
 CBC policy and automated managed client identities remain separate unfinished
 work. The generic configuration still rejects invalid renegotiation levels
 before publication, and a failed HTTPS CA preparation retains the old site.
+
+
+### URI rewrite modifiers and upstream request views
+
+The rewrite handler and `reverse_proxy.rewrite` execute method/URI setters,
+prefix/suffix removal, ordered substring and Go-regexp path replacements and
+query rename/set/add/replace/delete operations. Query operations use the pinned
+reference order, including repeated values and old-query placeholder snapshots.
+URI components retain literal scheme-looking paths and decode/re-encode path
+escapes once. Fragment and alternate RawPath facts remain available to native
+URL projections; fragments are not transmitted upstream.
+
+Upstream rewriting uses an independent attempt request. Its direct matcher and
+transport see the changed method/URI; its replacer continues to see inbound
+facts. Exclusively borrowed values/providers move into that view and return on
+normal completion or cancellation, avoiding a full metadata-table clone.
+Retries reuse the prepared rewrite while recalculating per-attempt headers.
+A rewritten GET/HEAD may omit its outgoing body without consuming the inbound
+body needed by later handlers. Extended WebSocket upload owners remain separate
+from the HTTP handshake body, including when its method is explicitly GET.
+
+A shared 128 MiB rewrite allocation pool spans generations. It covers live
+component projections, admitted arguments, bounded-worker workspace and attempt
+metadata through their actual last owner. Individual component/expanded-argument
+and encoded-URI limits are 4 MiB, arrays admit at most 65,536 operations, and
+regexp/query work has an independent 150 ms bound (query value scanning also
+has a 64 MiB work allowance). These are resource admission bounds, not CPU
+thread counts or a whole-process RSS cap. Expensive transforms run on the
+existing bounded regexp CPU lane. Exhaustion fails the affected rewrite before
+unfunded growth; other requests and the committed configuration remain active.
+
+Documented repairs/extensions include no-op empty path-regexp rules, preserving
+unknown-length GET/CONNECT uploads when forwarding to HTTP/1, correct zero
+outgoing FastCGI body length, and removing a HEAD representation length from a
+response sent to an original non-HEAD client. Native ordinary CONNECT forwarding
+retains the handler response body and authority/path request target; generic
+Hyper tunnel upgrades remain the default unless its native opt-in is selected.
+Raw Go-string query facts are retained internally; octets illegal in an HTTP URI
+are percent-encoded only in mechanical transport storage. General raw-byte path
+matching and additional nonstandard CONNECT wire forms remain separate bounds.
+
+
+Byte-preserving request routing and push
+---------------------------------------
+
+HTTP path matching uses the pinned Go simple Unicode lower table and byte/rune
+path.Match rules, including escaped slash patterns, invalid UTF-8 rune errors,
+character classes and stars which can advance into a multibyte rune. Filename
+selection and Caddyfile import matching reuse the same primitive. The adapter's
+existing one-wildcard import safety restriction is retained; this does not claim
+support for arbitrary filesystem encodings or all Windows path rules.
+
+Path-regexp matching cleans decoded path bytes on the existing bounded CPU lane.
+The regexp search interprets each invalid UTF-8 byte as one RuneError while
+capture offsets map back to exact original bytes. Named, numeric, unmatched and
+zero-width captures preserve reference behavior. Raw captures reach byte-aware
+response, header, template and CEL consumers without lossy text conversion.
+Capture input, temporary normalization/search workspace and retained results are
+admitted separately; the retained credits move with exclusive upstream views
+and retire with the actual request owner. A per-request cumulative capture cap
+and the shared rewrite workspace bound return overload rather than an unbounded
+allocation. These bounds do not establish a whole-process memory ceiling.
+
+Native explicit/Link push and its bounded protocol ownership are documented in
+`docs/PUSH.md`. Combined acceptance includes actual parent completion/reset,
+interim heads, target/header behavior, backpressure and old/new generation
+separation through reload. Shared HeaderOps replacement and the other release
+gates remain tracked work; accepting a handler name is not full compatibility.

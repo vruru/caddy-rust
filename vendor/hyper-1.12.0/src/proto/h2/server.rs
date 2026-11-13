@@ -47,6 +47,7 @@ pub(crate) struct Config {
     pub(crate) initial_stream_window_size: u32,
     pub(crate) max_frame_size: u32,
     pub(crate) enable_connect_protocol: bool,
+    pub(crate) native_plain_connect_body: bool,
     pub(crate) max_concurrent_streams: Option<u32>,
     pub(crate) max_pending_accept_reset_streams: Option<usize>,
     pub(crate) max_local_error_reset_streams: Option<usize>,
@@ -69,6 +70,7 @@ impl Default for Config {
             initial_stream_window_size: DEFAULT_STREAM_WINDOW,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             enable_connect_protocol: false,
+            native_plain_connect_body: false,
             max_concurrent_streams: Some(200),
             max_pending_accept_reset_streams: None,
             max_local_error_reset_streams: Some(DEFAULT_MAX_LOCAL_ERROR_RESET_STREAMS),
@@ -99,6 +101,7 @@ pin_project! {
         informational: Option<crate::ext::InformationalLimits>,
         push:Option<crate::ext::PushLimits>,
         push_activity:Option<std::sync::Arc<crate::ext::PushActivity>>,
+        native_plain_connect_body:bool,
         close_pending: bool,
         idle_timeout: Option<Duration>,
     }
@@ -132,6 +135,7 @@ where
     informational: Option<crate::ext::InformationalLimits>,
     push:Option<crate::ext::PushLimits>,
         push_activity:Option<std::sync::Arc<crate::ext::PushActivity>>,
+    native_plain_connect_body:bool,
 }
 
 impl<T, S, B, E> Server<T, S, B, E>
@@ -199,6 +203,7 @@ where
             informational: config.informational,
             push:if push_activity.is_some(){config.push.clone()}else{None},
             push_activity,
+            native_plain_connect_body:config.native_plain_connect_body,
             close_pending: false,
             idle_timeout: config.idle_timeout,
         }
@@ -253,6 +258,7 @@ where
                         informational: me.informational,
                         push:me.push.clone(),
                         push_activity:me.push_activity.clone(),
+                        native_plain_connect_body:me.native_plain_connect_body,
                     })
                 }
                 State::Serving(srv) => {
@@ -337,7 +343,8 @@ where
                         // Record the headers received
                         ping.record_non_data();
 
-                        let is_connect = req.method() == Method::CONNECT;
+                        let is_connect = req.method() == Method::CONNECT
+                            && !(self.native_plain_connect_body && req.extensions().get::<h2::ext::Protocol>().is_none());
                         let (mut parts, stream) = req.into_parts();
                         let (mut req, connect_parts, continue_demand) = if !is_connect {
                             let expects_continue = self.informational.is_some()

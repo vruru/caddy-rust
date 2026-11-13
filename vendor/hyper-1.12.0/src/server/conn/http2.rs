@@ -297,6 +297,12 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Treat ordinary CONNECT requests as HTTP bodies rather than raw upgrade
+    /// requests. Extended CONNECT retains its upgrade path. Disabled by default.
+    pub fn native_plain_connect_body(&mut self,enabled:bool)->&mut Self{
+        self.h2_builder.native_plain_connect_body=enabled;self
+    }
+
     /// Enable per-stream informational responses with aggregate frame-count
     /// and header-byte limits. A zero limit disables them.
     pub fn informational_responses(

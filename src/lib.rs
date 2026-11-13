@@ -37,6 +37,8 @@ pub(crate) mod module_json;
 pub mod root_backend;
 
 mod go_regexp;
+mod go_case;
+mod go_path_glob;
 #[path = "http_runtime/http_redirect/url.rs"]
 pub(crate) mod go_url_compat;
 pub mod logging;

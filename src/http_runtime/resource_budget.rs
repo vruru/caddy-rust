@@ -190,6 +190,7 @@ impl BlockingBudget {
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ResourceDiagnostics {
+    pub rewrite_uri_bytes:usize,
     pub tls_event_metadata_bytes:usize,
     pub client_certificate_metadata_bytes: usize,
     pub proxy_health_events_coalesced: u64,
@@ -219,6 +220,7 @@ pub struct ResourceDiagnostics {
 }
 
 pub(crate) struct Resources {
+    pub(super) rewrite_bytes: native_write_policy::Pool,
     pub(super) transfer_deadlines: native_write_policy::Pool,
     pub(crate) ssl_verify:Arc<native_ssl_tls::VerificationScope>,
     pub(super) proxy_health_events_coalesced: Arc<AtomicU64>,
@@ -409,6 +411,7 @@ impl Resources {
                 fastcgi_dns.clone(),
                 None,
             )?,
+            rewrite_bytes: native_write_policy::Pool::new(128<<20),
             request_regexp,
             directory_listing,
             directory_listing_bytes: Arc::new(Semaphore::new(
@@ -475,6 +478,7 @@ impl Resources {
             self.access_capture.stats();
         let (cel_dynamic_entries, cel_dynamic_bytes) = self.cel_dynamic.snapshot();
         ResourceDiagnostics {
+            rewrite_uri_bytes:self.rewrite_bytes.used(),
             proxy_health_events_coalesced: self.proxy_health_events_coalesced.load(Ordering::Relaxed),
             cel_body_capture_bytes: (super::cel_body::POOL_UNITS - self.cel_body_bytes.available_permits()) * super::cel_body::UNIT,
             client_certificate_metadata_bytes: (super::client_cert_facts::POOL_UNITS-self.client_cert_bytes.available_permits())*1024,

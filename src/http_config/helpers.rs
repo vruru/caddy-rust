@@ -90,7 +90,7 @@ pub(crate) fn replace_accounted(
 pub(crate) fn replace_bytes(input:&str,unknown_empty:bool,lookup:impl Fn(&str)->Option<Vec<u8>>)->Result<Vec<u8>>{
     replace_bytes_accounted(input,unknown_empty,lookup,|_|Ok(()))
 }
-fn replace_bytes_accounted(input:&str,unknown_empty:bool,lookup:impl Fn(&str)->Option<Vec<u8>>,mut charge:impl FnMut(usize)->Result<()>)->Result<Vec<u8>>{
+pub(crate) fn replace_bytes_accounted(input:&str,unknown_empty:bool,lookup:impl Fn(&str)->Option<Vec<u8>>,mut charge:impl FnMut(usize)->Result<()>)->Result<Vec<u8>>{
     ensure!(
         input.len() <= 1024 * 1024,
         "replacement input exceeds limit"

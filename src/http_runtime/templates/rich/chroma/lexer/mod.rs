@@ -18,7 +18,7 @@ use std::{
 pub struct Registry {
     pub db: Database,
     pub max_caps: usize,
-    globs: Vec<(Vec<regex::Regex>, Vec<regex::Regex>)>,
+    globs: Vec<(Vec<registry::path_glob::CompiledGoGlob>, Vec<registry::path_glob::CompiledGoGlob>)>,
     raku_substitution_emitter: Arc<serde_json::Value>,
 }
 impl Registry {

@@ -1,6 +1,5 @@
 use super::*;
-#[path = "go_case.rs"]
-mod go_case;
+use crate::go_case;
 #[path="byte_ops.rs"]mod byte_ops;
 #[path="go_xstrings.rs"]mod go_xstrings;
 pub(super) fn add(m: &mut M) {

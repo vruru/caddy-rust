@@ -1263,7 +1263,11 @@ impl Http1Transaction for Client {
             msg.body
         );
 
-        *msg.req_method = Some(msg.head.subject.0.clone());
+        // The response decoder only needs body semantics here. The actual
+        // request method below is still CONNECT. A native ordinary response
+        // follows normal length/EOF framing instead of fulfilling OnUpgrade.
+        let ordinary_connect=msg.head.subject.0==Method::CONNECT && msg.head.extensions.get::<crate::ext::NativeConnectBody>().is_some();
+        *msg.req_method = Some(if ordinary_connect{Method::GET}else{msg.head.subject.0.clone()});
 
         let body = Client::set_length(msg.head, msg.body);
 
@@ -1273,7 +1277,8 @@ impl Http1Transaction for Client {
         extend(dst, msg.head.subject.0.as_str().as_bytes());
         extend(dst, b" ");
         //TODO: add API to http::Uri to encode without std::fmt
-        let _ = write!(FastWrite(dst), "{} ", msg.head.subject.1);
+        let target=if ordinary_connect{&msg.head.extensions.get::<crate::ext::NativeConnectBody>().expect("native CONNECT marker checked").target}else{&msg.head.subject.1};
+        let _ = write!(FastWrite(dst), "{} ", target);
 
         match msg.head.version {
             Version::HTTP_10 => extend(dst, b"HTTP/1.0"),

@@ -3,6 +3,10 @@
 //! active generation. This module never starts a Go process.
 #[path = "http_runtime/connection_budget.rs"]
 mod connection_budget;
+#[path="http_runtime/push.rs"]
+mod push;
+#[path="http_runtime/path_match.rs"]
+pub(crate) mod path_match;
 #[path = "http_runtime/descriptor_budget.rs"]
 mod descriptor_budget;
 #[path = "http_runtime/pressure.rs"]
@@ -153,6 +157,8 @@ mod http_dial;
 mod http_dial_io;
 #[path = "http_runtime/rewrite_uri.rs"]
 mod rewrite_uri;
+mod rewrite_ops;
+mod rewrite_runtime;
 #[path = "http_runtime/sniff.rs"]
 mod sniff;
 #[path = "http_runtime/timeout_io.rs"]
@@ -1233,6 +1239,7 @@ async fn serve_connection<I>(
     let svc_server = server.clone();
     let requested_drain = CancellationToken::new();
     let service_drain = requested_drain.clone();
+    let push_pool=inner.resources.transfer_deadlines.clone();
     let service = service_fn(move |mut request: Request<Incoming>| {
         let service_entered = admission.upgrade().is_some_and(|owner| owner.enter_service());
         let inner = svc_inner.clone();
@@ -1347,6 +1354,10 @@ async fn serve_connection<I>(
                 || current.plan.request_head_limit() != accepted_server.plan.request_head_limit()
                 || current.plan.idle_timeout != accepted_server.plan.idle_timeout;
             let request_h2 = request.version() == http::Version::HTTP_2;
+            if !crate::go_url_compat::valid_path_escapes(request.uri().path().as_bytes()){
+                if request_h2{return Err(h2::Error::from(h2::Reason::PROTOCOL_ERROR))}
+                let mut response=simple(StatusCode::BAD_REQUEST,"Bad Request\n");response.headers_mut().insert(http::header::CONNECTION,http::HeaderValue::from_static("close"));return Ok(response);
+            }
             let metadata = match trailer_policy::prepare_request(&mut request) {
                 Ok(metadata) => metadata,
                 Err(()) => {
@@ -1430,7 +1441,8 @@ async fn serve_connection<I>(
     }
     // The original HTTP/2 sender queues informational headers separately
     // from DATA flow control. Limit their aggregate per request/stream.
-    builder.http2().enable_connect_protocol().timer(TokioTimer::new()).idle_timeout(server.plan.idle_timeout).informational_responses(
+    if push::configured(&server.plan){builder.http2().server_push(8,32,push_pool);}
+    builder.http2().enable_connect_protocol().native_plain_connect_body(true).timer(TokioTimer::new()).idle_timeout(server.plan.idle_timeout).informational_responses(
         request::MAX_INFORMATIONAL_HEADS,
         request::MAX_INFORMATIONAL_BYTES,
     );

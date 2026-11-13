@@ -740,7 +740,7 @@ where
                         }
                     }
 
-                    let is_connect = req.method() == Method::CONNECT;
+                    let is_connect = req.method() == Method::CONNECT && req.extensions().get::<crate::ext::NativeConnectBody>().is_none();
                     let eos = body.is_end_stream();
 
                     if is_connect

@@ -32,9 +32,9 @@ impl View{
   "Scheme"=>Value::from_go_bytes(facts.scheme.as_slice()),"Opaque"=>Value::from_go_bytes(facts.opaque.as_slice()),"User"=>user_value(facts.user.as_ref(),&self.owner)?,"Host"=>Value::from_go_bytes(facts.host.as_slice()),"Path"=>Value::from_go_bytes(facts.path.as_slice()),"Fragment"=>Value::from_go_bytes(facts.fragment.as_slice()),"RawQuery"=>Value::from_go_bytes(facts.query.as_slice()),"RawPath"=>Value::from_go_bytes(facts.raw_path.as_slice()),"RawFragment"=>Value::from_go_bytes(facts.raw_fragment.as_slice()),"ForceQuery"=>Value::Bool(facts.force_query),"OmitHost"=>Value::Bool(facts.omit_host),_=>return Ok(None)}))}
 }
 fn encoded_valid(bytes:&[u8],fragment:bool)->bool{bytes.iter().all(|b|b.is_ascii_alphanumeric()||b"-_.~$&+,/:;=@!\'()*[]%".contains(b)||(fragment&&*b==b'?'))}
-fn escaped_path(facts:&Facts)->Vec<u8>{if !facts.raw_path.is_empty()&&encoded_valid(&facts.raw_path,false){facts.raw_path.clone()}else if facts.path==b"*"{b"*".to_vec()}else{escape_path(&facts.path)}}
+fn escaped_path(facts:&Facts)->Vec<u8>{if !facts.raw_path.is_empty()&&encoded_valid(&facts.raw_path,false)&&decode(&facts.raw_path).is_ok_and(|path|path==facts.path){facts.raw_path.clone()}else if facts.path==b"*"{b"*".to_vec()}else{escape_path(&facts.path)}}
 fn escape_fragment(bytes:&[u8])->Vec<u8>{let mut result=Vec::new();for b in bytes{if b.is_ascii_alphanumeric()||b"-_.~$&+,/:;=?@!()*".contains(b){result.push(*b);}else{result.push(b'%');result.push(b"0123456789ABCDEF"[usize::from(b>>4)]);result.push(b"0123456789ABCDEF"[usize::from(b&15)]);}}result}
-fn escaped_fragment(facts:&Facts)->Vec<u8>{if !facts.raw_fragment.is_empty()&&encoded_valid(&facts.raw_fragment,true){facts.raw_fragment.clone()}else{escape_fragment(&facts.fragment)}}
+fn escaped_fragment(facts:&Facts)->Vec<u8>{if !facts.raw_fragment.is_empty()&&encoded_valid(&facts.raw_fragment,true)&&decode(&facts.raw_fragment).is_ok_and(|fragment|fragment==facts.fragment){facts.raw_fragment.clone()}else{escape_fragment(&facts.fragment)}}
 fn user_text(user:&User,redacted:bool)->Vec<u8>{let mut bytes=escape_user(&user.username);if let Some(password)=&user.password{bytes.push(b':');if redacted{bytes.extend_from_slice(b"xxxxx");}else{bytes.extend_from_slice(&escape_user(password));}}bytes}
 fn string(facts:&Facts,redacted:bool)->Vec<u8>{
  let mut bytes=Vec::new();if !facts.scheme.is_empty(){bytes.extend_from_slice(&facts.scheme);bytes.push(b':');}
@@ -47,7 +47,7 @@ fn string(facts:&Facts,redacted:bool)->Vec<u8>{
 }
 fn request_uri(facts:&Facts)->Vec<u8>{let mut bytes=if !facts.opaque.is_empty(){let mut value=Vec::new();if facts.opaque.starts_with(b"//"){value.extend_from_slice(&facts.scheme);value.push(b':');}value.extend_from_slice(&facts.opaque);value}else{let mut value=escaped_path(facts);if value.is_empty(){value.push(b'/');}value};if facts.force_query||!facts.query.is_empty(){bytes.push(b'?');bytes.extend_from_slice(&facts.query);}bytes}
 fn host_port(host:&[u8])->(&[u8],&[u8]){let(host,port)=host.iter().rposition(|b|*b==b':').filter(|i|host[i+1..].iter().all(u8::is_ascii_digit)).map_or((host,b"".as_slice()),|i|(&host[..i],&host[i+1..]));(if host.starts_with(b"[")&&host.ends_with(b"]"){&host[1..host.len()-1]}else{host},port)}
-fn from_uri(uri:&http::Uri,origin:Option<&http::Uri>,origin_form:bool,control:&Arc<Control>)->RenderResult<Facts>{
+fn from_uri(uri:&http::Uri,origin:Option<&http::Uri>,origin_form:bool,control:&Arc<Control>,rewrite:Option<&crate::http_runtime::rewrite_runtime::Projection>)->RenderResult<Facts>{
  let origin=origin.unwrap_or(uri);
  let scheme=if origin_form{""}else{origin.scheme_str().unwrap_or("")};
  let authority=if origin_form{""}else{origin.authority().map_or("",|a|a.as_str())};
@@ -55,7 +55,7 @@ fn from_uri(uri:&http::Uri,origin:Option<&http::Uri>,origin_form:bool,control:&A
  prepay(control,sum(&[scheme.len(),authority.len(),path.len(),query.len(),32])?,32,16384)?;
  let mut facts=Facts::empty();facts.scheme=scheme.as_bytes().iter().map(u8::to_ascii_lowercase).collect();core::authority(&mut facts,authority.as_bytes())?;
  if path=="*"&&scheme.is_empty()&&authority.is_empty()&&uri.query().is_none(){facts.path=b"*".to_vec();}else{core::set_path(&mut facts,path.as_bytes())?;}
- facts.query=query.as_bytes().to_vec();facts.force_query=uri.query()==Some("");Ok(facts)
+ facts.query=query.as_bytes().to_vec();facts.force_query=uri.query()==Some("");if let Some(rewrite)=rewrite{let state=&rewrite.state;prepay(control,state.bytes(),8,1024)?;facts.path=state.path.clone();facts.raw_path=state.raw_path.clone();facts.query=state.query.clone();facts.fragment=state.fragment.clone();facts.force_query=state.force_query;}Ok(facts)
 }
 fn view(control:&Arc<Control>,facts:Facts)->Arc<View>{Arc::new(View{state:Mutex::new(State{epoch:0,facts:Arc::new(facts)}),owner:Arc::downgrade(control)})}
 fn data(object:&Object)->RenderResult<&View>{object.data.as_ref().and_then(|v|v.downcast_ref::<View>()).ok_or_else(||error("invalid URL receiver"))}
@@ -89,10 +89,10 @@ fn make_object(view:Arc<View>,control:&Arc<Control>)->RenderResult<Value>{
  let method_signatures=BTreeMap::from([("Parse".into(),gotmpl::Signature::new(vec![gotmpl::ArgKind::String],None)),("JoinPath".into(),gotmpl::Signature::new(Vec::new(),Some(gotmpl::ArgKind::String))),("AppendBinary".into(),gotmpl::Signature::from_static(&[gotmpl::ArgKind::ByteSlice],None)),("UnmarshalBinary".into(),gotmpl::Signature::from_static(&[gotmpl::ArgKind::ByteSlice],None)),("ResolveReference".into(),gotmpl::Signature::from_static(&[gotmpl::ArgKind::GoPointer("*url.URL")],None))]);
  Ok(Value::Object(Arc::new(Object{fields,dynamic_fields:Some(Arc::new(move|name|{let Some(name)=FIELDS.into_iter().find(|field|*field==name)else{return Ok(None);};let control=live(&read.owner)?;control.reserve_host_bytes(std::mem::size_of::<gotmpl::FieldReference>()+64)?;let kind=match name{"ForceQuery"|"OmitHost"=>gotmpl::FieldKind::Bool,"User"=>gotmpl::FieldKind::Pointer("*url.Userinfo"),_=>gotmpl::FieldKind::String};Ok(Some(Value::Field(Arc::new(gotmpl::FieldReference::new(read.clone(),name,kind)))))})),methods,method_signatures,dynamic_stringer:Some(dynamic_stringer),go_type:Some("*url.URL"),pointer_identity:Some(Arc::as_ptr(&view)as usize),data_bytes:std::mem::size_of::<View>(),data:Some(view),field_order:Some(FIELDS.map(Arc::from).into()),..Object::default()})))
 }
-pub(super)fn value(uri:&http::Uri,control:&Arc<Control>)->RenderResult<Value>{make_object(view(control,from_uri(uri,None,false,control)?),control)}
-pub(super)fn cached(uri:&http::Uri,origin:Option<&http::Uri>,origin_form:bool,control:&Arc<Control>,cache:&Cache,original:bool)->RenderResult<Value>{
+pub(super)fn value(uri:&http::Uri,control:&Arc<Control>)->RenderResult<Value>{make_object(view(control,from_uri(uri,None,false,control,None)?),control)}
+pub(super)fn cached(uri:&http::Uri,origin:Option<&http::Uri>,origin_form:bool,control:&Arc<Control>,cache:&Cache,original:bool,rewrite:Option<&crate::http_runtime::rewrite_runtime::Projection>)->RenderResult<Value>{
  let owner=Arc::downgrade(control);let index=usize::from(original);let existing={let slot=cache.slots[index].lock().map_err(|_|error("request URL cache poisoned"))?;slot.as_ref().filter(|v|v.owner.ptr_eq(&owner)).cloned()};if let Some(view)=existing{return make_object(view,control);}
- let prepared=view(control,from_uri(uri,origin,origin_form,control)?);let(result,retired)={let mut slot=cache.slots[index].lock().map_err(|_|error("request URL cache poisoned"))?;if let Some(existing)=slot.as_ref().filter(|v|v.owner.ptr_eq(&owner)){(existing.clone(),None)}else{let retired=slot.replace(prepared.clone());(prepared.clone(),retired)}};drop(retired);drop(prepared);make_object(result,control)
+ let prepared=view(control,from_uri(uri,origin,origin_form,control,rewrite)?);let(result,retired)={let mut slot=cache.slots[index].lock().map_err(|_|error("request URL cache poisoned"))?;if let Some(existing)=slot.as_ref().filter(|v|v.owner.ptr_eq(&owner)){(existing.clone(),None)}else{let retired=slot.replace(prepared.clone());(prepared.clone(),retired)}};drop(retired);drop(prepared);make_object(result,control)
 }
 
 fn user_value(user: Option<&Arc<User>>, weak: &Weak<Control>) -> RenderResult<Value> {

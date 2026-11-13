@@ -441,12 +441,13 @@ pub(super) async fn serve(
     config: &ProxyConfig,
     server: &Arc<ActiveServer>,
 ) -> Result<PreparedResponse> {
+    let rewrite=if let Some(plan)=&config.rewrite{Some(super::rewrite_runtime::upstream(plan,ctx).await?)}else{None};
     let previous = ctx
         .req()
         .extensions()
         .get::<super::proxy_replay::ReplaySource>()
         .cloned();
-    let mut source = if ctx.fastcgi_body_claimed {
+    let mut source = if rewrite.as_ref().is_some_and(|r|r.omit_body)&&!websocket::is_extended(ctx.req()){super::proxy_replay::ReplaySource::empty()}else if ctx.fastcgi_body_claimed {
         let source =
             previous.ok_or_else(|| anyhow::anyhow!("request body ownership unavailable"))?;
         ensure!(source.replayable(), "proxy request body already consumed");
@@ -479,7 +480,7 @@ pub(super) async fn serve(
         && let Some(transport) = &config.fastcgi
     {
         let body = source.take_unconsumed()?;
-        source = super::fastcgi::prepare_source(ctx, config, transport, body).await?;
+        source = if let Some(rewrite)=&rewrite{let mut view=ctx.upstream_view(rewrite)?;super::fastcgi::prepare_source(&mut view, config, transport, body).await?}else{super::fastcgi::prepare_source(ctx, config, transport, body).await?};
     }
     ctx.req_mut().extensions_mut().insert(source.clone());
     let start = std::time::Instant::now();
@@ -488,7 +489,7 @@ pub(super) async fn serve(
         ctx.values
             .insert("http.reverse_proxy.retries".into(), retries.to_string());
         let mut progress = AttemptProgress::default();
-        let result = serve_once(ctx, config, server, Some(&source), &mut progress).await;
+        let result = serve_once(ctx, config, server, Some(&source), &mut progress,rewrite.as_ref()).await;
         if result.is_ok() {
             if let Some(guard) = progress.guard.take() {
                 guard.disarm();
@@ -518,9 +519,7 @@ pub(super) async fn serve(
         } else if !error.is::<super::proxy_retry::NoUpstream>() {
             return Err(error);
         }
-        let allowed =
-            super::proxy_retry::allowed(ctx, &config.ext.retry, start, retries, &error, &source)
-                .await;
+        let allowed = if let Some(rewrite)=&rewrite{let mut view=ctx.upstream_view(rewrite)?;super::proxy_retry::allowed(&mut view,&config.ext.retry,start,retries,&error,&source).await}else{super::proxy_retry::allowed(ctx,&config.ext.retry,start,retries,&error,&source).await};
         if !matches!(allowed, Ok(true)) {
             return Err(error);
         }
@@ -571,6 +570,7 @@ async fn serve_once(
     server: &Arc<ActiveServer>,
     replay: Option<&super::proxy_replay::ReplaySource>,
     progress: &mut AttemptProgress,
+    rewrite:Option<&super::rewrite_runtime::Upstream>,
 ) -> Result<PreparedResponse> {
     let trailer_metadata = ctx
         .req()
@@ -635,11 +635,13 @@ async fn serve_once(
     } else {
         state.selection.clone()
     };
+    let rewrite_uri=rewrite.map(|r|r.uri()).transpose()?;
+    let outgoing_method=rewrite.map_or_else(||ctx.req().method().clone(),|r|r.method.clone());
     let selection = {
         let peer_ip=ctx.peer.raw_host();let client_ip=ctx.client_ip.map_or_else(String::new,|ip|ip.to_string());
         let input = SelectionInput {
             authority: &ctx.authority,
-            uri: ctx.req().uri(),
+            uri: rewrite_uri.as_ref().unwrap_or_else(||ctx.req().uri()),
             version: ctx.req().version(),
             headers: ctx.req().headers(),
             peer_ip: &peer_ip,
@@ -694,27 +696,15 @@ async fn serve_once(
             .begin()?;
         progress.observation = Some(attempt.observation.clone());
         progress.guard = Some(attempt.guard);
-        let metadata = ctx
-            .request
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("request metadata unavailable"))?;
-        let (parts, _) = metadata.into_parts();
-        let body = super::proxy_replay::observe(attempt.body, attempt.observation.clone());
-        ctx.request = Some(Request::from_parts(
-            parts,
-            super::proxy_policy::with_lease(body, lease.clone()),
-        ));
-        let mut exchange =
-            super::fastcgi::ExchangeState::new(replay.and_then(|source| source.complete_length()));
-        let response = super::fastcgi::serve(
-            ctx,
-            config,
-            transport,
-            dial,
-            server.logging.as_ref(),
-            &mut exchange,
-        )
-        .await;
+        let body=super::proxy_policy::with_lease(super::proxy_replay::observe(attempt.body,attempt.observation.clone()),lease.clone());
+        let mut exchange=super::fastcgi::ExchangeState::new(replay.and_then(|source|source.complete_length()));
+        let response=if let Some(rewrite)=rewrite{
+            let mut view=ctx.upstream_view_with_body(rewrite,body)?;
+            super::fastcgi::serve(&mut view,config,transport,dial,server.logging.as_ref(),&mut exchange).await
+        }else{
+            let metadata=ctx.request.take().ok_or_else(||anyhow::anyhow!("request metadata unavailable"))?;let(parts,_)=metadata.into_parts();ctx.request=Some(Request::from_parts(parts,body));
+            super::fastcgi::serve(ctx,config,transport,dial,server.logging.as_ref(),&mut exchange).await
+        };
         progress.fetch_started = exchange.transport_started;
         if response.is_err()
             && let Some(request) = ctx.request.take()
@@ -829,6 +819,7 @@ async fn serve_once(
     }
     let mut headers = proxy_headers(ctx, config, outgoing, is_upgrade, false, unix_host.as_deref())?;
     trailer_metadata.write_upstream_declaration(&mut headers);
+    if rewrite.is_some_and(|r|r.omit_body){headers.remove(http::header::CONTENT_LENGTH);headers.remove(http::header::TRANSFER_ENCODING);headers.remove(http::header::TRAILER);}
     let replacement = ctx
         .req()
         .extensions()
@@ -859,7 +850,7 @@ async fn serve_once(
         }
     }
     let automatically_gzip = config.compression
-        && ctx.req().method() != http::Method::HEAD
+        && outgoing_method != http::Method::HEAD
         && headers
             .get(http::header::ACCEPT_ENCODING)
             .is_none_or(|v| v.is_empty())
@@ -881,16 +872,9 @@ async fn serve_once(
         .unwrap_or(dial_address);
     let outgoing_host = outgoing_host.to_owned();
     headers.insert(http::header::HOST, HeaderValue::from_str(&outgoing_host)?);
-    let uri = format!(
-        "{scheme}://{outgoing_host}{}",
-        ctx.req()
-            .uri()
-            .path_and_query()
-            .map(|x| x.as_str())
-            .unwrap_or("/")
-    )
-    .parse::<Uri>()
-    .map_err(|_| anyhow::anyhow!("invalid expanded upstream authority"))?;
+    let target=rewrite_uri.as_ref().unwrap_or_else(||ctx.req().uri()).path_and_query().map_or("/",|x|x.as_str());
+    let mut parts=http::uri::Parts::default();parts.scheme=Some(scheme.parse()?);parts.authority=Some(outgoing_host.parse()?);parts.path_and_query=Some(http::uri::PathAndQuery::from_native_rewrite_path_query(target.to_owned())?);
+    let uri=Uri::from_parts(parts).map_err(|_|anyhow::anyhow!("invalid expanded upstream authority"))?;
     // Header operations may replace the generated nonce. Bind this attempt to
     // exactly the one challenge that is actually serialized upstream.
     let expected_accept=if extended.is_some(){Some(websocket::expected_accept(&headers)?)}else{None};
@@ -898,10 +882,25 @@ async fn serve_once(
     let attempt = source.begin()?;
     progress.observation = Some(attempt.observation.clone());
     progress.guard = Some(attempt.guard);
+    // HTTP/2 and HTTP/3 uploads need not carry Content-Length. Hyper's H1
+    // client otherwise treats unknown-length GET/HEAD/CONNECT as empty; retain
+    // the admitted real body with explicit H1 framing instead of losing DATA.
+    if !config.http2_only && extended.is_none() && !hyper::body::Body::is_end_stream(&attempt.body)
+        && !headers.contains_key(http::header::CONTENT_LENGTH)
+        && !headers.contains_key(http::header::TRANSFER_ENCODING)
+        && matches!(outgoing_method,http::Method::GET|http::Method::HEAD|http::Method::CONNECT)
+    { headers.insert(http::header::TRANSFER_ENCODING,HeaderValue::from_static("chunked")); }
     let mut request = Request::new(attempt.body);
-    *request.method_mut() = if extended.is_some(){http::Method::GET}else{ctx.req().method().clone()};
+    *request.method_mut() = if extended.is_some(){http::Method::GET}else{outgoing_method.clone()};
     *request.version_mut() = ctx.req().version();
     *request.extensions_mut() = ctx.req().extensions().clone();
+    if outgoing_method==http::Method::CONNECT && extended.is_none(){
+        let current=rewrite_uri.as_ref().unwrap_or_else(||ctx.req().uri());
+        let target=if current.path_and_query().is_none_or(|p|p.raw_path().is_empty()){
+            if let Some(authority)=ctx.req().uri().authority(){authority.as_str().parse::<Uri>()?}else{"/".parse()?}
+        }else{let mut parts=http::uri::Parts::default();parts.path_and_query=Some(current.path_and_query().expect("path checked").clone());Uri::from_parts(parts)?};
+        request.extensions_mut().insert(hyper::ext::NativeConnectBody{target});
+    }
     // The downstream upgrade belongs to the inbound request until an
     // upstream actually accepts the upgrade. Failed attempts must preserve it.
     request
@@ -942,6 +941,13 @@ async fn serve_once(
     ))
     .await?;
     progress.response_received = true;
+    if outgoing_method==http::Method::HEAD&&ctx.req().method()!=http::Method::HEAD&&!matches!(response.status(),StatusCode::NO_CONTENT|StatusCode::NOT_MODIFIED){
+        // A rewritten HEAD has no representation bytes to forward to the
+        // original non-HEAD client. Its upstream Content-Length describes a
+        // hypothetical GET; carrying it downstream would reset H2/H3 streams.
+        response.headers_mut().remove(http::header::TRANSFER_ENCODING);
+        response.headers_mut().insert(http::header::CONTENT_LENGTH,HeaderValue::from_static("0"));
+    }
     count_response_failure(
         ctx,
         config,
@@ -1258,9 +1264,10 @@ pub(super) fn proxy_headers(
         // forwarding headers. Never substitute the physical proxy's IP.
         for name in ["x-forwarded-for","x-forwarded-host","x-forwarded-proto"]{headers.remove(name);}
     }
-    if !headers.contains_key(http::header::HOST) {
-        headers.insert(http::header::HOST, HeaderValue::from_str(&original_host)?);
-    }
+    // net/http stores the validated authority outside Header. An absolute or
+    // authority-form target wins over a conflicting raw wire Host; explicit
+    // header_up operations below may still replace that initial value.
+    headers.insert(http::header::HOST, HeaderValue::from_str(&original_host)?);
     // Caddy HTTPTransport supplies this default before the handler's user ops.
     if !fastcgi
         && config.tls.is_some()

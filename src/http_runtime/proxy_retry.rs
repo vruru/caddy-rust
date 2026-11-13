@@ -52,17 +52,12 @@ pub(super) async fn allowed(
     let dial = is_dial(error);
     if !dial && !no_upstream {
         if let Some(sets) = &cfg.retry_match {
-            let key = "http.reverse_proxy.is_transport_error";
-            let previous = ctx.values.insert(key.into(), "true".into());
-            let matched = super::request::match_sets(sets, ctx).await;
-            match previous {
-                Some(value) => {
-                    ctx.values.insert(key.into(), value);
-                }
-                None => {
-                    ctx.values.remove(key);
-                }
-            }
+            struct Flag<'a>{ctx:&'a mut Context,previous:Option<String>}
+            impl Drop for Flag<'_>{fn drop(&mut self){let key="http.reverse_proxy.is_transport_error";match self.previous.take(){Some(value)=>{if let Some(slot)=self.ctx.values.get_mut(key){*slot=value;}else{self.ctx.values.insert(key.into(),value);}},None=>{self.ctx.values.remove(key);}}}}
+            let previous=ctx.values.insert("http.reverse_proxy.is_transport_error".into(),"true".into());
+            let flag=Flag{ctx,previous};
+            let matched=super::request::match_sets(sets,flag.ctx).await;
+            drop(flag);
             if !matched? {
                 return Ok(false);
             }

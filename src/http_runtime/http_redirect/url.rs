@@ -298,3 +298,42 @@ pub(crate) fn template_encode_host_bytes(raw:&[u8])->Vec<u8>{escape(raw,|byte|by
 pub(crate) fn template_decode_bytes(raw:&[u8])->Result<Vec<u8>,()>{unescape(raw,0)}
 pub(crate) fn template_encode_path_bytes(raw:&[u8])->Vec<u8>{escape(raw,path_allowed)}
 pub(crate) fn template_encode_user_bytes(raw:&[u8])->Vec<u8>{escape(raw,user_allowed)}
+
+/// url.Parse followed by Go's HTTP/2 Push URL checks. Preserve RawPath,
+/// ForceQuery and decoded authority; a scheme-relative target deliberately
+/// inherits the parent's authority, as net/http does.
+pub(crate) fn push_target(raw:&str,wanted:&str,parent:&str)->Result<String,()>{push_target_bytes(raw.as_bytes(),wanted,parent)}
+pub(crate) fn push_target_bytes(raw:&[u8],wanted:&str,parent:&str)->Result<String,()>{
+    let(raw,fragment)=match raw.iter().position(|b|*b==b'#'){Some(i)=>(&raw[..i],&raw[i+1..]),None=>(raw,&b""[..])};
+    unescape(fragment,0)?;
+    if raw.is_empty()||raw.iter().any(|b|*b<32||*b==127){return Err(())}
+    let mut scheme=None;
+    for(index,byte)in raw.iter().copied().enumerate(){
+        if byte==b':'{if index==0{return Err(())}scheme=Some((raw[..index].iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>(),index+1));break}
+        if !(byte.is_ascii_alphabetic()||index>0&&(byte.is_ascii_digit()||b"+-.".contains(&byte))){break}
+    }
+    let(host,path)=if let Some((scheme,start))=scheme{
+        if scheme!=wanted.as_bytes(){return Err(())}let rest=&raw[start..];
+        if !rest.starts_with(b"//"){return Err(())}
+        let after=&rest[2..];let end=after.iter().position(|b|matches!(*b,b'/'|b'?')).unwrap_or(after.len());
+        let(host,_)=authority(&after[..end],&scheme)?;
+        if host.is_empty(){return Err(())}
+        (String::from_utf8(host).map_err(|_|())?,&after[end..])
+    }else{
+        if !raw.starts_with(b"/"){return Err(())}
+        let path=if raw.starts_with(b"//")&&!raw.starts_with(b"///"){
+            let after=&raw[2..];let end=after.iter().position(|b|matches!(*b,b'/'|b'?')).unwrap_or(after.len());authority(&after[..end],b"")?;&after[end..]
+        }else{raw};
+        (parent.to_owned(),path)
+    };
+    let(path,query)=match path.iter().position(|b|*b==b'?'){Some(i)=>(&path[..i],Some(&path[i+1..])),None=>(path,None)};
+    let mut escaped=escaped_path(path)?;if escaped.is_empty(){escaped.push(b'/');}
+    if let Some(query)=query{escaped.push(b'?');escaped.extend_from_slice(query);}
+    let path=String::from_utf8(escaped).map_err(|_|())?;
+    Ok(format!("{wanted}://{host}{path}"))
+}
+
+/// Validate percent triples without allocating a decoded copy at ingress.
+pub(crate) fn valid_path_escapes(raw:&[u8])->bool{
+    let mut i=0;while i<raw.len(){if raw[i]==b'%'{if raw.len()-i<3||nibble(raw[i+1]).is_err()||nibble(raw[i+2]).is_err(){return false}i+=3;}else{i+=1;}}true
+}

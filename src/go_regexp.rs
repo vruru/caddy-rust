@@ -217,6 +217,33 @@ impl GoRegexp {
         }
         Ok(Some(result))
     }
+    /// Match Go byte strings without replacing captured invalid UTF-8 bytes.
+    /// The normalized search text is temporary; spans map back to the exact
+    /// original input before any capture is copied to its bounded result.
+    pub(crate) fn first_match_bytes_limited(
+        &self, original:&[u8], budget:&ReplaceBudget, limit:usize,
+        mut charge:impl FnMut(usize)->std::result::Result<(),OperationError>,
+    )->std::result::Result<Option<BTreeMap<String,Vec<u8>>>,OperationError>{
+        budget.check()?;
+        let scratch=budget.scratch.checked_sub(self.search_memory).ok_or(OperationError::ByteLimit)?;
+        let input=Normalized::new(original,&ReplaceBudget::new(scratch,budget.deadline))?;
+        let mut captures=self.native.create_captures();let mut cache=self.native.create_cache();
+        if !self.search_captures(&input.text,0,&mut cache,&mut captures,budget)?{return Ok(None)}
+        let mut result=BTreeMap::new();let mut output=0usize;
+        for(index,name)in self.names.iter().enumerate(){
+            budget.check()?;
+            let value=if let Some(span)=captures.get_group(index){
+                let start=input.original_offset(span.start)?;let end=input.original_offset(span.end)?;
+                original.get(start..end).ok_or(OperationError::MatchInvariant)?
+            }else{&[]};
+            charge(256)?;
+            let key=index.to_string();output=output.saturating_add(key.len()).saturating_add(value.len());
+            if let Some(name)=name{output=output.saturating_add(name.len()).saturating_add(value.len());}
+            if output>limit{return Err(OperationError::ByteLimit)}
+            charge(key.len().saturating_add(value.len()).saturating_add(name.as_ref().map_or(0,|n|n.len().saturating_add(value.len()))).saturating_mul(8).saturating_add(1024))?;
+            result.insert(key,value.to_vec());if let Some(name)=name{result.insert(name.to_string(),value.to_vec());}
+        }Ok(Some(result))
+    }
     /// Boolean match of Go's byte input: each invalid UTF-8 byte is one RuneError.
     /// Reuse normalization and the same bounded native search as replacement.
     pub(crate) fn is_match_bytes(
@@ -475,7 +502,7 @@ impl<'a> Normalized<'a> {
 }
 
 pub(crate) struct Replacement {
-    text: Box<str>,
+    text: Box<[u8]>,
     parts: Vec<Part>,
     named: Vec<Vec<usize>>,
     identity: Arc<()>,
@@ -488,6 +515,9 @@ enum Part {
 }
 impl Replacement {
     pub(crate) fn compile(regex: &GoRegexp, text: String, budget: usize) -> Result<Self> {
+        Self::compile_bytes(regex,text.into_bytes(),budget)
+    }
+    pub(crate) fn compile_bytes(regex:&GoRegexp,text:Vec<u8>,budget:usize)->Result<Self>{
         let mut parts = Vec::new();
         let mut lookup: BTreeMap<&str, (Vec<usize>, Option<usize>)> = BTreeMap::new();
         for (i, name) in regex.names.iter().enumerate() {
@@ -506,20 +536,20 @@ impl Replacement {
             parts.push(part);
             Ok::<_, anyhow::Error>(())
         };
-        while let Some(mark) = text[at..].find('$') {
+        while let Some(mark) = text[at..].iter().position(|b|*b==b'$') {
             let mark = at + mark;
             if mark > at {
                 push(Part::Raw(at..mark))?;
             }
             at = mark + 1;
-            if text[at..].starts_with('$') {
+            if text[at..].starts_with(b"$") {
                 push(Part::Dollar)?;
                 at += 1;
                 continue;
             }
             if let Some((name, after)) = extract(&text, at) {
                 at = after;
-                let name = &text[name];
+                let name = std::str::from_utf8(&text[name]).expect("extracted capture name is valid UTF-8");
                 if let Some(i) = parse_index(name) {
                     if i < regex.names.len() {
                         push(Part::Indexed(i))?;
@@ -540,7 +570,7 @@ impl Replacement {
             push(Part::Raw(at..text.len()))?;
         }
         let result = Self {
-            text: text.into_boxed_str(),
+            text: text.into_boxed_slice(),
             parts,
             named,
             identity: regex.identity.clone(),
@@ -585,7 +615,7 @@ impl Replacement {
             }
             let span = match part {
                 Part::Raw(r) => {
-                    out.add(self.text[r.clone()].as_bytes())?;
+                    out.add(&self.text[r.clone()])?;
                     continue;
                 }
                 Part::Dollar => {
@@ -604,22 +634,13 @@ impl Replacement {
         Ok(())
     }
 }
-fn extract(text: &str, at: usize) -> Option<(Range<usize>, usize)> {
-    let braced = text[at..].starts_with('{');
-    let a = at + usize::from(braced);
-    let len = text[a..]
-        .char_indices()
-        .find(|(_, c)| !unicode::is_name_character(*c))
-        .map_or(text.len() - a, |(i, _)| i);
-    if len == 0 {
-        return None;
-    }
-    let end = a + len;
-    if braced && !text[end..].starts_with('}') {
-        return None;
-    }
-    Some((a..end, end + usize::from(braced)))
+fn extract(text:&[u8],at:usize)->Option<(Range<usize>,usize)>{
+    let braced=text[at..].starts_with(b"{");let a=at+usize::from(braced);
+    let suffix=&text[a..];let valid=match std::str::from_utf8(suffix){Ok(s)=>s,Err(e)=>std::str::from_utf8(&suffix[..e.valid_up_to()]).ok()?};
+    let len=valid.char_indices().find(|(_,c)|!unicode::is_name_character(*c)).map_or(valid.len(),|(i,_)|i);
+    if len==0{return None}let end=a+len;if braced&&!text[end..].starts_with(b"}"){return None}Some((a..end,end+usize::from(braced)))
 }
+
 fn parse_index(name: &str) -> Option<usize> {
     if name.len() > 1 && name.starts_with('0') {
         return None;

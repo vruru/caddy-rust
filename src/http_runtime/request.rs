@@ -37,6 +37,7 @@ pub(super) struct Context {
     pub peer: NetAddress,
     pub local: NetAddress,
     pub tls: bool,
+    pub(super) push_sni:Option<String>,
     access_names: Option<Vec<String>>,
     skip_access: bool,
     pub authority: String,
@@ -51,6 +52,7 @@ pub(super) struct Context {
     access_start: Option<std::time::Instant>,
     log_fields: Option<Box<log_append::LogFields>>,
     pub values: HashMap<String, String>,
+    pub(super) raw_regex_captures:super::request_regex::RawCaptures,
     pub(super) regex_capture_budget: usize,
     pub immediate: HeaderMap,
     informational: Option<InformationalOutput>,
@@ -62,11 +64,19 @@ pub(super) struct Context {
     proxy_response: Option<Box<super::proxy::PreparedResponse>>,
     maps: Vec<LazyMap>,
     pub(super) probe: bool,
+    // Last field: additional attempt metadata drops before its atomic credit.
+    _rewrite_view_credit:Option<Arc<native_write_policy::Lease>>,
 }
 #[path = "response_routes.rs"]
 mod response_routes;
 
+pub(super) struct UpstreamView<'a>{parent:&'a mut Context,view:Option<Context>,return_body:bool}
+impl std::ops::Deref for UpstreamView<'_>{type Target=Context;fn deref(&self)->&Context{self.view.as_ref().expect("live upstream view")}}
+impl std::ops::DerefMut for UpstreamView<'_>{fn deref_mut(&mut self)->&mut Context{self.view.as_mut().expect("live upstream view")}}
+impl Drop for UpstreamView<'_>{fn drop(&mut self){if let Some(view)=self.view.take(){self.parent.merge_upstream(view,self.return_body);}}}
+
 enum DeferredResponse {
+    Push(Arc<super::push::LinkPlan>),
     Headers(HeaderOps),
     Encode(super::encode_response::ResponseEncoding),
     LogBody(usize),
@@ -116,7 +126,8 @@ impl Context {
             metrics: None,
             trace_context: None,
             request_started: std::time::Instant::now(),
-            typed_vars: HashMap::new(),
+            raw_regex_captures:Default::default(),
+        typed_vars: HashMap::new(),
             cel_body: None,
             cel_body_failure: None,
             original_uri: request.uri().clone(),
@@ -130,6 +141,7 @@ impl Context {
             resources,
             peer: zero.into(), // 占位；REMOTE_* 由 D2 置空，SERVER_ADDR 由 D3 移除
             local: zero.into(),
+            push_sni:None,
             tls: false, // FastCGI 健康 scheme 恒为 http：无 HTTPS/SSL_*
             access_names: None,
             skip_access: true,
@@ -153,7 +165,33 @@ impl Context {
             proxy_response: None,
             maps: Vec::new(),
             probe: true,
+            _rewrite_view_credit:None,
         })
+    }
+    pub(super) fn upstream_view<'a>(&'a mut self,rewritten:&super::rewrite_runtime::Upstream)->Result<UpstreamView<'a>>{let view=self.fork_upstream(rewritten,None)?;Ok(UpstreamView{parent:self,view:Some(view),return_body:true})}
+    pub(super) fn upstream_view_with_body<'a>(&'a mut self,rewritten:&super::rewrite_runtime::Upstream,body:Body)->Result<UpstreamView<'a>>{let view=self.fork_upstream(rewritten,Some(body))?;Ok(UpstreamView{parent:self,view:Some(view),return_body:false})}
+    /// Independent proxy transport/matcher view. The inbound metadata is never
+    /// modified, including while this owned view is suspended or cancelled.
+    /// Exclusively borrowed replacer values/providers move to the view until
+    /// Drop merges them back; no other task can borrow those mutable fields.
+    fn fork_upstream(&mut self,rewritten:&super::rewrite_runtime::Upstream,body:Option<Body>)->Result<Self>{
+        let header_bytes=self.req().headers().iter().map(|(k,v)|k.as_str().len()+v.as_bytes().len()+512).sum::<usize>();
+        let bytes=header_bytes.checked_mul(4).and_then(|n|n.checked_add(rewritten.projection.state.bytes().saturating_mul(8))).and_then(|n|n.checked_add(self.authority.len()*2+self.req().extensions().len()*2048+16384)).ok_or_else(||failure(StatusCode::SERVICE_UNAVAILABLE))?;
+        let credit=Arc::new(self.resources.rewrite_bytes.reserve(bytes).map_err(|_|failure(StatusCode::SERVICE_UNAVAILABLE))?);
+        let mut request=Request::new(full(Bytes::new()));*request.method_mut()=Method::from_bytes(rewritten.method.as_str().as_bytes())?;*request.uri_mut()=rewritten.uri()?;*request.version_mut()=self.req().version();for(name,value)in self.req().headers(){let mut copy=HeaderValue::from_bytes(value.as_bytes())?;copy.set_sensitive(value.is_sensitive());request.headers_mut().append(HeaderName::from_bytes(name.as_str().as_bytes())?,copy);}*request.extensions_mut()=self.req().extensions().clone();
+        request.extensions_mut().insert(super::rewrite_runtime::Original{uri:self.req().uri().clone(),method:self.req().method().clone(),projection:super::rewrite_runtime::projection(self.req()).cloned()});
+        request.extensions_mut().insert(rewritten.projection.clone());
+        *request.body_mut()=body.unwrap_or_else(||std::mem::replace(self.req_mut().body_mut(),full(Bytes::new())));
+        Ok(Self{metrics:self.metrics.clone(),request_started:self.request_started,push_sni:self.push_sni.clone(),trace_context:self.trace_context.clone(),timeouts:self.timeouts.take(),raw_regex_captures:std::mem::take(&mut self.raw_regex_captures),typed_vars:std::mem::take(&mut self.typed_vars),cel_body:self.cel_body.take(),cel_body_failure:self.cel_body_failure,request:Some(request),fastcgi_body_claimed:self.fastcgi_body_claimed,body_limit:self.body_limit.clone(),await_h2_response_head:self.await_h2_response_head,original_framing:self.original_framing,resources:self.resources.clone(),peer:self.peer.clone(),local:self.local.clone(),tls:self.tls,access_names:None,skip_access:true,authority:self.authority.clone(),client_ip:self.client_ip,trusted:self.trusted,drain:self.drain.clone(),business:self.business.clone(),original_uri:self.original_uri.clone(),request_content_length:self.request_content_length,original_method:self.original_method.clone(),error_status:self.error_status,access_start:None,log_fields:None,values:std::mem::take(&mut self.values),regex_capture_budget:self.regex_capture_budget,immediate:std::mem::take(&mut self.immediate),informational:None,close_after_response:self.close_after_response,deferred:Vec::new(),groups:HashSet::new(),invoke_depth:self.invoke_depth,response_route_depth:self.response_route_depth,proxy_response:None,maps:std::mem::take(&mut self.maps),probe:self.probe,_rewrite_view_credit:Some(credit)})
+    }
+    fn merge_upstream(&mut self,mut view:Self,return_body:bool){
+        self.timeouts=view.timeouts.take();
+        self.raw_regex_captures=std::mem::take(&mut view.raw_regex_captures);
+        if return_body&&let Some(mut request)=view.request.take(){*self.req_mut().body_mut()=std::mem::replace(request.body_mut(),full(Bytes::new()));}
+        self.maps=std::mem::take(&mut view.maps);self.values=std::mem::take(&mut view.values);self.typed_vars=std::mem::take(&mut view.typed_vars);self.cel_body=view.cel_body.take();self.cel_body_failure=view.cel_body_failure;if return_body{self.body_limit=view.body_limit.take();self.fastcgi_body_claimed=view.fastcgi_body_claimed;}self.regex_capture_budget=view.regex_capture_budget;self.immediate=std::mem::take(&mut view.immediate);self.close_after_response|=view.close_after_response;
+        // Existing values/maps were moved, never copied. Their original
+        // owners/budgets remain in force. The additional request/header/view
+        // allocations die here before view._rewrite_view_credit drops last.
     }
     pub(super) fn template_original_method(&self)->&Method {&self.original_method}
     pub(super) fn template_content_length(&self)->i64 {
@@ -186,6 +224,8 @@ impl Context {
         crate::http_config::helpers::replace_bytes(s,true,|name|self.lookup_bytes(name))
     }
     pub fn lookup_bytes(&self,name:&str)->Option<Vec<u8>>{
+        if let Some(value)=self.raw_regex_captures.get(name){return Some(value.to_vec())}
+        if !self.values.contains_key(name)&&let Some(rewrite)=self.request.as_ref().and_then(super::rewrite_runtime::lookup_projection){if name=="http.request.uri"{return Some(rewrite.request_uri.to_vec())}if name=="http.request.uri.path"{return Some(rewrite.state.path.clone())}if name=="http.request.uri.query"{return Some(rewrite.state.query.clone())}}
         if !self.probe && !self.values.contains_key(name){
             let address=match name{
                 "http.request.remote"|"http.request.remote.host"|"http.request.remote.port"=>Some(&self.peer),
@@ -193,8 +233,15 @@ impl Context {
             };
             if let Some(address)=address{return Some(if name.ends_with(".host"){address.raw_host().into_owned()}else if name.ends_with(".port"){address.raw_port().into_owned()}else{address.raw_text().into_owned()});}
         }
+        if !self.values.contains_key(name)&&let Some(req)=self.request.as_ref(){
+            if matches!(name,"http.request.uri.path"|"http.request.orig_uri.path"){let uri=if name=="http.request.orig_uri.path"{&self.original_uri}else{req.extensions().get::<super::rewrite_runtime::Original>().map_or_else(||req.uri(),|v|&v.uri)};return super::http_redirect::url::template_decode_bytes(uri.path_and_query().map_or("",|p|p.raw_path()).as_bytes()).ok()}
+            if let Some(field)=name.strip_prefix("http.request.header."){if field.eq_ignore_ascii_case("Host"){return Some(Vec::new())}let values=req.headers().get_all(field);let mut out=Vec::new();for (i,value) in values.iter().enumerate(){if i>0{out.push(b',');}out.extend_from_slice(value.as_bytes());}return Some(out)}
+            if let Some(key)=name.strip_prefix("http.request.uri.query."){let query=self.replacer_query();let mut out=Vec::with_capacity(query.len());let mut first=true;for part in query.split(|b|*b==b'&'){if let Some((k,v))=super::query_match::query_pair(part)&&k.as_ref()==key.as_bytes(){if !first{out.push(b',');}first=false;out.extend_from_slice(&v);}}return Some(out)}
+        }
         self.lookup(name).map(String::into_bytes)
     }
+    pub(super) fn replacer_uri(&self)->&Uri{let req=self.req();req.extensions().get::<super::rewrite_runtime::Original>().map_or_else(||req.uri(),|v|&v.uri)}
+    pub(super) fn replacer_query(&self)->&[u8]{let req=self.req();if let Some(p)=super::rewrite_runtime::lookup_projection(req){&p.state.query}else{let uri=req.extensions().get::<super::rewrite_runtime::Original>().map_or_else(||req.uri(),|v|&v.uri);uri.query().unwrap_or_default().as_bytes()}}
     pub fn lookup(&self, name: &str) -> Option<String> {
         self.lookup_depth(name, 0)
     }
@@ -202,6 +249,7 @@ impl Context {
         replace(input, true, |key| self.lookup_depth(key, depth + 1)).ok()
     }
     fn lookup_depth(&self, name: &str, depth: usize) -> Option<String> {
+        if let Some(value)=self.raw_regex_captures.get(name){return std::str::from_utf8(value).ok().map(str::to_owned)}
         if let Some(value) = crate::http_config::helpers::global_lookup(name) {
             return Some(value);
         }
@@ -215,6 +263,9 @@ impl Context {
             return Some(value.clone());
         }
         let req = self.request.as_ref();
+        let source=req.and_then(|r|r.extensions().get::<super::rewrite_runtime::Original>());
+        let lookup_uri=source.map(|s|&s.uri).or_else(||req.map(Request::uri));
+        let lookup_method=source.map(|s|&s.method).or_else(||req.map(Request::method));
         Some(match name {
             "http.shutting_down" => self.business.generation().shutting_down().to_string(),
             "http.time_until_shutdown" => self
@@ -245,23 +296,24 @@ impl Context {
                     "http".into()
                 }
             }
-            "http.request.method" => req?.method().to_string(),
+            "http.request.method" => lookup_method?.to_string(),
             "http.request.orig_method" => self.original_method.to_string(),
-            "http.request.uri" => req?
-                .uri()
+            "http.request.uri" if req.and_then(super::rewrite_runtime::lookup_projection).is_some()=>String::from_utf8(self.lookup_bytes(name)?).ok()?,
+            "http.request.uri.query" if req.and_then(super::rewrite_runtime::lookup_projection).is_some()=>String::from_utf8(self.lookup_bytes(name)?).ok()?,
+            "http.request.uri" => lookup_uri?
                 .path_and_query()
                 .map(|x| x.as_str())
                 .unwrap_or("/")
                 .to_owned(),
-            "http.request.uri.path" => decoded_path(req?.uri().path()).ok()?,
-            "http.request.uri.query" => req?.uri().query().unwrap_or_default().to_owned(),
+            "http.request.uri.path" => String::from_utf8(self.lookup_bytes(name)?).ok()?,
+            "http.request.uri.query" => lookup_uri?.query().unwrap_or_default().to_owned(),
             "http.request.orig_uri" => self
                 .original_uri
                 .path_and_query()
                 .map(|x| x.as_str())
                 .unwrap_or("/")
                 .to_owned(),
-            "http.request.orig_uri.path" => decoded_path(self.original_uri.path()).ok()?,
+            "http.request.orig_uri.path" => String::from_utf8(self.lookup_bytes(name)?).ok()?,
             "http.request.orig_uri.query" => {
                 self.original_uri.query().unwrap_or_default().to_owned()
             }
@@ -279,26 +331,7 @@ impl Context {
             }
             .into(),
             "http.vars.root" => ".".into(),
-            _ if name.starts_with("http.request.header.") => {
-                let field = &name[20..];
-                if field.eq_ignore_ascii_case("Host") {
-                    // net/http keeps the wire Host in Request.Host and removes
-                    // it from Header before the replacer observes the request.
-                    String::new()
-                } else {
-                    req?.headers()
-                        .get(field)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or_default()
-                        .to_owned()
-                }
-            }
-            _ if name.starts_with("http.request.uri.query.") => {
-                url::form_urlencoded::parse(req?.uri().query().unwrap_or_default().as_bytes())
-                    .find(|(key, _)| key == &name[23..])
-                    .map(|(_, v)| v.into_owned())
-                    .unwrap_or_default()
-            }
+            _ if name.starts_with("http.request.header.") || name.starts_with("http.request.uri.query.") => String::from_utf8(self.lookup_bytes(name)?).ok()?,
             _ => {
                 for map in &self.maps {
                     let Some(index) = map.destinations.iter().position(|dest| dest == name) else {
@@ -491,6 +524,7 @@ where
         .get::<super::trailer_policy::RequestMetadata>()
         .cloned()
         .unwrap_or_default();
+    let push_seed=request.extensions_mut().remove::<super::route_timeouts::PushSeed>();
     let http3 = request.version() == Version::HTTP_3;
     let alt_svc = request.extensions().get::<super::h3::AltSvc>().cloned();
     let (parts, body) = request.into_parts();
@@ -505,9 +539,10 @@ where
         body.boxed_unsync()
     };
     let mut ctx = Context {
-        timeouts:None,
+        timeouts:push_seed.as_ref().and_then(|seed|seed.take()),
         metrics: crate::metrics::observe::Group::new(server.metrics.clone(),0),
-        request_started: std::time::Instant::now(),
+        request_started: push_seed.as_ref().map_or_else(std::time::Instant::now,|seed|seed.started),
+        raw_regex_captures:Default::default(),
         typed_vars: HashMap::new(),
         cel_body: None,
         cel_body_failure: None,
@@ -520,6 +555,7 @@ where
         peer,
         local,
         tls,
+        push_sni:sni.map(str::to_owned),
         access_names: None,
         skip_access: false,
         authority,
@@ -553,8 +589,9 @@ where
         proxy_response: None,
         maps: Vec::new(),
         probe: false,
+        _rewrite_view_credit:None,
     };
-    let timeout_setup=super::route_timeouts::install_server(&mut ctx,&server.plan);
+    let timeout_setup=if push_seed.is_some(){if let Some(control)=ctx.timeouts.as_deref().and_then(|state|state.control()){ctx.bind_timeout_control(control)}else{Err(anyhow::anyhow!("pushed timeout seed already consumed"))}}else{super::route_timeouts::install_server(&mut ctx,&server.plan)};
     let result = if timeout_setup.is_err(){
         ctx.close_after_response=true;
         Err(budget_failure(&mut ctx,super::resource_budget::BudgetError::Overloaded))
@@ -615,7 +652,7 @@ where
             return super::request_body::mark_response(response, ctx.await_h2_response_head);
         }
     } else if explicit_headers
-        && apply_deferred_headers(&mut headers, response.status(), &ctx).is_err()
+        && apply_deferred_headers(&mut headers, response.status(), &mut ctx).await.is_err()
     {
         let response = simple(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error\n");
         return super::request_body::mark_response(response, ctx.await_h2_response_head);
@@ -987,6 +1024,15 @@ fn handlers<'a>(
                 && let Some(logging)=server.logging.as_deref()
                 && let Some(module)=traces.get(index) {module.emit(logging);}
             match handler {
+                Handler::Push(plan)=>{
+                    if let Ok(Some(push))=super::push::LinkPlan::new(ctx,plan,inner,server){
+                        for resource in &plan.resources{
+                            let Ok((target,_target_scratch))=super::push::expand_target(ctx,&resource.target)else{break};
+                            if push.dispatch_bytes(&target,&resource.method,&ctx.authority).await.is_err(){break}
+                        }
+                        ctx.deferred.push(DeferredResponse::Push(push));
+                    }
+                }
                 Handler::Tracing(plan)=>{
                     let Some(provider)=server.tracing.as_ref()else{continue};
                     let entered=super::tracing::enter(ctx,provider,plan);
@@ -1223,71 +1269,7 @@ fn handlers<'a>(
                         Err(error) => return Err(error),
                     }
                 }
-                Handler::Rewrite {
-                    uri,
-                    method,
-                    strip_path_prefix,
-                    strip_path_suffix,
-                } => {
-                    if let Some(method) = method {
-                        let method = ctx.expand(method)?.to_uppercase().parse::<Method>()?;
-                        *ctx.req_mut().method_mut() = method;
-                    }
-                    if uri.as_ref().is_none_or(|value| value.is_empty())
-                        && strip_path_prefix.is_none() && strip_path_suffix.is_none()
-                    {
-                        continue;
-                    }
-                    let mut target = ctx
-                        .req()
-                        .uri()
-                        .path_and_query()
-                        .map(|x| x.as_str())
-                        .unwrap_or("/")
-                        .to_owned();
-                    if let Some(uri) = uri {
-                        target = super::rewrite_uri::rewrite_uri(uri, ctx.req().uri(), |name| {
-                            ctx.lookup(name)
-                        })?;
-                    }
-                    if strip_path_prefix.is_some() || strip_path_suffix.is_some() {
-                        let (path, query) = target
-                            .split_once('?')
-                            .map_or((target.as_str(), None), |(p, q)| (p, Some(q)));
-                        let query = query.map(str::to_owned);
-                        let mut path = decoded_path(path)?;
-                        if let Some(prefix) = strip_path_prefix {
-                            let prefix = ctx.expand(prefix)?;
-                            if let Some(rest) = path.strip_prefix(&prefix) {
-                                path = rest.to_owned();
-                            }
-                        }
-                        if let Some(suffix) = strip_path_suffix {
-                            let suffix = ctx.expand(suffix)?;
-                            if let Some(rest) = path.strip_suffix(&suffix) {
-                                path = rest.to_owned();
-                            }
-                        }
-                        if !path.starts_with('/') {
-                            path.insert(0, '/');
-                        }
-                        target = String::from_utf8(super::http_redirect::url::template_encode_path_bytes(path.as_bytes()))?;
-                        if let Some(query) = query {
-                            target.push('?');
-                            target.push_str(&query);
-                        }
-                    }
-                    ensure!(
-                        !target.contains(['\r', '\n', '\0']),
-                        "invalid rewritten request URI"
-                    );
-                    // Construct a path/query component explicitly. Parsing this as a
-                    // full URI would reinterpret a colon in the first path segment
-                    // as a scheme and would lose an original absolute target's host.
-                    let mut parts = http::uri::Parts::default();
-                    parts.path_and_query = Some(http::uri::PathAndQuery::from_native_rewrite_path_query(target)?);
-                    *ctx.req_mut().uri_mut() = Uri::from_parts(parts)?;
-                }
+                Handler::Rewrite(plan) => super::rewrite_runtime::apply(plan,ctx).await?,
                 Handler::Vars(vars) => {
                     for (name, value) in vars {
                         let name = ctx.expand(name)?;
@@ -1555,6 +1537,8 @@ async fn var_match_value(ctx: &mut Context, key: &str) -> Result<String> {
     .unwrap_or_default())
 }
 
+fn rewritten_path(ctx:&Context)->Result<String>{if let Some(p)=super::rewrite_runtime::projection(ctx.req()){Ok(String::from_utf8(p.state.path.clone())?)}else{decoded_path(ctx.req().uri().path_and_query().map_or("",|p|p.raw_path()))}}
+
 pub(super) fn matches<'a>(
     matcher: &'a Matcher,
     ctx: &'a mut Context,
@@ -1567,33 +1551,22 @@ pub(super) fn matches<'a>(
                     .is_ok_and(|host| host_match(&host, &hostname(&ctx.authority)))
             }),
             Matcher::Path(patterns) => {
-                let path = decoded_path(ctx.req().uri().path())?.to_lowercase();
-                let mut found = false;
-                for pattern in patterns {
-                    let pattern = ctx.expand(pattern)?;
-                    if path_match(&pattern, &path) {
-                        found = true;
-                        break;
-                    }
-                }
-                found
+                let escaped=ctx.req().uri().path().to_owned();
+                let patterns=patterns.iter().map(|pattern|ctx.expand(pattern)).collect::<Result<Vec<_>>>()?;
+                let result=if super::path_match::fast(&patterns,&escaped){super::path_match::matches(&patterns,&escaped)}else{
+                    ctx.resources.request_regexp.run(move||super::path_match::matches(&patterns,&escaped)).await
+                        .map_err(|_|failure(StatusCode::SERVICE_UNAVAILABLE))?
+                };result.map_err(|_|failure(StatusCode::SERVICE_UNAVAILABLE))?
             }
             Matcher::PathRegex(plan) => {
-                let path = decoded_path(ctx.req().uri().path())?;
+                let path_bytes=super::rewrite_runtime::projection(ctx.req()).map_or_else(||ctx.req().uri().path_and_query().map_or(0,|p|p.raw_path().len()),|p|p.state.path.len());
+                let input_credit=ctx.resources.rewrite_bytes.reserve(path_bytes.saturating_mul(2).saturating_add(4096)).map_err(|_|failure(StatusCode::SERVICE_UNAVAILABLE))?;
+                let path=if let Some(p)=super::rewrite_runtime::projection(ctx.req()){p.state.path.clone()}else{
+                    super::http_redirect::url::template_decode_bytes(ctx.req().uri().path_and_query().map_or("",|p|p.raw_path()).as_bytes()).map_err(|_|failure(StatusCode::BAD_REQUEST))?
+                };
                 #[cfg(windows)]
-                let path = path
-                    .replace('\\', "/")
-                    .split('/')
-                    .map(|segment| {
-                        if matches!(segment, "." | "..") {
-                            segment
-                        } else {
-                            segment.trim_end_matches(['.', ' '])
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("/");
-                super::request_regex::matches(plan, vec![clean_path(&path, true)], ctx).await?
+                let path={let text=String::from_utf8(path)?;text.replace('\\',"/").split('/').map(|part|if matches!(part,"."|".."){part}else{part.trim_end_matches(['.',' '])}).collect::<Vec<_>>().join("/").into_bytes()};
+                super::request_regex::matches_bytes(plan,path,input_credit,ctx).await?
             }
             Matcher::HeaderRegex(rules) => {
                 let mut all = true;
@@ -1744,7 +1717,7 @@ fn static_informational<'a>(
         let mut fields = std::mem::take(&mut ctx.immediate);
         let mut final_status = status;
         if status.is_informational() && status != StatusCode::SWITCHING_PROTOCOLS {
-            apply_deferred_headers(&mut fields, status, ctx)?;
+            apply_deferred_headers(&mut fields, status, ctx).await?;
             ctx.immediate = fields;
             emit_informational(ctx, status).await?;
             if status == StatusCode::EARLY_HINTS {
@@ -1826,10 +1799,24 @@ fn apply_static_headers(
     Ok(())
 }
 
-fn apply_deferred_headers(fields: &mut HeaderMap, status: StatusCode, ctx: &Context) -> Result<()> {
-    for operations in ctx.deferred.iter().rev() {
-        if let DeferredResponse::Headers(operations) = operations {
-            apply_response_headers(fields, status.as_u16(), operations, ctx)?;
+fn push_links_unseen(ctx:&Context)->bool{
+    const KEY:&str="http.handlers.push.pushed_link";
+    match ctx.typed_vars.get(KEY){Some(value)=>value.is_null(),None=>!ctx.values.contains_key("http.vars.http.handlers.push.pushed_link")}
+}
+fn mark_push_links(ctx:&mut Context){
+    ctx.typed_vars.insert("http.handlers.push.pushed_link".into(),Arc::new(serde_json::Value::Bool(true)));
+    ctx.values.insert("http.vars.http.handlers.push.pushed_link".into(),"true".into());
+}
+async fn apply_deferred_headers(fields:&mut HeaderMap,status:StatusCode,ctx:&mut Context)->Result<()> {
+    for index in (0..ctx.deferred.len()).rev(){
+        match &ctx.deferred[index]{
+            DeferredResponse::Headers(operations)=>apply_response_headers(fields,status.as_u16(),operations,ctx)?,
+            DeferredResponse::Push(push)=>{
+                if fields.contains_key(http::header::LINK)&&push_links_unseen(ctx){
+                    let push=push.clone();mark_push_links(ctx);
+                    push.links(fields,&ctx.authority).await;
+                }
+            },_=>{}
         }
     }
     Ok(())
@@ -1873,7 +1860,7 @@ pub(super) async fn forward_informational(
     for (name, value) in fields.iter() {
         snapshot.append(name, value.clone());
     }
-    apply_deferred_headers(&mut snapshot, status, ctx)?;
+    apply_deferred_headers(&mut snapshot, status, ctx).await?;
     // Upstream interim headers are not part of the final response. Preserve
     // prior application headers; never clear the underlying writer map.
     write_informational(ctx, status, snapshot).await
@@ -1883,7 +1870,7 @@ async fn emit_informational(ctx: &mut Context, status: StatusCode) -> Result<()>
     if !accepts_informational(ctx) {
         return Ok(());
     }
-    write_informational(ctx, status, ctx.immediate.clone()).await
+    write_informational(ctx,status,ctx.immediate.clone()).await
 }
 
 async fn write_informational(
@@ -1954,8 +1941,27 @@ pub(super) fn apply_headers(
     operations: &HeaderOps,
     ctx: &Context,
 ) -> Result<()> {
-    let expand = |value: &str| replace(value, false, |name| ctx.lookup(name));
-    let expand_value=|value:&str|crate::http_config::helpers::replace_bytes(value,false,|name|ctx.lookup_bytes(name));
+    apply_headers_with(headers,operations,|value|replace(value,false,|name|ctx.lookup(name)),|value|crate::http_config::helpers::replace_bytes(value,false,|name|ctx.lookup_bytes(name)),None)
+}
+// Only Push needs the much smaller promise-head budget. Preserve the ordinary
+// header handler's existing semantics and share its exact operation ordering.
+pub(super) fn apply_push_headers(headers:&mut HeaderMap,operations:&HeaderOps,ctx:&Context)->Result<()> {
+    let entries=operations.delete.len().checked_add(operations.add.iter().chain(&operations.set).try_fold(0usize,|n,(_,v)|n.checked_add(v.len()).and_then(|n|n.checked_add(1))).ok_or_else(||anyhow::anyhow!("push header count overflow"))?).ok_or_else(||anyhow::anyhow!("push header count overflow"))?;
+    if entries==0{return Ok(())}
+    // Replacer sources are already bounded by the native request/config limits.
+    // Cover one temporary source clone plus old/new replacement buffers and
+    // all operation-list cells before evaluating any expansion. This is a
+    // concrete allocation lease, not an allocated dummy byte buffer.
+    let scratch=entries.checked_mul(128).and_then(|n|n.checked_add(8<<20)).ok_or_else(||anyhow::anyhow!("push header allocation overflow"))?;
+    let _scratch=ctx.resources.transfer_deadlines.reserve(scratch)?;
+    let remaining=std::cell::Cell::new(2usize<<20);
+    let charge=|bytes:usize|{anyhow::ensure!(bytes<=128<<10,"push header replacement exceeds limit");let n=remaining.get().checked_sub(bytes).ok_or_else(||anyhow::anyhow!("push header scratch exhausted"))?;remaining.set(n);Ok(())};
+    apply_headers_with(headers,operations,
+        |value|crate::http_config::helpers::replace_accounted(value,false,|name|ctx.lookup(name),charge),
+        |value|crate::http_config::helpers::replace_bytes_accounted(value,false,|name|ctx.lookup_bytes(name),charge),Some(65536))
+}
+fn apply_headers_with(headers:&mut HeaderMap,operations:&HeaderOps,expand:impl Fn(&str)->Result<String>,expand_value:impl Fn(&str)->Result<Vec<u8>>,maximum:Option<usize>)->Result<()> {
+    let checked=|fields:&HeaderMap|->Result<()>{if let Some(maximum)=maximum{let mut bytes=0usize;for(name,value)in fields{bytes=bytes.checked_add(name.as_str().len()).and_then(|n|n.checked_add(value.len())).and_then(|n|n.checked_add(32)).ok_or_else(||anyhow::anyhow!("push header size overflow"))?;anyhow::ensure!(bytes<=maximum,"push headers exceed limit");}}Ok(())};
     // Caddy clears '*' first, then adds, sets, and finally deletes matching
     // names. Unknown placeholders are preserved by ReplaceKnown.
     if operations
@@ -1971,7 +1977,7 @@ pub(super) fn apply_headers(
     for (name, values) in &operations.add {
         let name = HeaderName::try_from(expand(name)?)?;
         for value in values {
-            headers.append(name.clone(), HeaderValue::from_bytes(&expand_value(value)?)?);
+            headers.append(name.clone(), HeaderValue::from_bytes(&expand_value(value)?)?);checked(headers)?;
         }
     }
     for (name, values) in &operations.set {
@@ -1983,10 +1989,10 @@ pub(super) fn apply_headers(
         headers.remove(&name);
         if name == http::header::SET_COOKIE && values.len() > 1 {
             for value in values {
-                headers.append(name.clone(), HeaderValue::from_bytes(&value)?);
+                headers.append(name.clone(), HeaderValue::from_bytes(&value)?);checked(headers)?;
             }
         } else {
-            headers.insert(name, HeaderValue::from_bytes(&values.join(b",".as_slice()))?);
+            headers.insert(name, HeaderValue::from_bytes(&values.join(b",".as_slice()))?);checked(headers)?;
         }
     }
     for pattern in &operations.delete {
@@ -2050,25 +2056,6 @@ pub(super) fn clean_path(path: &str, merge_slashes: bool) -> String {
 pub(super) fn safe_join(root: &Path, path: &str) -> Result<PathBuf> {
     ensure!(!path.contains('\0'), "NUL in file path");
     Ok(root.join(clean_path(path, true).trim_start_matches('/')))
-}
-fn path_match(pattern: &str, path: &str) -> bool {
-    let path = clean_path(path, !pattern.contains("//"));
-    let count = pattern.matches('*').count();
-    if pattern == "*" {
-        return true;
-    }
-    if count == 2 && pattern.starts_with('*') && pattern.ends_with('*') {
-        return path.contains(&pattern[1..pattern.len() - 1]);
-    }
-    if count == 1 {
-        if let Some(p) = pattern.strip_prefix('*') {
-            return path.ends_with(p);
-        }
-        if let Some(p) = pattern.strip_suffix('*') {
-            return path.starts_with(p);
-        }
-    }
-    go_path_glob(pattern, &path)
 }
 pub(super) fn header_value_pattern(pattern: &str, value: &str) -> bool {
     header_value_bytes_pattern(pattern.as_bytes(), value.as_bytes())
@@ -2159,6 +2146,11 @@ fn finalize_transforms<'a>(
         };
         for entry in deferred.iter().rev() {
             match entry {
+                DeferredResponse::Push(push)=>{
+                    if headers.contains_key(http::header::LINK)&&push_links_unseen(ctx){
+                        mark_push_links(ctx);push.links(headers,&ctx.authority).await;
+                    }
+                }
                 DeferredResponse::Headers(ops) if explicit => {
                     apply_response_headers(headers, status.as_u16(), ops, ctx)?;
                 }

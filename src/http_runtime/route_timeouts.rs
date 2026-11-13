@@ -122,16 +122,32 @@ pub(super) fn install_server(ctx:&mut super::request::Context,server:&crate::htt
         state.reads.push(shared);
     }
     if write_enabled {
-        let hard=plan.write_hard.map(|limit|now.checked_add(limit).ok_or_else(denied)).transpose()?;
-        let rule=Rule{installed:now,idle:plan.write_idle,rate:NonZeroU64::new(plan.write_min_rate.max(0)as u64),hard};
-        state.writes.push(rule);
-        install_control(&mut state,&pool,rule)?;
-        state.chunk=Some(plan.max_write_chunk);
+        server_write(&mut state,&pool,server,now)?;
     }
     let control=state.control();
     ctx.timeouts=Some(state);
     if let Some(control)=control{ctx.bind_timeout_control(control)?;}
     Ok(())
+}
+fn server_write(state:&mut RequestTimeouts,pool:&Pool,server:&crate::http_config::ServerConfig,now:Instant)->anyhow::Result<()> {
+    let plan=&server.transfers;
+    let hard=plan.write_hard.map(|limit|now.checked_add(limit).ok_or_else(denied)).transpose()?;
+    let rule=Rule{installed:now,idle:plan.write_idle,rate:NonZeroU64::new(plan.write_min_rate.max(0)as u64),hard};
+    state.writes.push(rule);install_control(state,pool,rule)?;state.chunk=Some(plan.max_write_chunk);Ok(())
+}
+// A seed is protocol state only: failed promises do not create a business
+// Context, access-log entry or metrics observation. Exactly one child takes it.
+#[derive(Clone)]
+pub(super) struct PushSeed {state:std::sync::Arc<std::sync::Mutex<Option<Box<RequestTimeouts>>>>,pub(super) started:Instant}
+impl PushSeed {
+    pub(super) fn new(pool:&Pool,server:&crate::http_config::ServerConfig)->anyhow::Result<(Self,ResponseWriteControl)>{
+        let started=Instant::now();let mut state=RequestTimeouts::new(pool,Version::HTTP_2,1)?;
+        if server.transfers.write_idle.is_some()||server.transfers.write_hard.is_some(){state.scopes=1;server_write(&mut state,pool,server,started)?;}
+        else{install_control(&mut state,pool,Rule{installed:started,idle:None,rate:None,hard:None})?;}
+        let control=state.control().ok_or_else(denied)?;
+        Ok((Self{state:std::sync::Arc::new(std::sync::Mutex::new(Some(state))),started},control))
+    }
+    pub(super) fn take(&self)->Option<Box<RequestTimeouts>>{self.state.lock().unwrap_or_else(|e|e.into_inner()).take()}
 }
 fn install_control(state:&mut RequestTimeouts,pool:&Pool,rule:Rule)->anyhow::Result<()> {
     let policies=PolicySet::compile(pool,&state.writes)?;

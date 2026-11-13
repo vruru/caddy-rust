@@ -15,6 +15,8 @@ use helpers::*;
 use serde_json::Value;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use types::*;
+#[path = "http_config/rewrite.rs"]
+mod rewrite;
 
 #[derive(Clone)]
 pub struct PreparedConfig {
@@ -799,10 +801,7 @@ pub(crate) fn parse_matcher_sets(
                 }
                 "path" => {
                     let patterns = strings(v, "path")?;
-                    if patterns.iter().any(|p| p.contains('%')) {
-                        return Err(unsupported("/match/path/escaped_patterns"));
-                    }
-                    Matcher::Path(patterns.iter().map(|s| s.to_lowercase()).collect())
+                    Matcher::Path(patterns.iter().map(|s|crate::http_runtime::path_match::lower(s.as_bytes())).collect())
                 }
                 "path_regexp" => Matcher::PathRegex(parse_request_regexp(v, regex_remaining)?),
                 "header_regexp" => Matcher::HeaderRegex(
@@ -1016,6 +1015,18 @@ fn parse_handler(
                 early: boolean(m.get("early").filter(|value| !value.is_null()), false, path)?,
             }))
         }
+        "push"=>{
+            deny_unknown(m,&["handler","resources","headers"],path)?;
+            let mut resources=Vec::new();
+            if let Some(value)=m.get("resources").filter(|v|!v.is_null()){
+                for (index,value)in value.as_array().ok_or_else(||anyhow::anyhow!("push resources array required at {path}"))?.iter().enumerate(){
+                    let rp=format!("{path}/resources/{index}");let resource=object(value,&rp)?;deny_unknown(resource,&["method","target"],&rp)?;
+                    resources.push(PushResource{method:optional_handler_string(resource,"method",&rp)?,target:optional_handler_string(resource,"target",&rp)?});
+                }
+            }
+            let headers=m.get("headers").filter(|v|!v.is_null()).map(|v|parse_header_ops(v,path,false)).transpose()?.unwrap_or_default();
+            Handler::Push(std::sync::Arc::new(PushConfig{resources,headers}))
+        }
         "tracing" => Handler::Tracing(std::sync::Arc::new(crate::metrics::distributed_trace::config::Config::parse(value)?)),
         "metrics" => {
             deny_unknown(m, &["handler","disable_openmetrics"], path)?;
@@ -1135,31 +1146,7 @@ fn parse_handler(
                 },
             }
         }
-        "rewrite" => {
-            deny_unknown(
-                m,
-                &[
-                    "handler",
-                    "uri",
-                    "method",
-                    "strip_path_prefix",
-                    "strip_path_suffix",
-                ],
-                path,
-            )?;
-            Handler::Rewrite {
-                uri: m.get("uri").map(|v| string(v, path)).transpose()?,
-                method: m.get("method").map(|v| string(v, path)).transpose()?,
-                strip_path_prefix: m
-                    .get("strip_path_prefix")
-                    .map(|v| string(v, path))
-                    .transpose()?,
-                strip_path_suffix: m
-                    .get("strip_path_suffix")
-                    .map(|v| string(v, path))
-                    .transpose()?,
-            }
-        }
+        "rewrite" => Handler::Rewrite(Arc::new(rewrite::parse(m,path,regex_remaining,true)?)),
         "vars" => Handler::Vars(
             m.iter()
                 .filter(|(k, _)| k.as_str() != "handler" && k.as_str() != "@id")
@@ -1665,6 +1652,7 @@ fn parse_proxy(
             "handle_response",
             "health_checks",
             "dynamic_upstreams",
+            "rewrite",
         ],
         path,
     )?;
@@ -1962,6 +1950,7 @@ fn parse_proxy(
         }
     }
     Ok(ProxyConfig {
+        rewrite: m.get("rewrite").filter(|v|!v.is_null()).map(|v|rewrite::parse(object(v,path)?,path,regex_remaining,false).map(Arc::new)).transpose()?,
         ext,
         upstreams,
         selection,
