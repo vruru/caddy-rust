@@ -98,7 +98,7 @@ impl CertificateServices {
                 let charge=external.reservation.clone();let resources=this.context.resources.clone();
                 let runner_cancel=lifetime.clone();
                 let _admission=this.admission.lock().map_err(|_|anyhow!("certificate service admission unavailable"))?;
-                ensure!(!this.context.cancel.is_cancelled(),"certificate services stopped");
+                ensure!(!*_admission && !this.context.cancel.is_cancelled(),"certificate services stopped");
                 this.tasks.spawn(async move {
                     let _charge=charge;
                     let mut events=manager.subscribe();

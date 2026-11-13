@@ -40,7 +40,7 @@ impl OcspScope {
             .admission
             .lock()
             .map_err(|_| anyhow!("OCSP scope admission unavailable"))?;
-        if service.context.cancel.is_cancelled() || self.0.cancel.is_cancelled() || *started {
+        if *_parent || service.context.cancel.is_cancelled() || self.0.cancel.is_cancelled() || *started {
             return Ok(());
         }
         *started = true;
@@ -71,19 +71,22 @@ impl OcspScope {
                 });
             }
         }));
+        drop(started);
+        drop(_parent);
         self.0.tasks.close();
         Ok(())
     }
     pub(super) async fn stop(&self) -> Result<()> {
         {
-            let _guard = self
+            let mut guard = self
                 .0
                 .admission
                 .lock()
                 .map_err(|_| anyhow!("OCSP scope admission unavailable"))?;
-            self.0.cancel.cancel();
-            self.0.tasks.close();
+            *guard = true;
         }
+        self.0.cancel.cancel();
+        self.0.tasks.close();
         self.0.tasks.wait().await;
         Ok(())
     }

@@ -221,7 +221,8 @@ pub struct CertificateServices {
     staged_publication: AsyncMutex<()>,
     state: AsyncMutex<State>,
     tasks: TaskTracker,
-    admission: Mutex<()>,
+    // True closes every task-admission path before cancellation wakes callers.
+    admission: Mutex<bool>,
     activate: Mutex<Option<oneshot::Sender<()>>>,
     events: broadcast::Sender<CertificateEvent>,
     maintenance_changed: Arc<tokio::sync::Notify>,
@@ -303,7 +304,7 @@ impl CertificateServices {
                 ensured: None,
             }),
             tasks: tasks.clone(),
-            admission: Mutex::new(()),
+            admission: Mutex::new(false),
             activate: Mutex::new(Some(activate)),
             events,
             maintenance_changed: Arc::new(tokio::sync::Notify::new()),
@@ -418,7 +419,7 @@ impl CertificateServices {
             .unwrap_or_else(|error| error.into_inner());
         let token = self.context.cancel.child_token();
         ensure!(
-            !token.is_cancelled() && !self.tasks.is_closed(),
+            !*_admission && !token.is_cancelled() && !self.tasks.is_closed(),
             "certificate service stopped"
         );
         let owner = owner.clone();
@@ -435,52 +436,43 @@ impl CertificateServices {
     /// All fallible preparation/ensure work precedes this synchronous signal.
     /// Repeated calls are harmless; a dropped sender never activates maintenance.
     pub fn activate(&self) {
-        let _admission = self
-            .admission
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if self.context.cancel.is_cancelled() {
-            return;
-        }
-        if let Some(signal) = self
-            .activate
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
-            if let Some(epoch) = self.cache_epoch.get() {
-                let cache = self.context.resources.resident_cache.clone();
-                let epoch = epoch.clone();
-                let old = cache.activate(epoch.clone());
-                let cpu = self.context.resources.cpu.clone();
-                let cancel = self.context.cancel.clone();
-                self.tasks.spawn(async move {
-                    let _ = super::loaders::blocking(cpu, cancel, move || {
-                        cache.prune(&epoch)?;
-                        drop(old);
-                        Ok(())
-                    })
-                    .await;
-                });
+        let signal = {
+            let closed = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+            if *closed || self.context.cancel.is_cancelled() { return; }
+            let signal = self.activate.lock().unwrap_or_else(|e|e.into_inner()).take();
+            if signal.is_some() {
+                if let Some(epoch) = self.cache_epoch.get() {
+                    let cache = self.context.resources.resident_cache.clone();
+                    let epoch = epoch.clone();
+                    let old = cache.activate(epoch.clone());
+                    let cpu = self.context.resources.cpu.clone();
+                    let cancel = self.context.cancel.clone();
+                    self.tasks.spawn(async move {
+                        let _ = super::loaders::blocking(cpu, cancel, move || {
+                            cache.prune(&epoch)?; drop(old); Ok(())
+                        }).await;
+                    });
+                }
+                self.on_demand.active.store(true, Ordering::Release);
             }
-            self.on_demand.active.store(true, Ordering::Release);
-            let _ = signal.send(());
-        }
+            signal
+        };
+        // oneshot delivery may synchronously re-enter this service.
+        if let Some(signal) = signal { let _ = signal.send(()); }
     }
     pub async fn shutdown(&self) -> Result<()> {
-        {
-            let _admission = self
-                .admission
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            self.context.cancel.cancel();
-            self.ssl_verify.close();
-            self.activate
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
-            self.tasks.close();
-        }
+        let activation = {
+            let mut closed = self.admission.lock().unwrap_or_else(|e|e.into_inner());
+            *closed = true;
+            self.activate.lock().unwrap_or_else(|e|e.into_inner()).take()
+        };
+        // The closed fence rejects all new admissions before any wake/drop.
+        // Token cancellation, verifier close, sender drop and tracker close
+        // invoke no external waker while either service mutex is held.
+        self.context.cancel.cancel();
+        self.ssl_verify.close();
+        drop(activation);
+        self.tasks.close();
         self.tasks.wait().await;
         self.ssl_verify.wait().await;
         let pki = self
@@ -572,7 +564,7 @@ impl CertificateServices {
                 .lock()
                 .map_err(|_| anyhow!("certificate service admission unavailable"))?;
             ensure!(
-                !self.context.cancel.is_cancelled(),
+                !*_admission && !self.context.cancel.is_cancelled(),
                 "certificate services stopped"
             );
             let token = self.context.cancel.child_token();

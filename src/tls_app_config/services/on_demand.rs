@@ -1480,12 +1480,14 @@ impl CertificateServices {
         target: Option<Arc<Resident>>,
         selection: Option<crate::http_runtime::WarmSelection>,
     ) -> Result<(Arc<Flight>, bool)> {
+        let mut previous_owner:Option<(Arc<Flight>,bool)>=None;
+        let result=(|| {
         let _admission = self
             .admission
             .lock()
             .map_err(|_| anyhow!("certificate service admission unavailable"))?;
         ensure!(
-            !self.context.cancel.is_cancelled(),
+            !*_admission && !self.context.cancel.is_cancelled(),
             "certificate services stopped"
         );
         let policy = self.policy_index(&origin);
@@ -1495,12 +1497,11 @@ impl CertificateServices {
             .lock()
             .map_err(|_| anyhow!("on-demand flight state unavailable"))?;
         let predecessor = flights.get(&name).cloned();
-        if let Some(previous) = &predecessor
-            && previous.residency.as_ref().is_some_and(|slot| !slot.live())
-        {
-            previous.cancel.cancel(); // generation 退役，不是 handshake 取消
-        }
+        let stale=predecessor.as_ref().is_some_and(|p|p.residency.as_ref().is_some_and(|slot|!slot.live()));
+        // Preserve the real last owner until admission/map guards are gone.
+        previous_owner=predecessor.as_ref().map(|previous|(previous.clone(),stale));
         if let Some(flight) = &predecessor
+            && !stale
             && match (&flight.target, &target) {
                 (Some(previous), Some(current)) => previous.receipt.same_instance(&current.receipt),
                 (None, None) => true,
@@ -1669,6 +1670,12 @@ impl CertificateServices {
             }
         });
         Ok((flight, true))
+        })();
+        if let Some((previous,stale))=previous_owner {
+            if stale { previous.cancel.cancel(); }
+            drop(previous);
+        }
+        result
     }
 
     async fn on_demand_action(

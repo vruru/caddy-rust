@@ -219,7 +219,7 @@ impl CertificateServices {
             .started
             .lock()
             .map_err(|_| anyhow!("certificate scope admission unavailable"))?;
-        if self.context.cancel.is_cancelled()
+        if *_admission || self.context.cancel.is_cancelled()
             || group.cancel.is_cancelled()
             || *started
             || group
@@ -235,18 +235,21 @@ impl CertificateServices {
         group.tasks.spawn(self.tasks.track_future(async move {
             this.run_group(worker).await;
         }));
+        drop(started);
+        drop(_admission);
         group.tasks.close();
         Ok(())
     }
     pub(super) async fn stop_group(&self, group: Arc<Group>) -> Result<()> {
         {
-            let _admission = group
+            let mut admission = group
                 .started
                 .lock()
                 .map_err(|_| anyhow!("certificate scope admission unavailable"))?;
-            group.cancel.cancel();
-            group.tasks.close();
+            *admission = true;
         }
+        group.cancel.cancel();
+        group.tasks.close();
         // The gate is released only after actual acquisition, native lease and
         // solver cleanup are joined. A stopped waiter cannot start new work.
         {
