@@ -391,8 +391,11 @@ impl Resources {
         // These new lanes are included in the same scalar spare allowance;
         // their separate queues are not a physical CPU/thread isolation claim.
         let remaining=spare.saturating_sub(selection_running).saturating_sub(regex_running).saturating_sub(listing_running);
-        let dial_dns_running=cpu.clamp(2,16).min((remaining/2).max(1));
-        let map_running=cpu.div_ceil(2).clamp(1,16).min(remaining.saturating_sub(dial_dns_running).max(1));
+        // Leave headroom for compression after admitting both new lanes.
+        // Filling every remaining slot here would force compression's minimum
+        // admission above the same scalar allowance at large custom limits.
+        let dial_dns_running=cpu.clamp(2,16).min((remaining/3).max(1));
+        let map_running=cpu.div_ceil(2).clamp(1,16).min((remaining.saturating_sub(dial_dns_running)/2).max(1));
         let proxy_dial_dns=BlockingBudget::new(dial_dns_running,64,Duration::from_secs(2))?;
         let map_lookup=BlockingBudget::new(map_running,cpu.saturating_mul(16).clamp(32,256),Duration::from_secs(2))?;
         let request_regexp = BlockingBudget::new(
@@ -435,7 +438,8 @@ impl Resources {
             fastcgi,
             compression: super::encode_body::CompressionBudget::new(
                 cpu,
-                established + selection_running + regex_running + listing_running,
+                established + selection_running + regex_running + listing_running
+                    + dial_dns_running + map_running,
             )?,
             proxy_hosts: Arc::new(super::proxy_policy::HostRegistry::default()),
             proxy_selection,
