@@ -35,3 +35,63 @@ The standard resource identity remains the actual Rust SDK. The logical instrume
 ## Status
 
 This documentation covers implemented tracing paths. The project remains a development candidate. Full module/field acceptance, performance comparisons, browser business flows and the authorized canary remain release gates.
+
+### Trace encoding, IO and CPU retirement
+
+Trace actors poll the closed SDK exporter future on the existing bounded trace
+CPU lane. Each Pending step returns its running permit before socket readiness,
+retry delay, or console IO is awaited. The actual owned future and source batch
+remain registry-pinned; the async driver receives only a small outcome. The
+pinned generated gRPC unary codec is preencoded on that same lane before Hyper
+polls request DATA. Its separate small supervisor avoids nested single-slot CPU
+wait cycles. This is a closed unary seam, with explicit errors for unexpected
+Pending, multiple DATA frames or request trailers; arbitrary body callbacks are
+not a new supported encoding API.
+
+CPU admission failure, idle deadline, caller cancellation and unconsumed output
+leave large batch/future/body data with the same registry. One retirement thread
+per metrics Process takes the same running semaphore before actual destruction.
+It is prepared before provider ingress and fails preparation explicitly if it
+cannot start. It is neither an additional encoder pool nor a thread per batch.
+Prepaid intrusive cells and their weak/control metadata use the existing trace
+source budget; no unbounded cleanup queue or new count allowance is introduced.
+The existing source, workspace, output, actor, queue, retry and absolute-deadline
+limits remain in force. In particular, four retained 128MiB workspaces can fill
+the existing 512MiB pool: CPU independence does not waive memory admission.
+
+Immutable encoded bytes have a registry primary pin plus a concrete shared Bytes
+reader owner. Slices share that reader. The reader releases its actual backing
+reference before reporting reader0; only then can CPU retirement destroy the
+last primary data owner and return its memory/output loans. Trace BatchMemory
+contains the memory lifetime separately from the original logical IO Credit.
+Byte pins do not extend Credit.done, change its creation time, postpone an old
+batch deadline, or add a strong Credit reference to the existing retry test.
+A concrete previous-pin receipt bounds successive encoded attempts. Actual
+retained HTTP/2 DATA still prohibits replay; reader0 alone is not IO success.
+Console retains its original single physical writer, order, deadline and
+kill-and-wait behavior; its trace output loan follows actual byte destruction.
+Ordinary metrics keep their existing direct scratch/metadata representation.
+
+Driver/source tokens and transferred byte pins have separate completion layers.
+Actor stop preserves the existing 30-second queue drain, retires its future on
+CPU, and closes its own Plan transport before the Driver finishes. This permits
+actual IO readers to end; final Process shutdown then drains byte retirement and
+awaits the real thread join. A byte pin owns neither a Plan nor the Process or
+Driver. The resident export future does strongly own its actual Plan during
+consumption, while the Plan/context has only weak retirement links. Pending
+receiver disposal and expired queued input use a pre-registered CPU retirement
+cell instead of dropping the whole receiver on the reactor.
+
+Normal explicit shutdown holds the requested 2MiB stack reservation through the
+actual OS thread join. Last-owner Drop without a usable runtime can signal the
+preexisting retirement thread and retire business data without that runtime; it
+does not claim an async join or prove that OS TLS/TCB/stack mappings have already
+been reclaimed merely because the thread function ended. Allocator/provider and
+whole-process RSS remain outside these declared source/workspace/layout loans.
+
+This boundary covers admitted trace-driver batches and the closed local encoder
+and byte handoffs above. The SDK Processor::on_end's preexisting queue-full or
+closed direct SpanData destruction is outside it. Ordinary metrics
+ExportPlan::once still has its separate CPU-lane block_on of network work; this
+trace change does not claim all observability callers are split. Standalone SDK
+bodies and Windows runtime behavior have no new universal acceptance claim.

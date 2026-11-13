@@ -182,12 +182,50 @@ impl Drop for Transport {
 }
 #[derive(Debug)]
 pub(super) struct Credit {
-    pub(super) _scratch: OwnedSemaphorePermit,
+    _scratch: Option<OwnedSemaphorePermit>,
     pub(super) _metadata: Arc<super::budget::Metadata>,
+    memory: Option<Arc<BatchMemory>>,
     pub(super) created: tokio::time::Instant,
     pub(super) done: tokio_util::sync::CancellationToken,
     pub(super) deadline_started: std::sync::atomic::AtomicBool,
     pub(super) timer_credit: std::sync::Mutex<Option<OwnedSemaphorePermit>>,
+}
+
+/// Trace-only data lifetime. Pins must not retain Credit itself: its Drop
+/// controls the original IO deadline and retained-DATA retry predicate.
+#[derive(Debug)]
+pub(super) struct BatchMemory {
+    _scratch: OwnedSemaphorePermit,
+    _metadata: Arc<super::budget::Metadata>,
+    _control: Arc<super::distributed_trace::processor::Credit>,
+}
+impl Credit {
+    pub(super) fn new(scratch: OwnedSemaphorePermit, metadata: Arc<super::budget::Metadata>, timer: OwnedSemaphorePermit) -> Self {
+        Self { _scratch: Some(scratch), _metadata: metadata, memory: None,
+            created: tokio::time::Instant::now(), done: CancellationToken::new(),
+            deadline_started: Default::default(), timer_credit: Mutex::new(Some(timer)) }
+    }
+    /// Native trace CPU producers only; layout is paid before the extra Arc.
+    pub(super) fn trace(
+        scratch: OwnedSemaphorePermit,
+        metadata: Arc<super::budget::Metadata>,
+        timer: OwnedSemaphorePermit,
+        source: &Arc<super::distributed_trace::processor::Process>,
+        created: tokio::time::Instant,
+    ) -> anyhow::Result<Self> {
+        let layout = std::mem::size_of::<BatchMemory>()
+            .checked_add(std::mem::size_of::<super::distributed_trace::processor::Credit>())
+            .and_then(|n| n.checked_add(4 * std::mem::size_of::<usize>()))
+            .ok_or_else(|| anyhow::anyhow!("trace batch memory layout overflow"))?;
+        let control = source.metadata(layout)?;
+        let memory = Arc::new(BatchMemory { _scratch: scratch, _metadata: metadata.clone(), _control: control });
+        Ok(Self { _scratch: None, _metadata: metadata, memory: Some(memory),
+            created, done: CancellationToken::new(),
+            deadline_started: Default::default(), timer_credit: Mutex::new(Some(timer)) })
+    }
+    pub(super) fn memory(&self) -> anyhow::Result<Arc<BatchMemory>> {
+        self.memory.clone().ok_or_else(|| anyhow::anyhow!("trace batch memory unavailable"))
+    }
 }
 
 impl Drop for Credit {

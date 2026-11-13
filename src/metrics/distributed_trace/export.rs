@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 type Active=Arc<Mutex<Option<Arc<metrics::transport::Credit>>>>;
 enum Sink {
  None,
- Http(SpanExporter,Active,Arc<metrics::transport::Transport>),
+ Http(SpanExporter,Active,Arc<metrics::transport::Transport>,metrics::export::TraceActive),
  Grpc(metrics::grpc::Grpc,opentelemetry_sdk::Resource),
  Console(Arc<metrics::console_writer::Writer>),
 }
@@ -75,10 +75,11 @@ impl Plan {
       let connector=crate::http_runtime::metrics_client::Connector::prepare(endpoint,ca.as_deref(),cert.as_deref().zip(key.as_deref()),timeout,CancellationToken::new(),metadata,false,process)?;
       let transport=metrics::transport::Transport::new(connector,timeout,false);
       let active=Arc::new(Mutex::new(None));
+      let context=Arc::new(Mutex::new(None));
       let mut exporter=SpanExporter::builder().with_http().with_protocol(Protocol::HttpBinary).with_timeout(timeout)
-       .with_http_client(metrics::export::native_client(transport.clone(),active.clone()))
+       .with_http_client(metrics::export::native_trace_client(transport.clone(),active.clone(),context.clone()))
        .with_max_request_body_size(32<<20).build().map_err(|_|anyhow::anyhow!("preparing trace HTTP exporter failed"))?;
-      exporter.set_resource(resource);Sink::Http(exporter,active,transport)
+      exporter.set_resource(resource);Sink::Http(exporter,active,transport,context)
      }
      "grpc"=>{
       let raw=env.signal("ENDPOINT").unwrap_or("http://localhost:4317");
@@ -93,24 +94,40 @@ impl Plan {
  pub fn resource(&self)->&opentelemetry_sdk::Resource{&self.resource}
  pub fn console(&self)->Option<Arc<metrics::console_writer::Writer>>{if let Sink::Console(writer)=&self.sink{Some(writer.clone())}else{None}}
  pub async fn export(&self,data:Vec<SpanData>,credit:Arc<metrics::transport::Credit>)->Result<()>{
+  self.export_inner(data,credit,None).await
+ }
+ pub async fn export_with_context(&self,data:Vec<SpanData>,credit:Arc<metrics::transport::Credit>,
+  context:Arc<super::export_work::TraceContext>,cpu:crate::http_runtime::resource_budget::BlockingBudget)->Result<()>{
+  self.export_inner(data,credit,Some((context,cpu))).await
+ }
+ async fn export_inner(&self,data:Vec<SpanData>,credit:Arc<metrics::transport::Credit>,
+  trace:Option<(Arc<super::export_work::TraceContext>,crate::http_runtime::resource_budget::BlockingBudget)>)->Result<()>{
   match &self.sink{
    Sink::None=>Ok(()),
-   Sink::Http(exporter,active,_)=>{
-    *active.lock().unwrap_or_else(|e|e.into_inner())=Some(credit);
-    let _guard=ActiveGuard(active.clone());exporter.export(data).await.map_err(|_|anyhow::anyhow!("trace HTTP export failed"))
+   Sink::Http(exporter,active,_,context)=>{
+    let previous_context={let mut current=context.lock().unwrap_or_else(|e|e.into_inner());std::mem::replace(&mut *current,trace.as_ref().map(|v|v.0.clone()))};
+    let previous_credit=active.lock().unwrap_or_else(|e|e.into_inner()).replace(credit);
+    drop(previous_context);drop(previous_credit);
+    let _guard=ActiveGuard(active.clone(),context.clone());exporter.export(data).await.map_err(|_|anyhow::anyhow!("trace HTTP export failed"))
    }
-   Sink::Grpc(exporter,resource)=>exporter.export_traces(&data,resource,credit).await,
+   Sink::Grpc(exporter,resource)=>if let Some((context,cpu))=trace {
+    exporter.export_traces_with_context(&data,resource,credit,context,cpu).await
+   }else{exporter.export_traces(&data,resource,credit).await},
    Sink::Console(_)=>anyhow::bail!("console trace batch requires its bounded writer owner"),
   }
  }
  pub async fn shutdown(&self){
   match &self.sink {
-   Sink::Http(exporter,_,transport)=>{let _=exporter.shutdown();transport.shutdown().await;}
+   Sink::Http(exporter,_,transport,_)=>{let _=exporter.shutdown();transport.shutdown().await;}
    Sink::Grpc(exporter,_)=>exporter.shutdown().await,
    Sink::Console(writer)=>writer.shutdown().await,
    Sink::None=>{},
   }
  }
 }
-struct ActiveGuard(Active);
-impl Drop for ActiveGuard{fn drop(&mut self){let credit=self.0.lock().unwrap_or_else(|e|e.into_inner()).take();drop(credit);}}
+struct ActiveGuard(Active,metrics::export::TraceActive);
+impl Drop for ActiveGuard{fn drop(&mut self){
+ let credit=self.0.lock().unwrap_or_else(|e|e.into_inner()).take();
+ let context=self.1.lock().unwrap_or_else(|e|e.into_inner()).take();
+ drop(context);drop(credit);
+}}

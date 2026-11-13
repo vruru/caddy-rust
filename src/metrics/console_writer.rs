@@ -70,8 +70,10 @@ fn helper() -> std::io::Result<()> {
 }
 
 pub(super) struct Batch {
-    pub bytes: Vec<u8>,
-    pub output: OwnedSemaphorePermit,
+    pub bytes: bytes::Bytes,
+    /// Trace pins own this permit until their final CPU byte retirement.
+    /// Ordinary metrics retain the original direct Batch owner.
+    pub output: Option<OwnedSemaphorePermit>,
     pub credit: Arc<super::transport::Credit>,
     pub serial: OwnedSemaphorePermit,
 }

@@ -21,6 +21,7 @@ pub(super) struct AdminSeries {
 }
 pub struct Process {
     connections: super::connection::Connections,
+    trace_retirement: Mutex<TraceRetirementState>,
     pub(super) traces: Arc<super::distributed_trace::processor::Process>,
     pub(super) trace_workspace: Arc<Semaphore>,
     pub(super) trace_output: Arc<Semaphore>,
@@ -42,12 +43,44 @@ pub struct Process {
     generation_headroom: Mutex<Option<OwnedSemaphorePermit>>,
     _fixed_credit: OwnedSemaphorePermit,
 }
+#[derive(Default)]
+struct TraceRetirementState {
+    closed: bool,
+    owner: Option<Arc<super::distributed_trace::export_work::TraceRetirementOwner>>,
+}
 impl Process {
+    pub(crate) fn trace_retirement(&self) -> anyhow::Result<Arc<super::distributed_trace::export_work::TraceRetirementOwner>> {
+        let mut state = self.trace_retirement.lock().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(!state.closed, "trace retirement stopped");
+        if state.owner.is_none() {
+            state.owner = Some(Arc::new(super::distributed_trace::export_work::TraceRetirementOwner::new(
+                self.traces.clone(), self.trace_cpu.retirement_running(),
+            )?));
+        }
+        Ok(state.owner.as_ref().expect("prepared retirement owner").clone())
+    }
     pub(crate) fn connection_factory(&self) -> anyhow::Result<crate::outgoing_tls::ScopeFactory> {
         self.connections.factory()
     }
-    pub(crate) fn close_connections(&self) { self.connections.close(); }
+    pub(crate) fn close_connections(&self) {
+        let retirement = {
+            let mut state = self.trace_retirement.lock().unwrap_or_else(|e| e.into_inner());
+            state.closed = true;
+            state.owner.clone()
+        };
+        if let Some(owner) = retirement { owner.close(); }
+        self.connections.close();
+    }
     pub(crate) async fn shutdown_connections(&self) -> anyhow::Result<()> {
+        let retirement = {
+            let mut state = self.trace_retirement.lock().unwrap_or_else(|e| e.into_inner());
+            state.closed = true;
+            state.owner.clone()
+        };
+        if let Some(owner) = retirement { owner.shutdown().await?; }
+        let cpu = self.trace_cpu.tasks();
+        cpu.close();
+        cpu.wait().await;
         self.connections.shutdown().await
     }
 
@@ -141,6 +174,7 @@ impl Process {
             .expect("fresh generation headroom");
         Arc::new(Self {
             connections: Default::default(),
+            trace_retirement: Default::default(),
             traces: super::distributed_trace::processor::Process::new(),
             trace_workspace: Arc::new(Semaphore::new(512<<20)),
             trace_output: Arc::new(Semaphore::new(128<<20)),

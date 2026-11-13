@@ -1751,3 +1751,22 @@ error. Standalone public AcmeWire and CertificateServices constructors retain
 their earlier scope boundaries. This observability layer does not add CBC
 compatibility to default CA-loader, ACME or metrics clients, and does not claim
 complete issuer/PKIX or universal outgoing TLS compatibility.
+
+### Trace export CPU and IO ownership
+
+Trace SDK export futures are polled in bounded CPU steps; socket/console waits
+and retry sleeps release the running lane. Pinned generated unary gRPC bodies
+are preencoded on that lane. Registry-pinned futures, batches, inactive/expired
+receivers and concrete immutable byte backings retire under the same CPU
+semaphore, including cancellation and unconsumed results. Trace BatchMemory is
+separate from the original logical IO Credit, preserving deadlines, DATA replay
+checks and console writer ownership. Whole-worker cancellation closes overflow
+residence; ordinary step retirement preserves the next batch. Existing actor,
+source/workspace/output, queue, retry and 30-second drain bounds remain. See
+[docs/TRACING.md](docs/TRACING.md) for the Arc, IO and no-runtime boundaries.
+
+This does not cover the SDK Processor::on_end's original queue-full/closed direct
+SpanData destruction, split ordinary metrics ExportPlan::once's block_on of
+network work, claim whole-provider heap/RSS bounds, or add universal outgoing
+TLS/issuer compatibility. Normal shutdown joins the real retirement thread;
+no-runtime last-owner Drop does not claim OS stack/TLS/TCB mappings were joined.

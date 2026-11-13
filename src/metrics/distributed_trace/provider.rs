@@ -1,7 +1,7 @@
 //! Generation ownership and independent exporter actors. Requests only enqueue;
 //! each actor has a distinct transport so a failed export cannot close another
 //! actor's connection epoch. Export workspace is separate from metrics.
-use super::{config,processor,export};
+use super::{config,processor,export,export_work};
 use crate::metrics;
 use anyhow::{Result,ensure};
 use opentelemetry::{Context,KeyValue,propagation::TextMapCompositePropagator,trace::{TraceContextExt,Tracer,TracerProvider,SpanKind}};
@@ -21,9 +21,11 @@ pub(crate) struct Provider{
  settings:config::Settings,
  metric_process:Arc<metrics::Process>,
  metadata:Arc<metrics::Metadata>,
+ cells:Vec<Arc<export_work::ActorCell>>,
+ _cell_index:Arc<processor::Credit>,
 
 }
-struct State{receiver:Option<processor::Receiver>,driver:Option<Arc<Driver>>,stopped:bool}
+struct State{receiver:Option<export_work::OwnedReceiver>,driver:Option<Arc<Driver>>,stopped:bool}
 struct Driver{stop:CancellationToken,tasks:TaskTracker}
 impl Drop for Driver{fn drop(&mut self){self.stop.cancel();}}
 impl Provider{
@@ -35,6 +37,11 @@ impl Provider{
   let inputs=export::Inputs::prepare(&settings,&metric_process,&metadata)?;
   let resource=metrics::export::resource();
   let count=if settings.disabled||settings.exporters.is_empty(){1}else{std::thread::available_parallelism().map_or(1,usize::from).clamp(1,4)};
+  let retirement=metric_process.trace_retirement()?;
+  let receiver_slot=retirement.receiver_slot()?;
+  let cell_index=process.metadata(count.checked_mul(std::mem::size_of::<Arc<export_work::ActorCell>>()).and_then(|n|n.checked_add(128)).ok_or_else(||anyhow::anyhow!("trace actor index layout overflow"))?)?;
+  let mut cells=Vec::new();cells.try_reserve_exact(count)?;
+  for _ in 0..count{cells.push(retirement.register()?);}
   let mut plans=Vec::with_capacity(count);
   for _ in 0..count{plans.push(export::Plan::prepare(&settings,&inputs,metadata.clone(),&resource,&metric_process)?);}
   let(shared,receiver)=processor::Shared::new(process.clone(),settings.queue)?;
@@ -47,7 +54,7 @@ impl Provider{
   let scope=opentelemetry::InstrumentationScope::builder("go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp").with_version("0.71.0").build();
   let tracer=sdk.tracer_with_scope(scope);
   let propagators=super::propagators::compose(&settings.propagators);
-  Ok(Arc::new(Self{propagators,process,shared,sdk,tracer,lifecycle:Mutex::new(State{receiver:Some(receiver),driver:None,stopped:false}),plans,settings,metric_process,metadata}))
+  Ok(Arc::new(Self{propagators,process,shared,sdk,tracer,lifecycle:Mutex::new(State{receiver:Some(receiver_slot.wrap(receiver)),driver:None,stopped:false}),plans,settings,metric_process,metadata,cells,_cell_index:cell_index}))
  }
  pub fn admit(&self)->Option<Arc<processor::Credit>>{
   if self.shared.closed.load(Ordering::Acquire){return None}
@@ -60,17 +67,25 @@ impl Provider{
  }
  pub fn discard(&self,context:&Context){self.shared.discard(context.span().span_context().span_id());}
  pub fn activate(&self,logging:Option<&crate::logging::Logging>){
-  let mut state=self.lifecycle.lock().unwrap_or_else(|e|e.into_inner());
-  if state.stopped||state.driver.is_some(){return}
-  let Some(receiver)=state.receiver.take()else{return};
-  let stop=CancellationToken::new();let tasks=TaskTracker::new();
+  let Ok(runtime)=tokio::runtime::Handle::try_current()else{return};
+  let prepared={
+   let mut state=self.lifecycle.lock().unwrap_or_else(|e|e.into_inner());
+   if state.stopped||state.driver.is_some(){return}
+   let Some(receiver)=state.receiver.take()else{return};
+   let stop=CancellationToken::new();let tasks=TaskTracker::new();
+   // Keep close+wait nonempty until every admitted worker is registered.
+   let activation=tasks.token();
+   state.driver=Some(Arc::new(Driver{stop:stop.clone(),tasks:tasks.clone()}));
+   (receiver,stop,tasks,activation)
+  };
+  let(receiver,stop,tasks,activation)=prepared;
   let receiver=Arc::new(tokio::sync::Mutex::new(receiver));
-  for plan in &self.plans{
+  for(plan,cell)in self.plans.iter().zip(&self.cells){
    let input=receiver.clone();let token=stop.clone();let shared=self.shared.clone();let settings=self.settings.clone();
-   let process=self.metric_process.clone();let metadata=self.metadata.clone();let plan=plan.clone();
-   tasks.spawn(async move{worker(input,token,shared,settings,process,metadata,plan).await;});
+   let process=self.metric_process.clone();let metadata=self.metadata.clone();let plan=plan.clone();let cell=cell.clone();let group=tasks.clone();
+   tasks.spawn_on(async move{worker(input,token,shared,settings,process,metadata,plan,cell,group).await;},&runtime);
   }
-  state.driver=Some(Arc::new(Driver{stop,tasks}));
+  drop(activation);
   if self.settings.unknown_propagators!=0{
    if let(Some(logging),Ok(time))=(logging,crate::logging::Timestamp::now()){
     use crate::logging::{Event,Field,FieldValue,Level,Origin};
@@ -89,54 +104,65 @@ impl Provider{
  }
 }
 
-async fn worker(input:Arc<tokio::sync::Mutex<processor::Receiver>>,stop:CancellationToken,shared:Arc<processor::Shared>,settings:config::Settings,process:Arc<metrics::Process>,metadata:Arc<metrics::Metadata>,plan:Arc<export::Plan>){
- let mut pending=None;let mut stopping=None;
+async fn worker(input:Arc<tokio::sync::Mutex<export_work::OwnedReceiver>>,stop:CancellationToken,shared:Arc<processor::Shared>,settings:config::Settings,process:Arc<metrics::Process>,metadata:Arc<metrics::Metadata>,plan:Arc<export::Plan>,cell:Arc<export_work::ActorCell>,group:TaskTracker){
+ let mut stopping=None;
  loop{
   if stop.is_cancelled()&&stopping.is_none(){
-   stopping=Some(tokio::time::Instant::now()+Duration::from_secs(30));input.lock().await.inner.close();
+   stopping=Some(tokio::time::Instant::now()+Duration::from_secs(30));
+   if let Some(receiver)=input.lock().await.receiver_mut(){receiver.inner.close();}
   }
-  let expired=stopping.is_some_and(|deadline|tokio::time::Instant::now()>=deadline);
-  if expired{if let Some(item)=pending.take(){drop(item);shared.process.dropped.fetch_add(1,Ordering::Relaxed);}let mut input=input.lock().await;while let Ok(item)=input.inner.try_recv(){drop(item);shared.process.dropped.fetch_add(1,Ordering::Relaxed);}break}
-  let first=if let Some(item)=pending.take(){Some(item)}else{
-   let mut input=input.lock().await;
-   if stopping.is_some(){input.inner.try_recv().ok()}
-   else{tokio::select!{biased;_=stop.cancelled()=>{drop(input);continue},item=input.inner.recv()=>item}}
+  if stopping.is_some_and(|deadline|tokio::time::Instant::now()>=deadline){
+   let(count,signal)={let mut input=input.lock().await;input.retire_queue()};drop(signal);
+   shared.process.dropped.fetch_add((count+cell.pending_count())as u64,Ordering::Relaxed);break
+  }
+  let mut batch=cell.worker_batch_guard();
+  if cell.attach_token(group.token()).is_err(){break}
+  let first=if let Some(item)=cell.promote_pending(){Some(item)}else{
+   let next=cell.receive(&input,stopping.is_some());
+   let result=if stopping.is_some(){Some(next.await)}else{tokio::select!{biased;_=stop.cancelled()=>None,result=next=>Some(result)}};
+   match result{Some(Ok(item))=>item,Some(Err(_))=>{cell.finish_batch().await;batch.disarm();break},None=>{cell.finish_batch().await;batch.disarm();continue}}
   };
-  let Some(first)=first else{break};
-  if first.credit.held()>BATCH_WEIGHT{shared.process.dropped.fetch_add(1,Ordering::Relaxed);continue}
+  let Some(first)=first else{cell.finish_batch().await;batch.disarm();break};
+  if first.weight>BATCH_WEIGHT{shared.process.dropped.fetch_add(1,Ordering::Relaxed);cell.finish_batch().await;batch.disarm();continue}
   let max_count=settings.batch.min(BATCH_WEIGHT/8192).max(1);
-  let batch_metadata=match shared.process.metadata(max_count*(std::mem::size_of::<processor::Item>()*2+128)+4096){Ok(credit)=>credit,Err(_)=>{shared.process.dropped.fetch_add(1,Ordering::Relaxed);continue}};
-  let mut weight=first.credit.held();let mut items=Vec::with_capacity(max_count);items.push(first);
-  let deadline=tokio::time::Instant::now()+settings.schedule;
-  while items.len()<max_count{
-   let item=if stopping.is_some(){input.lock().await.inner.try_recv().ok()}else{
-    let next=async{input.lock().await.inner.recv().await};
-    tokio::select!{biased;_=stop.cancelled()=>None,item=tokio::time::timeout_at(deadline,next)=>item.ok().flatten()}
+  let collect_deadline=tokio::time::Instant::now()+settings.schedule;
+  if cell.begin_source(&process.trace_cpu,max_count).await.is_err(){shared.process.dropped.fetch_add(1,Ordering::Relaxed);cell.finish_batch().await;batch.disarm();continue}
+  let mut count=1;
+  while count<max_count{
+   let next=cell.receive(&input,stopping.is_some());
+   let result=if stopping.is_some(){Some(next.await)}else{
+    tokio::select!{biased;_=stop.cancelled()=>None,result=tokio::time::timeout_at(collect_deadline,next)=>result.ok()}
    };
-   let Some(item)=item else{break};
-   if weight+item.credit.held()>BATCH_WEIGHT{pending=Some(item);break}
-   weight+=item.credit.held();items.push(item);
+   let Some(Ok(Some(_)))=result else{break};
+   match cell.append_ingress(BATCH_WEIGHT){Ok(true)=>count+=1,Ok(false)|Err(_)=>break}
   }
-  let scratch=match process.trace_workspace.clone().try_acquire_many_owned(WORKSPACE){Ok(credit)=>credit,Err(_)=>{shared.process.dropped.fetch_add(items.len()as u64,Ordering::Relaxed);continue}};
-  let timer=match process.request_bytes.clone().try_acquire_many_owned(1024){Ok(credit)=>credit,Err(_)=>{shared.process.dropped.fetch_add(items.len()as u64,Ordering::Relaxed);continue}};
-  let credit=Arc::new(metrics::transport::Credit{_scratch:scratch,_metadata:metadata.clone(),created:tokio::time::Instant::now(),done:CancellationToken::new(),deadline_started:Default::default(),timer_credit:Mutex::new(Some(timer))});
-  let console_serial=if let Some(writer)=plan.console(){
-   match writer.admit_until(credit.created+plan.timeout).await{Ok(serial)=>Some(serial),Err(_)=>{shared.process.errors.fetch_add(1,Ordering::Relaxed);continue}}
-  }else{None};
-  let plan2=plan.clone();let process2=process.clone();let handle=tokio::runtime::Handle::current();let count=items.len();
-  let result=process.trace_cpu.run(move||{
-   let _batch_metadata=batch_metadata;
-   let mut data=Vec::with_capacity(count);let mut parents=Vec::with_capacity(count);let mut children=Vec::with_capacity(count);let mut owners=Vec::with_capacity(count);
-   for item in items{data.push(item.span);parents.push(item.parent);children.push(item.children);owners.push(item.credit);}
-   let _owners=owners;
-   if let Some(writer)=plan2.console(){
-    let serial=console_serial.ok_or_else(||anyhow::anyhow!("trace console owner missing"))?;let output=process2.trace_output.clone().try_acquire_many_owned(64<<20)?;
-    let bytes=super::console::encode(&data,&parents,&children,plan2.resource())?;
-    handle.block_on(writer.send(metrics::console_writer::Batch{bytes,output,credit,serial},plan2.timeout))?;
-   }else{handle.block_on(async{tokio::time::timeout(plan2.timeout,plan2.export(data,credit)).await??;Ok::<_,anyhow::Error>(())})?;}
-   Ok::<_,anyhow::Error>(())
-  }).await;
-  if !matches!(result,Ok(Ok(()))){shared.process.errors.fetch_add(1,Ordering::Relaxed);}
+  let scratch=match process.trace_workspace.clone().try_acquire_many_owned(WORKSPACE){Ok(credit)=>credit,Err(_)=>{shared.process.dropped.fetch_add(count as u64,Ordering::Relaxed);cell.finish_batch().await;batch.disarm();continue}};
+  let timer=match process.request_bytes.clone().try_acquire_many_owned(1024){Ok(credit)=>credit,Err(_)=>{shared.process.dropped.fetch_add(count as u64,Ordering::Relaxed);cell.finish_batch().await;batch.disarm();continue}};
+  let created=tokio::time::Instant::now();
+  let Some(deadline)=created.checked_add(plan.timeout)else{cell.finish_batch().await;batch.disarm();shared.process.errors.fetch_add(1,Ordering::Relaxed);continue};
+  let inputs=export_work::ExportInputs{plan:Arc::downgrade(&plan),metadata:metadata.clone(),scratch,timer,output:process.trace_output.clone(),created};
+  let start=tokio::time::timeout_at(deadline,cell.begin_export(&process.trace_cpu,inputs)).await;
+  let mut ready=matches!(start,Ok(Ok(export_work::Step::Started)));
+  if let Ok(Ok(export_work::Step::Console{writer,deadline}))=start{
+   if let Ok(serial)=writer.admit_until(deadline).await{
+    ready=matches!(tokio::time::timeout_at(deadline,cell.begin_console(&process.trace_cpu,Arc::downgrade(&plan),process.trace_output.clone(),serial)).await,Ok(Ok(export_work::Step::Started)));
+   }
+  }
+  let mut success=false;
+  if ready{
+   loop{
+    match tokio::time::timeout_at(deadline,cell.poll_export(&process.trace_cpu)).await{
+     Ok(Ok(export_work::Step::Complete(value)))=>{success=value;break},
+     Ok(Ok(export_work::Step::Pending))=>{if !cell.wait_wake(deadline).await{break}},
+     _=>break,
+    }
+   }
+  }
+  if !success{shared.process.errors.fetch_add(1,Ordering::Relaxed);}
+  // CPU input/future receipt only. Independent byte pins must not block the
+  // actor's own Plan.shutdown from closing its physical IO below.
+  cell.finish_batch().await;batch.disarm();
  }
  plan.shutdown().await;
+ cell.retire(true);
 }

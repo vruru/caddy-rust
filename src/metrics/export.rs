@@ -233,6 +233,7 @@ impl Plan {
                                 transport: transport.clone(),
                                 active: active.clone(),
                                 previous: Default::default(),
+                                trace_context: None,
                             })
                             .with_max_request_body_size(32 << 20)
                             .build()?,
@@ -322,14 +323,7 @@ impl Plan {
             .request_bytes
             .clone()
             .try_acquire_many_owned(1024)?;
-        let credit = Arc::new(super::transport::Credit {
-            _scratch: scratch,
-            _metadata: self._credit.clone(),
-            created: tokio::time::Instant::now(),
-            done: CancellationToken::new(),
-            deadline_started: Default::default(),
-            timer_credit: std::sync::Mutex::new(Some(timer)),
-        });
+        let credit = Arc::new(super::transport::Credit::new(scratch, self._credit.clone(), timer));
         let plan = self.clone();
         let owner = registry.clone();
         let handle = tokio::runtime::Handle::current();
@@ -350,8 +344,8 @@ impl Plan {
                         .try_acquire_many_owned(64 << 20)?;
                     let bytes = super::encode::console(&data)?;
                     return Ok(Some(super::console_writer::Batch {
-                        bytes,
-                        output,
+                        bytes: bytes.into(),
+                        output: Some(output),
                         credit,
                         serial: serial.expect("console admitted"),
                     }));
@@ -395,12 +389,21 @@ impl Drop for Active {
     }
 }
 pub(super) fn native_client(transport: Arc<super::transport::Transport>, active: Arc<std::sync::Mutex<Option<Arc<super::transport::Credit>>>>) -> impl opentelemetry_http::HttpClient {
-    Client { transport, active, previous: Default::default() }
+    Client { transport, active, previous: Default::default(), trace_context: None }
+}
+pub(super) type TraceActive = Arc<std::sync::Mutex<Option<Arc<super::distributed_trace::export_work::TraceContext>>>>;
+pub(super) fn native_trace_client(
+    transport: Arc<super::transport::Transport>,
+    active: Arc<std::sync::Mutex<Option<Arc<super::transport::Credit>>>>,
+    context: TraceActive,
+) -> impl opentelemetry_http::HttpClient {
+    Client { transport, active, previous: Default::default(), trace_context: Some(context) }
 }
 struct Client {
     transport: Arc<super::transport::Transport>,
     active: Arc<std::sync::Mutex<Option<Arc<super::transport::Credit>>>>,
     previous: std::sync::Mutex<std::sync::Weak<()>>,
+    trace_context: Option<TraceActive>,
 }
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -436,6 +439,14 @@ impl opentelemetry_http::HttpClient for Client {
             *previous = Arc::downgrade(&attempt);
         }
         let (mut parts, body) = request.into_parts();
+        // Keep the original attempt guard on actual DATA only. A backing pin
+        // owns immutable bytes/credit, never this attempt token.
+        let trace_context = self.trace_context.as_ref().and_then(|active| active.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        let body = if let Some(context) = trace_context {
+            context.pin_bytes(super::distributed_trace::export_work::ByteKind::Http, body,
+                credit.memory().map_err(|e| e.into_boxed_dyn_error())?)
+                .await.map_err(|e| e.into_boxed_dyn_error())?
+        } else { body };
         if let Some(auth) = self.transport.proxy_authorization() {
             parts
                 .headers

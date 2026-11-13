@@ -94,6 +94,7 @@ impl Grpc {
             let service = Service {
                 transport: self.transport.clone(),
                 credit: credit.clone(),
+                trace: None,
             };
             let mut client = MetricsServiceClient::with_origin(service, self.origin.clone())
                 .max_encoding_message_size(32 << 20);
@@ -162,6 +163,25 @@ pub(super) async fn export_traces(
     resource: &opentelemetry_sdk::Resource,
     credit: Arc<Credit>,
 ) -> anyhow::Result<()> {
+    self.export_traces_inner(data, resource, credit, None).await
+}
+pub(super) async fn export_traces_with_context(
+    &self,
+    data: &[opentelemetry_sdk::trace::SpanData],
+    resource: &opentelemetry_sdk::Resource,
+    credit: Arc<Credit>,
+    context: Arc<super::distributed_trace::export_work::TraceContext>,
+    budget: crate::http_runtime::resource_budget::BlockingBudget,
+) -> anyhow::Result<()> {
+    self.export_traces_inner(data, resource, credit, Some((context, budget))).await
+}
+async fn export_traces_inner(
+    &self,
+    data: &[opentelemetry_sdk::trace::SpanData],
+    resource: &opentelemetry_sdk::Resource,
+    credit: Arc<Credit>,
+    trace: Option<(Arc<super::distributed_trace::export_work::TraceContext>, crate::http_runtime::resource_budget::BlockingBudget)>,
+) -> anyhow::Result<()> {
     use opentelemetry_proto::tonic::collector::trace::v1::{
         ExportTraceServiceRequest, trace_service_client::TraceServiceClient,
     };
@@ -176,6 +196,7 @@ pub(super) async fn export_traces(
         let service = Service {
             transport: self.transport.clone(),
             credit: credit.clone(),
+            trace: trace.clone(),
         };
         let mut client = TraceServiceClient::with_origin(service, self.origin.clone())
             .max_encoding_message_size(32 << 20);
@@ -203,6 +224,12 @@ pub(super) async fn export_traces(
             Ok(_) => return Ok(()),
             Err(error) => error,
         };
+        if let Some((context, _)) = &trace {
+            // Finished reader0 needs its actual local CPU retirement before
+            // comparing the original credit count. Live DATA is not waited
+            // away to authorize a retry.
+            if !context.finish_body_if_idle().await { return Err(error.into()); }
+        }
         let hint = error.get_details_retry_info().and_then(|v| v.retry_delay);
         let retry = match error.code() {
             tonic::Code::ResourceExhausted => hint.is_some(),
@@ -251,6 +278,7 @@ pub(super) async fn export_traces(
 struct Service {
     transport: Arc<Transport>,
     credit: Arc<Credit>,
+    trace: Option<(Arc<super::distributed_trace::export_work::TraceContext>, crate::http_runtime::resource_budget::BlockingBudget)>,
 }
 impl tower_service::Service<http::Request<tonic::body::Body>> for Service {
     type Response = http::Response<hyper::body::Incoming>;
@@ -267,6 +295,14 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for Service {
     fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
         let transport = self.transport.clone();
         let credit = self.credit.clone();
-        Box::pin(async move { transport.send(request, credit).await })
+        let trace = self.trace.clone();
+        Box::pin(async move {
+            let request = if let Some((context, budget)) = trace {
+                context.prepare_unary(request,
+                    credit.memory().map_err(|e| e.into_boxed_dyn_error())?, budget).await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+            } else { request };
+            transport.send(request, credit).await
+        })
     }
 }

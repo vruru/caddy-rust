@@ -188,6 +188,11 @@ impl BlockingBudget {
     pub(crate) fn tasks(&self) -> TaskTracker {
         self.tasks.clone()
     }
+    /// Mandatory retirement uses the exact same CPU capacity, without a
+    /// runtime-dependent timer or a second execution allowance.
+    pub(crate) fn retirement_running(&self) -> Arc<Semaphore> {
+        self.running.clone()
+    }
     pub(crate) fn snapshot(&self) -> BudgetSnapshot {
         BudgetSnapshot {
             running_limit: self.running_limit,
