@@ -1171,6 +1171,13 @@ not substitute an artificial timeout for a configured unlimited drain.
 Explicit force shutdown and runtime drop close cancellation-bearing resources
 immediately, independently of whether the caller subsequently waits for joins.
 
+After a replaced generation's HTTP work drains and its certificate services
+finish shutting down, its logger explicitly closes admission. Retained TLS or
+listener snapshots cannot keep that old logging plan open until registry
+shutdown times out. Already accepted log jobs retain their own scope through
+the actual encoder and writer completion; retiring a plan does not discard
+those jobs or close writers still shared by the current generation.
+
 Local PKI admission and shutdown
 -------------------------------
 

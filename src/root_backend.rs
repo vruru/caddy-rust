@@ -553,6 +553,11 @@ impl Root {
                             "root event=retirement_failed category=certificate_shutdown_failed"
                         );
                     }
+                    // After HTTP drain and certificate shutdown, retained TLS
+                    // or listener snapshots may still own this logger; close
+                    // its admission explicitly. Already accepted log jobs keep
+                    // their own Scope until their actual writes have finished.
+                    retired.logging.retire();
                 });
             }
             Ok(Committed {
