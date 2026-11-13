@@ -39,6 +39,8 @@ mod ca_consumers;
 mod storage_pools;
 #[path = "services/http_pools.rs"]
 mod http_pools;
+#[path="services/managed_clients.rs"]
+mod managed_clients;
 #[path = "services/capacity.rs"]
 mod capacity;
 #[path = "services/group.rs"]
@@ -216,6 +218,7 @@ pub struct CertificateServices {
     manual_inventory: arc_swap::ArcSwap<ManualCertificates>,
     identity_client: Arc<identity::IdentityClient>,
     identity_ready: OnceCell<()>,
+    client_automate_names:std::sync::OnceLock<Vec<String>>,
     prepared: OnceCell<()>,
     ensure_gate: AsyncMutex<()>,
     staged_publication: AsyncMutex<()>,
@@ -295,6 +298,7 @@ impl CertificateServices {
             manual_inventory,
             identity_client: Arc::new(identity::IdentityClient::new()),
             identity_ready: OnceCell::new(),
+            client_automate_names:std::sync::OnceLock::new(),
             prepared: OnceCell::new(),
             ensure_gate: AsyncMutex::new(()),
             staged_publication: AsyncMutex::new(()),
@@ -810,13 +814,15 @@ impl CertificateServices {
         bound: &[StagedAddress],
         cancel: CancellationToken,
     ) -> Result<()> {
-        let mut names = names.to_vec();
-        names.extend(self.plan.automate.iter().map(|name| vec![name.clone()]));
+        let names = names.to_vec();
         let bound = bound.to_vec();
         self.owned(cancel, move |this, token| {
-            Box::pin(async move { this.ensure_business_inner(names, bound, token).await })
-        })
-        .await
+            Box::pin(async move {
+                let worker=this.clone();
+                let names=crate::cert_cpu::run(this.context.resources.cpu.clone(),token.clone(),move||worker.prepare_business_names(names)).await?;
+                this.ensure_business_inner(names,bound,token).await
+            })
+        }).await
     }
     async fn ensure_business_inner(
         &self,
@@ -832,7 +838,7 @@ impl CertificateServices {
             self.prepared.initialized(),
             "certificate services are not prepared"
         );
-        let names = self.preflight(names)?;
+        // Names were normalized on the owned certificate CPU lane.
         if let Some(retained) = &self.restore {
             ensure!(
                 retained.business_names == names,

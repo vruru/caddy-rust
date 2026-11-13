@@ -1,6 +1,9 @@
 //! Explicit-policy OpenSSL TLS transport. The default Rustls transport is not
 //! replaced. Exact-wire certificate validation remains the caller's verifier.
 mod io;
+mod managed_request;
+mod managed_client;
+pub use managed_client::{ClientCredential,ClientCertificateRequest,ClientIdentityResolver,ManagedClientConfig,ManagedStream};
 mod raw;
 mod server_auth;
 pub use server_auth::{ServerClientAuth, signature_scheme_name};
@@ -245,7 +248,15 @@ unsafe extern "C" fn observe(
     ssl: *mut openssl_sys::SSL,
     _arg: *mut std::ffi::c_void,
 ) {
-    if write != 0 || kind != 22 || ptr.is_null() || len == 0 || ssl.is_null() {
+    if kind != 22 || ptr.is_null() || len == 0 || ssl.is_null() {
+        return;
+    }
+    if write!=0 {
+        // Managed clients attest the actual sent leaf; legacy clients retain
+        // their original incoming-only observer behavior.
+        let ssl=unsafe{openssl::ssl::SslRef::from_ptr(ssl)};
+        let bytes=unsafe{std::slice::from_raw_parts(ptr.cast::<u8>(),len)};
+        managed_client::observe_sent(ssl,bytes);
         return;
     }
     let Some(index) = INDEX.get() else {
@@ -450,25 +461,7 @@ impl ClientConfig {
             scope: VerificationScope::new(),
         })
     }
-    /// Bind tracked CPU work to the owning runtime/service shutdown fence.
-    pub fn with_verification_scope(mut self, scope: Arc<VerificationScope>) -> Self {
-        self.scope = scope;
-        self
-    }
-    pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
-        &self,
-        name: ServerName<'static>,
-        io: S,
-    ) -> stdio::Result<Stream<S>> {
-        self.connect_with_alpn(name, io, None).await
-    }
-    pub async fn connect_with_alpn<S: AsyncRead + AsyncWrite + Unpin>(
-        &self,
-        name: ServerName<'static>,
-        io: S,
-        alpn: Option<&[u8]>,
-    ) -> stdio::Result<Stream<S>> {
-        let _entry = self.scope.enter()?;
+    fn configured_connection(&self, name:ServerName<'static>, alpn:Option<&[u8]>) -> stdio::Result<(Ssl,Arc<Guard>)> {
         let mut ssl = Ssl::new(&self.context).map_err(stdio::Error::other)?;
         ssl.set_status_type(openssl::ssl::StatusType::OCSP)
             .map_err(stdio::Error::other)?;
@@ -495,6 +488,28 @@ impl ClientConfig {
             SSL_set_msg_callback(ssl.as_ptr(), Some(observe));
             SSL_set_info_callback(ssl.as_ptr(), Some(handshake_done));
         }
+        Ok((ssl,guard))
+    }
+    /// Bind tracked CPU work to the owning runtime/service shutdown fence.
+    pub fn with_verification_scope(mut self, scope: Arc<VerificationScope>) -> Self {
+        self.scope = scope;
+        self
+    }
+    pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        name: ServerName<'static>,
+        io: S,
+    ) -> stdio::Result<Stream<S>> {
+        self.connect_with_alpn(name, io, None).await
+    }
+    pub async fn connect_with_alpn<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        name: ServerName<'static>,
+        io: S,
+        alpn: Option<&[u8]>,
+    ) -> stdio::Result<Stream<S>> {
+        let _entry = self.scope.enter()?;
+        let (ssl, guard) = self.configured_connection(name, alpn)?;
         let mut inner = tokio_openssl::SslStream::new(
             ssl,
             io::GuardedIo {

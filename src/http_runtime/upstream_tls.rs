@@ -63,6 +63,8 @@ pub(super) struct PreparedTransport {
     http: [HttpConnector<super::http_dial::FamilyResolver>; 3],
     tls: Option<Arc<ClientConfig>>,
     native: Option<Arc<native_ssl_tls::ClientConfig>>,
+    managed:Option<Arc<crate::tls_app_config::ManagedClientSource>>,
+    client_executor:Option<Arc<super::tls_executor::TlsExecutor>>,
     http1_native: bool,
     read: Option<Duration>,
     write: Option<Duration>,
@@ -70,7 +72,7 @@ pub(super) struct PreparedTransport {
     connect_timeout: Duration,
 }
 impl PreparedTransport {
-    pub(super) fn prepare(config: &ProxyConfig,scope:&Arc<native_ssl_tls::VerificationScope>) -> Result<Self> {
+    pub(super) fn prepare(config: &ProxyConfig,resources:&Arc<super::resource_budget::Resources>) -> Result<Self> {
         let http = [
             super::http_dial::Family::Any,
             super::http_dial::Family::V4,
@@ -87,13 +89,16 @@ impl PreparedTransport {
         let tls = config
             .tls
             .as_ref()
-            .map(|t| provision_inner(t, config.enable_http2,false,Some(scope)))
+            .map(|t| provision_inner(t, config.enable_http2,false,Some(&resources.ssl_verify)))
             .transpose()?;
-        let (tls,native)=match tls{Some(t)=>(Some(Arc::new(t.rustls)),t.native),None=>(None,None)};
+        let (tls,native,managed)=match tls{Some(t)=>(Some(Arc::new(t.rustls)),t.native,t.managed),None=>(None,None,None)};
+        let client_executor=if managed.is_some()&&native.is_none(){Some(resources.client_tls_executor()?)}else{None};
         Ok(Self {
+            client_executor,
             http,
             tls,
             native,
+            managed,
             http1_native:false,
             read: config.read_timeout,
             write: config.write_timeout,
@@ -105,7 +110,7 @@ impl PreparedTransport {
         let family=super::http_dial::Family::Any;
         let mut http=HttpConnector::new_with_resolver(super::http_dial::FamilyResolver::new(family));
         http.enforce_http(false);http.set_connect_timeout(Some(timeout));http.set_nodelay(true);
-        FixedDialConnector{http,family,tls,native:None,http1_native:false,read:Some(timeout),write:Some(timeout),handshake:Some(timeout),dial,server_name:None,unix_path:None,connect_timeout:timeout}
+        FixedDialConnector{http,family,tls,native:None,managed:None,client_executor:None,http1_native:false,read:Some(timeout),write:Some(timeout),handshake:Some(timeout),dial,server_name:None,unix_path:None,connect_timeout:timeout}
     }
     pub(super) fn http1(&self) -> Self {
         let mut result = self.clone();
@@ -141,6 +146,8 @@ impl PreparedTransport {
                 None
             },
             native: if dial.scheme_str()==Some("https"){self.native.clone()}else{None},
+            managed:if dial.scheme_str()==Some("https"){self.managed.clone()}else{None},
+            client_executor:self.client_executor.clone(),
             http1_native:self.http1_native,
             read: self.read,
             write: self.write,
@@ -227,12 +234,13 @@ fn provider_roots(raw:&serde_json::Value,depth:usize,budget:&mut u64,count:&mut 
     }
     Ok(())
 }
-pub(crate) struct PreparedTls {pub(crate) rustls:ClientConfig,pub(crate) native:Option<Arc<native_ssl_tls::ClientConfig>>}
+pub(crate) struct PreparedTls {pub(crate) rustls:ClientConfig,pub(crate) native:Option<Arc<native_ssl_tls::ClientConfig>>,pub(crate) managed:Option<Arc<crate::tls_app_config::ManagedClientSource>>}
 fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool,scope:Option<&Arc<native_ssl_tls::VerificationScope>>) -> Result<PreparedTls> {
     ensure!(
         tls.client_certificate_file.is_some() == tls.client_certificate_key_file.is_some(),
         "client_certificate_file and client_certificate_key_file must be set together"
     );
+    ensure!(tls.client_certificate_automate.is_none()||tls.managed_client.is_some(),"managed client certificate source is not prepared");
     let mut budget = 64 * 1024 * 1024;
     let mut roots = rustls::RootCertStore::empty();
     if let Some(module)=&tls.ca {
@@ -320,7 +328,7 @@ fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool,
     } else {
         Vec::new()
     };
-    Ok(PreparedTls{rustls:config,native})
+    Ok(PreparedTls{rustls:config,native,managed:tls.managed_client.clone()})
 }
 #[derive(Debug)]
 struct InsecureVerifier {
@@ -375,22 +383,26 @@ type Dial=TimeoutIo<super::http_dial_io::DialIo>;
 pub(super) enum Output{
     Rustls(MaybeHttpsStream<Dial>),
     Native(TokioIo<native_ssl_tls::Stream<TokioIo<Dial>>>),
+    ManagedNative(TokioIo<native_ssl_tls::ManagedStream<TokioIo<Dial>>>),
+    ManagedRustls(TokioIo<crate::tls_app_config::BoundClientIo<TokioIo<MaybeHttpsStream<Dial>>>>),
 }
 impl hyper_util::client::legacy::connect::Connection for Output{
     fn connected(&self)->hyper_util::client::legacy::connect::Connected{
-        match self{Self::Rustls(s)=>s.connected(),Self::Native(s)=>{
+        match self{Self::Rustls(s)=>s.connected(),Self::ManagedRustls(s)=>s.inner().get_ref().inner().connected(),Self::Native(s)=>{
             let connected=s.inner().get_ref().inner().connected();
             if s.inner().ssl().selected_alpn_protocol()==Some(b"h2"){connected.negotiated_h2()}else{connected}
-        }}
+        },Self::ManagedNative(s)=>{let connected=s.inner().get_ref().inner().connected();if s.inner().selected_alpn_protocol()==b"h2"{connected.negotiated_h2()}else{connected}}}
     }
 }
 impl hyper::rt::Read for Output{
-    fn poll_read(self:Pin<&mut Self>,cx:&mut Context<'_>,buf:hyper::rt::ReadBufCursor<'_>)->Poll<std::io::Result<()>>{match self.get_mut(){Self::Rustls(s)=>Pin::new(s).poll_read(cx,buf),Self::Native(s)=>Pin::new(s).poll_read(cx,buf)}}
+    fn poll_read(self:Pin<&mut Self>,cx:&mut Context<'_>,buf:hyper::rt::ReadBufCursor<'_>)->Poll<std::io::Result<()>>{match self.get_mut(){Self::Rustls(s)=>Pin::new(s).poll_read(cx,buf),Self::Native(s)=>Pin::new(s).poll_read(cx,buf),Self::ManagedNative(s)=>Pin::new(s).poll_read(cx,buf),Self::ManagedRustls(s)=>Pin::new(s).poll_read(cx,buf)}}
 }
 impl hyper::rt::Write for Output{
-    fn poll_write(self:Pin<&mut Self>,cx:&mut Context<'_>,buf:&[u8])->Poll<std::io::Result<usize>>{match self.get_mut(){Self::Rustls(s)=>Pin::new(s).poll_write(cx,buf),Self::Native(s)=>Pin::new(s).poll_write(cx,buf)}}
-    fn poll_flush(self:Pin<&mut Self>,cx:&mut Context<'_>)->Poll<std::io::Result<()>>{match self.get_mut(){Self::Rustls(s)=>Pin::new(s).poll_flush(cx),Self::Native(s)=>Pin::new(s).poll_flush(cx)}}
-    fn poll_shutdown(self:Pin<&mut Self>,cx:&mut Context<'_>)->Poll<std::io::Result<()>>{match self.get_mut(){Self::Rustls(s)=>Pin::new(s).poll_shutdown(cx),Self::Native(s)=>Pin::new(s).poll_shutdown(cx)}}
+    fn poll_write(self:Pin<&mut Self>,cx:&mut Context<'_>,buf:&[u8])->Poll<std::io::Result<usize>>{match self.get_mut(){Self::Rustls(s)=>Pin::new(s).poll_write(cx,buf),Self::Native(s)=>Pin::new(s).poll_write(cx,buf),Self::ManagedNative(s)=>Pin::new(s).poll_write(cx,buf),Self::ManagedRustls(s)=>Pin::new(s).poll_write(cx,buf)}}
+    fn poll_flush(self:Pin<&mut Self>,cx:&mut Context<'_>)->Poll<std::io::Result<()>>{match self.get_mut(){Self::Rustls(s)=>Pin::new(s).poll_flush(cx),Self::Native(s)=>Pin::new(s).poll_flush(cx),Self::ManagedNative(s)=>Pin::new(s).poll_flush(cx),Self::ManagedRustls(s)=>Pin::new(s).poll_flush(cx)}}
+    fn poll_shutdown(self:Pin<&mut Self>,cx:&mut Context<'_>)->Poll<std::io::Result<()>>{match self.get_mut(){Self::Rustls(s)=>Pin::new(s).poll_shutdown(cx),Self::Native(s)=>Pin::new(s).poll_shutdown(cx),Self::ManagedNative(s)=>Pin::new(s).poll_shutdown(cx),Self::ManagedRustls(s)=>Pin::new(s).poll_shutdown(cx)}}
+    fn is_write_vectored(&self)->bool{match self{Self::Rustls(s)=>s.is_write_vectored(),Self::Native(s)=>s.is_write_vectored(),Self::ManagedNative(s)=>s.is_write_vectored(),Self::ManagedRustls(s)=>s.is_write_vectored()}}
+    fn poll_write_vectored(self:Pin<&mut Self>,cx:&mut Context<'_>,buf:&[std::io::IoSlice<'_>])->Poll<std::io::Result<usize>>{match self.get_mut(){Self::Rustls(s)=>Pin::new(s).poll_write_vectored(cx,buf),Self::Native(s)=>Pin::new(s).poll_write_vectored(cx,buf),Self::ManagedNative(s)=>Pin::new(s).poll_write_vectored(cx,buf),Self::ManagedRustls(s)=>Pin::new(s).poll_write_vectored(cx,buf)}}
 }
 
 
@@ -400,6 +412,8 @@ pub(super) struct FixedDialConnector {
     family: super::http_dial::Family,
     pub(super) tls: Option<Arc<ClientConfig>>,
     native:Option<Arc<native_ssl_tls::ClientConfig>>,
+    managed:Option<Arc<crate::tls_app_config::ManagedClientSource>>,
+    client_executor:Option<Arc<super::tls_executor::TlsExecutor>>,
     http1_native:bool,
     pub(super) read: Option<Duration>,
     pub(super) write: Option<Duration>,
@@ -438,6 +452,8 @@ impl Service<Uri> for FixedDialConnector {
         let mut http = self.http.clone();
         let tls = self.tls.clone();
         let native=self.native.clone();
+        let managed=self.managed.clone();
+        let client_executor=self.client_executor.clone();
         let http1_native=self.http1_native;
         let read = self.read;
         let write = self.write;
@@ -483,14 +499,33 @@ impl Service<Uri> for FixedDialConnector {
                         }
                     };
 
+                    let binding=managed.as_ref().map(|source|source.binding());
                     if let Some(native)=native{
+                        if let Some(binding)=binding{
+                            let config=native_ssl_tls::ManagedClientConfig::from_shared_base(native,binding.clone())?;
+                            let connect=config.connect_with_alpn(server_name,TokioIo::new(io),if http1_native{Some(&[])}else{None});
+                            let stream=match handshake{Some(d)if !d.is_zero()=>timeout(d,connect).await.map_err(|_|std::io::Error::new(std::io::ErrorKind::TimedOut,"TLS handshake timeout"))??,_=>connect.await?};
+                            binding.check()?;return Ok(Output::ManagedNative(TokioIo::new(stream)));
+                        }
                         let connect=native.connect_with_alpn(server_name,TokioIo::new(io),if http1_native{Some(&[])}else{None});
                         let stream=match handshake{Some(d)if !d.is_zero()=>timeout(d,connect).await.map_err(|_|std::io::Error::new(std::io::ErrorKind::TimedOut,"TLS handshake timeout"))??,_=>connect.await?};
                         return Ok(Output::Native(TokioIo::new(stream)));
                     }
+                    let cfg=if let Some(binding)=&binding{let mut config=(*cfg).clone();config.client_auth_cert_resolver=binding.clone();Arc::new(config)}else{cfg};
                     let tls_connector = TlsConnector::from(cfg);
                     let tokio_io = TokioIo::new(io);
-                    let connect_future = tls_connector.connect(server_name, tokio_io);
+                    // connect() constructs ClientConnection synchronously, including
+                    // its initial keyshare. Defer that construction to first poll.
+                    let connect_future = async move {
+                        tls_connector.connect(server_name, tokio_io).await
+                    };
+                    let stream = if let Some(executor)=client_executor {
+                        let deadline=handshake.filter(|d|!d.is_zero()).map(|d|tokio::time::Instant::now()+d);
+                        executor.execute(async move { Ok(connect_future.await?) },tokio_util::sync::CancellationToken::new(),deadline).await.map_err(|error| match error.downcast::<std::io::Error>() {
+                            Ok(error)=>Box::new(error) as Self::Error,
+                            Err(error)=>error.into(),
+                        })?
+                    } else {
 
                     let stream = match handshake {
                         Some(d) if !d.is_zero() => match timeout(d, connect_future).await {
@@ -507,7 +542,10 @@ impl Service<Uri> for FixedDialConnector {
                             .map_err(|e| Box::new(e) as Self::Error)?,
                     };
 
-                    Ok(Output::Rustls(MaybeHttpsStream::Https(TokioIo::new(stream))))
+                    stream
+                    };
+                    let stream=MaybeHttpsStream::Https(TokioIo::new(stream));
+                    if let Some(binding)=binding{binding.check()?;Ok(Output::ManagedRustls(TokioIo::new(crate::tls_app_config::BoundClientIo::new(TokioIo::new(stream),binding))))}else{Ok(Output::Rustls(stream))}
                 }
             }
         })
@@ -518,6 +556,6 @@ impl Service<Uri> for FixedDialConnector {
 /// TLS policy as proxy traffic, with no client identity or per-port exception.
 pub(crate) fn ca_source_client_tls(ca:Option<serde_json::Value>,insecure:bool)->Result<ClientConfig>{Ok(ca_source_prepared_tls(ca,insecure,native_ssl_tls::Renegotiation::Never,None)?.rustls)}
 pub(crate) fn ca_source_prepared_tls(ca:Option<serde_json::Value>,insecure:bool,renegotiation:native_ssl_tls::Renegotiation,scope:Option<&Arc<native_ssl_tls::VerificationScope>>)->Result<PreparedTls>{
-    let options=ProxyTls{renegotiation,curves:Vec::new(),ca,except_ports:Vec::new(),server_name:None,insecure_skip_verify:insecure,root_ca_pem_files:Vec::new(),root_ca_pool:Vec::new(),client_certificate_file:None,client_certificate_key_file:None,handshake_timeout:None};
+    let options=ProxyTls{client_certificate_automate:None,managed_client:None,renegotiation,curves:Vec::new(),ca,except_ports:Vec::new(),server_name:None,insecure_skip_verify:insecure,root_ca_pem_files:Vec::new(),root_ca_pool:Vec::new(),client_certificate_file:None,client_certificate_key_file:None,handshake_timeout:None};
     provision_inner(&options,true,true,scope)
 }

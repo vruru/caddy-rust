@@ -107,19 +107,18 @@ pub(super) fn prepare_clients(
     hosts: &HostRegistry,
     dns: &Arc<super::proxy_dynamic::DnsShared>,
     logging_available: bool,
-    ssl_verify:&Arc<native_ssl_tls::VerificationScope>,
+    resources:&Arc<super::resource_budget::Resources>,
 ) -> Result<()> {
     crate::http_config::helpers::initialize_globals();
     for route in routes {
         for handler in &route.handlers {
             match handler {
                 Handler::Subroute { routes, errors, .. } => {
-                    prepare_clients(routes, output, hosts, dns, logging_available, ssl_verify)?;
-                    prepare_clients(errors, output, hosts, dns, logging_available, ssl_verify)?;
+                    prepare_clients(routes, output, hosts, dns, logging_available, resources)?;
+                    prepare_clients(errors, output, hosts, dns, logging_available, resources)?;
                 }
                 Handler::Intercept(response) => {
-                    prepare_response_clients(response, output, hosts, dns, logging_available, ssl_verify,
-                    )?;
+                    prepare_response_clients(response, output, hosts, dns, logging_available, resources)?;
                 }
                 Handler::FileServer { .. } => {
                     super::mime::initialize();
@@ -133,7 +132,7 @@ pub(super) fn prepare_clients(
                         hosts,
                         dns,
                         logging_available,
-                        ssl_verify,
+                        resources,
                     )?;
                     if let Some(fastcgi) = &config.fastcgi {
                         ensure!(
@@ -141,7 +140,7 @@ pub(super) fn prepare_clients(
                             "FastCGI capture_stderr requires generation logging"
                         );
                     }
-                    let connector = PreparedTransport::prepare(config,ssl_verify)?;
+                    let connector = PreparedTransport::prepare(config,resources)?;
                     let http1_connector = connector.http1();
                     output.insert(
                         config as *const ProxyConfig as usize,
@@ -189,11 +188,11 @@ fn prepare_response_clients(
     hosts: &HostRegistry,
     dns: &Arc<super::proxy_dynamic::DnsShared>,
     logging_available: bool,
-    ssl_verify:&Arc<native_ssl_tls::VerificationScope>,
+    resources:&Arc<super::resource_budget::Resources>,
 ) -> Result<()> {
     for entry in entries {
         if let Some(routes) = &entry.routes {
-            prepare_clients(routes, output, hosts, dns, logging_available, ssl_verify)?;
+            prepare_clients(routes, output, hosts, dns, logging_available, resources)?;
         }
     }
     Ok(())

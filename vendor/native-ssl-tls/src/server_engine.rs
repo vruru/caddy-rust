@@ -2,7 +2,7 @@
 //!
 //! This is a stepping interface, not a TLS record implementation. OpenSSL owns
 //! record authentication, padding, transcript, handshake signatures and secrets.
-use crate::VerificationScope;
+use crate::{Guard, VerificationScope};
 use openssl::ssl::{ErrorCode, Ssl, SslStream};
 use std::{
     collections::VecDeque,
@@ -97,6 +97,8 @@ pub struct ServerEngine {
     _credit: Arc<Credit>,
     output_credit: Option<Credit>,
     spare_credit: Option<Credit>,
+    client: Option<Arc<Guard>>,
+    pending_verification: bool,
 }
 pub enum Operation {
     Handshake,
@@ -138,7 +140,20 @@ impl ServerEngine {
             _credit: credit,
             output_credit,
             spare_credit,
+            client: None,
+            pending_verification: false,
         })
+    }
+    /// Complete client SSL uses the same owned record engine and budgets.
+    /// The public legacy client Stream interface remains unchanged.
+    pub(crate) fn new_client(
+        ssl: Ssl,
+        guard: Arc<Guard>,
+        admission: Admission,
+    ) -> io::Result<Self> {
+        let mut engine = Self::new(ssl, admission)?;
+        engine.client = Some(guard);
+        Ok(engine)
     }
     pub(crate) fn admission(&self) -> Admission {
         self.admission.clone()
@@ -167,6 +182,18 @@ impl ServerEngine {
                 io::ErrorKind::InvalidInput,
                 "SSL step input exceeds bounds",
             ));
+        }
+        if self.pending_verification {
+            let guard = self
+                .client
+                .as_ref()
+                .ok_or_else(|| io::Error::other("SSL retry verification without client owner"))?
+                .clone();
+            // The previous SSL step has already returned its CPU permit. This
+            // verifier can acquire the same shared lane without recursive
+            // permit ownership; raw evidence retains its actual owner.
+            guard.verify_initial(&scope).await?;
+            self.pending_verification = false;
         }
         let output = self
             .output_credit
@@ -197,7 +224,13 @@ impl ServerEngine {
         let mut plain = Zeroizing::new(Vec::new());
         let mut retry_write = None;
         let result = match op {
-            Operation::Handshake => self.ssl.accept().map(|()| 0),
+            Operation::Handshake => {
+                if self.client.is_some() {
+                    self.ssl.connect().map(|()| 0)
+                } else {
+                    self.ssl.accept().map(|()| 0)
+                }
+            }
             Operation::Read => {
                 plain.try_reserve_exact(CLEAR).map_err(io::Error::other)?;
                 plain.resize(CLEAR, 0);
@@ -212,7 +245,8 @@ impl ServerEngine {
                     }
                     Err(e)
                         if e.code() == ErrorCode::WANT_READ
-                            || e.code() == ErrorCode::WANT_WRITE =>
+                            || e.code() == ErrorCode::WANT_WRITE
+                            || (self.client.is_some() && e.code().as_raw() == 12) =>
                     {
                         retry_write = Some(bytes)
                     }
@@ -228,6 +262,12 @@ impl ServerEngine {
             Ok(n) => (Progress::Complete, n, None),
             Err(e) if e.code() == ErrorCode::WANT_READ => (Progress::Read, 0, None),
             Err(e) if e.code() == ErrorCode::WANT_WRITE => (Progress::Write, 0, None),
+            Err(e) if self.client.is_some() && e.code().as_raw() == 12 => {
+                self.pending_verification = true;
+                // No wire progress is required; the next owned step first
+                // completes the explicit public retry-verification boundary.
+                (Progress::Write, 0, None)
+            }
             Err(e) if e.code() == ErrorCode::ZERO_RETURN => (Progress::Closed, 0, None),
             Err(e) => (Progress::Fatal, 0, Some(io::Error::other(e))),
         };

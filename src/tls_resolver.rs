@@ -5,6 +5,9 @@
 
 #[path="tls_resolver/native_key.rs"]
 mod native_key;
+pub(crate) use native_key::PreparedNativeKey;
+#[path="tls_resolver/client_identity.rs"]
+mod client_identity;
 pub(crate) use native_key::{NativeCertificate,NativePrivateKey};
 use crate::challenge::{ACME_ALPN, ChallengeRegistry, normalize_domain};
 use crate::leaf_guard::{LeafGuard, LeafState, Observation, leaf_id};
@@ -260,6 +263,8 @@ struct Staple {
 
 #[derive(Clone)]
 struct LoadedCertificate {
+    client_signing:Arc<client_identity::ClientSigningGate>,
+    client_issuer_names:Arc<Vec<Vec<u8>>>,
     native_key:Arc<NativePrivateKey>,
     managed_key_veto: bool,
     key_state: Arc<crate::key_compromise::KeyState>,
@@ -1216,6 +1221,27 @@ impl HotCertificateResolver {
         )
     }
 
+    /// Managed client selection uses actual CertificateRequest evidence and
+    /// already parsed issuer DER. No source I/O or X509 parsing at handshake.
+    pub(crate) fn select_client_for_version(
+        &self,name:&str,issuer_allowed:impl Fn(&[u8])->bool,schemes:&[SignatureScheme],version:ProtocolVersion,
+    )->Option<CertificateSelection>{
+        if !matches!(version,ProtocolVersion::TLSv1_2|ProtocolVersion::TLSv1_3){return None}
+        let name=normalize_certificate_name(name).ok()?;
+        let snapshot=self.certificates.read().ok()?.clone();
+        let now=i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs()).ok()?;
+        let select=|entries:&Vec<Arc<LoadedCertificate>>|entries.iter().find_map(|entry|{
+            if entry.key_state.banned()||!entry.client_issuer_names.iter().any(|issuer|issuer_allowed(issuer)){return None}
+            let mut selected=select_loaded(entry,schemes,Some(version),now)?;
+            entry.client_signing.require();if !entry.client_signing.allowed(){return None}
+            if let Some(native)=selected.native.as_mut(){native.enforce_key_veto=true}
+            Some(selected)
+        });
+        if let Some(selected)=snapshot.names.get(&name).and_then(select){return Some(selected)}
+        if name.parse::<IpAddr>().is_ok()||name.starts_with("*."){return None}
+        let(_,suffix)=name.split_once('.')?;snapshot.names.get(&format!("*.{suffix}")).and_then(select)
+    }
+
     fn select_internal(
         &self,
         sni: Option<&str>,
@@ -1307,7 +1333,7 @@ fn select_loaded(
     };
     key.key.choose_scheme(signature_schemes)?;
     Some(CertificateSelection {
-        native:Some(NativeCertificate{private:entry.native_key.clone(),leaf:entry.leaf_state.clone(),key_state:entry.key_state.clone(),enforce_key_veto:entry.managed_key_veto||entry.owner.is_some(),not_after:entry.not_after}),
+        native:Some(NativeCertificate{client_gate:entry.client_signing.clone(),private:entry.native_key.clone(),leaf:entry.leaf_state.clone(),key_state:entry.key_state.clone(),enforce_key_veto:entry.managed_key_veto||entry.owner.is_some(),not_after:entry.not_after}),
         key,
         instance: Some(CertificateInstance {
             identity: entry.identity,
@@ -1631,13 +1657,17 @@ fn load_certificate(
     output=output.checked_add(crate::cert_transient::key_decode_bound(input.private_key_pem)?).ok_or(crate::cert_transient::ResourceDenied)?;
     let native_key_cost=NativePrivateKey::retained_bound(input.private_key_pem)?;
     output=output.checked_add(native_key_cost).ok_or(crate::cert_transient::ResourceDenied)?;
+    let client_metadata=blocks.iter().try_fold(client_identity::ClientSigningGate::retained_bound()+128usize,|sum,(_,der)|sum.checked_add(der.len()).and_then(|n|n.checked_add(2*std::mem::size_of::<Vec<u8>>())).ok_or(crate::cert_transient::ResourceDenied))?;
+    output=output.checked_add(client_metadata).ok_or(crate::cert_transient::ResourceDenied)?;
     let preparation=crate::tls_app_config::CertificatePreparation::reserve(output)?;
     let mut chain = Vec::with_capacity(blocks.len());
+    let mut client_issuer_names=Vec::new();client_issuer_names.try_reserve_exact(blocks.len()).map_err(|_|crate::cert_transient::ResourceDenied)?;
     for (label, der) in &blocks {
         ensure!(label == "CERTIFICATE", "unexpected certificate PEM label");
-        let (remaining, _) = crate::cert_transient::parse_certificate(der)
+        let (remaining, certificate) = crate::cert_transient::parse_certificate(der)
             .context("invalid certificate DER")?;
         ensure!(remaining.is_empty(), "trailing certificate DER");
+        let raw=certificate.issuer().as_raw();let mut issuer=Vec::new();issuer.try_reserve_exact(raw.len()).map_err(|_|crate::cert_transient::ResourceDenied)?;issuer.extend_from_slice(raw);client_issuer_names.push(issuer);
         chain.push(CertificateDer::from(der.to_vec()));
     }
     let preferred = crate::cert_transient::signing_key(input.private_key_pem, "tls-candidate")?;
@@ -1722,28 +1752,38 @@ fn load_certificate(
     let facts = Arc::new(CertificateFacts::from_leaf(&leaf));
     let management_name = certificate_management_name(&leaf)?;
     let native_key=NativePrivateKey::new(input.private_key_pem,preparation.clone())?;
+    let client_issuer_bytes=client_issuer_names.iter().try_fold(client_identity::ClientSigningGate::retained_bound()+client_issuer_names.capacity()*std::mem::size_of::<Vec<u8>>()+128usize,|n,issuer|n.checked_add(issuer.capacity()).ok_or(crate::cert_transient::ResourceDenied))?;
     let size = input
         .certificate_pem
         .len()
         .checked_add(input.private_key_pem.len())
         .and_then(|v| v.checked_add(extra_key_bytes))
         .and_then(|v|v.checked_add(native_key_cost))
+        .and_then(|v|v.checked_add(client_issuer_bytes))
         .and_then(|v| v.checked_add(facts.retained_bytes()))
         .and_then(|v| v.checked_add(leaf.public_key().raw.len()))
         .and_then(|v| v.checked_add(management_name.len() + 2 * std::mem::size_of::<usize>()))
         .and_then(|v| v.checked_add(san_names.capacity() * std::mem::size_of::<String>()))
         .and_then(|v| v.checked_add(san_names.iter().map(String::capacity).sum::<usize>()))
         .ok_or_else(|| anyhow!("certificate size overflow"))?;
+    let key_state=leaf_guard.key_deny().register_spki(Arc::from(leaf.public_key().raw))?;
+    let leaf_state=leaf_guard.intern(leaf_id(&blocks[0].1),leaf.validity().not_after.timestamp())?;
+    let client_signing=client_identity::ClientSigningGate::new(leaf_state.clone(),key_state.clone());
+    // Fresh constructor keys have no external owners. Rebind their signing
+    // objects without a deep certificate/OCSP copy or a mutable public key.
+    let(key,tls13_key)=client_identity::guard_keys(key,tls13_key,client_signing.clone())?;
     let leaf_sha256 = leaf_id(&blocks[0].1);
     Ok((
         names,
         LoadedCertificate {
+            client_signing,
+            client_issuer_names:Arc::new(client_issuer_names),
             native_key,
             managed_key_veto: false,
-            key_state: leaf_guard.key_deny().register_spki(Arc::from(leaf.public_key().raw))?,
+            key_state,
             key,
             tls13_key,
-            leaf_state: leaf_guard.intern(leaf_sha256, leaf.validity().not_after.timestamp())?,
+            leaf_state,
             leaf_sha256,
             identity,
             instance_generation: 0,

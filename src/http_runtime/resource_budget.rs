@@ -251,6 +251,7 @@ pub(crate) struct Resources {
     pub header_replacements:native_write_policy::Pool,
     pub(super) transfer_deadlines: native_write_policy::Pool,
     pub(crate) ssl_verify:Arc<native_ssl_tls::VerificationScope>,
+    pub(super) client_tls:Arc<super::tls_executor::ClientTlsExecutor>,
     pub(super) proxy_health_events_coalesced: Arc<AtomicU64>,
     pub(super) cel_body_bytes: Arc<Semaphore>,
     pub(crate) client_cert_bytes: Arc<Semaphore>,
@@ -292,6 +293,10 @@ pub(crate) struct Resources {
 }
 
 impl Resources {
+    // Only transport provisioning on the metadata CPU lane calls this.
+    pub(super) fn client_tls_executor(&self) -> std::io::Result<Arc<super::tls_executor::TlsExecutor>> {
+        self.client_tls.prepare()
+    }
     pub(crate) fn automatic() -> Self {
         Self::from_limits(ResourceLimits::automatic()).expect("valid automatic HTTP limits")
     }
@@ -388,6 +393,7 @@ impl Resources {
         Ok(Self {
             transfer_deadlines: native_write_policy::Pool::new(cpu.saturating_mul(8<<20).clamp(32<<20,256<<20)),
             ssl_verify:native_ssl_tls::VerificationScope::new(),
+            client_tls:Arc::new(super::tls_executor::ClientTlsExecutor::new()),
             proxy_health_events_coalesced: Arc::new(AtomicU64::new(0)),
             cel_body_bytes: Arc::new(Semaphore::new(super::cel_body::POOL_UNITS)),
             tls_event_bytes:Arc::new(Semaphore::new(super::tls_events::POOL_UNITS)),
@@ -478,6 +484,7 @@ impl Resources {
     /// Called only after HTTP owners join, or immediately for explicit force.
     /// It is idempotent, and does not refund a real worker's retained credit.
     pub(crate) fn cancel_work(&self) {
+        self.client_tls.close();
         self.ssl_verify.close();
         self.proxy_cleanup.close();
         self.proxy_dns.close();
@@ -487,6 +494,7 @@ impl Resources {
         // shutdown_wait joins HTTP connections and upgrades before this call.
         // No outer transport can register a new crypto step after this fence;
         // cancelled/detached blocking results still carry their own tokens.
+        let _ = self.client_tls.shutdown().await;
         self.cancel_work();
         self.ssl_verify.wait().await;
         self.cel_compile.tasks.wait().await;

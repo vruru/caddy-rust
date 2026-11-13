@@ -211,6 +211,8 @@ pub(crate) struct ProxyTls {
     pub(crate) root_ca_pool: Vec<String>,
     pub(crate) client_certificate_file: Option<String>,
     pub(crate) client_certificate_key_file: Option<String>,
+    pub(crate) client_certificate_automate: Option<String>,
+    pub(crate) managed_client:Option<std::sync::Arc<crate::tls_app_config::ManagedClientSource>>,
     pub(crate) handshake_timeout: Option<std::time::Duration>,
 }
 

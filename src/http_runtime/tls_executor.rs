@@ -11,13 +11,56 @@ use tokio::{
     sync::{Semaphore, oneshot, watch},
     time::Instant,
 };
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio_util::{sync::CancellationToken, task::{TaskTracker, task_tracker::TaskTrackerToken}};
 
 pub struct TlsExecutor {
     handle: Handle,
     shared: Arc<Shared>,
     supervisor: Mutex<Option<thread::JoinHandle<()>>>,
     joined: watch::Sender<Option<bool>>,
+}
+/// One lazily provisioned client handshake runtime per resource owner. Creating
+/// the runtime is synchronous and must be called on the provisioning CPU lane.
+/// Closing admission does not join: graceful owners call shutdown after business
+/// requests drain, while a force path may close immediately.
+pub(super) struct ClientTlsExecutor {
+    state: Mutex<ClientState>,
+}
+struct ClientState {
+    closed: bool,
+    executor: Option<Arc<TlsExecutor>>,
+}
+impl ClientTlsExecutor {
+    pub(super) fn new() -> Self {
+        Self { state: Mutex::new(ClientState { closed: false, executor: None }) }
+    }
+    pub(super) fn prepare(&self) -> io::Result<Arc<TlsExecutor>> {
+        let mut state = self.state.lock().map_err(|_| io::Error::other("client TLS executor state failed"))?;
+        if state.closed {
+            return Err(io::Error::other("client TLS executor stopped"));
+        }
+        if state.executor.is_none() {
+            // No externally supplied payload, future or waker is invoked while
+            // holding this setup fence. Publication and close are atomic even
+            // when the dedicated runtime is still being constructed.
+            state.executor = Some(Arc::new(TlsExecutor::new()?));
+        }
+        Ok(state.executor.as_ref().expect("prepared client TLS executor").clone())
+    }
+    pub(super) fn close(&self) {
+        let executor = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.closed = true;
+            state.executor.clone()
+        };
+        if let Some(executor) = executor { executor.close(); }
+    }
+    pub(super) async fn shutdown(&self) -> Result<()> {
+        self.close();
+        let executor = self.state.lock().map_err(|_| anyhow!("client TLS executor state failed"))?.executor.clone();
+        if let Some(executor) = executor { executor.shutdown().await?; }
+        Ok(())
+    }
 }
 /// Independent snapshots of handshake concurrency, not CPU execution quotas.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -119,6 +162,15 @@ impl<F> Drop for HandshakeJob<F> {
         drop(self.proof.take());
     }
 }
+struct TrackedHandshake<F> {
+    job: HandshakeJob<F>,
+    // A closed executor cannot finish waiting while a spawn has been admitted
+    // but not yet submitted. The actual payload and permits drop before this.
+    _token: TaskTrackerToken,
+}
+fn deadline_elapsed() -> anyhow::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "TLS handshake deadline elapsed").into()
+}
 async fn wait_deadline(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -133,11 +185,15 @@ impl Drop for CancelOnDrop {
 }
 impl Shared {
     fn close(&self) {
-        let mut closed = self
-            .admission_closed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *closed = true;
+        {
+            let mut closed = self
+                .admission_closed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *closed = true;
+        }
+        // Cancellation and tracker completion may synchronously wake callers.
+        // Their wakers must be free to re-enter the admission fence.
         self.tasks.close();
         self.stop.cancel();
     }
@@ -326,13 +382,13 @@ impl TlsExecutor {
                         tokio::select! {biased;
                             _=self.shared.stop.cancelled()=>return Err(anyhow!("TLS executor stopped")),
                             _=cancel.cancelled()=>return Err(anyhow!("TLS handshake cancelled")),
-                            _=wait_deadline(deadline)=>return Err(anyhow!("TLS handshake deadline elapsed")),
+                            _=wait_deadline(deadline)=>return Err(deadline_elapsed()),
                             result=completed.wait()=>result?,
                         }
                         tokio::select! {biased;
                             _=self.shared.stop.cancelled()=>return Err(anyhow!("TLS executor stopped")),
                             _=cancel.cancelled()=>return Err(anyhow!("TLS handshake cancelled")),
-                            _=wait_deadline(deadline)=>return Err(anyhow!("TLS handshake deadline elapsed")),
+                            _=wait_deadline(deadline)=>return Err(deadline_elapsed()),
                             result=&mut acquisition=>result.map_err(|_|anyhow!("TLS executor stopped"))?,
                         }
                     }
@@ -342,13 +398,13 @@ impl TlsExecutor {
             tokio::select! { biased;
                 _ = self.shared.stop.cancelled() => return Err(anyhow!("TLS executor stopped")),
                 _ = cancel.cancelled() => return Err(anyhow!("TLS handshake cancelled")),
-                _ = wait_deadline(deadline) => return Err(anyhow!("TLS handshake deadline elapsed")),
+                _ = wait_deadline(deadline) => return Err(deadline_elapsed()),
                 permit = running.clone().acquire_owned() => permit.map_err(|_| anyhow!("TLS executor stopped"))?,
             }
         };
         drop(waiting);
         let (send, receive) = oneshot::channel();
-        {
+        let token = {
             let closed = self
                 .shared
                 .admission_closed
@@ -357,38 +413,57 @@ impl TlsExecutor {
             if *closed {
                 return Err(anyhow!("TLS executor stopped"));
             }
-            let shared = self.shared.clone();
-            let worker_cancel = cancel.clone();
-            self.shared.tasks.spawn_on(async move {
-                let mut job=HandshakeJob{future:Some(Box::pin(future)),permit:Some(permit),proof:None};
-                let registered=if reserved {ProofRunning::register(&shared.proof_reserved_live,worker_cancel.clone()).map(Some)}else{Ok(None)};
-                let result=match registered {
-                    Ok(proof)=>{job.proof=proof;tokio::select! { biased;
+            self.shared.tasks.token()
+        };
+        let shared = self.shared.clone();
+        let worker_cancel = cancel.clone();
+        let tracked = TrackedHandshake {
+            job: HandshakeJob {
+                future: Some(Box::pin(future)),
+                permit: Some(permit),
+                proof: None,
+            },
+            _token: token,
+        };
+        // Even a stopped runtime can drop the submitted future immediately.
+        // Submit outside the fence and move the complete envelope so that an
+        // unpolled task still drops its payload before releasing its token.
+        self.handle.spawn(async move {
+            let mut tracked = tracked;
+            let job = &mut tracked.job;
+            let registered = if reserved {
+                ProofRunning::register(&shared.proof_reserved_live, worker_cancel.clone()).map(Some)
+            } else {
+                Ok(None)
+            };
+            let result = match registered {
+                Ok(proof) => {
+                    job.proof = proof;
+                    tokio::select! { biased;
                         _ = shared.stop.cancelled() => Err(anyhow!("TLS executor stopped")),
                         _ = worker_cancel.cancelled() => Err(anyhow!("TLS handshake cancelled")),
-                        _ = wait_deadline(deadline) => Err(anyhow!("TLS handshake deadline elapsed")),
+                        _ = wait_deadline(deadline) => Err(deadline_elapsed()),
                         result = job.future.as_mut().expect("live handshake job") => result,
-                    }},
-                    Err(_)=>Err(anyhow!("TLS proof cancellation registry unavailable")),
-                };
-                drop(job);
-                let _ = send.send(result);
-            }, &self.handle);
-        }
+                    }
+                }
+                Err(_) => Err(anyhow!("TLS proof cancellation registry unavailable")),
+            };
+            drop(tracked);
+            let _ = send.send(result);
+        });
         tokio::select! { biased;
             _ = self.shared.stop.cancelled() => Err(anyhow!("TLS executor stopped")),
             _ = cancel.cancelled() => Err(anyhow!("TLS handshake cancelled")),
-            _ = wait_deadline(deadline) => Err(anyhow!("TLS handshake deadline elapsed")),
+            _ = wait_deadline(deadline) => Err(deadline_elapsed()),
             result = receive => result.map_err(|_| anyhow!("TLS handshake worker failed"))?,
         }
     }
     fn check_live(&self, cancel: &CancellationToken, deadline: Option<Instant>) -> Result<()> {
         anyhow::ensure!(!self.shared.stop.is_cancelled(), "TLS executor stopped");
         anyhow::ensure!(!cancel.is_cancelled(), "TLS handshake cancelled");
-        anyhow::ensure!(
-            deadline.is_none_or(|deadline| deadline > Instant::now()),
-            "TLS handshake deadline elapsed"
-        );
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            return Err(deadline_elapsed());
+        }
         Ok(())
     }
     /// Synchronous admission/force fence; actual workers retain their permits

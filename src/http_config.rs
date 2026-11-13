@@ -1805,6 +1805,7 @@ fn parse_proxy(
                         "except_ports",
                         "client_certificate_file",
                         "client_certificate_key_file",
+                        "client_certificate_automate",
                         "handshake_timeout",
                     ],
                     path,
@@ -1844,6 +1845,8 @@ fn parse_proxy(
                         .map(|v| string(v, path))
                         .transpose()?
                         .filter(|v| !v.is_empty()),
+                    client_certificate_automate:t.get("client_certificate_automate").filter(|v|!v.is_null()).map(|v|string(v,path)).transpose()?.filter(|v|!v.is_empty()),
+                    managed_client:None,
                     handshake_timeout: t
                         .get("handshake_timeout")
                         .map(|v| duration(v, path))

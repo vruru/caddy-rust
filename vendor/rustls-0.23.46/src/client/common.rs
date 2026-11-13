@@ -103,7 +103,12 @@ impl ClientAuthDetails {
             .map(|p| p.as_ref())
             .collect::<Vec<&[u8]>>();
 
-        if let Some(certkey) = resolver.resolve(&acceptable_issuers, sigschemes) {
+        let version = if auth_context_tls13.is_some() {
+            crate::ProtocolVersion::TLSv1_3
+        } else {
+            crate::ProtocolVersion::TLSv1_2
+        };
+        if let Some(certkey) = resolver.resolve_for_version(&acceptable_issuers, sigschemes, version) {
             if let Some(signer) = certkey.key.choose_scheme(sigschemes) {
                 debug!("Attempting client auth");
                 return Self::Verify {

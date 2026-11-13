@@ -23,7 +23,7 @@ The project currently covers a specific subset of functionalities:
 *   **Compatibility**: Correct useful extensions remain supported even where the baseline rejects them. Resource bounds and repairs to upstream bugs are documented differences; accepting a configuration alone does not establish correct execution.
 
 **Known Gaps**:
-Remaining standard modules/fields, remaining listener/address combinations, remaining replacer/provider scheduling, complete template mutability and remaining host methods, automated client certificates, Go PKIX edge cases, and full issuer/CA-loader capabilities are not yet implemented.
+Remaining standard modules/fields, remaining listener/address combinations, remaining replacer/provider scheduling, complete template mutability and remaining host methods, Go PKIX edge cases, and full issuer/CA-loader capabilities are not yet implemented.
 
 ## Build
 

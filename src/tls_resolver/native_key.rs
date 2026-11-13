@@ -89,11 +89,13 @@ pub(crate) struct NativeCertificate {
     pub(crate) leaf: Arc<LeafState>,
     pub(crate) key_state: Arc<crate::key_compromise::KeyState>,
     pub(crate) enforce_key_veto: bool,
+    pub(super) client_gate:Arc<super::client_identity::ClientSigningGate>,
     pub(crate) not_after: i64,
 }
 impl NativeCertificate {
     pub(crate) fn admitted(&self) -> bool {
-        self.leaf.admission().allow_certificate
+        self.client_gate.allowed()
+            && self.leaf.admission().allow_certificate
             && (!self.enforce_key_veto || !self.key_state.banned())
     }
 }

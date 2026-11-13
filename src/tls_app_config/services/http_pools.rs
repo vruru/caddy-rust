@@ -504,6 +504,7 @@ impl CertificateServices {
         config: crate::http_config::PreparedConfig,
         cancel: CancellationToken,
     ) -> Result<crate::http_config::PreparedConfig> {
+        let config = self.prepare_managed_clients(config, cancel.clone()).await?;
         let config = self.prepare_storage_pools(config, cancel.clone()).await?;
         self.owned(cancel, move |this, token| {
             Box::pin(async move {

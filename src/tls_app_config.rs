@@ -54,3 +54,7 @@ impl CertificatePlan {
         parse::parse(views)
     }
 }
+
+#[path="tls_app_config/managed_client.rs"]
+mod managed_client;
+pub(crate) use managed_client::{ManagedClientSource,ClientBinding,BoundClientIo};

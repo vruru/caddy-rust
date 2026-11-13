@@ -208,3 +208,6 @@ application callbacks and do not add background actors or protocol queues.
 
 
 Incoming explicit TLS1.2 CBC uses complete OpenSSL SSL records/sessions via native-ssl-tls server_* modules, owned CPU steps and asynchronous socket I/O. Rustls exposes a read-only client-chain observation and an owned TLS1.2 PRF exporter for exact snapshots. native-openssl-src derives from the pinned openssl-src400.0.2+4.0.3 builder (MIT/Apache-2.0): source_dir/version forward to the original pinned source package; tls-deprecated-ec adds OpenSSL Configure enable-tls-deprecated-ec. openssl-sys uses that named feature for its vendored builder. OpenSSL C sources remain unchanged. Default Native Rustls/H3 groups, versions and verification are unchanged.
+
+
+Managed outbound client identity support extends the local `native-ssl-tls` crate with owned CertificateRequest facts and a callback for already prepared credentials. It reuses the full SSL record engine and existing verification scope; the legacy ClientConfig/Stream API remains available. The rustls client resolver trait has a default `resolve_for_version` method, preserving existing implementations while allowing the host to use the negotiated version for client-certificate selection. These are Rust source-level extensions and require rebuilding the normal dependency graph; no external Rust ABI compatibility is claimed.

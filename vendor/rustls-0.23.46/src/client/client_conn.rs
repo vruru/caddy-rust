@@ -121,6 +121,17 @@ pub trait ResolvesClientCert: fmt::Debug + Send + Sync {
         sigschemes: &[SignatureScheme],
     ) -> Option<Arc<sign::CertifiedKey>>;
 
+    /// Resolve against the actual negotiated wire version. Existing resolvers
+    /// retain their original behavior through this default implementation.
+    fn resolve_for_version(
+        &self,
+        root_hint_subjects: &[&[u8]],
+        sigschemes: &[SignatureScheme],
+        _version: crate::ProtocolVersion,
+    ) -> Option<Arc<sign::CertifiedKey>> {
+        self.resolve(root_hint_subjects, sigschemes)
+    }
+
     /// Return true if the client only supports raw public keys.
     ///
     /// See [RFC 7250](https://www.rfc-editor.org/rfc/rfc7250).

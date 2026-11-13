@@ -941,8 +941,7 @@ facts and shared-client issuance/trust regressions cover this behavior.
 The pinned baseline only recognizes TLS1.2/TLS1.3 as server protocols. Legacy
 TLS1.0/TLS1.1 names fall back to modern defaults and do not enable those wire
 versions; they are not an unimplemented baseline feature.
-automated client certificates and remaining
-issuer features remain separate unfinished work. PKI KeyPair formats other
+Remaining issuer features are separate unfinished work. PKI KeyPair formats other
 than empty/pem_file are likewise not implemented by the pinned baseline.
 
 CONNECT and WebSocket ownership
@@ -1022,8 +1021,8 @@ Protocol, suite, ALPN, peer certificates, stapled OCSP bytes, session reuse and
 exporter values exposed by this outgoing transport come from its live SSL
 connection; this does not add OCSP-revocation policy to native upstream trust.
 The outgoing connector does not replace incoming TLS snapshots or the default
-server/HTTP3 provider. Automated managed client identities remain separate
-unfinished work. The generic configuration still rejects invalid renegotiation levels
+server/HTTP3 provider. Managed client identities are covered below.
+The generic configuration still rejects invalid renegotiation levels
 before publication, and a failed HTTPS CA preparation retains the old site.
 
 
@@ -1147,7 +1146,7 @@ The SSL object moves through bounded CPU steps; socket I/O stays asynchronous. P
 
 The small native-openssl-src builder obtains unchanged OpenSSL C sources from exact openssl-src400.0.2+4.0.3. Its tls-deprecated-ec build feature makes legacy certificate curves such as P224 available without adding them to configured/default key-exchange groups or enabling TLS1.0/1.1. P224 certificates work when the peer explicitly advertises that curve. Native retains RFC8422's requirement that EC certificate curves respect the peer's supported groups. The pinned Go pair accepted P224 without advertising it; that observed difference is recorded separately and does not cause weaker SSL verification. Security policy is local to the explicit compatibility context; no global security level is changed.
 
-Isolated actual-main checks cover four suites, selection/preference, modern and TLS1.3 controls, Caddyfile, P224/P256/P384/P521/Ed25519 and RSA1024 through RSA8192, leaves above64KiB, same-connection exporters, mTLS and invalid CertificateVerify, modified CBC ciphertext, session/ticket rotation, real reason1 plus restart, real ACME TLS-ALPN-01 proof, parallel large keys, reload, graceful drain and hard-stop. Evidence and fixtures stay local. Remaining client_certificate_automate, issuer and PKIX work is separate; this addition does not claim complete TLS compatibility.
+Isolated actual-main checks cover four suites, selection/preference, modern and TLS1.3 controls, Caddyfile, P224/P256/P384/P521/Ed25519 and RSA1024 through RSA8192, leaves above64KiB, same-connection exporters, mTLS and invalid CertificateVerify, modified CBC ciphertext, session/ticket rotation, real reason1 plus restart, real ACME TLS-ALPN-01 proof, parallel large keys, reload, graceful drain and hard-stop. Evidence and fixtures stay local. Issuer and PKIX residuals remain separate; this addition does not claim complete TLS compatibility.
 
 
 Graceful in-flight resource retirement
@@ -1281,3 +1280,12 @@ preparation rejected at that boundary does not initialize inventory or poison
 the service; preparation on a live executor remains available. Task registration
 and possible executor-side synchronous payload destruction remain separated
 from service admission locks.
+
+
+### Managed outbound client certificates
+
+The HTTP transport supports `client_certificate_automate`, including the Caddyfile single-name `tls_client_auth` form. Names are always registered with the existing certificate services for acquisition, status maintenance and renewal, even when a valid manual certificate is already cached. The actual CertificateRequest selects a valid cached credential using its DER issuer names, signature schemes and negotiated TLS version; a missing compatible credential fails the requested authentication. A server that does not request a client certificate receives none. In the last valid encoded UTC second of a manual leaf, a compatible cached managed successor with strictly later expiry can take over early, provided it is also outside its own last valid second. This avoids the observed millisecond-scale expiry race without relaxing verification or retrying application requests; it does not guarantee against arbitrary network delay or clock skew. Callback selection performs no network or storage I/O. When static client certificate files and automated identity are both configured, the static pair is still validated during provisioning, but the automated resolver takes precedence during authentication. An automated-selection mismatch does not silently fall back to the static pair.
+
+Default Rustls client handshakes use one lazily provisioned runtime per shared resource owner, created on the provisioning CPU lane. The existing OpenSSL once/freely engine performs its operations in the owned SSL CPU lane. Cancellation and forced stop close admission without waking callers under its fence; graceful shutdown joins HTTP owners before joining the client runtime. Deadline errors retain their timeout category. Selected client credentials retain leaf/SPKI vetoes through signing and application I/O, including reload and durable restart.
+
+Isolated actual-main evidence covers Internal and dual-purpose Native ACME issuance, ordinary renewal, manual-leaf expiry followed by managed takeover and another renewal, real CRI selection, live signed reason1, same-key sibling leaves, reload/drain/hard-stop, large-RSA CPU progress, Caddyfile, nested/error/response/named consumers and health probes. Frontend HTTP/1, HTTP/2 and HTTP/3 compose with the existing HTTP/1 and HTTP/2 upstream transports. Outgoing HTTP/3 and remaining issuer/PKIX capabilities are separate inventory items; this entry does not claim whole TLS compatibility or a process RSS bound. A serverAuth-only ACME certificate is not reinterpreted as clientAuth: the upstream's normal purpose and trust validation still applies.
