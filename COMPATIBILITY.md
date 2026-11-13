@@ -525,11 +525,10 @@ existing HTTP headers, payload producers or QUIC retransmission storage. Native
 HTTP/1 and HTTP/2 metadata allowances are exposed separately; callers supplying
 retention guards must not make them refer back to their response control.
 
-These are internal, opt-in transport primitives. The Caddy `timeouts` route handler
-and the remaining server read/write timeout settings are still rejected until
-configuration, interim responses on all protocols, native admission, error paths,
-reload and combined runtime acceptance are complete. This plumbing alone does
-not mark that configuration feature as implemented.
+These transport primitives are opt-in. Native server and route timeout
+configuration is now integrated as described in [TIMEOUTS.md](docs/TIMEOUTS.md),
+including interim responses, admission, reload and unwind behavior. The named
+transport-allocation contracts above remain distinct from full release gates.
 
 
 ## Scoped builtin formatter ownership
@@ -610,8 +609,8 @@ loan through actual destruction; the table buffers retire before their table
 loan. A pool cannot replace one already bound to the connection. Legacy unscoped
 observation remains available without claiming a prepaid allocation contract.
 These named metadata limits exclude existing task/header/payload storage, QUIC
-retransmission storage and whole-process RSS. This internal support does not by
-itself register the remaining timeout configuration feature.
+retransmission storage and whole-process RSS. Configuration activation uses the
+separately integrated server/route path described in the timeout contract.
 
 
 Startup-selected directory aliases
@@ -696,8 +695,9 @@ Callers prepay its generic body size with the native H2 allowance; existing
 header/payload storage and connection tables retain separate actual owners.
 Replacing route clauses between acknowledged boundaries requires the same pool,
 no pending output and no final payload progress, preserving all outer clauses.
-Controlled HTTP/2 CONNECT tunnel handoff remains an explicit unsupported path.
-Route/server timeout configuration remains a development integration gate.
+Controlled HTTP/2 CONNECT tunnel handoff and route/server timeout configuration
+are now integrated; their ownership and physical-progress semantics are
+specified in the CONNECT and timeout sections below.
 
 
 Server client-authentication CA pools now resolve native `pki_root` and
@@ -834,8 +834,8 @@ Template request URLs also distinguish transport provenance: H2/H3 pseudo-field
 reconstruction does not expose an artificial scheme/authority in the ordinary
 server URL. Request.Host retains the independently validated authority. H1
 absolute-form targets, CONNECT authority-form and virtual include targets keep
-their own representations. Server/route timeout activation and the remaining
-full release gates are tracked independently.
+their own representations. Implemented server/route timeout activation and the
+remaining full release gates are tracked independently.
 
 
 Formatter reflection and static layouts
@@ -1108,3 +1108,16 @@ are retained. File/record/operation capacities, retained worker/output credits,
 correctness repairs and the distinction from Smallstep's non-Caddy APIs are
 described in [ACME-SERVER.md](docs/ACME-SERVER.md). This does not establish global
 TLS resolver support, all PKIX edge semantics or full-project acceptance.
+
+
+Process-manager state
+---------------------
+
+Linux serving processes now publish bounded native readiness, reload and stop
+notifications for `Type=notify`. The inherited endpoint is captured only by
+`run`; short-lived control clients and ordinary library use do not announce
+readiness. Failed initial preparation never claims readiness, and notifications
+cannot return to ready after stopping begins. See
+[PROCESS-NOTIFY.md](docs/PROCESS-NOTIFY.md) for scope and failure behavior. Final
+acceptance under the target machine's real service manager remains a deployment
+gate, separate from datagram/credential validation.
