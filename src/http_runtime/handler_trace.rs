@@ -38,9 +38,10 @@ impl Module {
             | Handler::StaticError { status, .. }
             | Handler::CopyResponse(status) => weak(&mut value, "status_code", status),
             Handler::Headers { .. } => headers(&mut value),
-            Handler::Map { destinations, .. } => {
+            Handler::Map(plan) => {
+                let destinations=&plan.destinations;
                 if !destinations.is_empty() {
-                    value.insert("destinations".into(), json!(destinations));
+                    value.insert("destinations".into(), json!(&**destinations));
                 }
             }
             Handler::Subroute { .. } => {

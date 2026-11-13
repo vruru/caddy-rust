@@ -111,10 +111,12 @@ struct HeaderInjector<'a>(&'a mut http::HeaderMap);
 impl Injector for HeaderInjector<'_>{
  fn set(&mut self,key:&str,value:String){if let(Ok(key),Ok(value))=(http::HeaderName::from_bytes(key.as_bytes()),http::HeaderValue::try_from(value)){self.0.insert(key,value);}}
 }
-fn expand(ctx:&Context,value:&str,credit:&Credit)->anyhow::Result<String>{
- crate::http_config::helpers::replace_accounted(value,true,|name|ctx.lookup(name),|bytes|credit.charge(bytes))
+async fn expand(view:super::request::ReplacerView<'_>,value:&str,credit:&Credit)->anyhow::Result<String>{
+ let bytes=view.expand_resolved(value,true).await?;
+ credit.charge(bytes.len().saturating_mul(4).saturating_add(8192))?;
+ String::from_utf8(bytes.to_vec()).map_err(Into::into)
 }
-pub(super) fn enter(ctx:&mut Context,provider:&Arc<Provider>,plan:&Config)->Arc<Observation>{
+pub(super) async fn enter(ctx:&mut Context,provider:&Arc<Provider>,plan:&Config)->Arc<Observation>{
  let mut credit=provider.admit();
  if let Some(owner)=&credit{
   let request=ctx.req();let input=request.headers().iter().fold(0usize,|n,(key,value)|n.saturating_add(key.as_str().len()+value.as_bytes().len()+64));
@@ -125,7 +127,7 @@ pub(super) fn enter(ctx:&mut Context,provider:&Arc<Provider>,plan:&Config)->Arc<
  let parent=provider.propagators.extract_with_context(&parent,&Carrier::new(ctx.req().headers(),credit.is_some()));
  let mut name="handler".to_owned();let mut attributes=Vec::new();
  if let Some(owner)=&credit{
-  if let Ok(expanded)=expand(ctx,&plan.span,owner){name=expanded;}
+  if let Ok(expanded)=expand(ctx.lookup_view(),&plan.span,owner).await{name=expanded;}
   let request=ctx.req();let scheme=if ctx.tls{"https"}else{"http"};
   let authority=ctx.authority.parse::<http::uri::Authority>().ok();
   let host=authority.as_ref().map_or(ctx.authority.as_str(),|a|a.host()).trim_start_matches('[').trim_end_matches(']');
@@ -153,13 +155,14 @@ pub(super) fn enter(ctx:&mut Context,provider:&Arc<Provider>,plan:&Config)->Arc<
  *ctx.req_mut().body_mut()=RequestTraceBody{body,observation:observation.clone()}.boxed_unsync();
  observation
 }
-pub(super) fn attributes(ctx:&Context,observation:&Observation,plan:&Config){
+pub(super) fn attributes<'a>(ctx:&'a Context,observation:&'a Observation,plan:&'a Config)->impl std::future::Future<Output=()>+Send+'a{
+ let view=ctx.lookup_view();async move{
  let Some(credit)=&observation.credit else{return};let span=observation.context.span();if !span.is_recording(){return}
  for(key,value)in plan.attributes.iter(){
   if credit.charge(key.len()+128).is_err(){break}
-  if let Ok(value)=expand(ctx,value,credit){span.set_attribute(KeyValue::new(key.to_string(),value));}
+  if let Ok(value)=expand(view,value,credit).await{span.set_attribute(KeyValue::new(key.to_string(),value));}
  }
-}
+ }}
 #[derive(Clone,Copy)]pub(super) struct TracedResponse;
 pub(super) fn attach_body(body:Body,observation:Arc<Observation>,normal_discard:bool)->Body{
  TraceBody{body,observation:Some(observation),normal_discard}.boxed_unsync()

@@ -610,7 +610,7 @@ impl HttpProbe {
         let (family,address)=if unix_path.is_some(){(super::http_dial::Family::Any,"localhost:0")}else{super::http_dial::Family::parse(&p.dial).map_err(|e|e.to_string())?};
         let client = self
             .client
-            .client_for(&format!("{}://{}", url.scheme, address), family, false, sni,unix_path)
+            .client_for(&format!("{}://{}", url.scheme, address),family,false,sni,unix_path,&self.resources.proxy_client_cache_bytes,None,self.resources.proxy_dial_dns.clone())
             .map_err(|e| format!("upstream client: {e}"))?;
         let resp = client.request(req).await.map_err(|e| error_chain(&e))?;
         let gzip = gzip_req

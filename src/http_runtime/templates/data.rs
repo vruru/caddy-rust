@@ -6,6 +6,7 @@ use http::{HeaderMap,HeaderName,HeaderValue,Method,Uri,Version,header};
 use std::{collections::BTreeMap,path::Path,sync::{Arc,Mutex,OnceLock}};
 #[derive(Clone)]
 pub(crate) struct RequestData {
+    maps:Option<Arc<crate::http_runtime::map_runtime::Provider>>,
     dynamic:crate::http_runtime::placeholder_value::Dynamic,
     tls_snapshot:Option<Arc<crate::http_runtime::ConnectionSnapshot>>,
     tls_values:tls_values::Cache,
@@ -23,13 +24,16 @@ pub(crate) struct RequestData {
 // rewritten method or operator-overridable placeholder. Rewrites change the
 // path/query while the original scheme/authority remain independent facts.
 impl RequestData {
-    pub(crate) fn capture(ctx:&super::super::super::request::Context)->Result<Self,super::super::TemplateFailure>{
+    pub(crate) fn capture<'a>(ctx:&'a super::super::super::request::Context)->impl std::future::Future<Output=Result<Self,super::super::TemplateFailure>>+Send+'a{
+        let prepared=Self::capture_primitives(ctx);let view=ctx.lookup_view();
+        async move{let mut value=prepared?;value.maps=crate::http_runtime::map_runtime::Provider::capture(view).await.map_err(|_|super::super::TemplateFailure(http::StatusCode::SERVICE_UNAVAILABLE))?;Ok(value)}
+    }
+    fn capture_primitives(ctx:&super::super::super::request::Context)->Result<Self,super::super::TemplateFailure>{
         let req=ctx.req();let mut placeholders=BTreeMap::new();
         for name in ["http.shutting_down","http.time_until_shutdown","http.request.hostport","http.request.host","http.request.port","http.request.remote","http.request.remote.host","http.request.remote.port","http.request.local","http.request.local.host","http.request.local.port","http.request.client_ip","http.vars.client_ip","http.request.scheme","http.request.method","http.request.orig_method","http.request.uri","http.request.uri.path","http.request.uri.query","http.request.orig_uri","http.request.orig_uri.path","http.request.orig_uri.query","http.request.orig_uri.prefixed_query","http.request.proto","http.vars.root","http.error.status_code","http.error.message","http.error.id","http.error.trace"] {
             if let Some(value)=ctx.lookup_bytes(name){placeholders.insert(name.into(),(value,false));}
         }
         for name in ctx.values.keys(){if let Some(value)=ctx.lookup_bytes(name){placeholders.insert(name.clone(),(value,true));}}
-        for name in ctx.template_map_destinations(){if let Some(value)=ctx.lookup_bytes(name){placeholders.insert(name.to_owned(),(value,true));}}
         let bytes=placeholders.iter().try_fold(0usize,|n,(key,value)|n.checked_add(key.len()+value.0.len()+64));
         if !bytes.is_some_and(|n|n<=1<<20){return Err(super::super::TemplateFailure(http::StatusCode::INTERNAL_SERVER_ERROR));}
         let target=req.extensions().get::<super::super::virtual_request::VirtualTarget>();
@@ -52,23 +56,36 @@ impl RequestData {
         }else{None};
         if h2_protocol.as_ref().is_some_and(|p|p.len()>128*1024){return Err(super::super::TemplateFailure(http::StatusCode::INTERNAL_SERVER_ERROR));}
 
-        Ok(Self{tls_snapshot:req.extensions().get::<Arc<crate::http_runtime::ConnectionSnapshot>>().cloned(),tls_values:tls_values::cache(),url_values:OnceLock::new(),dynamic:crate::http_runtime::placeholder_value::Dynamic::capture(ctx),h2_protocol,rewrite,url_origin,url_origin_form,uri,original_uri,request_uri,form,method:req.method().clone(),original_method:ctx.lookup("http.request.orig_method").and_then(|s|s.parse().ok()).unwrap_or(Method::GET),headers,version:req.version(),host:ctx.authority.clone(),remote:ctx.peer.raw_text().into_owned(),remote_ip:ctx.peer.raw_host().into_owned(),client_ip:ctx.client_ip.map_or_else(String::new,|ip|ip.to_string()),tls:ctx.tls,content_length:if target.is_some(){0}else{ctx.template_content_length()},placeholders})
+        Ok(Self{maps:None,tls_snapshot:req.extensions().get::<Arc<crate::http_runtime::ConnectionSnapshot>>().cloned(),tls_values:tls_values::cache(),url_values:OnceLock::new(),dynamic:crate::http_runtime::placeholder_value::Dynamic::capture(ctx),h2_protocol,rewrite,url_origin,url_origin_form,uri,original_uri,request_uri,form,method:req.method().clone(),original_method:ctx.lookup("http.request.orig_method").and_then(|s|s.parse().ok()).unwrap_or(Method::GET),headers,version:req.version(),host:ctx.authority.clone(),remote:ctx.peer.raw_text().into_owned(),remote_ip:ctx.peer.raw_host().into_owned(),client_ip:ctx.client_ip.map_or_else(String::new,|ip|ip.to_string()),tls:ctx.tls,content_length:if target.is_some(){0}else{ctx.template_content_length()},placeholders})
     }
-    pub(super) fn placeholder(&self,name:&str,control:&Arc<super::Control>)->RenderResult<Value> {
-        if let Some(value)=crate::http_config::helpers::global_lookup(name){control.reserve_host_bytes(value.len()+64)?;return Ok(string(value));}
-        if !self.placeholders.get(name).is_some_and(|(_,explicit)|*explicit){if let Some(cache)=self.url_values.get(){if let Some(value)=request_url::placeholder(cache,control,name)?{return Ok(value);}}}
+    pub(super) fn placeholder(&self,name:&str,control:&Arc<super::Control>)->RenderResult<Value>{
+        if let Some(value)=self.placeholder_primitive(name,control)?{return Ok(value)}
+        let Some(provider)=&self.maps else{return Ok(string(""))};
+        let value=provider.lookup_controlled(name,|key|{
+            control.charge(1).map_err(|e|anyhow::anyhow!("map primitive: {e}"))?;
+            let Some(value)=self.placeholder_primitive(key,control).map_err(|e|anyhow::anyhow!("map primitive: {e}"))?else{return Ok(None)};
+            let bytes=value.as_go_bytes().ok_or_else(||anyhow::anyhow!("map primitive must be a string"))?;
+            let credit=provider.pool().reserve(bytes.len().saturating_mul(2)+1024)?;
+            Ok(Some(crate::http_runtime::map_runtime::owned(bytes.to_vec(),credit)))
+        },Some(control.cancel.clone()),control.deadline()).map_err(|e|error(e.to_string()))?;
+        if let Some(bytes)=value{control.reserve_host_bytes(bytes.len().saturating_mul(2)+64)?;return Ok(Value::from_go_bytes(bytes.to_vec()))}
+        Ok(string(""))
+    }
+    fn placeholder_primitive(&self,name:&str,control:&Arc<super::Control>)->RenderResult<Option<Value>> {
+        if let Some(value)=crate::http_config::helpers::global_lookup(name){control.reserve_host_bytes(value.len()+64)?;return Ok(Some(string(value)));}
+        if !self.placeholders.get(name).is_some_and(|(_,explicit)|*explicit){if let Some(cache)=self.url_values.get(){if let Some(value)=request_url::placeholder(cache,control,name)?{return Ok(Some(value));}}}
         if let Some(value)=self.dynamic.get(name){
             use crate::http_runtime::placeholder_value::Value as P;
             let value=match value{P::Null=>String::new(),P::Bool(v)=>v.to_string(),P::Duration(v)=>crate::duration::format(v),P::Double(v)=>v.to_string(),P::Unavailable(message)=>return Err(error(message)),_=>return Err(error("unexpected dynamic placeholder type"))};
-            control.reserve_host_bytes(value.len()+64)?;return Ok(string(value));
+            control.reserve_host_bytes(value.len()+64)?;return Ok(Some(string(value)));
         }
-        if let Some((value,_))=self.placeholders.get(name){control.reserve_host_bytes(value.len()+64)?;return Ok(Value::from_go_bytes(value.clone()));}
+        if let Some((value,_))=self.placeholders.get(name){control.reserve_host_bytes(value.len()+64)?;return Ok(Some(Value::from_go_bytes(value.clone())));}
         if let Some(name)=name.strip_prefix("http.request.header."){
             let values=self.headers.get_all(name);let count=values.iter().count();
             let length=values.iter().try_fold(count.saturating_sub(1),|n,v|n.checked_add(v.as_bytes().len())).ok_or_else(||error("header placeholder size overflow"))?;
             control.reserve_host_bytes(length.checked_mul(2).and_then(|n|n.checked_add(64)).ok_or_else(||error("header placeholder size overflow"))?)?;
             let mut bytes=Vec::with_capacity(length);for(index,value)in values.iter().enumerate(){if index!=0{bytes.push(b',');}bytes.extend_from_slice(value.as_bytes());}
-            return Ok(Value::from_go_bytes(bytes));
+            return Ok(Some(Value::from_go_bytes(bytes)));
         }
         if let Some(name)=name.strip_prefix("http.request.uri.query."){
             let query=self.uri.query().unwrap_or_default().as_bytes();
@@ -78,9 +95,9 @@ impl RequestData {
                 if index>=16_384{return Err(error("query placeholder entry limit exceeded"));}control.charge(1)?;
                 if let Some((key,value))=crate::http_runtime::query_match::query_pair(part){if key.as_ref()==name.as_bytes(){if !first{bytes.push(b',');}first=false;bytes.extend_from_slice(&value);}}
             }
-            return Ok(Value::from_go_bytes(bytes));
+            return Ok(Some(Value::from_go_bytes(bytes)));
         }
-        Ok(string(""))
+        Ok(None)
     }
     pub(super) fn method(&self,name:&str,args:&[Value])->RenderResult<Value>{
         if name=="Cookie"{

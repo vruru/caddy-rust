@@ -46,10 +46,10 @@ struct Rule {
     values: HashSet<String>,
 }
 
-pub(super) fn matches(
+pub(super) async fn matches(
     raw: &str,
     rules: &[(String, Vec<String>)],
-    expand: impl Fn(&str) -> Result<String>,
+    view:super::request::ReplacerView<'_>,
 ) -> Result<bool> {
     let segments = raw
         .as_bytes()
@@ -65,12 +65,12 @@ pub(super) fn matches(
         if values.is_empty() {
             return Ok(false);
         }
-        let key = expand(key)?.into_bytes();
+        let key = view.expand_text_resolved(key,true).await?.into_bytes();
         expanded_bytes = expanded_bytes.saturating_add(key.len());
         let mut accepted = HashSet::new();
         let mut any = false;
         for value in values {
-            let value = expand(value)?;
+            let value = view.expand_text_resolved(value,true).await?;
             expanded_bytes = expanded_bytes.saturating_add(value.len());
             anyhow::ensure!(
                 expanded_bytes <= 1 << 20,

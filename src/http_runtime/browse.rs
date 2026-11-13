@@ -515,7 +515,7 @@ pub(super) async fn serve(
     let (prepared, mut memory) = ctx
         .resources
         .directory_listing
-        .run(move || {
+        .run(super::map_runtime::text_job(ctx.text_owner(),move || {
             let mut listing = scan(&path, &plan, listing, |item| hidden.matches(item))?;
             let unchanged=options.since.is_some_and(|since|super::files::seconds(listing.last_modified)<=super::files::seconds(since));
             if custom&&!unchanged {
@@ -523,9 +523,9 @@ pub(super) async fn serve(
                 let bytes=listing.allocation_bytes()?;
                 Ok((Prepared::Custom(listing,PathBuf::from(plan.template_file),bytes),memory))
             } else {render(listing,&options).map(|rendered|(Prepared::Rendered(rendered),memory))}
-        })
+        })?)
         .await
-        .map_err(|e| budget_failure(ctx, e))?
+        .map_err(|e| budget_failure(ctx, e))?.into_context(ctx)?
         .map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 failure(StatusCode::NOT_FOUND)

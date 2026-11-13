@@ -130,6 +130,7 @@ impl Family {
 pub(super) struct FamilyResolver {
     inner: hyper_util::client::legacy::connect::dns::GaiResolver,
     family: Family,
+    retained:Option<(super::resource_budget::BlockingBudget,std::sync::Arc<super::map_runtime::DialOwner>)>,
 }
 
 impl FamilyResolver {
@@ -137,12 +138,19 @@ impl FamilyResolver {
         Self {
             inner: hyper_util::client::legacy::connect::dns::GaiResolver::new(),
             family,
+            retained:None,
         }
+    }
+    pub(super) fn with_map(family:Family,budget:super::resource_budget::BlockingBudget,owner:std::sync::Arc<super::map_runtime::DialOwner>)->Self{
+        Self{inner:hyper_util::client::legacy::connect::dns::GaiResolver::new(),family,retained:Some((budget,owner))}
     }
 }
 
+pub(super) struct FamilyAddrs{values:vec::IntoIter<SocketAddr>,_retained:Option<super::resource_budget::RetainedBlockingOutput<io::Result<Vec<SocketAddr>>>>}
+impl Iterator for FamilyAddrs{type Item=SocketAddr;fn next(&mut self)->Option<SocketAddr>{self.values.next()}fn size_hint(&self)->(usize,Option<usize>){self.values.size_hint()}}
+
 impl Service<Name> for FamilyResolver {
-    type Response = vec::IntoIter<SocketAddr>;
+    type Response = FamilyAddrs;
     type Error = io::Error;
     type Future = Pin<Box<dyn Future<Output = io::Result<Self::Response>> + Send>>;
 
@@ -151,6 +159,27 @@ impl Service<Name> for FamilyResolver {
     }
 
     fn call(&mut self, name: Name) -> Self::Future {
+        let family=self.family;
+        if let Some((budget,owner))=&self.retained{
+            let task=match owner.dns_work(name.as_str().len()){
+                Ok(task)=>task,Err(error)=>return Box::pin(async move{Err(io::Error::other(error.to_string()))}),
+            };
+            let budget=budget.clone();
+            return Box::pin(async move{
+                use std::net::ToSocketAddrs;
+                // Same synchronous NSS semantics as GaiResolver. The actual
+                // Name and result stay behind the closed retained envelope,
+                // including after a detached receiver is cancelled.
+                let output=budget.run_retained(task.clone(),move||{
+                    (name.as_str(),0).to_socket_addrs()
+                        .and_then(|addrs|super::mapped_dns::copy_admitted(addrs,|addr|family.admit(addr)))
+                }).await.map_err(|error|io::Error::other(format!("proxy DNS lane: {error:?}")))?;
+                let values=match output.get(){Ok(values)=>values,Err(error)=>return Err(io::Error::new(error.kind(),error.to_string()))};
+                if values.is_empty(){return Err(io::Error::new(io::ErrorKind::AddrNotAvailable,"no addresses admitted"))}
+                crate::cert_cpu::MaterialOwner::reserve(&*task,values.len().saturating_mul(std::mem::size_of::<SocketAddr>()*2).saturating_add(2048)).map_err(|error|io::Error::other(error.to_string()))?;
+                let values=values.clone().into_iter();Ok(FamilyAddrs{values,_retained:Some(output)})
+            })
+        }
         let mut inner = self.inner.clone();
         let family = self.family;
         Box::pin(async move {
@@ -167,7 +196,7 @@ impl Service<Name> for FamilyResolver {
                     "no addresses admitted",
                 ));
             }
-            Ok(result.into_iter())
+            Ok(FamilyAddrs{values:result.into_iter(),_retained:None})
         })
     }
 }

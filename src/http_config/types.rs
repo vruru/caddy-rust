@@ -122,12 +122,7 @@ pub(crate) enum Handler {
     },
     Rewrite(std::sync::Arc<RewritePlan>),
     Vars(Vec<(String, std::sync::Arc<serde_json::Value>)>),
-    Map {
-        source: String,
-        destinations: Vec<String>,
-        mappings: Vec<MapEntry>,
-        defaults: Vec<serde_json::Value>,
-    },
+    Map(std::sync::Arc<MapPlan>),
     Authentication {
         algorithm: crate::http_runtime::auth_hash::Algorithm,
         accounts: Vec<Account>,
@@ -164,10 +159,17 @@ pub(crate) struct LogAppendConfig {
     pub(crate) early: bool,
 }
 
+pub(crate) struct MapPlan{
+    pub(crate) source:std::sync::Arc<str>,
+    pub(crate) destinations:std::sync::Arc<[String]>,
+    pub(crate) mappings:std::sync::Arc<[MapEntry]>,
+    pub(crate) defaults:std::sync::Arc<[serde_json::Value]>,
+}
 #[derive(Clone)]
 pub(crate) struct MapEntry {
     pub(crate) input: Option<String>,
-    pub(crate) regex: Option<regex::Regex>,
+    pub(crate) regex: Option<std::sync::Arc<crate::go_regexp::GoRegexp>>,
+    pub(crate) pattern: Option<String>,
     pub(crate) outputs: Vec<serde_json::Value>,
 }
 

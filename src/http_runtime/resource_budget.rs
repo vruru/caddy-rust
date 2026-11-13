@@ -218,6 +218,10 @@ impl<F> RetainedBlockingJob<F> {
 pub struct ResourceDiagnostics {
     pub rewrite_uri_bytes:usize,
     pub header_replacement_bytes:usize,
+    pub map_replacer_bytes:usize,
+    pub proxy_client_cache_bytes:usize,
+    pub proxy_dial_dns:BudgetSnapshot,
+    pub map_lookup:BudgetSnapshot,
     pub tls_event_metadata_bytes:usize,
     pub client_certificate_metadata_bytes: usize,
     pub proxy_health_events_coalesced: u64,
@@ -281,6 +285,10 @@ pub(crate) struct Resources {
     pub(super) proxy_health_schedulers: Arc<Semaphore>,
     pub(super) proxy_dns: Arc<super::proxy_dynamic::DnsShared>,
     pub(super) proxy_cleanup: Arc<super::proxy_cleanup::Coordinator>,
+    pub(super) map_bytes: native_write_policy::Pool,
+    pub(super) proxy_client_cache_bytes:native_write_policy::Pool,
+    pub(super) proxy_dial_dns:BlockingBudget,
+    pub(super) map_lookup:BlockingBudget,
     pub request_regexp: BlockingBudget,
     pub directory_listing: BlockingBudget,
     pub directory_listing_bytes: Arc<Semaphore>,
@@ -377,20 +385,31 @@ impl Resources {
             .div_ceil(2)
             .clamp(1, 16)
             .min((spare.saturating_sub(selection_running) / 2).max(1));
+        let listing_running = cpu
+            .clamp(1, 8)
+            .min((spare.saturating_sub(selection_running + regex_running) / 2).max(1));
+        // These new lanes are included in the same scalar spare allowance;
+        // their separate queues are not a physical CPU/thread isolation claim.
+        let remaining=spare.saturating_sub(selection_running).saturating_sub(regex_running).saturating_sub(listing_running);
+        let dial_dns_running=cpu.clamp(2,16).min((remaining/2).max(1));
+        let map_running=cpu.div_ceil(2).clamp(1,16).min(remaining.saturating_sub(dial_dns_running).max(1));
+        let proxy_dial_dns=BlockingBudget::new(dial_dns_running,64,Duration::from_secs(2))?;
+        let map_lookup=BlockingBudget::new(map_running,cpu.saturating_mul(16).clamp(32,256),Duration::from_secs(2))?;
         let request_regexp = BlockingBudget::new(
             regex_running,
             cpu.saturating_mul(16).clamp(32, 256),
             Duration::from_secs(2),
         )?;
-        let listing_running = cpu
-            .clamp(1, 8)
-            .min((spare.saturating_sub(selection_running + regex_running) / 2).max(1));
         let directory_listing = BlockingBudget::new(
             listing_running,
             cpu.saturating_mul(4).clamp(8, 64),
             Duration::from_secs(2),
         )?;
         Ok(Self {
+            map_bytes: native_write_policy::Pool::new(128<<20),
+            proxy_client_cache_bytes:native_write_policy::Pool::new(32<<20),
+            proxy_dial_dns,
+            map_lookup,
             transfer_deadlines: native_write_policy::Pool::new(cpu.saturating_mul(8<<20).clamp(32<<20,256<<20)),
             ssl_verify:native_ssl_tls::VerificationScope::new(),
             client_tls:Arc::new(super::tls_executor::ClientTlsExecutor::new()),
@@ -478,6 +497,8 @@ impl Resources {
         self.request_regexp.tasks.close();
         self.directory_listing.tasks.close();
         self.fastcgi_dns.tasks.close();
+        self.proxy_dial_dns.tasks.close();
+        self.map_lookup.tasks.close();
         self.fastcgi_spool_io.tasks.close();
         self.fastcgi_admission.diagnostics.close();
     }
@@ -519,6 +540,8 @@ impl Resources {
         self.request_regexp.tasks.wait().await;
         self.directory_listing.tasks.wait().await;
         self.fastcgi_dns.tasks.wait().await;
+        self.proxy_dial_dns.tasks.wait().await;
+        self.map_lookup.tasks.wait().await;
         self.fastcgi_spool_io.tasks.wait().await;
         self.fastcgi_admission.diagnostics.wait().await;
     }
@@ -527,6 +550,10 @@ impl Resources {
             self.access_capture.stats();
         let (cel_dynamic_entries, cel_dynamic_bytes) = self.cel_dynamic.snapshot();
         ResourceDiagnostics {
+            map_replacer_bytes:self.map_bytes.used(),
+            proxy_client_cache_bytes:self.proxy_client_cache_bytes.used(),
+            proxy_dial_dns:self.proxy_dial_dns.snapshot(),
+            map_lookup:self.map_lookup.snapshot(),
             rewrite_uri_bytes:self.rewrite_bytes.used(),
             proxy_health_events_coalesced: self.proxy_health_events_coalesced.load(Ordering::Relaxed),
             cel_body_capture_bytes: (super::cel_body::POOL_UNITS - self.cel_body_bytes.available_permits()) * super::cel_body::UNIT,

@@ -488,7 +488,12 @@ impl RequestHost<'_> {
                 let len = value.len();
                 self.tick(0, len + 128)?;
             }
-            super::placeholder_value::request(self.ctx, name)
+            let projected=super::placeholder_value::request(self.ctx,name);
+            if projected.is_none(){
+                let value=self.ctx.lookup_typed_resolved(name).await.map_err(|e|self.fail(e))?;
+                if let Some(value)=value{if value.null{return Ok(Arc::new(CelNull))}self.tick(0,value.bytes.len()+128)?;return Ok(super::cel_native_string::value(value.bytes));}
+            }
+            projected
         };
         self.project(projected).await
     }

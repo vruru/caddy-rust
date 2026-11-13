@@ -92,3 +92,22 @@ pub(super) fn compile_static(pattern: &str, remaining: &mut usize) -> Result<Arc
     *remaining = next.unwrap();
     Ok(compiled.regex.clone())
 }
+
+/// Map historically accepted Rust regex syntax. Keep those useful extensions,
+/// without treating resource admission as a syntax failure and retrying it.
+pub(super) fn compile_map_static(pattern:&str,remaining:&mut usize)->Result<Arc<GoRegexp>>{
+    let compiled=match compile_dynamic(pattern,&CONSTRUCTORS){
+        Ok(compiled)=>compiled,
+        Err(error)if is_resource(&error)=>return Err(error),
+        Err(_go_syntax)=>{
+            let translation=CONSTRUCTORS.reserve(TRANSLATION_UPPER).map_err(|_|CompileAdmission)?;
+            let mut native=None;
+            let regex=GoRegexp::compile_map_extension_preflight(pattern,COMPILE_LIMIT,|shape|{
+                native=Some(CONSTRUCTORS.reserve(native_compile_upper(shape)?).map_err(|_|CompileAdmission)?);Ok(())
+            })?;
+            Compiled{regex:Arc::new(regex),_native:native,_translation:translation}
+        }
+    };
+    *remaining=remaining.checked_sub(compiled.regex.memory_usage()).ok_or_else(||anyhow::anyhow!("HTTP regexp configuration memory budget exceeded"))?;
+    Ok(compiled.regex.clone())
+}

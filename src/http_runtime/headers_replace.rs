@@ -60,7 +60,11 @@ struct Snapshot {
     entries: Vec<Entry>,
     keys: Arc<[String]>,
     dynamic: Dynamic,
+    deadline: Instant,
     pool: Pool,
+    maps:Option<Arc<super::map_runtime::Provider>>,
+    map_lane:BlockingBudget,
+    _dependencies:Option<super::map_runtime::DependencyKeys>,
     // Immutable after capture: real arena/entry allocations precede credits.
     _leases: Vec<Lease>,
 }
@@ -85,18 +89,29 @@ impl Snapshot {
         scope: Scope,
         pool: Pool,
         dynamic: Dynamic,
+        lane:BlockingBudget,
     ) -> Result<Self> {
+        let maps=super::map_runtime::Provider::capture(view).await?;
+        let dependencies=if let Some(provider)=&maps{
+            let provider=provider.clone();let roots=ops.replace_keys.clone();
+            Some(lane.run(move||provider.dependencies(&roots)).await.map_err(|_|limit())??)
+        }else{None};
+        let keys=dependencies.as_ref().map_or_else(||ops.replace_keys.clone(),|deps|deps.keys.clone());
         let ledger = Ledger::new(pool.clone());
-        ledger.pay(ops.replace_keys.len() * std::mem::size_of::<Entry>() + 1024)?;
+        ledger.pay(keys.len() * std::mem::size_of::<Entry>() + 1024)?;
         let mut this = Self {
             data: Vec::new(),
-            entries: Vec::with_capacity(ops.replace_keys.len()),
-            keys: ops.replace_keys.clone(),
+            entries: Vec::with_capacity(keys.len()),
+            keys,
+            maps,
+            map_lane:lane,
+            _dependencies:dependencies,
             dynamic,
+            deadline:Instant::now(),
             pool,
             _leases: Vec::new(),
         };
-        for (index, name) in ops.replace_keys.iter().enumerate() {
+        for (index, name) in this.keys.clone().iter().enumerate() {
             if index > 0 && index.is_multiple_of(128) {
                 tokio::task::yield_now().await;
             }
@@ -116,13 +131,13 @@ impl Snapshot {
                 let _temporary = this.pool.reserve(8 << 20)?;
                 let value = if let Some(field) = name.strip_prefix("http.request.header.") {
                     Some(if field.eq_ignore_ascii_case("Host") {
-                        Vec::new()
+                        Bytes::new()
                     } else {
-                        view.headers()
-                            .map_or_else(Vec::new, |fields| join(fields, field))
+                        Bytes::from(view.headers()
+                            .map_or_else(Vec::new, |fields| join(fields, field)))
                     })
                 } else {
-                    view.lookup_bytes(name)
+                    view.lookup_bytes(name).map(Bytes::from)
                 };
                 if let Some(value) = value {
                     this.store(&value, &ledger)?
@@ -155,7 +170,7 @@ impl Snapshot {
         self.data.extend_from_slice(value);
         Ok(Entry::Value(at, value.len()))
     }
-    fn get(&self, fields: &HeaderMap, name: &str, ledger: &Ledger) -> Result<Option<Vec<u8>>> {
+    fn get_primitive(&self, fields: &HeaderMap, name: &str, ledger: &Ledger) -> Result<Option<Vec<u8>>> {
         let Some(i) = self
             .keys
             .binary_search_by(|key| key.as_str().cmp(name))
@@ -204,6 +219,14 @@ impl Snapshot {
             }
         })
     }
+    fn get(&self,fields:&HeaderMap,name:&str,ledger:&Ledger)->Result<Option<Vec<u8>>>{
+        if let Some(value)=self.get_primitive(fields,name,ledger)?{return Ok(Some(value))}
+        let Some(provider)=&self.maps else{return Ok(None)};
+        let value=provider.lookup_controlled(name,|key|self.get_primitive(fields,key,ledger).map(|value|value.map(Bytes::from)),None,self.deadline)?;
+        match value{
+            Some(value)=>{ledger.pay(value.len().saturating_mul(2)+1024)?;Ok(Some(value.to_vec()))},None=>Ok(None),
+        }
+    }
     fn expand(&self, text: &str, fields: &HeaderMap) -> Result<Arc<Expanded>> {
         let ledger = Ledger::new(self.pool.clone());
         ledger.pay(256)?;
@@ -246,7 +269,8 @@ async fn expand_owned(
 ) -> Result<Arc<Expanded>> {
     // Small expressions have a bounded scanner. Large placeholder programs
     // must not turn the service poll into a CPU worker.
-    if text.len() <= 4096 {
+    let may_map=snapshot.maps.is_some()&&text.as_bytes().contains(&b'{');
+    if text.len() <= 4096 && !may_map {
         return snapshot.expand(text, fields);
     }
     ensure!(text.len() <= 1 << 20, "replacement input exceeds limit");
@@ -256,6 +280,7 @@ async fn expand_owned(
         _credit: credit,
     };
     let overlay = header_overlay(snapshot, fields, pool).await?;
+    let lane=if snapshot.maps.is_some()&&text.as_bytes().contains(&b'{'){&snapshot.map_lane}else{lane};
     let snapshot = snapshot.clone();
     lane.run(move || {
         let _input = input;
@@ -489,7 +514,8 @@ pub(super) fn prepare_owned<'a>(
         let view = ctx.lookup_view();
         let dynamic = Dynamic::capture(ctx);
         let p = pool.clone();
-        Some(Box::pin(Snapshot::capture(view, ops, scope, p, dynamic))
+        let lane=ctx.resources.map_lookup.clone();
+        Some(Box::pin(Snapshot::capture(view, ops, scope, p, dynamic,lane))
             as Pin<
                 Box<dyn Future<Output = Result<Snapshot>> + Send + 'a>,
             >)
@@ -515,13 +541,14 @@ pub(super) fn apply_owned<'a>(
     Box::pin(async move {
         // Keep the future allocation credit behind the actual captured future.
         let mut prepared = prepared;
-        let snapshot = prepared
+        let mut snapshot = prepared
             .capture
             .as_mut()
             .expect("active capture")
             .as_mut()
             .await
             .map_err(|_| limit())?;
+        snapshot.deadline=Instant::now()+Duration::from_millis(150);
         let snapshot = Arc::new(snapshot);
         let lane = prepared.lane.clone();
         let pool = prepared.pool.clone();
@@ -538,7 +565,7 @@ pub(super) fn apply_owned<'a>(
         if total > maximum {
             return Err(limit());
         }
-        let deadline = Instant::now() + Duration::from_millis(150);
+        let deadline = snapshot.deadline;
         let _names_credit = pool.reserve(headers.len() * 128 + total * 2 + 4096)?;
         let mut names = Vec::with_capacity(headers.len());
         for (index, key) in headers.keys().enumerate() {
@@ -568,8 +595,6 @@ pub(super) fn apply_owned<'a>(
                 {
                     continue;
                 }
-                let search = expand_owned(&snapshot, &rule.search, headers, &lane, &pool).await?;
-                let with = expand_owned(&snapshot, &rule.replace, headers, &lane, &pool).await?;
                 let dynamic = !rule.search_regexp.is_empty() && rule.regex.is_none();
                 for name in names.iter().filter(|name| {
                     selector.bytes == b"*" || name.as_bytes().eq_ignore_ascii_case(&selector.bytes)
@@ -580,6 +605,8 @@ pub(super) fn apply_owned<'a>(
                         if Instant::now() >= deadline {
                             return Err(limit());
                         }
+                        let search = expand_owned(&snapshot, &rule.search, headers, &lane, &pool).await?;
+                        let with = expand_owned(&snapshot, &rule.replace, headers, &lane, &pool).await?;
                         let pattern = if dynamic {
                             Some(
                                 expand_owned(&snapshot, &rule.search_regexp, headers, &lane, &pool)
@@ -588,7 +615,7 @@ pub(super) fn apply_owned<'a>(
                         } else {
                             None
                         };
-                        let amount = if dynamic { 1 } else { 256 };
+                        let amount = if dynamic || snapshot.maps.is_some() { 1 } else { 256 };
                         let lengths = headers
                             .get_all(name.as_str())
                             .iter()

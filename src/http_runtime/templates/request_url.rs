@@ -65,6 +65,7 @@ fn string_arg(args:&[Value],i:usize)->RenderResult<&[u8]>{args.get(i).and_then(V
 fn method(view:&Arc<View>,name:&str,args:&[Value])->RenderResult<Value>{
  let control=live(&view.owner)?;let(epoch,facts)=view.snapshot()?;
  match name{
+  "Clone"=>{arity(args,0,0)?;prepay(&control,facts.bytes()?,64,32768)?;let mut cloned=facts.as_ref().clone();cloned.user=facts.user.as_ref().map(|user|Arc::new(User{username:user.username.clone(),password:user.password.clone()}));control.check()?;make_object(self::view(&control,cloned),&control)}
   "Parse"=>{arity(args,1,1)?;let raw=string_arg(args,0)?;prepay(&control,sum(&[facts.bytes()?,raw.len()])?,64,32768)?;let reference=core::parse(raw)?;let facts=core::resolve(&facts,&reference)?;control.check()?;make_object(self::view(&control,facts),&control)}
   "ResolveReference"=>{arity(args,1,1)?;if matches!(args[0],Value::Nil){return Err(error("nil URL reference"));}let Value::Object(object)=&args[0]else{return Err(error("URL reference requires *url.URL"));};let other=data(object)?;if !view.owner.ptr_eq(&other.owner){return Err(error("foreign URL reference owner"));}let(_,reference)=other.snapshot()?;prepay(&control,sum(&[facts.bytes()?,reference.bytes()?])?,64,32768)?;let facts=core::resolve(&facts,&reference)?;control.check()?;make_object(self::view(&control,facts),&control)}
   "JoinPath"=>{let n=args.iter().try_fold(facts.bytes()?,|n,v|sum(&[n,v.as_go_bytes().ok_or_else(||error("URL path element requires string"))?.len()]))?;prepay(&control,sum(&[n,args.len().checked_mul(64).ok_or_else(||error("URL path arguments overflow"))?])?,64,32768)?;let parts=args.iter().map(|v|v.as_go_bytes().unwrap()).collect::<Vec<_>>();let joined=core::join(&facts,&parts);control.check()?;make_object(self::view(&control,joined),&control)}
@@ -85,9 +86,29 @@ fn append(control:&Arc<Control>,prefix:TypedSlice,suffix:&[u8])->RenderResult<Va
 impl gotmpl::FieldSource for View {fn read_field(&self,name:&'static str)->RenderResult<Value>{self.field(name)?.ok_or_else(||error("unknown URL field reference"))}}
 fn make_object(view:Arc<View>,control:&Arc<Control>)->RenderResult<Value>{
  prepay(control,0,1,8192)?;let fields=FIELDS.into_iter().map(|name|(Arc::from(name),Value::Nil)).collect();let read=view.clone();let mut methods=BTreeMap::<Arc<str>,ValueFunc>::new();
- for name in ["String","Redacted","RequestURI","EscapedPath","EscapedFragment","Hostname","Port","IsAbs","Query","MarshalBinary","AppendBinary","UnmarshalBinary","Parse","JoinPath","ResolveReference"]{let view=view.clone();methods.insert(name.into(),Arc::new(move|args|method(&view,name,args)));}
+ for name in ["String","Redacted","RequestURI","EscapedPath","EscapedFragment","Hostname","Port","IsAbs","Query","MarshalBinary","AppendBinary","UnmarshalBinary","Parse","JoinPath","ResolveReference","Clone"]{let view=view.clone();methods.insert(name.into(),Arc::new(move|args|method(&view,name,args)));}
  let method_signatures=BTreeMap::from([("Parse".into(),gotmpl::Signature::new(vec![gotmpl::ArgKind::String],None)),("JoinPath".into(),gotmpl::Signature::new(Vec::new(),Some(gotmpl::ArgKind::String))),("AppendBinary".into(),gotmpl::Signature::from_static(&[gotmpl::ArgKind::ByteSlice],None)),("UnmarshalBinary".into(),gotmpl::Signature::from_static(&[gotmpl::ArgKind::ByteSlice],None)),("ResolveReference".into(),gotmpl::Signature::from_static(&[gotmpl::ArgKind::GoPointer("*url.URL")],None))]);
  Ok(Value::Object(Arc::new(Object{fields,dynamic_fields:Some(Arc::new(move|name|{let Some(name)=FIELDS.into_iter().find(|field|*field==name)else{return Ok(None);};let control=live(&read.owner)?;control.reserve_host_bytes(std::mem::size_of::<gotmpl::FieldReference>()+64)?;let kind=match name{"ForceQuery"|"OmitHost"=>gotmpl::FieldKind::Bool,"User"=>gotmpl::FieldKind::Pointer("*url.Userinfo"),_=>gotmpl::FieldKind::String};Ok(Some(Value::Field(Arc::new(gotmpl::FieldReference::new(read.clone(),name,kind)))))})),methods,method_signatures,dynamic_stringer:Some(dynamic_stringer),go_type:Some("*url.URL"),pointer_identity:Some(Arc::as_ptr(&view)as usize),data_bytes:std::mem::size_of::<View>(),data:Some(view),field_order:Some(FIELDS.map(Arc::from).into()),..Object::default()})))
+}
+/// Certificate SAN admission is stricter than ordinary net/url parsing. Apply
+/// this only to the authenticated initial projection; mutable template methods
+/// retain ordinary URL rules and cannot change the certificate DER or TLS facts.
+pub(super) fn certificate_value(raw: &[u8], control: &Arc<Control>) -> RenderResult<Value> {
+    if !raw.is_ascii() {
+        return Err(error("X.509 URI SAN is not IA5"));
+    }
+    // Covers the parser, facts/view/Arc construction and temporary byte copies
+    // before any parse or view allocation, in the existing render allowance.
+    prepay(control, raw.len(), 64, 32768)?;
+    let facts = core::parse(raw)?;
+    if !facts.host.is_empty()
+        && (facts.host.ends_with(b".")
+            || facts.host.iter().any(|b| !(33..=126).contains(b))
+            || facts.host.split(|b| *b == b'.').any(|label| label.is_empty()))
+    {
+        return Err(error("invalid X.509 URI domain"));
+    }
+    make_object(view(control, facts), control)
 }
 pub(super)fn value(uri:&http::Uri,control:&Arc<Control>)->RenderResult<Value>{make_object(view(control,from_uri(uri,None,false,control,None)?),control)}
 pub(super)fn cached(uri:&http::Uri,origin:Option<&http::Uri>,origin_form:bool,control:&Arc<Control>,cache:&Cache,original:bool,rewrite:Option<&crate::http_runtime::rewrite_runtime::Projection>)->RenderResult<Value>{

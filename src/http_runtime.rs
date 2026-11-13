@@ -1610,3 +1610,9 @@ mod tracing;
 
 #[path="http_runtime/headers_replace.rs"]
 mod headers_replace;
+
+#[path="http_runtime/replacer_async.rs"]
+mod replacer_async;
+#[path="http_runtime/map_runtime.rs"]
+mod map_runtime;
+mod mapped_dns;

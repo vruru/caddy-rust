@@ -202,13 +202,13 @@ impl Target {
                         vec![SocketAddr::new(ip, port)]
                     } else {
                         let dns = ctx.resources.fastcgi_dns.clone();
-                        dns.run(move || {
+                        dns.run(super::map_runtime::text_job(ctx.text_owner(),move || {
                             (host.as_str(), port)
                                 .to_socket_addrs()
                                 .map(|addrs| addrs.take(64).collect::<Vec<_>>())
-                        })
+                        })?)
                         .await
-                        .map_err(|error| budget_failure(ctx, error))??
+                        .map_err(|error| budget_failure(ctx, error))?.into_context(ctx)??
                     };
                     let (primary, fallback) = split_families(candidates, ipv6);
                     let socket = if fallback.is_empty() {
@@ -304,11 +304,7 @@ async fn unix_connect(_path: String) -> Result<Box<dyn Io>> {
 }
 
 async fn root(ctx: &mut Context, config: &FastCgiConfig) -> Result<PathBuf> {
-    let expanded = crate::http_config::helpers::replace(
-        config.root.as_deref().unwrap_or("{http.vars.root}"),
-        true,
-        |key| Some(ctx.lookup(key).unwrap_or_else(|| ".".to_owned())),
-    )?;
+    let expanded=ctx.root_resolved(config.root.as_deref().unwrap_or("{http.vars.root}")).await?;
     let path = PathBuf::from(if expanded.is_empty() {
         ".".into()
     } else {
@@ -319,8 +315,9 @@ async fn root(ctx: &mut Context, config: &FastCgiConfig) -> Result<PathBuf> {
         return Ok(clean_absolute(path));
     }
     let metadata = ctx.resources.metadata.clone();
+    ctx.reserve_text_copy(path.as_os_str().len().saturating_mul(8).saturating_add(8192))?;
     Ok(metadata
-        .run(move || {
+        .run(super::map_runtime::text_job(ctx.text_owner(),move || {
             let absolute = clean_absolute(if path.is_absolute() {
                 path
             } else {
@@ -331,9 +328,9 @@ async fn root(ctx: &mut Context, config: &FastCgiConfig) -> Result<PathBuf> {
             } else {
                 Ok(absolute)
             }
-        })
+        })?)
         .await
-        .map_err(|e| budget_failure(ctx, e))??)
+        .map_err(|e| budget_failure(ctx, e))?.into_context(ctx)??)
 }
 
 fn clean_absolute(path: PathBuf) -> PathBuf {
@@ -623,6 +620,7 @@ pub(super) async fn serve(
     exchange: &mut ExchangeState,
 ) -> Result<proxy::PreparedResponse> {
     let probe = ctx.probe;
+    ctx.reserve_text_copy(dial.len().saturating_mul(16).saturating_add(8192))?;
     let target = Target::parse(&dial)?;
     target.set_placeholders(ctx);
     let path = percent_encoding::percent_decode_str(ctx.req().uri().path()).collect::<Vec<_>>();
@@ -753,13 +751,15 @@ pub(super) async fn serve(
     let mut overrides = BTreeMap::new();
     let mut env_size = 0usize;
     for (key, template) in &transport.env {
-        let value = ctx.expand_bytes(template)?;
+        let expanded=ctx.expand_resolved(template,true).await?;
         env_size = env_size
             .checked_add(key.len())
-            .and_then(|n| n.checked_add(value.len()))
+            .and_then(|n| n.checked_add(expanded.len()))
             .filter(|&n| n <= 1024 * 1024)
             .ok_or_else(|| failure(StatusCode::BAD_GATEWAY))?;
-        overrides.insert(key.clone(), value);
+        let view=ctx.lookup_view();
+        if !view.map_plans().is_empty(){view.retain_text(expanded.clone())?;view.reserve_text_copy(expanded.len().saturating_mul(8).saturating_add(key.len().saturating_mul(4)).saturating_add(2048))?;}
+        overrides.insert(key.clone(),expanded.to_vec());
     }
     if probe {
         for name in ["REMOTE_ADDR", "REMOTE_HOST", "REMOTE_PORT"] {
@@ -768,6 +768,8 @@ pub(super) async fn serve(
             }
         }
     }
+    let fields_bytes=headers.iter().fold(0usize,|sum,(key,value)|sum.saturating_add(key.as_str().len()).saturating_add(value.len()));
+    ctx.reserve_text_copy(root.as_os_str().len().saturating_add(path.len()).saturating_add(env_size).saturating_add(fields_bytes).saturating_mul(8).saturating_add(headers.len().saturating_add(overrides.len()).saturating_add(32).saturating_mul(2048)))?;
     let mut params = env::build(&root, &split, &request, &overrides)
         .map_err(|_| failure(StatusCode::BAD_REQUEST))?;
     if probe && !transport.env.contains_key("SERVER_ADDR") {

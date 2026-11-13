@@ -208,15 +208,29 @@ pub(super) async fn apply(ctx: &mut Context, plan: &RequestBodyConfig) -> Result
             close_original(ctx, old, chunked).await?
         };
         let mut credit = None;
-        let text = replace_accounted(
-            &plan.set,
-            false,
-            |name| match name {
-                "http.request.body" | "http.request.body_base64" => Some(String::new()),
-                _ => ctx.lookup(name),
-            },
-            |bytes| charge(&ctx.resources.request_body_bytes, &mut credit, bytes),
-        );
+        let view = ctx.lookup_view();
+        let text = if view.map_plans().is_empty() {
+            // Keep ordinary replacement bodies on their existing admission pool.
+            replace_accounted(
+                &plan.set,
+                false,
+                |name| match name {
+                    "http.request.body" | "http.request.body_base64" => Some(String::new()),
+                    _ => ctx.lookup(name),
+                },
+                |bytes| charge(&ctx.resources.request_body_bytes, &mut credit, bytes),
+            ).map(String::into_bytes)
+        } else {
+            let lookup = ReplacementLookup { view };
+            match super::replacer_async::expand(&plan.set, false, &lookup, view.pool()).await {
+                Ok(bytes) => charge(
+                    &ctx.resources.request_body_bytes,
+                    &mut credit,
+                    bytes.len().saturating_mul(2).saturating_add(8192),
+                ).map(|()| bytes.to_vec()),
+                Err(error) => Err(error),
+            }
+        };
         let text = match text {
             Ok(text) => text,
             Err(error) if error.is::<MemoryBusy>() => {
@@ -229,7 +243,7 @@ pub(super) async fn apply(ctx: &mut Context, plan: &RequestBodyConfig) -> Result
         };
         let length = text.len() as u64;
         let bytes = Bytes::from_owner(OwnedReplacement {
-            bytes: text.into_bytes(),
+            bytes: text,
             _credit: credit,
         });
         *ctx.req_mut().body_mut() = full(bytes);
@@ -307,4 +321,11 @@ pub(super) fn outgoing_body(body: Body, replacement: Option<Replacement>) -> Bod
         )
         .boxed_unsync();
     super::trailer_policy::policy(body, false)
+}
+
+struct ReplacementLookup<'a>{view:super::request::ReplacerView<'a>}
+impl super::replacer_async::Lookup for ReplacementLookup<'_>{
+ fn lookup<'a>(&'a self,name:&'a str)->impl std::future::Future<Output=Result<Option<Bytes>>>+Send+'a{
+  async move{if matches!(name,"http.request.body"|"http.request.body_base64"){Ok(Some(Bytes::new()))}else{self.view.lookup_resolved(name).await}}
+ }
 }

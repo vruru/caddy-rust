@@ -161,6 +161,7 @@ impl ServerEngine {
     pub fn can_recycle(&self) -> bool {
         self.output_credit.is_none() || self.spare_credit.is_none()
     }
+    pub(crate) fn connection_credits(&self)->Option<Arc<crate::ConnectionCredits>> { self.client.as_ref().and_then(|g|g.connection_credits.clone()) }
     pub fn ssl(&self) -> &openssl::ssl::SslRef {
         self.ssl.ssl()
     }
@@ -175,13 +176,14 @@ impl ServerEngine {
         op: Operation,
         input: EncryptedInput,
     ) -> io::Result<Step> {
+        let credits=self.client.as_ref().and_then(|g|g.connection_credits.clone());
         if input.bytes().len() > WINDOW
             || matches!(&op,Operation::Write(p)if p.remaining().len()>CLEAR)
         {
-            return Err(io::Error::new(
+            return Err(crate::connection_credits::retain_error(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "SSL step input exceeds bounds",
-            ));
+            ),&credits));
         }
         if self.pending_verification {
             let guard = self
@@ -200,8 +202,14 @@ impl ServerEngine {
             .take()
             .or_else(|| self.spare_credit.take())
             .map(Ok)
-            .unwrap_or_else(StepData::reserve_output)?;
-        scope.run(move || self.process(op, input, output)).await?
+            .unwrap_or_else(StepData::reserve_output)
+            .map_err(|e|crate::connection_credits::retain_error(e,&credits))?;
+        let worker_credits=credits.clone();
+        scope.run(move || {
+            self.process(op,input,output).map(|mut step|{
+                step.error=step.error.map(|e|crate::connection_credits::retain_error(e,&worker_credits));step
+            }).map_err(|e|crate::connection_credits::retain_error(e,&worker_credits))
+        }).await.map_err(|e|crate::connection_credits::retain_error(e,&credits))?
     }
     fn process(
         mut self,

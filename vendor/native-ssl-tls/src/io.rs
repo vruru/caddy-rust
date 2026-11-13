@@ -22,7 +22,7 @@ macro_rules! guarded {
   $self.guard.check()?;
   let result=Pin::new(&mut $self.inner).$method($cx $(,$arg)*);
   $self.guard.check()?;
-  result
+  result.map(|r|r.map_err(|e|$self.guard.retained_error(e)))
  }};
 }
 macro_rules! impl_io {
@@ -41,7 +41,7 @@ macro_rules! impl_io {
                     buf.set_filled(old);
                     return Poll::Ready(Err(e));
                 }
-                result
+                result.map(|r|r.map_err(|e|self.guard.retained_error(e)))
             }
         }
         impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for $ty<S> {

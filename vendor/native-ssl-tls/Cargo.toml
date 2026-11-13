@@ -14,3 +14,4 @@ rustls={version="=0.23.46",default-features=false,features=["std","tls12"]}
 tokio-util={version="0.7",features=["rt"]}
 zeroize="1"
 futures-util={version="0.3",default-features=false,features=["std"]}
+native-write-policy={path="../native-write-policy"}

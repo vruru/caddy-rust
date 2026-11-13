@@ -1304,12 +1304,13 @@ struct Entry {
     ups: Arc<[String]>,
     bytes: usize,
     zero: bool,
+    _expansion: Option<Arc<native_write_policy::Lease>>,
 }
 
 #[derive(Clone)]
 enum Out {
     Ok(Arc<[String]>),
-    Err(Arc<str>),
+    Err(Arc<str>,Option<Arc<native_write_policy::Lease>>),
     Retry,
 }
 
@@ -1342,6 +1343,7 @@ impl LeafState {
         ups: Arc<[String]>,
         fresh_until: Instant,
         zero: bool,
+        expansion: Option<Arc<native_write_policy::Lease>>,
     ) -> Option<String> {
         if let Some(old) = self.cache.remove(key) {
             self.bytes -= old.bytes;
@@ -1372,6 +1374,7 @@ impl LeafState {
                 ups,
                 bytes,
                 zero,
+                _expansion: expansion,
             },
         );
         None
@@ -1398,6 +1401,28 @@ struct Plan {
     leaf: Arc<Leaf>,
     key: String,
     query: Query,
+    _expansion: Option<Arc<native_write_policy::Lease>>,
+}
+
+// A detached resolver owns its actual expanded key/query, not a request arena.
+// Credit is the last field and survives cancellation until all query/cache/error
+// copies have retired. It contains only pure atomic pool ownership.
+struct QueryWork {
+    leaf: Arc<Leaf>, key:String, query:Query, tx:Arc<FlightTx>, source_epoch:u64,
+    _permit:tokio::sync::OwnedSemaphorePermit,
+    expansion:Option<Arc<native_write_policy::Lease>>,
+}
+impl QueryWork {
+    async fn run(self){
+        let stop=self.leaf.shared.stop.clone();
+        let outcome=tokio::select!{biased;
+            _=stop.cancelled()=>Outcome::Stopped,
+            _=self.tx.closed()=>Outcome::Abandoned,
+            result=self.leaf.lookup_bounded(&self.query)=>Outcome::Done(result),
+        };
+        let out=self.leaf.finish(self.source_epoch,&self.key,&self.tx,outcome,self.expansion.clone());
+        self.tx.send_replace(Some(out));
+    }
 }
 
 impl Leaf {
@@ -1500,10 +1525,33 @@ impl Leaf {
             leaf: self.clone(),
             key,
             query,
+            _expansion:None,
         })
     }
 
-    fn join_or_lead(self: &Arc<Self>, key: &str, query: &Query) -> Result<Join> {
+    async fn plan_resolved(self:&Arc<Self>,view:super::request::ReplacerView<'_>)->Result<Plan>{
+        if view.map_plans().is_empty(){return self.plan(&|text|crate::http_config::helpers::replace(text,true,|name|view.lookup(name)))}
+        let _preparation=view.pool().reserve(8192)?;
+        let mut inputs=Vec::with_capacity(3);
+        match &self.kind {
+            LeafKind::A{name,port,..}=>{inputs.push(view.expand_resolved(name,true).await?);inputs.push(view.expand_resolved(port,true).await?);},
+            LeafKind::Srv{name,service,proto,..}=>{
+                inputs.push(view.expand_resolved(name,true).await?);
+                if !service.is_empty()||!proto.is_empty(){inputs.push(view.expand_resolved(service,true).await?);inputs.push(view.expand_resolved(proto,true).await?);}
+            },
+        }
+        // Key/query strings are cloned into the serializer, detached DNS job and
+        // possibly the bounded cache. Prepay before the first String copy.
+        let size=inputs.iter().try_fold(8192usize,|n,value|n.checked_add(value.len().checked_mul(16)?)).ok_or_else(||anyhow!("dynamic expansion allocation overflow"))?;
+        let credit=Arc::new(view.pool().reserve(size)?);
+        let strings=inputs.iter().map(|bytes|std::str::from_utf8(bytes).map(str::to_owned)).collect::<std::result::Result<Vec<_>,_>>()?;
+        let mut strings=strings.into_iter();
+        let strings=std::cell::RefCell::new(&mut strings);
+        let mut plan=self.plan(&|_|strings.borrow_mut().next().ok_or_else(||anyhow!("dynamic expansion field mismatch")))?;
+        plan._expansion=Some(credit);Ok(plan)
+    }
+
+    fn join_or_lead(self: &Arc<Self>, key: &str, query: &Query, expansion:Option<Arc<native_write_policy::Lease>>) -> Result<Join> {
         ensure!(!self.shared.stop.is_cancelled(), STOPPED);
         let mut st = self.lock();
         if let Some(e) = st.cache.get(key)
@@ -1527,23 +1575,12 @@ impl Leaf {
         st.inflight.insert(key.to_owned(), tx.clone());
         let source_epoch = st.generation;
         drop(st);
-        let (leaf, key, query) = (self.clone(), key.to_owned(), query.clone());
-        self.shared.tasks.spawn(async move {
-            let _permit = permit;
-            let stop = leaf.shared.stop.clone();
-            let outcome = tokio::select! {
-                biased;
-                _ = stop.cancelled() => Outcome::Stopped,
-                _ = tx.closed() => Outcome::Abandoned,
-                r = leaf.lookup_bounded(&query) => Outcome::Done(r),
-            };
-            let out = leaf.finish(source_epoch, &key, &tx, outcome);
-            tx.send_replace(Some(out));
-        });
+        let work=QueryWork{leaf:self.clone(),key:key.to_owned(),query:query.clone(),tx,source_epoch,_permit:permit,expansion};
+        self.shared.tasks.spawn(work.run());
         Ok(Join::Lead(rx))
     }
 
-    fn finish(&self, source_epoch: u64, key: &str, tx: &Arc<FlightTx>, outcome: Outcome) -> Out {
+    fn finish(&self, source_epoch: u64, key: &str, tx: &Arc<FlightTx>, outcome: Outcome, expansion:Option<Arc<native_write_policy::Lease>>) -> Out {
         let mut note = None;
         let out = {
             let mut g = self.lock();
@@ -1557,17 +1594,17 @@ impl Leaf {
             let cache = current && (self.refresh_ns >= 0 || grace);
             match outcome {
                 Outcome::Abandoned => Out::Retry,
-                Outcome::Stopped => Out::Err(Arc::from(STOPPED)),
+                Outcome::Stopped => Out::Err(Arc::from(STOPPED),expansion.clone()),
                 Outcome::Done(Ok(ups)) => {
                     if cache {
                         let until = after(pos_dur(self.refresh_ns));
                         note = st
-                            .store(key, ups.clone(), until, false)
+                            .store(key, ups.clone(), until, false, expansion.clone())
                             .map(|m| (Level::Warn, m));
                     }
                     Out::Ok(ups)
                 }
-                Outcome::Done(Err(e)) if !grace => Out::Err(Arc::from(e)),
+                Outcome::Done(Err(e)) if !grace => Out::Err(Arc::from(e),expansion.clone()),
                 Outcome::Done(Err(e)) => {
                     let ups = match st.cache.get_mut(key).filter(|en| !en.zero) {
                         Some(en) => {
@@ -1589,7 +1626,7 @@ impl Leaf {
                                 after(w)
                             };
                             let empty: Arc<[String]> = Arc::from(Vec::new());
-                            let _ = st.store(key, empty.clone(), until, true);
+                            let _ = st.store(key, empty.clone(), until, true, expansion.clone());
                             empty
                         }
                     };
@@ -1759,11 +1796,15 @@ impl Leaf {
     }
 }
 
+#[derive(Debug)]
+struct ExpandedLookupError{message:Arc<str>,_expansion:Option<Arc<native_write_policy::Lease>>}
+impl std::fmt::Display for ExpandedLookupError{fn fmt(&self,out:&mut std::fmt::Formatter<'_>)->std::fmt::Result{out.write_str(&self.message)}}
+impl std::error::Error for ExpandedLookupError{}
 impl Plan {
     async fn run(self) -> Result<Arc<[String]>> {
         let work = async {
             loop {
-                match self.leaf.join_or_lead(&self.key, &self.query)? {
+                match self.leaf.join_or_lead(&self.key, &self.query,self._expansion.clone())? {
                     Join::Hit(ups) => return Ok(ups),
                     // Go re-checks freshness after taking the lookup lock.
                     // A follower never adopts somebody else's stale/error result.
@@ -1772,7 +1813,7 @@ impl Plan {
                     }
                     Join::Lead(rx) => match wait(rx).await {
                         Out::Ok(ups) => return Ok(ups),
-                        Out::Err(e) => return Err(anyhow!("{e}")),
+                        Out::Err(message,_expansion) => return Err(ExpandedLookupError{message,_expansion}.into()),
                         Out::Retry => {}
                     },
                 }
@@ -1781,10 +1822,10 @@ impl Plan {
         tokio::time::timeout(LOOKUP_DEADLINE, work)
             .await
             .map_err(|_| {
-                anyhow!(
-                    "dynamic upstreams: lookup for {:?} exceeded {LOOKUP_DEADLINE:?}",
-                    self.key
-                )
+                anyhow::Error::new(ExpandedLookupError{
+                    message:Arc::from(format!("dynamic upstreams: lookup for {:?} exceeded {LOOKUP_DEADLINE:?}",self.key)),
+                    _expansion:self._expansion.clone(),
+                })
             })?
     }
 }
@@ -1880,6 +1921,28 @@ impl DynamicUpstreams {
                 })
             }
         }
+    }
+
+    pub(in crate::http_runtime) async fn get_resolved(&self,view:super::request::ReplacerView<'_>)->Result<Vec<Upstream>>{
+        let leaves=match &self.root{Root::Single(leaf)=>std::slice::from_ref(leaf),Root::Multi(leaves)=>leaves.as_slice()};
+        let mut output=Vec::new();
+        for(index,leaf)in leaves.iter().enumerate(){
+            let result=match leaf.plan_resolved(view).await{Ok(plan)=>plan.run().await,Err(error)=>Err(error)};
+            match result{
+                Ok(upstreams)=>{ensure!(output.len().saturating_add(upstreams.len())<=MAX_ENDPOINTS,"multi upstreams exceed endpoint limit");output.extend(upstreams.iter().map(|dial|Upstream{dial:dial.clone(),max_requests:0}));},
+                Err(error)if matches!(self.root,Root::Single(_))=>return Err(error),
+                Err(error)=>self.shared.emit(Level::Error,&format!("upstream source returned error (source_idx={index}): {error:#}")),
+            }
+        }
+        ensure!(!self.shared.stop.is_cancelled(),STOPPED);Ok(output)
+    }
+    pub(in crate::http_runtime) async fn reset_cache_resolved(&self,view:super::request::ReplacerView<'_>)->Result<bool>{
+        let Root::Single(leaf)=&self.root else{return Ok(false)};
+        if !matches!(leaf.kind,LeafKind::Srv{..}){return Ok(false)}
+        let plan=leaf.plan_resolved(view).await?;
+        let mut state=leaf.lock();state.generation=state.generation.wrapping_add(1);
+        state.inflight.remove(&plan.key);
+        if let Some(entry)=state.cache.remove(&plan.key){state.bytes-=entry.bytes;}Ok(true)
     }
 
     /// Go `CachingUpstreamSource`: only a top-level SRV source; never recurses into Multi.

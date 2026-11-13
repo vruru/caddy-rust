@@ -58,6 +58,9 @@ struct Selection {
 }
 impl Selection {
     fn check(&self) -> io::Result<()> {
+        self.check_inner().map_err(|e|self.guard.retained_error(e))
+    }
+    fn check_inner(&self) -> io::Result<()> {
         let error = self
             .error
             .lock()
@@ -343,12 +346,15 @@ impl ManagedClientConfig {
     ) -> io::Result<ManagedStream<S>> {
         let base = self.base.clone();
         let resolver = self.resolver.clone();
-        let alpn = alpn.map(<[u8]>::to_vec);
         let scope = base.scope.clone();
+        let credits=base.connection_credits.clone();
+        let result=async {
+        let mut input=crate::connection_credits::ClientFactoryInput::new(base,name,alpn);
         let output = Arc::new(Mutex::new(None));
         let handoff = output.clone();
         let stream = ServerStream::prepare(io, scope, move || {
-            let (mut ssl, guard) = base.configured_connection(name, alpn.as_deref())?;
+            let result=(||{
+            let (mut ssl, guard) = input.configure()?;
             let selection = Arc::new(Selection {
                 resolver,
                 selected: Mutex::new(None),
@@ -378,8 +384,9 @@ impl ManagedClientConfig {
             };
             drop(prior);
             Ok(engine)
+            })();input.retained(result)
         })
-        .await?;
+        .await.map_err(|e|crate::connection_credits::retain_error(e,&credits))?;
         let selection = output
             .lock()
             .map_err(|_| io::Error::other("managed identity handoff poisoned"))?
@@ -401,6 +408,8 @@ impl ManagedClientConfig {
             alpn,
             selection,
         })
+        }.await;
+        result.map_err(|e|crate::connection_credits::retain_error(e,&credits))
     }
 }
 pub struct ManagedStream<S> {
@@ -456,7 +465,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for ManagedStream<S> {
             buf.set_filled(old);
             return Poll::Ready(Err(error));
         }
-        result
+        result.map(|r|r.map_err(|e|this.selection.guard.retained_error(e)))
     }
 }
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ManagedStream<S> {
@@ -469,20 +478,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ManagedStream<S> {
         this.selection.check()?;
         let result = Pin::new(&mut this.stream).poll_write(cx, data);
         this.selection.check()?;
-        result
+        result.map(|r|r.map_err(|e|this.selection.guard.retained_error(e)))
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         this.selection.check()?;
         let result = Pin::new(&mut this.stream).poll_flush(cx);
         this.selection.check()?;
-        result
+        result.map(|r|r.map_err(|e|this.selection.guard.retained_error(e)))
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         this.selection.check()?;
         let result = Pin::new(&mut this.stream).poll_shutdown(cx);
         this.selection.check()?;
-        result
+        result.map(|r|r.map_err(|e|this.selection.guard.retained_error(e)))
     }
 }

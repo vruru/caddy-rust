@@ -159,9 +159,12 @@ impl<I: AsyncRead + AsyncWrite + Unpin> ServerStream<I> {
             .engine
             .take()
             .ok_or_else(|| io::Error::other("SSL unavailable for facts"))?;
+        let credits=engine.connection_credits();
+        let worker_credits=credits.clone();
         let (engine, value) = self
             .scope
             .run(move || {
+                let result=(|| {
                 engine
                     .ssl()
                     .is_init_finished()
@@ -181,8 +184,10 @@ impl<I: AsyncRead + AsyncWrite + Unpin> ServerStream<I> {
                     ));
                 }
                 Ok::<_, io::Error>((engine, value))
+                })();
+                result.map_err(|e|crate::connection_credits::retain_error(e,&worker_credits))
             })
-            .await??;
+            .await.map_err(|e|crate::connection_credits::retain_error(e,&credits))??;
         self.engine = Some(engine);
         Ok((self, value))
     }

@@ -51,6 +51,11 @@ Required feature families:
   capabilities remain explicit migration work; unsupported configuration must
   fail before it changes a working listener or published snapshot.
 
+Demand-driven Map reads, their CPU/ownership boundaries, retained native regexp
+extensions and remaining provider scope are described in
+[`docs/MAP-REPLACER.md`](docs/MAP-REPLACER.md). This does not waive the remaining
+provider and full-runtime acceptance gates.
+
 Current production inputs and all authentication material remain exclusively in
 LocalOps. The live service names, ports, certificate storage, domain routing and
 other applications' loopback backends must be preserved during eventual rollout.
@@ -1322,4 +1327,33 @@ This layer applies to reverse-proxy consumers, including nested routes and healt
 
 The reverse-proxy CBC-only retry sends TLS_FALLBACK_SCSV through the public SSL mode. A TLS1.3-capable peer can therefore reject a forced TLS1.2 fallback; direct modern TLS remains unchanged and a genuine TLS1.2-only CBC peer can still connect. This protects protocol-version fallback, not suite-only selection within TLS1.2, and does not reveal the server's private early-alert reason. The finite Go-default CBC subset remains the explicit legacy-peer compatibility policy.
 
-The default Rustls path without managed identity retains its existing ClientConnection construction and handshake on the caller. The new complete owned SSL path applies to native static/absent identity, as managed native identity already did; this entry does not claim every outgoing TLS handshake is off reactor. CA-loader, ACME and other HTTPS callers remain separate work.
+Default reverse-proxy Rustls client handshakes, with or without a managed identity, use the shared bounded client TLS executor. Provisioning creates that executor on the configuration CPU lane; its runtime derives workers from the CPUs available to the process. Native static/absent and managed identity paths use the complete owned SSL engine. CA-loader, ACME, metrics and other HTTPS callers remain separate work; this does not claim every outgoing TLS handshake is off reactor.
+
+
+Certificate URI SAN template URL methods
+---------------------------------------
+
+Certificate `URIs` now use the same guarded `*url.URL` view as request URLs.
+`Parse`, `ResolveReference`, `JoinPath`, `AppendBinary`, `UnmarshalBinary`, and
+`Clone` are reachable with their typed arguments. Clone copies the URL and its
+Userinfo; Parse, ResolveReference and JoinPath return independent URL receivers.
+A certificate URL and request URL may resolve against each other within the
+same admitted render. Repeated certificate field/index/range reads share the
+same private URL identity within that render. A later render starts from the
+original signed certificate; mutable views never update DER, trust, routing or
+TLS authentication facts. This intentionally avoids the baseline's observable
+sharing of mutated certificate URLs across requests on one connection.
+
+Initial certificate projection retains IA5 admission and its decoded ASCII
+domain checks. ASCII controls in the fragment follow the baseline URL parser:
+string output escapes them, and RequestURI omits the fragment. The preceding
+URL components retain the existing control-character checks. Later ordinary
+URL methods are not subjected to certificate-SAN admission again. Decoded Go
+string bytes and RawPath/RawFragment remain distinct, including escaped invalid
+UTF-8 path bytes. Construction and copying are prepaid on the existing render
+Control; no separate allowance or general host-value provenance bypass is added.
+
+This host-method change does not equate certificate parsing stages: some invalid
+URI SANs are rejected by the Go TLS certificate parser while the current native
+transport can reach a failing template projection. No authenticated facts are
+relaxed by this view adapter, and full PKIX equivalence is not established here.

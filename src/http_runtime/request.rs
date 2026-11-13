@@ -16,12 +16,8 @@ use std::{
 
 #[path="request_replacer.rs"]mod request_replacer;
 pub(super) use request_replacer::View as ReplacerView;
-struct LazyMap {
-    source: String,
-    destinations: Vec<String>,
-    mappings: Vec<MapEntry>,
-    defaults: Vec<serde_json::Value>,
-}
+pub(super) type LazyMap=Arc<crate::http_config::types::MapPlan>;
+
 pub(super) struct Context {
     pub(super) trace_context: Option<opentelemetry::Context>,
     pub(super) timeouts:Option<Box<super::route_timeouts::RequestTimeouts>>,
@@ -67,6 +63,8 @@ pub(super) struct Context {
     maps: Vec<LazyMap>,
     pub(super) probe: bool,
     // Last field: additional attempt metadata drops before its atomic credit.
+    _map_text:std::sync::OnceLock<Arc<super::map_runtime::TextRetentions>>,
+    _map_registration_credit:Option<native_write_policy::Lease>,
     _rewrite_view_credit:Option<Arc<native_write_policy::Lease>>,
 }
 #[path = "response_routes.rs"]
@@ -167,6 +165,8 @@ impl Context {
             proxy_response: None,
             maps: Vec::new(),
             probe: true,
+            _map_text:Default::default(),
+            _map_registration_credit:None,
             _rewrite_view_credit:None,
         })
     }
@@ -184,13 +184,13 @@ impl Context {
         request.extensions_mut().insert(super::rewrite_runtime::Original{uri:self.req().uri().clone(),method:self.req().method().clone(),projection:super::rewrite_runtime::projection(self.req()).cloned()});
         request.extensions_mut().insert(rewritten.projection.clone());
         *request.body_mut()=body.unwrap_or_else(||std::mem::replace(self.req_mut().body_mut(),full(Bytes::new())));
-        Ok(Self{metrics:self.metrics.clone(),request_started:self.request_started,push_sni:self.push_sni.clone(),trace_context:self.trace_context.clone(),timeouts:self.timeouts.take(),raw_regex_captures:std::mem::take(&mut self.raw_regex_captures),typed_vars:std::mem::take(&mut self.typed_vars),cel_body:self.cel_body.take(),cel_body_failure:self.cel_body_failure,request:Some(request),fastcgi_body_claimed:self.fastcgi_body_claimed,body_limit:self.body_limit.clone(),await_h2_response_head:self.await_h2_response_head,original_framing:self.original_framing,resources:self.resources.clone(),peer:self.peer.clone(),local:self.local.clone(),tls:self.tls,access_names:None,skip_access:true,authority:self.authority.clone(),client_ip:self.client_ip,trusted:self.trusted,drain:self.drain.clone(),business:self.business.clone(),original_uri:self.original_uri.clone(),request_content_length:self.request_content_length,original_method:self.original_method.clone(),error_status:self.error_status,access_start:None,log_fields:None,values:std::mem::take(&mut self.values),regex_capture_budget:self.regex_capture_budget,immediate:std::mem::take(&mut self.immediate),informational:None,close_after_response:self.close_after_response,deferred:Vec::new(),groups:HashSet::new(),invoke_depth:self.invoke_depth,response_route_depth:self.response_route_depth,proxy_response:None,maps:std::mem::take(&mut self.maps),probe:self.probe,_rewrite_view_credit:Some(credit)})
+        Ok(Self{metrics:self.metrics.clone(),request_started:self.request_started,push_sni:self.push_sni.clone(),trace_context:self.trace_context.clone(),timeouts:self.timeouts.take(),raw_regex_captures:std::mem::take(&mut self.raw_regex_captures),typed_vars:std::mem::take(&mut self.typed_vars),cel_body:self.cel_body.take(),cel_body_failure:self.cel_body_failure,request:Some(request),fastcgi_body_claimed:self.fastcgi_body_claimed,body_limit:self.body_limit.clone(),await_h2_response_head:self.await_h2_response_head,original_framing:self.original_framing,resources:self.resources.clone(),peer:self.peer.clone(),local:self.local.clone(),tls:self.tls,access_names:None,skip_access:true,authority:self.authority.clone(),client_ip:self.client_ip,trusted:self.trusted,drain:self.drain.clone(),business:self.business.clone(),original_uri:self.original_uri.clone(),request_content_length:self.request_content_length,original_method:self.original_method.clone(),error_status:self.error_status,access_start:None,log_fields:None,values:std::mem::take(&mut self.values),regex_capture_budget:self.regex_capture_budget,immediate:std::mem::take(&mut self.immediate),informational:None,close_after_response:self.close_after_response,deferred:Vec::new(),groups:HashSet::new(),invoke_depth:self.invoke_depth,response_route_depth:self.response_route_depth,proxy_response:None,maps:std::mem::take(&mut self.maps),probe:self.probe,_map_text:std::mem::take(&mut self._map_text),_map_registration_credit:self._map_registration_credit.take(),_rewrite_view_credit:Some(credit)})
     }
     fn merge_upstream(&mut self,mut view:Self,return_body:bool){
         self.timeouts=view.timeouts.take();
         self.raw_regex_captures=std::mem::take(&mut view.raw_regex_captures);
         if return_body&&let Some(mut request)=view.request.take(){*self.req_mut().body_mut()=std::mem::replace(request.body_mut(),full(Bytes::new()));}
-        self.maps=std::mem::take(&mut view.maps);self.values=std::mem::take(&mut view.values);self.typed_vars=std::mem::take(&mut view.typed_vars);self.cel_body=view.cel_body.take();self.cel_body_failure=view.cel_body_failure;if return_body{self.body_limit=view.body_limit.take();self.fastcgi_body_claimed=view.fastcgi_body_claimed;}self.regex_capture_budget=view.regex_capture_budget;self.immediate=std::mem::take(&mut view.immediate);self.close_after_response|=view.close_after_response;
+        self.maps=std::mem::take(&mut view.maps);self._map_registration_credit=view._map_registration_credit.take();self._map_text=std::mem::take(&mut view._map_text);self.values=std::mem::take(&mut view.values);self.typed_vars=std::mem::take(&mut view.typed_vars);self.cel_body=view.cel_body.take();self.cel_body_failure=view.cel_body_failure;if return_body{self.body_limit=view.body_limit.take();self.fastcgi_body_claimed=view.fastcgi_body_claimed;}self.regex_capture_budget=view.regex_capture_budget;self.immediate=std::mem::take(&mut view.immediate);self.close_after_response|=view.close_after_response;
         // Existing values/maps were moved, never copied. Their original
         // owners/budgets remain in force. The additional request/header/view
         // allocations die here before view._rewrite_view_credit drops last.
@@ -230,6 +230,15 @@ impl Context {
     pub(super) fn replacer_uri(&self)->&Uri{let req=self.req();req.extensions().get::<super::rewrite_runtime::Original>().map_or_else(||req.uri(),|v|&v.uri)}
     pub(super) fn replacer_query(&self)->&[u8]{let req=self.req();if let Some(p)=super::rewrite_runtime::lookup_projection(req){&p.state.query}else{let uri=req.extensions().get::<super::rewrite_runtime::Original>().map_or_else(||req.uri(),|v|&v.uri);uri.query().unwrap_or_default().as_bytes()}}
     pub fn lookup(&self,name:&str)->Option<String>{self.lookup_view().lookup(name)}
+    pub(super) fn text_owner(&self)->Option<Arc<super::map_runtime::TextRetentions>>{self._map_text.get().cloned()}
+    pub(super) fn reserve_text_copy(&self,bytes:usize)->Result<()>{self.lookup_view().reserve_text_copy(bytes)}
+    pub(super) fn root_resolved<'a>(&'a self,text:&'a str)->impl Future<Output=Result<String>>+Send+'a{let view=self.lookup_view();async move{view.root_resolved(text).await}}
+    pub(super) fn lookup_text_resolved<'a>(&'a self,name:&'a str)->impl Future<Output=Result<Option<String>>>+Send+'a{let view=self.lookup_view();async move{view.lookup_text_resolved(name).await}}
+    pub(super) fn expand_text_resolved<'a>(&'a self,text:&'a str,unknown_empty:bool)->impl Future<Output=Result<String>>+Send+'a{let view=self.lookup_view();async move{view.expand_text_resolved(text,unknown_empty).await}}
+    pub(super) fn lookup_typed_resolved<'a>(&'a self,name:&'a str)->impl Future<Output=Result<Option<request_replacer::ResolvedValue>>>+Send+'a{let view=self.lookup_view();async move{view.lookup_typed_resolved(name).await}}
+    pub(super) fn lookup_resolved<'a>(&'a self,name:&'a str)->impl Future<Output=Result<Option<Bytes>>>+Send+'a{let view=self.lookup_view();async move{view.lookup_resolved(name).await}}
+    pub(super) fn expand_resolved<'a>(&'a self,text:&'a str,unknown_empty:bool)->impl Future<Output=Result<Bytes>>+Send+'a{let view=self.lookup_view();async move{view.expand_resolved(text,unknown_empty).await}}
+
 
 }
 // Match Caddy's SplitHostPort fallback: an absent or malformed port leaves
@@ -451,7 +460,9 @@ where
         proxy_response: None,
         maps: Vec::new(),
         probe: false,
-        _rewrite_view_credit:None,
+        _map_text:Default::default(),
+            _map_registration_credit:None,
+            _rewrite_view_credit:None,
     };
     let timeout_setup=if push_seed.is_some(){if let Some(control)=ctx.timeouts.as_deref().and_then(|state|state.control()){ctx.bind_timeout_control(control)}else{Err(anyhow::anyhow!("pushed timeout seed already consumed"))}}else{super::route_timeouts::install_server(&mut ctx,&server.plan)};
     let result = if timeout_setup.is_err(){
@@ -889,7 +900,7 @@ fn handlers<'a>(
                 Handler::Push(plan)=>{
                     if let Ok(Some(push))=super::push::LinkPlan::new(ctx,plan,inner,server).await{
                         for resource in &plan.resources{
-                            let Ok((target,_target_scratch))=super::push::expand_target(ctx,&resource.target)else{break};
+                            let Ok((target,_target_scratch))=super::push::expand_target(ctx,&resource.target).await else{break};
                             if push.dispatch_bytes(&target,&resource.method,&ctx.authority).await.is_err(){break}
                         }
                         ctx.deferred.push(DeferredResponse::Push(push));
@@ -897,13 +908,13 @@ fn handlers<'a>(
                 }
                 Handler::Tracing(plan)=>{
                     let Some(provider)=server.tracing.as_ref()else{continue};
-                    let entered=super::tracing::enter(ctx,provider,plan);
+                    let entered=super::tracing::enter(ctx,provider,plan).await;
                     let previous=ctx.trace_context.replace(entered.context.clone());
                     log_append::trace_fields(ctx,&entered.context);
                     ctx.deferred.push(DeferredResponse::Trace(entered.clone()));
                     let after=Next::Handlers(&list[index+1..],traces.get(index+1..).unwrap_or_default(),next);
                     let result=continue_chain(after,ctx,inner,server).await;
-                    super::tracing::attributes(ctx,&entered,plan);
+                    super::tracing::attributes(ctx,&entered,plan).await;
                     ctx.trace_context=previous;
                     if let Err(error)=&result {entered.failed(error.downcast_ref::<HttpError>().map_or(500,|e|e.status.as_u16()));}
                     return result;
@@ -942,7 +953,7 @@ fn handlers<'a>(
                     let code = if status.is_empty() {
                         StatusCode::INTERNAL_SERVER_ERROR
                     } else {
-                        let raw = ctx.expand(status)?;
+                        let raw = ctx.expand_text_resolved(status,true).await?;
                         let code = raw.parse::<i64>().map_err(|error| {
                             let reason = match error.kind() {
                                 std::num::IntErrorKind::PosOverflow
@@ -960,7 +971,7 @@ fn handlers<'a>(
                             .filter(|status| !status.is_informational())
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
                     };
-                    let message = replace(message, false, |name| ctx.lookup(name))?;
+                    let message = ctx.expand_text_resolved(message,false).await?;
                     return Err(failure_with_message(code, Some(message)));
                 }
                 Handler::Invoke(name) => {
@@ -994,19 +1005,19 @@ fn handlers<'a>(
                     headers,
                     close,
                 } => {
-                    let bytes = crate::http_config::helpers::replace_bytes(body, false, |name| ctx.lookup_bytes(name))?;
+                    let bytes = ctx.expand_resolved(body,false).await?;
                     let mut fields = std::mem::take(&mut ctx.immediate);
                     if *close && ctx.req().version() != Version::HTTP_2 {
                         ctx.close_after_response = true;
                         fields.insert(http::header::CONNECTION, HeaderValue::from_static("close"));
                     }
-                    let prepared = apply_static_headers(&mut fields, headers, ctx, &bytes);
+                    let prepared = apply_static_headers(&mut fields, headers, ctx.lookup_view(), &bytes).await;
                     ctx.immediate = fields;
                     prepared?;
                     let status = if status.is_empty() {
                         ctx.error_status.unwrap_or(StatusCode::OK)
                     } else {
-                        StatusCode::from_u16(ctx.expand(status)?.parse()?)
+                        StatusCode::from_u16(ctx.expand_text_resolved(status,true).await?.parse()?)
                             .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR))?
                     };
                     if status.is_informational() {
@@ -1096,7 +1107,7 @@ fn handlers<'a>(
                     // the final Host value as the request authority.
                     headers.remove(http::header::HOST);
                     headers.append(http::header::HOST, HeaderValue::from_str(&ctx.authority)?);
-                    apply_request_headers(&mut headers, request, ctx)?;
+                    apply_request_headers(&mut headers, request, ctx).await?;
                     super::headers_replace::apply(&mut headers,request,ctx,super::headers_replace::Scope::Request,None).await?;
                     ctx.authority = headers
                         .get_all(http::header::HOST)
@@ -1112,7 +1123,7 @@ fn handlers<'a>(
                             .push(DeferredResponse::Headers(response.clone()));
                     } else {
                         let mut headers = std::mem::take(&mut ctx.immediate);
-                        apply_headers(&mut headers, response, ctx)?;
+                        apply_headers(&mut headers, response, ctx).await?;
                         super::headers_replace::apply(&mut headers,response,ctx,super::headers_replace::Scope::Original,None).await?;
                         ctx.immediate = headers;
                     }
@@ -1147,7 +1158,7 @@ fn handlers<'a>(
                 Handler::Rewrite(plan) => super::rewrite_runtime::apply(plan,ctx).await?,
                 Handler::Vars(vars) => {
                     for (name, value) in vars {
-                        let name = ctx.expand(name)?;
+                        let name = ctx.expand_text_resolved(name,true).await?;
                         log_append::remember_var(ctx, &name, value);
                         if name == "log_skip" {
                             ctx.skip_access = value.as_bool() == Some(true);
@@ -1168,30 +1179,26 @@ fn handlers<'a>(
                                 });
                         }
                         let value = match value.as_ref() {
-                            serde_json::Value::String(s) => ctx.expand(s)?,
+                            serde_json::Value::String(s) => ctx.expand_text_resolved(s,true).await?,
                             serde_json::Value::Null => String::new(),
                             other => crate::http_config::helpers::value_string(other),
                         };
                         if name == "http.auth.user.id" {
+                            ctx.lookup_view().reserve_text_copy(name.len().saturating_add(value.len()))?;
                             ctx.values.insert(name.clone(), value.clone());
                         }
+                        ctx.lookup_view().reserve_text_copy(name.len().saturating_add(16))?;
                         ctx.values.insert(format!("http.vars.{name}"), value);
                     }
                 }
-                Handler::Map {
-                    source,
-                    destinations,
-                    mappings,
-                    defaults,
-                } => {
-                    // Caddy maps are lazy replacer providers; source and literal
-                    // outputs must observe mutations made by later middleware.
-                    ctx.maps.push(LazyMap {
-                        source: source.clone(),
-                        destinations: destinations.clone(),
-                        mappings: mappings.clone(),
-                        defaults: defaults.clone(),
-                    });
+                Handler::Map(plan) => {
+                    if ctx.maps.len()==ctx.maps.capacity(){
+                        let capacity=ctx.maps.capacity().saturating_mul(2).max(4);
+                        let credit=ctx.resources.map_bytes.reserve(capacity.saturating_mul(std::mem::size_of::<LazyMap>()*2)+1024).map_err(|_|failure(StatusCode::SERVICE_UNAVAILABLE))?;
+                        ctx.maps.try_reserve_exact(capacity-ctx.maps.len())?;
+                        ctx._map_registration_credit=Some(credit);
+                    }
+                    ctx.maps.push(plan.clone());
                 }
                 Handler::Authentication {
                     algorithm,
@@ -1405,7 +1412,7 @@ async fn var_match_value(ctx: &mut Context, key: &str) -> Result<String> {
         .and_then(|key| key.strip_suffix('}'))
         .filter(|key| !key.contains('{'))
     {
-        ctx.lookup(key)
+        ctx.lookup_text_resolved(key).await?
     } else {
         ctx.values.get(&format!("http.vars.{key}")).cloned()
     }
@@ -1421,13 +1428,16 @@ pub(super) fn matches<'a>(
     Box::pin(async move {
         Ok(match matcher {
             Matcher::Expression(plan) => plan.matches(ctx).await?,
-            Matcher::Host(hosts) => hosts.iter().any(|host| {
-                ctx.expand(host)
-                    .is_ok_and(|host| host_match(&host, &hostname(&ctx.authority)))
-            }),
+            Matcher::Host(hosts) => {
+                let mut found=false;
+                for host in hosts{let host=ctx.expand_text_resolved(host,true).await?;if host_match(&host,&hostname(&ctx.authority)){found=true;break;}}
+                found
+            },
             Matcher::Path(patterns) => {
                 let escaped=ctx.req().uri().path().to_owned();
-                let patterns=patterns.iter().map(|pattern|ctx.expand(pattern)).collect::<Result<Vec<_>>>()?;
+                let mut expanded=Vec::with_capacity(patterns.len());
+                for pattern in patterns{expanded.push(ctx.expand_text_resolved(pattern,true).await?);}
+                let patterns=expanded;
                 let result=if super::path_match::fast(&patterns,&escaped){super::path_match::matches(&patterns,&escaped)}else{
                     ctx.resources.request_regexp.run(move||super::path_match::matches(&patterns,&escaped)).await
                         .map_err(|_|failure(StatusCode::SERVICE_UNAVAILABLE))?
@@ -1500,13 +1510,14 @@ pub(super) fn matches<'a>(
                     let matched = match patterns {
                         None => values.is_empty(),
                         Some(patterns) if patterns.is_empty() => !values.is_empty(),
-                        Some(patterns) => patterns.iter().any(|p| {
-                            ctx.expand(p).is_ok_and(|p| {
-                                values
-                                    .iter()
-                                    .any(|v| header_value_bytes_pattern(p.as_bytes(), v))
-                            })
-                        }),
+                        Some(patterns) => {
+                            let mut found=false;
+                            for pattern in patterns{
+                                let pattern=ctx.expand_resolved(pattern,true).await?;
+                                if values.iter().any(|v|header_value_bytes_pattern(&pattern,v)){found=true;break;}
+                            }
+                            found
+                        },
                     };
                     if !matched {
                         all = false;
@@ -1518,14 +1529,14 @@ pub(super) fn matches<'a>(
             Matcher::Query(rules) => super::query_match::matches(
                 ctx.req().uri().query().unwrap_or_default(),
                 rules,
-                |value| ctx.expand(value),
-            )?,
+                ctx.lookup_view(),
+            ).await?,
             Matcher::Vars(rules) => {
                 let mut matched = rules.is_empty();
                 'variables: for (key, values) in rules {
                     let actual = var_match_value(ctx, key).await?;
                     for value in values {
-                        if actual == ctx.expand(value)? {
+                        if actual == ctx.expand_text_resolved(value,true).await? {
                             matched = true;
                             break 'variables;
                         }
@@ -1580,7 +1591,7 @@ pub(super) fn matches<'a>(
 fn static_informational<'a>(
     ctx: &'a mut Context,
     status: StatusCode,
-    bytes: Vec<u8>,
+    bytes: Bytes,
 ) -> ResponseFuture<'a> {
     Box::pin(async move {
         if status == StatusCode::SWITCHING_PROTOCOLS && ctx.req().version() != Version::HTTP_11 {
@@ -1609,7 +1620,7 @@ fn static_informational<'a>(
         let body = if status == StatusCode::SWITCHING_PROTOCOLS {
             fields.remove(http::header::CONTENT_LENGTH);
             fields.remove(http::header::TRANSFER_ENCODING);
-            Vec::new()
+            Bytes::new()
         } else {
             bytes
         };
@@ -1638,19 +1649,20 @@ fn static_head_length(ctx: &Context, body: &[u8]) -> Option<StaticHeadLength> {
 }
 
 #[inline]
-fn apply_static_headers(
+async fn apply_static_headers(
     fields: &mut HeaderMap,
     operations: &HeaderOps,
-    ctx: &Context,
+    view: ReplacerView<'_>,
     body: &[u8],
 ) -> Result<()> {
     for (name, values) in &operations.set {
-        let name = HeaderName::try_from(replace(name, false, |name| ctx.lookup(name))?)?;
+        let name_bytes=view.expand_resolved(name,false).await?;
+        let name = HeaderName::from_bytes(&name_bytes)?;
         fields.remove(&name);
         for value in values {
             fields.append(
                 name.clone(),
-                HeaderValue::from_bytes(&crate::http_config::helpers::replace_bytes(value, false, |name| ctx.lookup_bytes(name))?)?,
+                HeaderValue::from_maybe_shared(view.expand_resolved(value,false).await?)?,
             );
         }
     }
@@ -1779,30 +1791,15 @@ async fn write_informational(
     Ok(())
 }
 
-pub(super) fn apply_response_headers<'a>(
-    headers: &'a mut HeaderMap,
-    status: u16,
-    operations: &'a HeaderOps,
-    ctx: &'a Context,
-) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-    if operations
-        .require
-        .as_ref()
-        .is_none_or(|matcher| matcher.matches(status, headers))
-    {
-        if let Err(error) = apply_headers(headers, operations, ctx) {
-            return Box::pin(async move { Err(error) });
-    }
-        super::headers_replace::apply(
-            headers,
-            operations,
-            ctx,
-            super::headers_replace::Scope::Original,
-            None,
-        )
-    } else {
-        Box::pin(async { Ok(()) })
-    }
+pub(super) fn apply_response_headers<'a>(headers:&'a mut HeaderMap,status:u16,operations:&'a HeaderOps,ctx:&'a Context)
+    ->Pin<Box<dyn Future<Output=Result<()>>+Send+'a>>{
+    if operations.require.as_ref().is_some_and(|matcher|!matcher.matches(status,headers)){return Box::pin(async{Ok(())})}
+    let view=ctx.lookup_view();
+    let prepared=super::headers_replace::prepare_owned(operations,ctx,super::headers_replace::Scope::Original);
+    Box::pin(async move{
+        apply_headers_view(headers,operations,view).await?;
+        super::headers_replace::apply_owned(headers,operations,prepared?,None).await
+    })
 }
 pub(super) fn file_split<'a>(path: &'a str, extensions: &[String]) -> (&'a str, &'a str) {
     for extension in extensions.iter().filter(|value| !value.is_empty()) {
@@ -1821,143 +1818,81 @@ pub(super) fn file_split<'a>(path: &'a str, extensions: &[String]) -> (&'a str, 
     (path, "")
 }
 
-pub(super) fn apply_headers(
-    headers: &mut HeaderMap,
-    operations: &HeaderOps,
-    ctx: &Context,
-) -> Result<()> {
-    apply_headers_with(
-        headers,
-        operations,
-        |_, value| replace(value, false, |name| ctx.lookup(name)),
-        |_, value| {
-            crate::http_config::helpers::replace_bytes(value,false,|name|ctx.lookup_bytes(name))
-        },
-        None,
-    )
+pub(super) fn apply_headers<'a>(headers:&'a mut HeaderMap,operations:&'a HeaderOps,ctx:&'a Context)
+    ->impl Future<Output=Result<()>>+Send+'a{
+    apply_headers_view(headers,operations,ctx.lookup_view())
 }
-fn header_lookup(fields: &HeaderMap, ctx: &Context, name: &str) -> Option<Vec<u8>> {
-    if !ctx.values.contains_key(name)
-        && let Some(key) = name.strip_prefix("http.request.header.")
-    {
-        let mut bytes = Vec::new();
-        for (i, value) in fields.get_all(key).iter()
-        .enumerate() {
-            if i > 0 {
-                bytes.push(b',');
-            }
-            bytes.extend_from_slice(value.as_bytes());
-        }
-        Some(bytes)
-    } else {
-        ctx.lookup_bytes(name)
+pub(super) fn apply_headers_view<'a>(headers:&'a mut HeaderMap,operations:&'a HeaderOps,view:ReplacerView<'a>)
+    ->impl Future<Output=Result<()>>+Send+'a{apply_headers_with(headers,operations,view,false,None)}
+fn apply_request_headers<'a>(headers:&'a mut HeaderMap,operations:&'a HeaderOps,ctx:&'a Context)
+    ->impl Future<Output=Result<()>>+Send+'a{
+    apply_headers_with(headers,operations,ctx.lookup_view(),true,None)
+}
+pub(super) fn apply_push_headers<'a>(headers:&'a mut HeaderMap,operations:&'a HeaderOps,ctx:&'a Context)
+    ->impl Future<Output=Result<()>>+Send+'a{
+    apply_push_headers_view(headers,operations,ctx.lookup_view(),ctx.resources.transfer_deadlines.clone())
+}
+pub(super) fn apply_push_headers_view<'a>(headers:&'a mut HeaderMap,operations:&'a HeaderOps,view:ReplacerView<'a>,pool:native_write_policy::Pool)
+    ->impl Future<Output=Result<()>>+Send+'a{
+    async move{
+        let entries=operations.delete.len().checked_add(operations.add.iter().chain(&operations.set).try_fold(0usize,|n,(_,v)|n.checked_add(v.len()).and_then(|n|n.checked_add(1))).ok_or_else(||anyhow::anyhow!("push header count overflow"))?).ok_or_else(||anyhow::anyhow!("push header count overflow"))?;
+        if entries==0{return Ok(())}
+        let scratch=entries.checked_mul(128).and_then(|n|n.checked_add(8<<20)).ok_or_else(||anyhow::anyhow!("push header allocation overflow"))?;
+        let _scratch=pool.reserve(scratch)?;
+        apply_headers_with(headers,operations,view,false,Some(65536)).await
     }
 }
-fn apply_request_headers(
-    headers: &mut HeaderMap,
-    operations: &HeaderOps,
-    ctx: &Context,
-) -> Result<()> {
-    apply_headers_with(
-        headers,
-        operations,
-        |fields, value| {
-            String::from_utf8(crate::http_config::helpers::replace_bytes(
-                value,
-                false,
-                |name| header_lookup(fields, ctx, name),
-            )?)
-            .map_err(Into::into)
-        },
-        |fields, value| {
-            crate::http_config::helpers::replace_bytes(value, false, |name| {
-                header_lookup(fields, ctx, name)
-            })
-        },
-        None,
-    )
+async fn header_expand(view:&ReplacerView<'_>,fields:&HeaderMap,request:bool,text:&str)->Result<Bytes>{
+    if request{view.with_headers(fields).expand_resolved(text,false).await}else{view.expand_resolved(text,false).await}
 }
-pub(super) fn apply_push_headers(headers:&mut HeaderMap,operations:&HeaderOps,ctx:&Context)->Result<()> {
-    let entries=operations.delete.len().checked_add(operations.add.iter().chain(&operations.set).try_fold(0usize,|n,(_,v)|n.checked_add(v.len()).and_then(|n|n.checked_add(1))).ok_or_else(||anyhow::anyhow!("push header count overflow"))?).ok_or_else(||anyhow::anyhow!("push header count overflow"))?;
-    if entries==0{return Ok(())}
-    // Replacer sources are already bounded by the native request/config limits.
-    // Cover one temporary source clone plus old/new replacement buffers and
-    // all operation-list cells before evaluating any expansion. This is a
-    // concrete allocation lease, not an allocated dummy byte buffer.
-    let scratch=entries.checked_mul(128).and_then(|n|n.checked_add(8<<20)).ok_or_else(||anyhow::anyhow!("push header allocation overflow"))?;
-    let _scratch=ctx.resources.transfer_deadlines.reserve(scratch)?;
-    let remaining=std::cell::Cell::new(2usize<<20);
-    let charge=|bytes:usize|{anyhow::ensure!(bytes<=128<<10,"push header replacement exceeds limit");let n=remaining.get().checked_sub(bytes).ok_or_else(||anyhow::anyhow!("push header scratch exhausted"))?;remaining.set(n);Ok(())};
-    apply_headers_with(headers,operations,
-        |_,value|crate::http_config::helpers::replace_accounted(value,false,|name|ctx.lookup(name),charge),
-        |_,value|crate::http_config::helpers::replace_bytes_accounted(value,false,|name|ctx.lookup_bytes(name),charge),Some(65536))
+struct HeaderValueOwner{bytes:Bytes,_name:Bytes,_name_credit:Arc<native_write_policy::Lease>}
+impl AsRef<[u8]> for HeaderValueOwner{fn as_ref(&self)->&[u8]{&self.bytes}}
+fn owned_header(bytes:Bytes,name:&Bytes,credit:&Arc<native_write_policy::Lease>)->Result<HeaderValue>{
+    Ok(HeaderValue::from_maybe_shared(Bytes::from_owner(HeaderValueOwner{bytes,_name:name.clone(),_name_credit:credit.clone()}))?)
 }
-fn apply_headers_with(
-    headers: &mut HeaderMap,
-    operations: &HeaderOps,
-    expand: impl Fn(&HeaderMap, &str) -> Result<String>,
-    expand_value: impl Fn(&HeaderMap, &str) -> Result<Vec<u8>>,
-    maximum: Option<usize>,
-) -> Result<()> {
-    let checked = |fields: &HeaderMap| -> Result<()> {
-        if let Some(maximum) = maximum {
-            let mut bytes = 0usize;
-            for (name, value) in fields {
-                bytes = bytes
-                    .checked_add(name.as_str()
-        .len() + value.len() + 32)
-                    .ok_or_else(|| anyhow::anyhow!("header size overflow"))?;
-            }
-            ensure!(bytes <= maximum, "headers exceed limit");
-        }
-        Ok(())
-    };
-    // Caddy clears '*' first, then adds, sets, and finally deletes matching
-    // names. Unknown placeholders are preserved by ReplaceKnown.
-    for pattern in &operations.delete {
-        if expand(headers, pattern)? == "*" {
-        headers.clear();
+async fn apply_headers_with(headers:&mut HeaderMap,operations:&HeaderOps,view:ReplacerView<'_>,request:bool,maximum:Option<usize>)->Result<()>{
+    let checked=|fields:&HeaderMap|->Result<()>{if let Some(maximum)=maximum{
+        let bytes=fields.iter().try_fold(0usize,|n,(name,value)|n.checked_add(name.as_str().len()+value.len()+32)).ok_or_else(||anyhow::anyhow!("header size overflow"))?;
+        ensure!(bytes<=maximum,"headers exceed limit");
+    }Ok(())};
+    for pattern in &operations.delete{
+        if header_expand(&view,headers,request,pattern).await?.as_ref()==b"*"{headers.clear();}
+    }
+    for (name,values) in &operations.add{
+        let name_bytes=header_expand(&view,headers,request,name).await?;
+        let name_credit=Arc::new(view.pool().reserve(name_bytes.len().saturating_mul(2)+1024)?);
+        let name=HeaderName::from_bytes(&name_bytes)?;
+        for value in values{
+            let value=header_expand(&view,headers,request,value).await?;
+            headers.append(name.clone(),owned_header(value,&name_bytes,&name_credit)?);checked(headers)?;
         }
     }
-    for (name, values) in &operations.add {
-        let name = HeaderName::try_from(expand(headers, name)?)?;
-        for value in values {
-            headers.append(name.clone(), HeaderValue::from_bytes(&expand_value(headers, value)?)?,
-            );
-            checked(headers)?;
-        }
-    }
-    for (name, values) in &operations.set {
-        let name = HeaderName::try_from(expand(headers, name)?)?;
-        let values = values
-            .iter()
-            .map(|s| expand_value(headers, s))
-            .collect::<Result<Vec<_>>>()?;
+    for (name,values) in &operations.set{
+        let name_bytes=header_expand(&view,headers,request,name).await?;
+        let name_credit=Arc::new(view.pool().reserve(name_bytes.len().saturating_mul(2)+1024)?);
+        let name=HeaderName::from_bytes(&name_bytes)?;
+        let _cells=view.pool().reserve(values.len().saturating_mul(std::mem::size_of::<Bytes>()*2)+1024)?;
+        let mut expanded=Vec::with_capacity(values.len());
+        for value in values{expanded.push(header_expand(&view,headers,request,value).await?);}
         headers.remove(&name);
-        if name == http::header::SET_COOKIE && values.len() > 1 {
-            for value in values {
-                headers.append(name.clone(), HeaderValue::from_bytes(&value)?);
-                checked(headers)?;
-            }
-        } else {
-            headers.insert(name, HeaderValue::from_bytes(&values.join(b",".as_slice()))?,
-            );
-            checked(headers)?;
+        if name==http::header::SET_COOKIE&&expanded.len()>1{
+            for value in expanded{headers.append(name.clone(),owned_header(value,&name_bytes,&name_credit)?);checked(headers)?;}
+        }else{
+            let length=expanded.iter().try_fold(expanded.len().saturating_sub(1),|n,v|n.checked_add(v.len())).filter(|n|*n<=4<<20).ok_or_else(||anyhow::anyhow!("header replacement exceeds limit"))?;
+            let credit=view.pool().reserve(length.saturating_mul(2)+1024)?;
+            let mut joined=Vec::new();joined.try_reserve_exact(length)?;
+            for (i,value)in expanded.iter().enumerate(){if i>0{joined.push(b',')}joined.extend_from_slice(value);}
+            let value=super::map_runtime::owned(joined,credit);
+            headers.insert(name,owned_header(value,&name_bytes,&name_credit)?);checked(headers)?;
         }
     }
-    for pattern in &operations.delete {
-        let pattern = expand(headers, pattern)?;
-        if pattern == "*" {
-            continue;
-        }
-        let names = headers
-            .keys()
-            .filter(|name| header_pattern(&pattern, name.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        for name in names {
-            headers.remove(name);
-        }
+    for pattern in &operations.delete{
+        let pattern=header_expand(&view,headers,request,pattern).await?;
+        let pattern=std::str::from_utf8(&pattern)?;
+        if pattern=="*"{continue}
+        let _names=view.pool().reserve(headers.len().saturating_mul(std::mem::size_of::<HeaderName>()*2)+1024)?;
+        let names=headers.keys().filter(|name|header_pattern(pattern,name.as_str())).cloned().collect::<Vec<_>>();
+        for name in names{headers.remove(name);}
     }
     Ok(())
 }

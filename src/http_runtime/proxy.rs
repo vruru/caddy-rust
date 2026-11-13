@@ -31,8 +31,19 @@ pub(super) struct ProxyClient {
 }
 struct ClientCache {
     clock: u64,
-    clients: HashMap<String, (HyperClient, u64)>,
+    clients: HashMap<ClientKey, (HyperClient, u64)>,
+    bytes:usize,
+    table:Option<native_write_policy::Lease>,
+    table_buckets:usize,
 }
+// The key itself owns its allocation credit, independently of HashMap's
+// entry destruction order and the connector/client's asynchronous lifetime.
+#[derive(Clone)]
+struct ClientKey{text:String,cost:usize,_cache:Option<Arc<native_write_policy::Lease>>,_map:Option<Arc<super::map_runtime::DialOwner>>}
+impl std::borrow::Borrow<str> for ClientKey{fn borrow(&self)->&str{&self.text}}
+impl PartialEq for ClientKey{fn eq(&self,other:&Self)->bool{self.text==other.text}}impl Eq for ClientKey{}
+impl std::hash::Hash for ClientKey{fn hash<H:std::hash::Hasher>(&self,state:&mut H){std::hash::Hash::hash(&self.text,state)}}
+const CLIENT_CACHE_BYTES:usize=4<<20;
 impl ProxyClient {
     pub(super) fn metric_probes(&self)->Vec<(Arc<str>,crate::metrics::upstream::Probe)>{self.selection.metric_probes()}
 
@@ -43,19 +54,40 @@ impl ProxyClient {
         force_http1: bool,
         server_name: Option<ServerName<'static>>,
         unix_path:Option<&str>,
+        cache_pool:&native_write_policy::Pool,
+        map_pool:Option<&native_write_policy::Pool>,
+        dns:super::resource_budget::BlockingBudget,
     ) -> Result<HyperClient> {
-        let cache_key = format!("{family:?}|{dial}|{force_http1}|{server_name:?}|{unix_path:?}");
+        let input=dial.len().checked_add(unix_path.map_or(0,str::len)).and_then(|n|n.checked_add(512)).ok_or_else(||anyhow::anyhow!("proxy dial metadata size overflow"))?;
+        let cost=input.checked_mul(16).and_then(|n|n.checked_add(if map_pool.is_some(){65536}else{8192})).ok_or_else(||anyhow::anyhow!("proxy dial metadata size overflow"))?;
+        let _workspace=map_pool.map(|pool|pool.reserve(input.saturating_mul(8).saturating_add(8192))).transpose().map_err(|_|super::request::failure(StatusCode::SERVICE_UNAVAILABLE))?;
+        let cache_key = format!("{family:?}|{dial}|{force_http1}|{server_name:?}|{unix_path:?}|mapped:{}",map_pool.is_some());
         let mut cache = self
             .cache
             .lock()
             .map_err(|_| anyhow::anyhow!("upstream client cache unavailable"))?;
         cache.clock = cache.clock.wrapping_add(1);
         let clock = cache.clock;
-        if let Some((client, last)) = cache.clients.get_mut(&cache_key) {
+        if let Some((client, last)) = cache.clients.get_mut(cache_key.as_str()) {
             *last = clock;
             return Ok(client.clone());
         }
         drop(cache);
+        // Eviction never drops a client, TLS config or metadata owner while
+        // the cache mutex is held. Capacity failure falls through uncached.
+        while cost<=CLIENT_CACHE_BYTES{
+            let evicted={let mut cache=self.cache.lock().map_err(|_|anyhow::anyhow!("upstream client cache unavailable"))?;
+                if cache.clients.len()<1024&&cache.bytes.saturating_add(cost)<=CLIENT_CACHE_BYTES{None}else{
+                    let key=cache.clients.iter().min_by_key(|(_,(_,last))|*last).map(|(key,_)|key.clone());
+                    key.and_then(|key|cache.clients.remove_entry(key.text.as_str())).map(|(key,value)|{cache.bytes=cache.bytes.saturating_sub(key.cost);(key,value)})
+                }};
+            if let Some(evicted)=evicted{drop(evicted)}else{break}
+        }
+        let cache_credit=if cost<=CLIENT_CACHE_BYTES{cache_pool.reserve(cost).ok().map(Arc::new)}else{None};
+        let owner=if let Some(pool)=map_pool{
+            let retained=match &cache_credit{Some(credit)=>credit.clone(),None=>Arc::new(pool.reserve(cost).map_err(|_|super::request::failure(StatusCode::SERVICE_UNAVAILABLE))?)};
+            Some(super::map_runtime::DialOwner::new(pool.clone(),retained))
+        }else{None};
         let uri = dial.parse::<Uri>()?;
         let mut builder = Client::builder(TokioExecutor::new());
         // Go's transfer reader requires the whole HTTP/1 trailer block to fit
@@ -72,7 +104,10 @@ impl ProxyClient {
         } else {
             &self.connector
         };
-        let client = builder.build(transport.connector(uri, family, server_name,unix_path));
+        let mut connector=transport.connector(uri,family,server_name,unix_path);
+        if let Some(owner)=&owner{connector=connector.with_map_owner(owner.clone(),dns);}
+        let client = builder.build(connector);
+        if cache_credit.is_none(){return Ok(client)}
         // Building a pool must not hold the shared cache lock. Another request
         // may have populated the same key meanwhile; keep that existing pool.
         let mut cache = self
@@ -81,23 +116,39 @@ impl ProxyClient {
             .map_err(|_| anyhow::anyhow!("upstream client cache unavailable"))?;
         cache.clock = cache.clock.wrapping_add(1);
         let clock = cache.clock;
-        if let Some((existing, last)) = cache.clients.get_mut(&cache_key) {
+        if let Some((existing, last)) = cache.clients.get_mut(cache_key.as_str()) {
             *last = clock;
             return Ok(existing.clone());
         }
-        let evicted = if cache.clients.len() >= 1024 {
-            let oldest = cache
-                .clients
-                .iter()
-                .min_by_key(|(_, (_, last))| *last)
-                .map(|(key, _)| key.clone());
-            oldest.and_then(|key| cache.clients.remove(&key))
-        } else {
-            None
-        };
-        cache.clients.insert(cache_key, (client.clone(), clock));
+        // A concurrent insertion may have consumed this proxy's optional
+        // space after construction. Keep the usable client without caching.
+        if cache.clients.len()>=1024||cache.bytes.saturating_add(cost)>CLIENT_CACHE_BYTES{drop(cache);return Ok(client)}
+        if cache.clients.len()==cache.clients.capacity(){
+            // Pinned std/hashbrown tables use power-of-two buckets with at
+            // least 7/8 load capacity (small tables have 4/8 buckets). Include
+            // controls/alignment and retain both old/new allocations while
+            // try_reserve rehashes. Empty retained capacity keeps this lease.
+            let needed=cache.clients.len().saturating_add(1);
+            let needed_buckets=needed.saturating_mul(8).saturating_add(6).checked_div(7).unwrap_or(usize::MAX).max(4).checked_next_power_of_two().ok_or_else(||anyhow::anyhow!("proxy client cache table overflow"))?;
+            // capacity() includes tombstone growth-left. The actual pinned
+            // resize may double the old physical table even if len+1 alone
+            // would fit that table. Track clean physical buckets explicitly.
+            let buckets=needed_buckets.max(cache.table_buckets.saturating_mul(2)).max(4);
+            let upper=buckets.checked_mul(std::mem::size_of::<(ClientKey,(HyperClient,u64))>().saturating_add(16)).and_then(|n|n.checked_add(1024)).ok_or_else(||anyhow::anyhow!("proxy client cache table overflow"))?;
+            let before=cache.table.as_ref().map_or(0,|lease|lease.bytes());
+            if cache.bytes.saturating_sub(before).saturating_add(upper).saturating_add(cost)>CLIENT_CACHE_BYTES{drop(cache);return Ok(client)}
+            let table=match cache_pool.reserve(upper){Ok(table)=>table,Err(_)=>{drop(cache);return Ok(client)}};
+            if cache.clients.try_reserve(1).is_err(){drop(cache);return Ok(client)}
+            let capacity=cache.clients.capacity();
+            let actual_buckets=if capacity<4{4}else if capacity<8{8}else if capacity<15{16}else{(capacity.saturating_mul(8)/7).next_power_of_two()};
+            debug_assert!(actual_buckets<=buckets);
+            cache.table_buckets=actual_buckets;
+            cache.bytes=cache.bytes.saturating_sub(before).saturating_add(upper);
+            cache.table=Some(table);
+        }
+        cache.bytes+=cost;
+        cache.clients.insert(ClientKey{text:cache_key,cost,_cache:cache_credit,_map:owner},(client.clone(),clock));
         drop(cache);
-        drop(evicted);
         Ok(client)
     }
 }
@@ -172,6 +223,9 @@ pub(super) fn prepare_clients(
                             cache: Arc::new(std::sync::Mutex::new(ClientCache {
                                 clock: 0,
                                 clients: HashMap::new(),
+                                bytes:0,
+                                table:None,
+                                table_buckets:0,
                             })),
                         },
                     );
@@ -608,9 +662,9 @@ async fn serve_once(
             .get("http.reverse_proxy.retries")
             .is_some_and(|v| v != "0")
         {
-            let _ = dynamic.reset_cache(Some(&|value| ctx.expand(value)));
+            let _ = dynamic.reset_cache_resolved(ctx.lookup_view()).await;
         }
-        let pending = dynamic.get(&|value| ctx.expand(value));
+        let pending = dynamic.get_resolved(ctx.lookup_view());
         match pending.await {
             Ok(upstreams) => {
                 let base = state.selection.clone();
@@ -676,7 +730,7 @@ async fn serve_once(
     for value in selection.cookies {
         ctx.immediate.append(http::header::SET_COOKIE, value);
     }
-    let dial = ctx.expand(&selection.dial)?;
+    let dial = ctx.expand_text_resolved(&selection.dial,true).await?;
     for (name, value) in [
         (
             "http.reverse_proxy.upstream.requests",
@@ -784,7 +838,7 @@ async fn serve_once(
     let server_name = if let Some(tls) = effective_tls {
         match tls.server_name.as_ref() {
             Some(template) => {
-                let name = ctx.expand(template)?;
+                let name = ctx.expand_text_resolved(template,true).await?;
                 if name.is_empty() && template.contains('{') {
                     // Caddy's dynamic DialTLS path passes the expanded config
                     // directly to tls.Client; unlike the static net/http path
@@ -814,7 +868,8 @@ async fn serve_once(
     };
     let unix_host = (unix_path.is_some() && config.tls.is_some())
         .then(|| super::http_dial::unix_tls_host(server_name.as_ref()));
-    let client = state.client_for(&connection_uri, family, is_upgrade, server_name,unix_path)?;
+    let map_scope=ctx.text_owner().is_some();
+    let client = state.client_for(&connection_uri,family,is_upgrade,server_name,unix_path,&ctx.resources.proxy_client_cache_bytes,if map_scope{Some(&ctx.resources.map_bytes)}else{None},ctx.resources.proxy_dial_dns.clone())?;
     let mut outgoing = ctx.req().headers().clone();
     if extended.is_some() {
         use base64::Engine;
@@ -1304,9 +1359,10 @@ pub(super) fn proxy_headers<'a>(
             headers.insert(http::header::USER_AGENT, HeaderValue::from_static(""));
         }
     }
-    apply_headers(&mut headers, &config.request_headers, ctx)?;
+
         Ok(headers)
     })();
+    let view=ctx.lookup_view();
     let snapshot = super::headers_replace::prepare_owned(
         &config.request_headers,
         ctx,
@@ -1314,6 +1370,7 @@ pub(super) fn proxy_headers<'a>(
     );
     Box::pin(async move {
         let mut headers = prepared?;
+        super::request::apply_headers_view(&mut headers,&config.request_headers,view).await?;
         super::headers_replace::apply_owned(&mut headers, &config.request_headers, snapshot?, None)
             .await?;
         if !fastcgi && let Some(host) = headers.get(http::header::HOST).and_then(|v| v.to_str().ok())

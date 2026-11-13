@@ -214,3 +214,17 @@ Managed outbound client identity support extends the local `native-ssl-tls` crat
 
 
 Reverse-proxy CBC compatibility adds native-ssl-tls ClientConfig::go_compatible, ClientConfig::cbc_fallback and the additive OwnedClientStream/connect_owned_with_alpn interface. The latter reuses ServerEngine::new_client, the original Guard callbacks and the shared bounded record/verification scopes for static or absent client identity. Public legacy ClientConfig/Stream behavior remains unchanged. No OpenSSL C source or new dependency is added. Default Rustls remains the first reverse-proxy engine; only the explicitly fenced early-alert compatibility candidate uses the TLS1.2 CBC-only context. HTTP CA-loader/ACME callers are not implicitly switched by this layer. Rust dependency graphs must be rebuilt; no external Rust ABI guarantee is made.
+
+Native SSL per-connection metadata ownership
+-------------------------------------------
+
+`native-ssl-tls` optionally accepts concrete `ConnectionCredits` containing only
+atomic `native-write-policy` leases. A per-call client capsule leaves the shared
+base unchanged. The real SSL guard, factory and verification inputs, engine
+steps, pending results and errors retain those leases until their data retires.
+The caller prepays the finite capsule and held metadata; this adds neither a
+new pool nor arbitrary callback ownership. Without a capsule, errors retain
+their original I/O representation. With a capsule, kind, Display and the original
+source chain remain available, while top-level raw OS error extraction is no
+longer the inline representation. This layer does not meter the OpenSSL heap or
+change certificate verification, cipher policy or application retry behavior.

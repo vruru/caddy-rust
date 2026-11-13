@@ -15,6 +15,8 @@ use tower_service::Service;
 #[path="upstream_tls/compatibility.rs"]
 mod compatibility;
 use compatibility::FirstAlertIo;
+#[path="upstream_tls/retained.rs"]
+mod retained;
 
 use super::timeout_io::TimeoutIo;
 
@@ -95,7 +97,7 @@ impl PreparedTransport {
             .map(|t| provision_inner(t, config.enable_http2,false,Some(&resources.ssl_verify),true))
             .transpose()?;
         let (tls,native,fallback,managed)=match tls{Some(t)=>(Some(Arc::new(t.rustls)),t.native,t.fallback,t.managed),None=>(None,None,None,None)};
-        let client_executor=if managed.is_some()&&native.is_none(){Some(resources.client_tls_executor()?)}else{None};
+        let client_executor=if tls.is_some()&&native.is_none(){Some(resources.client_tls_executor()?)}else{None};
         Ok(Self {
             client_executor,
             http,
@@ -114,7 +116,7 @@ impl PreparedTransport {
         let family=super::http_dial::Family::Any;
         let mut http=HttpConnector::new_with_resolver(super::http_dial::FamilyResolver::new(family));
         http.enforce_http(false);http.set_connect_timeout((!timeout.is_zero()).then_some(timeout));http.set_nodelay(true);
-        FixedDialConnector{http,family,tls,native:None,fallback:None,managed:None,client_executor:None,http1_native:false,read:Some(timeout),write:Some(timeout),handshake:Some(timeout),dial,server_name:None,unix_path:None,connect_timeout:timeout}
+        FixedDialConnector{http,family,tls,native:None,fallback:None,managed:None,client_executor:None,http1_native:false,read:Some(timeout),write:Some(timeout),handshake:Some(timeout),dial,server_name:None,unix_path:None,connect_timeout:timeout,map_owner:None}
     }
     pub(super) fn http1(&self) -> Self {
         let mut result = self.clone();
@@ -161,6 +163,7 @@ impl PreparedTransport {
             server_name,
             unix_path:unix_path.map(Arc::from),
             connect_timeout:self.connect_timeout,
+            map_owner:None,
         }
     }
 }
@@ -452,6 +455,7 @@ pub(super) struct FixedDialConnector {
     pub(super) server_name: Option<ServerName<'static>>,
     unix_path:Option<Arc<str>>,
     connect_timeout:Duration,
+    map_owner:Option<Arc<super::map_runtime::DialOwner>>,
 }
 
 #[derive(Debug)]
@@ -528,14 +532,88 @@ async fn native_output(
         }
     }).await
 }
+
+fn executor_error(error:anyhow::Error)->ConnectError{
+    match error.downcast::<std::io::Error>(){
+        Ok(error)=>Box::new(error),
+        Err(error)=>error.into(),
+    }
+}
+fn credited_native(config:Arc<native_ssl_tls::ClientConfig>,credits:Option<&Arc<native_ssl_tls::ConnectionCredits>>)->Arc<native_ssl_tls::ClientConfig>{
+    match credits{
+        Some(credits)=>Arc::new(config.with_connection_credits(credits.clone())),
+        None=>config,
+    }
+}
 impl Service<Uri> for FixedDialConnector {
-    type Response=Output;
+    type Response=MapOutput;
     type Error=ConnectError;
     type Future=Pin<Box<dyn Future<Output=Result<Self::Response,Self::Error>>+Send>>;
     fn poll_ready(&mut self,cx:&mut Context<'_>)->Poll<Result<(),Self::Error>>{
         self.http.poll_ready(cx).map_err(|e|Box::new(e)as Self::Error)
     }
-    fn call(&mut self,_uri:Uri)->Self::Future{
+    fn call(&mut self, _uri: Uri) -> Self::Future {
+        let (workspace,output_credit)=if let Some(owner)=&self.map_owner{
+            let bytes=self.dial.authority().map_or(0,|value|value.as_str().len()).saturating_add(self.dial.scheme_str().map_or(0,str::len)).saturating_add(self.dial.path_and_query().map_or(0,|value|value.as_str().len())).saturating_add(self.unix_path.as_ref().map_or(0,|path|path.len())).saturating_add(520);
+            let workspace=match owner.work_pool.reserve(bytes.saturating_mul(4).saturating_add(8192)){Ok(credit)=>credit,Err(error)=>return Box::pin(async move{Err(Box::new(std::io::Error::other(error.to_string()))as Self::Error)})};
+            let output=match owner.work_pool.reserve(std::mem::size_of::<Output>().saturating_add(2048)){Ok(credit)=>Arc::new(credit),Err(error)=>return Box::pin(async move{Err(Box::new(std::io::Error::other(error.to_string()))as Self::Error)})};
+            (Some(Arc::new(workspace)),Some(output))
+        }else{(None,None)};
+        let state=DialState{http:self.http.clone(),tls:self.tls.clone(),native:self.native.clone(),fallback:self.fallback.clone(),managed:self.managed.clone(),client_executor:self.client_executor.clone(),http1_native:self.http1_native,read:self.read,write:self.write,handshake:self.handshake,dial:self.dial.clone(),family:self.family,server_name:self.server_name.clone(),unix_path:self.unix_path.clone(),connect_timeout:self.connect_timeout,map_owner:self.map_owner.clone(),output_credit,_workspace:workspace};
+        Box::pin(state.run())
+    }
+}
+
+/// Real configuration-time HTTP CA-fetch trust uses the same prepared client
+/// TLS policy as proxy traffic, with no client identity or per-port exception.
+pub(crate) fn ca_source_client_tls(ca:Option<serde_json::Value>,insecure:bool)->Result<ClientConfig>{Ok(ca_source_prepared_tls(ca,insecure,native_ssl_tls::Renegotiation::Never,None)?.rustls)}
+pub(crate) fn ca_source_prepared_tls(ca:Option<serde_json::Value>,insecure:bool,renegotiation:native_ssl_tls::Renegotiation,scope:Option<&Arc<native_ssl_tls::VerificationScope>>)->Result<PreparedTls>{
+    let options=ProxyTls{client_certificate_automate:None,managed_client:None,renegotiation,curves:Vec::new(),ca,except_ports:Vec::new(),server_name:None,insecure_skip_verify:insecure,root_ca_pem_files:Vec::new(),root_ca_pool:Vec::new(),client_certificate_file:None,client_certificate_key_file:None,handshake_timeout:None};
+    provision_inner(&options,true,true,scope,false)
+}
+
+impl FixedDialConnector{
+    pub(super) fn with_map_owner(mut self,owner:Arc<super::map_runtime::DialOwner>,budget:super::resource_budget::BlockingBudget)->Self{
+        // PreparedTransport configures exactly these TCP options. Only the
+        // resolver changes for a Map-derived dial; TLS state is untouched.
+        let mut http=HttpConnector::new_with_resolver(super::http_dial::FamilyResolver::with_map(self.family,budget,owner.clone()));
+        http.enforce_http(false);http.set_connect_timeout((!self.connect_timeout.is_zero()).then_some(self.connect_timeout));http.set_nodelay(true);
+        self.http=http;self.map_owner=Some(owner);self
+    }
+}
+// A TLS/name-validation error may itself own the expected ServerName. Keep
+// its final error value, not only successful IO, behind the same credit.
+#[derive(Debug)]
+struct MapDialError{inner:Box<dyn std::error::Error+Send+Sync>,_credit:Arc<native_write_policy::Lease>}
+impl std::fmt::Display for MapDialError{fn fmt(&self,out:&mut std::fmt::Formatter<'_>)->std::fmt::Result{std::fmt::Display::fmt(&self.inner,out)}}
+impl std::error::Error for MapDialError{fn source(&self)->Option<&(dyn std::error::Error+'static)>{Some(&*self.inner)}}
+pub(super) struct MapOutput{inner:Output,_credit:Option<Arc<native_write_policy::Lease>>}
+impl hyper_util::client::legacy::connect::Connection for MapOutput{fn connected(&self)->hyper_util::client::legacy::connect::Connected{hyper_util::client::legacy::connect::Connection::connected(&self.inner)}}
+impl hyper::rt::Read for MapOutput{fn poll_read(self:Pin<&mut Self>,cx:&mut Context<'_>,buf:hyper::rt::ReadBufCursor<'_>)->Poll<std::io::Result<()>>{Pin::new(&mut self.get_mut().inner).poll_read(cx,buf)}}
+impl hyper::rt::Write for MapOutput{
+ fn poll_write(self:Pin<&mut Self>,cx:&mut Context<'_>,buf:&[u8])->Poll<std::io::Result<usize>>{Pin::new(&mut self.get_mut().inner).poll_write(cx,buf)}
+ fn poll_flush(self:Pin<&mut Self>,cx:&mut Context<'_>)->Poll<std::io::Result<()>>{Pin::new(&mut self.get_mut().inner).poll_flush(cx)}
+ fn poll_shutdown(self:Pin<&mut Self>,cx:&mut Context<'_>)->Poll<std::io::Result<()>>{Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)}
+ fn is_write_vectored(&self)->bool{hyper::rt::Write::is_write_vectored(&self.inner)}
+ fn poll_write_vectored(self:Pin<&mut Self>,cx:&mut Context<'_>,buf:&[std::io::IoSlice<'_>])->Poll<std::io::Result<usize>>{Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx,buf)}
+}
+// This single concrete input owns its real fields before all credits. Explicit
+// Drop keeps that order even when its async run future is never first-polled.
+struct DialState{
+ http:HttpConnector<super::http_dial::FamilyResolver>,tls:Option<Arc<ClientConfig>>,native:Option<Arc<native_ssl_tls::ClientConfig>>,fallback:Option<Arc<native_ssl_tls::ClientConfig>>,managed:Option<Arc<crate::tls_app_config::ManagedClientSource>>,client_executor:Option<Arc<super::tls_executor::TlsExecutor>>,http1_native:bool,
+ read:Option<Duration>,write:Option<Duration>,handshake:Option<Duration>,dial:Uri,family:super::http_dial::Family,
+ server_name:Option<ServerName<'static>>,unix_path:Option<Arc<str>>,connect_timeout:Duration,
+ map_owner:Option<Arc<super::map_runtime::DialOwner>>,output_credit:Option<Arc<native_write_policy::Lease>>,_workspace:Option<Arc<native_write_policy::Lease>>,
+}
+impl Drop for DialState{fn drop(&mut self){}}
+impl DialState{
+ async fn run(mut self)->Result<MapOutput,ConnectError>{
+  match self.connect().await{
+   Ok(inner)=>Ok(MapOutput{inner,_credit:self.output_credit.clone()}),
+   Err(inner)=>match &self.output_credit{Some(credit)=>Err(Box::new(MapDialError{inner,_credit:credit.clone()})),None=>Err(inner)},
+  }
+ }
+ async fn connect(&mut self)->Result<Output,ConnectError>{
         let mut http=self.http.clone();
         let tls=self.tls.clone();
         let native=self.native.clone();
@@ -551,7 +629,17 @@ impl Service<Uri> for FixedDialConnector {
         let server_name=self.server_name.clone();
         let unix_path=self.unix_path.clone();
         let connect_timeout=self.connect_timeout;
-        Box::pin(async move{
+        // Only mapped attempts opt into concrete shared credits. This capsule
+        // follows detached TLS CPU jobs as well as their not-yet-consumed result.
+        let credits=match (&self.map_owner,&self.output_credit,&self._workspace){
+            (Some(owner),Some(output),Some(workspace))=>Some(owner.tls_credits(workspace.clone(),output.clone())),
+            _=>None,
+        };
+        let map_pool=self.map_owner.as_ref().map(|owner|owner.work_pool.clone());
+
+        // Preserve the current complete CBC/managed-client connector inside
+        // this concrete owner; both dial attempts share its resolver and credit.
+        async move {
             let dial_allowance=(!connect_timeout.is_zero()).then_some(connect_timeout);
             let first_dial=Instant::now();
             let tcp=dial_once(&mut http,family,&dial,unix_path.as_deref(),dial_allowance).await?;
@@ -572,6 +660,7 @@ impl Service<Uri> for FixedDialConnector {
             }).transpose()?;
             let binding=managed.as_ref().map(|source|source.binding());
             if let Some(native)=native{
+                let native=credited_native(native,credits.as_ref());
                 return native_output(native,binding,server_name,io,http1_native,deadline).await;
             }
             let cfg=if let Some(binding)=&binding{
@@ -585,15 +674,22 @@ impl Service<Uri> for FixedDialConnector {
             let connect=async move{
                 tls_connector.connect(first_name,FirstAlertIo::new(TokioIo::new(io))).into_fallible().await
             };
+            // Keep the result envelope alive until the final stream/error has
+            // been handed back to DialState. Its future owns the same capsule
+            // before first poll and while another runtime is still polling it.
+            let mut retained_result=None;
             let result=if let Some(executor)=client_executor{
-                executor.execute(async move{Ok(connect.await)},tokio_util::sync::CancellationToken::new(),deadline).await.map_err(|error|match error.downcast::<std::io::Error>(){
-                    Ok(error)=>Box::new(error)as ConnectError,
-                    Err(error)=>error.into(),
-                })?
+                if let (Some(credits),Some(pool))=(&credits,&map_pool){
+                    let connect=retained::RetainedTls::new(connect,credits.clone(),pool)?;
+                    retained_result=Some(executor.execute(async move{Ok(connect.await)},tokio_util::sync::CancellationToken::new(),deadline).await.map_err(executor_error)?);
+                    retained_result.as_mut().expect("retained TLS result").take()
+                }else{
+                    executor.execute(async move{Ok(connect.await)},tokio_util::sync::CancellationToken::new(),deadline).await.map_err(executor_error)?
+                }
             }else{
                 within_tls(deadline,async move{Ok(connect.await)}).await?
             };
-            match result{
+            let output=match result{
                 Ok(stream)=>{
                     if let Some(binding)=binding{
                         binding.check()?;
@@ -608,17 +704,13 @@ impl Service<Uri> for FixedDialConnector {
                     // the peer's private failure reason. The second context is
                     // TLS1.2/CBC-only with the identical native trust verifier.
                     let tcp=within_tls(deadline,dial_once(&mut http,family,&dial,unix_path.as_deref(),dial_left)).await?;
-                    native_output(fallback,binding,server_name,TimeoutIo::new(tcp,read,write),http1_native,deadline).await
+                    native_output(credited_native(fallback,credits.as_ref()),binding,server_name,TimeoutIo::new(tcp,read,write),http1_native,deadline).await
                 },
-            }
-        })
-    }
-}
-
-/// Real configuration-time HTTP CA-fetch trust uses the same prepared client
-/// TLS policy as proxy traffic, with no client identity or per-port exception.
-pub(crate) fn ca_source_client_tls(ca:Option<serde_json::Value>,insecure:bool)->Result<ClientConfig>{Ok(ca_source_prepared_tls(ca,insecure,native_ssl_tls::Renegotiation::Never,None)?.rustls)}
-pub(crate) fn ca_source_prepared_tls(ca:Option<serde_json::Value>,insecure:bool,renegotiation:native_ssl_tls::Renegotiation,scope:Option<&Arc<native_ssl_tls::VerificationScope>>)->Result<PreparedTls>{
-    let options=ProxyTls{client_certificate_automate:None,managed_client:None,renegotiation,curves:Vec::new(),ca,except_ports:Vec::new(),server_name:None,insecure_skip_verify:insecure,root_ca_pem_files:Vec::new(),root_ca_pool:Vec::new(),client_certificate_file:None,client_certificate_key_file:None,handshake_timeout:None};
-    provision_inner(&options,true,true,scope,false)
+            };
+            // The stream/error now owns its handoff value, and DialState still
+            // owns its corresponding output credit until MapOutput is built.
+            drop(retained_result);
+            output
+        }.await
+ }
 }

@@ -140,7 +140,7 @@ pub(super) async fn matches(
     splits: &[String],
     policy: FileMatchPolicy,
 ) -> Result<bool> {
-    let root = PathBuf::from(ctx.expand(root.unwrap_or("{http.vars.root}"))?);
+    let root = PathBuf::from(ctx.expand_text_resolved(root.unwrap_or("{http.vars.root}"),true).await?);
     let first = matches!(policy, FileMatchPolicy::First | FileMatchPolicy::Fallback);
     let mut work = Vec::with_capacity(patterns.len());
     let mut input_bytes = 0usize;
@@ -155,7 +155,10 @@ pub(super) async fn matches(
         let expanded = if status.is_some() {
             String::new()
         } else {
-            let value = replace(raw, true, |key| ctx.lookup(key).map(escaped_lookup))?;
+            let view=ctx.lookup_view();let lookup=EscapedLookup{view};
+            let value=super::replacer_async::expand(raw,true,&lookup,view.pool()).await?;
+            view.retain_text(value.clone())?;view.reserve_text_copy(value.len().saturating_mul(8).saturating_add(8192))?;
+            let value=String::from_utf8(value.to_vec())?;
             input_bytes = input_bytes.saturating_add(value.len());
             if input_bytes > 1 << 20 {
                 return Err(failure(StatusCode::SERVICE_UNAVAILABLE));
@@ -178,7 +181,7 @@ pub(super) async fn matches(
     let selected = ctx
         .resources
         .metadata
-        .run(move || {
+        .run(super::map_runtime::text_job(ctx.text_owner(),move || {
             let mut winner: Option<(Candidate, fs::Metadata)> = None;
             let mut remaining = ENTRY_LIMIT;
             let count = work.len();
@@ -223,13 +226,25 @@ pub(super) async fn matches(
             Ok::<_, io::Error>(Ok(
                 winner.map(|(candidate, info)| (candidate, info.is_dir()))
             ))
-        })
+        })?)
         .await
-        .map_err(|e| budget_failure(ctx, e))?
+        .map_err(|e| budget_failure(ctx, e))?.into_context(ctx)?
         .map_err(|e| file_io_failure(ctx, &e))?;
     let Some((candidate, is_dir)) = selected.map_err(failure)? else {
         return Ok(false);
     };
     publish(ctx, candidate, is_dir);
     Ok(true)
+}
+
+struct EscapedLookup<'a>{view:super::request::ReplacerView<'a>}
+impl super::replacer_async::Lookup for EscapedLookup<'_>{
+ fn lookup<'a>(&'a self,name:&'a str)->impl std::future::Future<Output=Result<Option<bytes::Bytes>>>+Send+'a{
+  async move{
+   let Some(value)=self.view.lookup_resolved(name).await?else{return Ok(None)};
+   let Ok(value)=std::str::from_utf8(&value)else{return Ok(None)};
+   let credit=self.view.pool().reserve(value.len().saturating_mul(10)+1024)?;
+   Ok(Some(super::map_runtime::owned(escaped_lookup(value.to_owned()).into_bytes(),credit)))
+  }
+ }
 }

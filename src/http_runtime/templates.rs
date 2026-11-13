@@ -86,7 +86,7 @@ pub(super) async fn browse(ctx:&mut Context,inner:&Arc<super::Inner>,server:&Arc
     let memory=if inherited.is_none(){Some(ctx.resources.templates.reserve().map_err(|_|unavailable())?)}else{None};
     let control=inherited.as_ref().map_or_else(||render::Control::for_browse(CancellationToken::new()),|i|i.tree.control.clone());
     let _stop=if inherited.is_none(){Some(StopOnDrop(control.cancel.clone()))}else{None};
-    let request=render::RequestData::capture(ctx).map_err(|_|broken())?;
+    let request=render::RequestData::capture(ctx).await.map_err(|_|broken())?;
     let root_owner=if inherited.is_none(){Some(ctx.resources.templates.admit_immediate(control.clone(),memory.ok_or_else(broken)?).await.map_err(|e|match e{BudgetError::Overloaded=>unavailable(),BudgetError::WorkerFailed=>broken()})?)}else{None};
     let tree=if let Some(i)=&inherited{i.tree.clone()}else{root_owner.as_ref().ok_or_else(broken)?.tree()};
     let depth=inherited.as_ref().map_or(0,|i|i.depth);
@@ -94,18 +94,18 @@ pub(super) async fn browse(ctx:&mut Context,inner:&Arc<super::Inner>,server:&Arc
     let mut reads=request.form.attach().map_err(|_|broken())?;
     let reading_control=control.clone();let resources=ctx.resources.clone();let mut output_headers=headers.clone();
     let owner=tree.clone();
-    let job=resources.templates.run(tree,move||{
+    let job=resources.templates.run(tree,super::map_runtime::text_job(ctx.text_owner(),move||{
         let result=render::execute_browse(root,request,&mut output_headers,file,control,Some(virtual_include),source)
             .map(|bytes|Bytes::from_owner(BufferedBytes{bytes,_tree:owner}));
         (result,output_headers)
-    });
+    }).map_err(|_|unavailable())?);
     tokio::pin!(job);
     let result=loop{tokio::select!{
         Some(read)=reads.recv()=>{let result=read_form_body(ctx.req_mut().body_mut(),&reading_control).await;let _=read.reply.send(result);}
         result=&mut job=>break result,
     }};
     if let Some(owner)=&root_owner{owner.finish();}
-    let(result,output_headers)=result.map_err(|e|match e{BudgetError::Overloaded=>unavailable(),BudgetError::WorkerFailed=>broken()})?;
+    let(result,output_headers)=result.map_err(|e|match e{BudgetError::Overloaded=>unavailable(),BudgetError::WorkerFailed=>broken()})?.into_context(ctx).map_err(|_|broken())?;
     *headers=output_headers;
     result
 }
@@ -147,12 +147,8 @@ pub(super) async fn finish(
     if !bounded_headers(headers) || !bounded_headers(ctx.req().headers()) {
         return Err(broken());
     }
-    let root = crate::http_config::helpers::replace(&plan.root, true, |key| {
-        ctx.lookup(key).or_else(|| Some(".".into()))
-    })
-    .map(PathBuf::from)
-    .map_err(|_| broken())?;
-    let request = render::RequestData::capture(ctx).map_err(|_| broken())?;
+    let root=ctx.root_resolved(&plan.root).await.map(PathBuf::from).map_err(|_|broken())?;
+    let request = render::RequestData::capture(ctx).await.map_err(|_| broken())?;
 
     let mut rendered_headers = headers.clone();
     // All further awaits own their request context. In particular, a template
@@ -192,10 +188,10 @@ pub(super) async fn finish(
     let mut form_reads=request.form.attach().map_err(|_|broken())?;
     let resources=ctx.resources.clone();let reading_control=control.clone();
     let plan=plan.clone();let owner=tree.clone();let name=request.uri.path().to_owned();
-    let job=resources.templates.run(tree,move||{
+    let job=resources.templates.run(tree,super::map_runtime::text_job(ctx.text_owner(),move||{
         let result=render::execute_named(&plan,root,request,&mut rendered_headers,&name,collected,control,Some(virtual_include),std::collections::BTreeMap::new());
         (result,rendered_headers)
-    });
+    }).map_err(|_|unavailable())?);
     tokio::pin!(job);
     let result=loop{tokio::select!{
         Some(read)=form_reads.recv()=>{
@@ -205,7 +201,7 @@ pub(super) async fn finish(
         result=&mut job=>break result,
     }};
     if let Some(owner)=root_owner.as_ref(){owner.finish();}
-    let (result,mut rendered_headers)=result.map_err(|error|match error{BudgetError::Overloaded=>unavailable(),BudgetError::WorkerFailed=>broken()})?;
+    let (result,mut rendered_headers)=result.map_err(|error|match error{BudgetError::Overloaded=>unavailable(),BudgetError::WorkerFailed=>broken()})?.into_context(ctx).map_err(|_|broken())?;
     *headers=rendered_headers.clone();
     let output=BufferedBytes{bytes:result?,_tree:owner};
     rendered_headers.insert(

@@ -4,6 +4,8 @@ mod io;
 mod managed_request;
 mod owned_client;
 pub use owned_client::OwnedClientStream;
+mod connection_credits;
+pub use connection_credits::ConnectionCredits;
 mod managed_client;
 pub use managed_client::{ClientCredential,ClientCertificateRequest,ClientIdentityResolver,ManagedClientConfig,ManagedStream};
 mod raw;
@@ -92,10 +94,14 @@ struct Guard {
     name: ServerName<'static>,
     verifier: Arc<dyn ServerCertVerifier>,
     certs: Mutex<Certificates>,
+    connection_credits: Option<Arc<ConnectionCredits>>,
 }
 impl Guard {
+    fn retained_error(&self,error:stdio::Error)->stdio::Error {
+        connection_credits::retain_error(error,&self.connection_credits)
+    }
     fn check(&self) -> stdio::Result<()> {
-        match self.rejected.load(Ordering::Acquire) {
+        let result=match self.rejected.load(Ordering::Acquire) {
             0 => Ok(()),
             1 => Err(stdio::Error::new(
                 stdio::ErrorKind::PermissionDenied,
@@ -110,7 +116,7 @@ impl Guard {
                 "TLS certificate observation capacity exhausted",
             )),
             _ => Err(stdio::Error::other("TLS observer failed")),
-        }
+        };result.map_err(|e|self.retained_error(e))
     }
     fn reject(&self, reason: u8) {
         let _ = self
@@ -162,6 +168,7 @@ impl Guard {
         true
     }
     async fn verify_initial(&self, scope: &VerificationScope) -> stdio::Result<()> {
+        let result=async {
         let next = self
             .certs
             .lock()
@@ -169,34 +176,36 @@ impl Guard {
             .current
             .clone()
             .ok_or_else(|| stdio::Error::other("TLS certificate evidence missing"))?;
-        let verifier = self.verifier.clone();
-        let name = self.name.clone();
-        let valid = scope
-            .run(move || {
-                // The raw Arc owns exact bytes and their admission credit throughout
-                // real CPU execution, even when its async caller is abandoned.
-                let intermediates = next
-                    .intermediates()
-                    .map(CertificateDer::from)
-                    .collect::<Vec<_>>();
-                let valid = verifier
-                    .verify_server_cert(
-                        &CertificateDer::from(next.leaf()),
-                        &intermediates,
-                        &name,
-                        next.ocsp(),
-                        UnixTime::now(),
-                    )
-                    .is_ok();
-                (valid, next)
-            })
-            .await?;
-        if !valid.0 {
+        let input=ClientVerifyInput {next:Some(next),verifier:self.verifier.clone(),name:self.name.clone(),credits:self.connection_credits.clone()};
+        let valid=scope.run(move||input.verify()).await.map_err(|e|self.retained_error(e))?;
+        if !valid.valid {
             self.reject(2)
         }
         self.verification_ready.store(true, Ordering::Release);
         drop(valid);
         self.check()
+        }.await;
+        result.map_err(|e|self.retained_error(e))
+    }
+}
+struct ClientVerifyInput {
+    next:Option<Arc<raw::Chain>>,
+    verifier:Arc<dyn ServerCertVerifier>,
+    name:ServerName<'static>,
+    credits:Option<Arc<ConnectionCredits>>,
+}
+impl Drop for ClientVerifyInput { fn drop(&mut self) {} }
+struct ClientVerifyOutput {
+    valid:bool,
+    _next:Arc<raw::Chain>,
+    _credits:Option<Arc<ConnectionCredits>>,
+}
+impl ClientVerifyInput {
+    fn verify(mut self)->ClientVerifyOutput {
+        let next=self.next.as_ref().expect("owned verification input");
+        let intermediates=next.intermediates().map(CertificateDer::from).collect::<Vec<_>>();
+        let valid=self.verifier.verify_server_cert(&CertificateDer::from(next.leaf()),&intermediates,&self.name,next.ocsp(),UnixTime::now()).is_ok();
+        ClientVerifyOutput {valid,_next:self.next.take().expect("owned verification result"),_credits:self.credits.clone()}
     }
 }
 static INDEX: OnceLock<openssl::ex_data::Index<Ssl, Arc<Guard>>> = OnceLock::new();
@@ -395,6 +404,7 @@ pub struct ClientConfig {
     policy: Renegotiation,
     verifier: Arc<dyn ServerCertVerifier>,
     scope: Arc<VerificationScope>,
+    connection_credits: Option<Arc<ConnectionCredits>>,
 }
 enum ClientSuites { Modern, GoDefault, CbcOnly }
 const CLIENT_AEAD: &str = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
@@ -497,6 +507,7 @@ impl ClientConfig {
             policy,
             verifier,
             scope: VerificationScope::new(),
+            connection_credits: None,
         })
     }
     fn configured_connection(&self, name:ServerName<'static>, alpn:Option<&[u8]>) -> stdio::Result<(Ssl,Arc<Guard>)> {
@@ -520,6 +531,7 @@ impl ClientConfig {
             name,
             verifier: self.verifier.clone(),
             certs: Mutex::new(Certificates::default()),
+            connection_credits: self.connection_credits.clone(),
         });
         ssl.set_ex_data(guard_index().map_err(stdio::Error::other)?, guard.clone());
         unsafe {
@@ -532,6 +544,12 @@ impl ClientConfig {
     pub fn with_verification_scope(mut self, scope: Arc<VerificationScope>) -> Self {
         self.scope = scope;
         self
+    }
+    /// Per-call capsule. The shared base is unchanged; pure atomic metadata
+    /// ownership follows this connection's actual SSL objects and CPU jobs.
+    pub fn with_connection_credits(&self, credits: Arc<ConnectionCredits>) -> Self {
+        Self { context:self.context.clone(), policy:self.policy, verifier:self.verifier.clone(),
+            scope:self.scope.clone(), connection_credits:Some(credits) }
     }
     pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
@@ -546,6 +564,7 @@ impl ClientConfig {
         io: S,
         alpn: Option<&[u8]>,
     ) -> stdio::Result<Stream<S>> {
+        let result=async {
         let _entry = self.scope.enter()?;
         let (ssl, guard) = self.configured_connection(name, alpn)?;
         let mut inner = tokio_openssl::SslStream::new(
@@ -573,6 +592,8 @@ impl ClientConfig {
             ));
         }
         Ok(Stream { inner, guard })
+        }.await;
+        result.map_err(|e|connection_credits::retain_error(e,&self.connection_credits))
     }
 }
 

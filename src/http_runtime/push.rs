@@ -34,13 +34,15 @@ impl LinkPlan{
             headers.append(name,HeaderValue::from_bytes(value.as_bytes())?);
         }
     }
-    super::request::apply_push_headers(&mut headers,&config.headers,ctx)?;
+
     anyhow::ensure!(header_bytes(&headers).is_some(),"pushed request headers exceed limit");
     let replacement=super::headers_replace::prepare_owned(&config.headers,ctx,super::headers_replace::Scope::Original)?;
     Ok(Some((Self{headers,push:push.clone(),inner:inner.clone(),server:server.clone(),peer:ctx.peer.clone(),local:ctx.local.clone(),tls:ctx.tls,sni:ctx.push_sni.clone(),business:ctx.business.clone(),
         snapshot:ctx.req().extensions().get::<Arc<ConnectionSnapshot>>().cloned(),facts:ctx.req().extensions().get::<Arc<client_cert_facts::Cache>>().cloned(),details:ctx.req().extensions().get::<fastcgi::TlsDetails>().cloned(),access_tls:ctx.req().extensions().get::<Arc<access_log::Tls>>().cloned(),_credit:Bytes::from_owner(credit)},replacement)))
     })();
+    let view=ctx.lookup_view();let header_pool=ctx.resources.transfer_deadlines.clone();
     Box::pin(async move{let Some((mut plan,replacement))=prepared? else{return Ok(None)};
+        super::request::apply_push_headers_view(&mut plan.headers,&config.headers,view,header_pool).await?;
         super::headers_replace::apply_owned(&mut plan.headers,&config.headers,replacement,Some(65536)).await?;
         Ok(Some(Arc::new(plan)))
     })
@@ -125,12 +127,11 @@ pub(super) fn configured(server:&ServerConfig)->bool{
     routes(&server.routes)||routes(&server.errors)||server.named_routes.values().any(route)
 }
 
-pub(super) fn expand_target(ctx:&Context,raw:&str)->Result<(Vec<u8>,native_write_policy::Lease)>{
-    let credit=ctx.resources.transfer_deadlines.reserve(8<<20)?;
-    let remaining=std::cell::Cell::new(2usize<<20);
-    let output=crate::http_config::helpers::replace_bytes_accounted(raw,true,|name|Some(ctx.lookup_bytes(name).unwrap_or_else(||b".".to_vec())),|bytes|{
-        anyhow::ensure!(bytes<=128<<10,"push target replacement exceeds limit");
-        remaining.set(remaining.get().checked_sub(bytes).ok_or_else(||anyhow::anyhow!("push target replacement scratch exhausted"))?);Ok(())
-    })?;
-    anyhow::ensure!(output.len()<=65536,"push target exceeds limit");Ok((output,credit))
+pub(super) fn expand_target<'a>(ctx:&'a Context,raw:&'a str)->impl std::future::Future<Output=Result<(Bytes,native_write_policy::Lease)>>+Send+'a{
+    let view=ctx.lookup_view();let pool=ctx.resources.transfer_deadlines.clone();
+    async move{
+        let credit=pool.reserve(8<<20)?;
+        let output=view.expand_root_bytes_limited(raw,65536).await?;
+        Ok((output,credit))
+    }
 }

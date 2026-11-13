@@ -39,16 +39,17 @@ fn chosen<'a>(routes: &'a [ResponseRoute], response: &Response<Body>) -> Option<
     })
 }
 
-fn replacement_status(
-    ctx: &Context,
-    template: &str,
+fn replacement_status<'a>(
+    ctx: &'a Context,
+    template: &'a str,
     zero_original: bool,
-) -> Result<Option<StatusCode>> {
+) -> impl std::future::Future<Output=Result<Option<StatusCode>>>+Send+'a {
+    let view=ctx.lookup_view();async move{
     if template.is_empty() {
         return Ok(None);
     }
     let bad = || failure(StatusCode::INTERNAL_SERVER_ERROR);
-    let status = ctx.expand(template)?.parse::<i64>().map_err(|_| bad())?;
+    let status = view.expand_text_resolved(template,true).await?.parse::<i64>().map_err(|_| bad())?;
     if status == 0 && zero_original {
         return Ok(None);
     }
@@ -56,7 +57,7 @@ fn replacement_status(
         .ok()
         .and_then(|number| StatusCode::from_u16(number).ok());
     status.map(Some).ok_or_else(bad)
-}
+}}
 
 fn canonical_header(name: &HeaderName) -> String {
     let mut word_start = true;
@@ -123,7 +124,7 @@ pub(super) fn reverse_proxy<'a>(
             return finish(source, ctx, inner).await;
         };
         if !rule.status.is_empty() {
-            if let Some(status) = replacement_status(ctx, &rule.status, true)? {
+            if let Some(status) = replacement_status(ctx, &rule.status, true).await? {
                 *source.response.status_mut() = status;
             }
             return finish(source, ctx, inner).await;
@@ -156,7 +157,7 @@ pub(super) async fn copy_response(
         .proxy_response
         .take()
         .ok_or_else(|| failure(StatusCode::INTERNAL_SERVER_ERROR))?;
-    if let Some(status) = replacement_status(ctx, status, false)? {
+    if let Some(status) = replacement_status(ctx, status, false).await? {
         *source.response.status_mut() = status;
     }
     finish(*source, ctx, inner).await
@@ -236,7 +237,7 @@ async fn intercept_inner(
     publish(ctx, "http.intercept", original.status(), original.headers());
 
     let Some(routes) = &rule.routes else {
-        if let Some(status) = replacement_status(ctx, &rule.status, true)
+        if let Some(status) = replacement_status(ctx, &rule.status, true).await
             .unwrap_or(Some(StatusCode::INTERNAL_SERVER_ERROR))
         {
             *original.status_mut() = status;

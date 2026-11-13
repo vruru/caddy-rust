@@ -21,16 +21,17 @@ pub(super) async fn serve(
     sidecars: &SidecarPlan,
     browse: Option<&super::browse::BrowsePlan>,
 ) -> Result<Option<Response<Body>>> {
-    let root = ctx.expand(root.unwrap_or("{http.vars.root}"))?;
+    let root = ctx.expand_text_resolved(root.unwrap_or("{http.vars.root}"),true).await?;
     let decoded = decoded_path(ctx.req().uri().path())?;
+    ctx.reserve_text_copy(root.len().saturating_add(decoded.len()).saturating_mul(8).saturating_add(8192))?;
     let mut path = safe_join(std::path::Path::new(&root), &decoded)?;
     let stat_path = path.clone();
     let mut metadata = match ctx
         .resources
         .metadata
-        .run(move || std::fs::metadata(stat_path))
+        .run(super::map_runtime::text_job(ctx.text_owner(),move || std::fs::metadata(stat_path))?)
         .await
-        .map_err(|error| super::request::budget_failure(ctx, error))?
+        .map_err(|error| super::request::budget_failure(ctx, error))?.into_context(ctx)?
     {
         Ok(meta) => meta,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -39,14 +40,16 @@ pub(super) async fn serve(
         }
         Err(error) => return Err(super::request::file_io_failure(ctx, &error)),
     };
-    let hidden = HiddenPaths::prepare(ctx, hide)?;
+    let hidden = HiddenPaths::prepare(ctx, hide).await?;
     if hidden.matches(&path) {
         return Ok(None);
     }
     let mut implicit_index = false;
     if metadata.is_dir() {
         for index in indices {
-            let candidate = path.join(ctx.expand(index)?);
+            let index=ctx.expand_text_resolved(index,true).await?;
+            ctx.reserve_text_copy(path.as_os_str().len().saturating_add(index.len()).saturating_mul(8).saturating_add(8192))?;
+            let candidate = path.join(index);
             if hidden.matches(&candidate) {
                 continue;
             }
@@ -54,9 +57,9 @@ pub(super) async fn serve(
             let lookup = ctx
                 .resources
                 .metadata
-                .run(move || std::fs::metadata(stat_path))
+                .run(super::map_runtime::text_job(ctx.text_owner(),move || std::fs::metadata(stat_path))?)
                 .await
-                .map_err(|error| super::request::budget_failure(ctx, error))?;
+                .map_err(|error| super::request::budget_failure(ctx, error))?.into_context(ctx)?;
             if let Err(error) = &lookup
                 && super::request::descriptor_exhausted(error)
             {
@@ -146,16 +149,16 @@ pub(super) async fn serve(
     let (representation, admission) = ctx
         .resources
         .metadata
-        .run(move || {
+        .run(super::map_runtime::text_job(ctx.text_owner(),move || {
             let representation = super::file_sidecars::open(
                 &opened_path,
                 &choices,
                 suffixes.as_deref().unwrap_or_default(),
             )?;
             Ok::<_, OpenError>((representation, open_admission))
-        })
+        })?)
         .await
-        .map_err(|error| super::request::budget_failure(ctx, error))?
+        .map_err(|error| super::request::budget_failure(ctx, error))?.into_context(ctx)?
         .map_err(|error| match error {
             OpenError::Body(error) => super::request::file_io_failure(ctx, &error),
             OpenError::Etag(error) if super::request::descriptor_exhausted(&error) => {
@@ -522,11 +525,13 @@ pub(super) struct HiddenPaths {
     cwd: Option<std::path::PathBuf>,
 }
 impl HiddenPaths {
-    fn prepare(ctx: &Context, patterns: &[String]) -> Result<Self> {
+    fn prepare<'a>(ctx:&'a Context,patterns:&'a [String])->impl std::future::Future<Output=Result<Self>>+Send+'a{
+        let view=ctx.lookup_view();async move {
         let mut cwd = None;
         let mut resolved = Vec::with_capacity(patterns.len());
         for pattern in patterns {
-            let mut pattern = ctx.expand(pattern)?;
+            let mut pattern = view.expand_text_resolved(pattern,true).await?;
+            view.reserve_text_copy(pattern.len().saturating_mul(8).saturating_add(8192))?;
             if pattern.contains(std::path::MAIN_SEPARATOR) {
                 let candidate = std::path::Path::new(&pattern);
                 let absolute = if candidate.is_absolute() {
@@ -562,7 +567,7 @@ impl HiddenPaths {
             patterns: resolved,
             cwd,
         })
-    }
+    }}
     pub(super) fn matches(&self, path: &std::path::Path) -> bool {
         let absolute = self.cwd.as_ref().map(|cwd| cwd.join(path));
         let absolute = absolute.as_deref().unwrap_or(path).to_string_lossy();

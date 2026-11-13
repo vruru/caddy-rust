@@ -1204,17 +1204,11 @@ fn parse_handler(
                     );
                     mappings.push(MapEntry {
                         input: entry.get("input").map(|v| string(v, path)).transpose()?,
-                        regex: entry
-                            .get("input_regexp")
-                            .map(|v| {
-                                regex::Regex::new(
-                                    v.as_str().ok_or_else(|| {
-                                        anyhow::anyhow!("map regexp string required")
-                                    })?,
-                                )
-                                .map_err(|_| anyhow::anyhow!("invalid map regexp"))
-                            })
-                            .transpose()?,
+                        pattern: entry.get("input_regexp").filter(|v|!v.is_null()).map(|v|string(v,path)).transpose()?,
+                        regex: entry.get("input_regexp").filter(|v|!v.is_null()).map(|v|{
+                            let pattern=v.as_str().ok_or_else(||anyhow::anyhow!("map regexp string required"))?;
+                            if pattern.is_empty(){Ok(None)}else{header_compile::compile_map_static(pattern,regex_remaining).map(Some)}
+                        }).transpose()?.flatten(),
                         outputs,
                     });
                 }
@@ -1222,18 +1216,8 @@ fn parse_handler(
             let mut literals = std::collections::HashSet::new();
             let mut expressions = std::collections::HashSet::new();
             for mapping in &mut mappings {
-                if mapping
-                    .regex
-                    .as_ref()
-                    .is_some_and(|r| r.as_str().is_empty())
-                {
-                    mapping.regex = None;
-                }
-                if let Some(regex) = &mapping.regex {
-                    ensure!(
-                        expressions.insert(regex.as_str().to_owned()),
-                        "duplicate map regular expression"
-                    );
+                if let Some(pattern) = mapping.pattern.as_ref().filter(|p|!p.is_empty()) {
+                    ensure!(expressions.insert(pattern.clone()), "duplicate map regular expression");
                 } else {
                     let input = mapping.input.clone().unwrap_or_default();
                     ensure!(literals.insert(input.clone()), "duplicate map literal");
@@ -1252,12 +1236,12 @@ fn parse_handler(
                 defaults.is_empty() || defaults.len() == destinations.len(),
                 "map default length mismatch"
             );
-            Handler::Map {
-                source: string(required(m, "source")?, path)?,
-                destinations,
-                mappings,
-                defaults,
-            }
+            Handler::Map(Arc::new(MapPlan {
+                source: string(required(m, "source")?, path)?.into(),
+                destinations: destinations.into(),
+                mappings: mappings.into(),
+                defaults: defaults.into(),
+            }))
         }
         "authentication" => {
             deny_unknown(m, &["handler", "providers"], path)?;

@@ -134,8 +134,11 @@ async fn append(ctx: &mut Context, plan: &LogAppendConfig, headers: Option<&Head
         }
         return;
     }
-    let value = lookup(ctx, &plan.value, headers);
-    push(ctx, &plan.key, value);
+    if let Some((value,_temporary)) = lookup(ctx, &plan.value, headers).await {
+        push(ctx, &plan.key, value);
+    } else {
+        ctx.resources.access_capture.record_omitted();
+    }
 }
 
 fn body_value(placeholder: &str, bytes: Bytes) -> V {
@@ -177,75 +180,53 @@ fn header_value(headers: &HeaderMap, key: &str) -> V {
     V::RawString(value)
 }
 
-fn lookup(ctx: &Context, input: &str, headers: Option<&HeaderMap>) -> V {
-    if !(input.starts_with('{') && input.ends_with('}') && input.matches('{').count() == 1) {
-        return variable(ctx, input).unwrap_or_else(|| V::String(input.to_owned()));
-    }
-    let name = input.trim_matches(['{', '}']);
-    if let Some(name) = name.strip_prefix("http.vars.") {
-        return variable(ctx, name).unwrap_or(V::Null);
-    }
-    if let Some(name) = name.strip_prefix("http.response.header.") {
-        return header_value(headers.unwrap_or(&ctx.immediate), name);
-    }
-    if let Some(name) = name.strip_prefix("http.request.header.") {
-        if name.eq_ignore_ascii_case("host") {
-            // Go stores the request Host outside req.Header.
-            return V::String(String::new());
+async fn lookup(ctx: &mut Context, input: &str, headers: Option<&HeaderMap>) -> Option<(V,Option<OwnedSemaphorePermit>)> {
+    // Only the final replacer fallback can run a lazy Map. Typed logging values
+    // remain typed, and no Map is touched for a literal or a known primitive.
+    let primitive=(|| -> Option<V> {
+        if !(input.starts_with('{') && input.ends_with('}') && input.matches('{').count() == 1) {
+            return Some(variable(ctx, input).unwrap_or_else(|| V::String(input.to_owned())));
         }
-        return ctx.request.as_ref().map_or_else(
-            || V::String(String::new()),
-            |request| header_value(request.headers(), name),
-        );
-    }
-    if name == "http.shutting_down" {
-        return V::Bool(ctx.business.generation().shutting_down());
-    }
-    if let Some(elapsed) = ctx.access_start.map(|start| start.elapsed()) {
-        match name {
-            "http.request.duration" => {
-                return V::Duration(i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX));
+        let name=input.trim_matches(['{','}']);
+        if let Some(name)=name.strip_prefix("http.vars.") {
+            if let Some(value)=variable(ctx,name){return Some(value)}
+        }
+        if let Some(name)=name.strip_prefix("http.response.header."){return Some(header_value(headers.unwrap_or(&ctx.immediate),name))}
+        if let Some(name)=name.strip_prefix("http.request.header."){
+            if name.eq_ignore_ascii_case("host"){return Some(V::String(String::new()))}
+            return Some(ctx.request.as_ref().map_or_else(||V::String(String::new()),|request|header_value(request.headers(),name)))
+        }
+        if name=="http.shutting_down"{return Some(V::Bool(ctx.business.generation().shutting_down()))}
+        if let Some(elapsed)=ctx.access_start.map(|start|start.elapsed()){
+            match name{
+                "http.request.duration"=>return Some(V::Duration(i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX))),
+                "http.request.duration_ms"=>return Some(V::F64(elapsed.as_secs_f64()*1e3)),_=>{}
             }
-            "http.request.duration_ms" => return V::F64(elapsed.as_secs_f64() * 1e3),
-            _ => {}
         }
-    }
-    if let Some(key) = name.strip_prefix("http.request.uri.query.") {
-        let mut joined = String::new();
-        if let Some(query) = ctx
-            .request
-            .as_ref()
-            .and_then(|request| request.uri().query())
-        {
-            for (index, (_, value)) in url::form_urlencoded::parse(query.as_bytes())
-                .filter(|(name, _)| name == key)
-                .enumerate()
-            {
-                if index > 0 {
-                    joined.push(',');
+        if let Some(key)=name.strip_prefix("http.request.uri.query."){
+            let mut joined=String::new();
+            if let Some(query)=ctx.request.as_ref().and_then(|request|request.uri().query()){
+                for(index,(_,value))in url::form_urlencoded::parse(query.as_bytes()).filter(|(name,_)|name==key).enumerate(){
+                    if index>0{joined.push(',')}joined.push_str(&value)
                 }
-                joined.push_str(&value);
             }
+            return Some(V::String(joined))
         }
-        return V::String(joined);
-    }
-    let Some(value) = ctx.lookup(name) else {
-        return V::Null;
+        None
+    })();
+    if let Some(value)=primitive{return Some((value,None))}
+    let name=input.trim_matches(['{','}']);
+    let Some(value)=ctx.lookup_typed_resolved(name).await.ok()? else{return Some((V::Null,None))};
+    if value.null{return Some((V::Null,None))}
+    // Reserve the copy before allocation. The temporary stays alive until push
+    // has acquired the access-log field's own last-owner permit.
+    let credit=ctx.resources.access_capture.reserve(value.bytes.len().saturating_add(128))?;
+    let value=match std::str::from_utf8(&value.bytes){
+        Ok(text) if name=="http.error"=>V::Error(text.to_owned()),
+        Ok(text) if matches!(name,"http.error.status_code"|"http.request.port"|"http.request.local.port"|"http.request.remote.port")=>text.parse::<i64>().map_or_else(|_|V::String(text.to_owned()),V::I64),
+        Ok(text)=>V::String(text.to_owned()),Err(_)=>V::RawString(value.bytes.to_vec()),
     };
-    if name == "http.error" {
-        return V::Error(value);
-    }
-    if matches!(
-        name,
-        "http.error.status_code"
-            | "http.request.port"
-            | "http.request.local.port"
-            | "http.request.remote.port"
-    ) && let Ok(number) = value.parse::<i64>()
-    {
-        return V::I64(number);
-    }
-    V::String(value)
+    Some((value,Some(credit)))
 }
 
 fn json_cost(value: &Value, depth: usize) -> usize {

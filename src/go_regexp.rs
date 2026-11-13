@@ -77,6 +77,26 @@ impl GoRegexp {
             .build()
             .parse(&pattern)
             .map_err(|_| anyhow!("regexp compilation failed after native translation"))?;
+        Self::from_hir(hir,Some(names),limit)
+    }
+    /// Preserve the pre-existing Rust-regex Map extensions only when Go syntax
+    /// rejected the expression. Admission precedes Rust AST/HIR allocation;
+    /// Go-valid patterns always retain their Go flags, classes and expansion.
+    pub(crate) fn compile_map_extension_preflight(pattern:&str,memory_limit:usize,before_parse:impl FnOnce(NativeCompileSize)->Result<()>)->Result<Self>{
+        let limit=memory_limit.min(MAX_PATTERN_MEMORY);
+        ensure!(limit>=1024,"regexp compile memory limit too small");
+        ensure!(pattern.len()<=1<<20,"regexp source byte limit exceeded");
+        let bytes=pattern.as_bytes();
+        let unicode_atoms=bytes.iter().filter(|b|matches!(b,b'.'|b'['|b'\\')).count();
+        before_parse(NativeCompileSize{
+            bytes:pattern.len(),nodes:pattern.len().saturating_mul(2).saturating_add(16),
+            ranges:unicode_atoms.checked_mul(8192).ok_or_else(||anyhow!("regexp native class size overflow"))?,
+            captures:pattern.len()/2+1,
+        })?;
+        let hir=regex_syntax::ParserBuilder::new().utf8(true).nest_limit(250).build().parse(pattern)?;
+        Self::from_hir(hir,None,limit)
+    }
+    fn from_hir(hir:regex_syntax::hir::Hir,names:Option<Vec<Option<Box<str>>>>,limit:usize)->Result<Self>{
         let maximum_match = hir.properties().maximum_len();
         // PikeVM allocates two state×capture-slot tables at cache creation.
         // Bound them using the same Thompson NFA before constructing meta,
@@ -98,6 +118,7 @@ impl GoRegexp {
             .and_then(|n| n.checked_add(8 * HYBRID_CACHE))
             .filter(|n| *n <= MAX_SEARCH_MEMORY)
             .ok_or_else(|| anyhow!("regexp native search memory limit exceeded"))?;
+        let names=names.unwrap_or_else(||proof.group_info().pattern_names(regex_automata::PatternID::ZERO).map(|name|name.map(Box::<str>::from)).collect());
         drop(proof);
         let native = meta::Regex::builder()
             .configure(
@@ -319,6 +340,42 @@ impl GoRegexp {
                 return Ok(matched.is_some());
             }
         }
+    }
+    /// Closed map callers prepay the actual dollar-program/capture shape.
+    pub(crate) fn replacement_compile_upper(&self,text:&[u8])->Result<usize>{
+        let(mut at,mut parts)=(0usize,0usize);
+        while let Some(mark)=text[at..].iter().position(|b|*b==b'$'){
+            let mark=at+mark;if mark>at{parts=parts.checked_add(1).ok_or_else(||anyhow!("map replacement shape overflow"))?;}
+            at=mark+1;parts=parts.checked_add(1).ok_or_else(||anyhow!("map replacement shape overflow"))?;
+            if text[at..].starts_with(b"$"){at+=1;}else if let Some((_,after))=extract(text,at){at=after;}
+        }
+        if at<text.len(){parts=parts.checked_add(1).ok_or_else(||anyhow!("map replacement shape overflow"))?;}
+        let capacity=if parts==0{0}else{parts.checked_next_power_of_two().ok_or_else(||anyhow!("map replacement shape overflow"))?.max(4)};
+        let names=self.names.len();
+        capacity.checked_mul(std::mem::size_of::<Part>()*2)
+            .and_then(|n|n.checked_add(names.div_ceil(5).saturating_add(3).saturating_mul(1024)))
+            .and_then(|n|n.checked_add(names.saturating_mul(320)))
+            .and_then(|n|n.checked_add(text.len().saturating_mul(3)))
+            .and_then(|n|n.checked_add(16384)).ok_or_else(||anyhow!("map replacement shape overflow"))
+    }
+    pub(crate) fn capture_memory_upper(&self)->usize{self.names.len().saturating_mul(128).saturating_add(16384)}
+    /// Construct the dollar program and admit output only after a real match.
+    /// The closed CPU caller returns the output owner alongside its bytes.
+    pub(crate) fn expand_first_lazy<P:AsRef<Replacement>,O>(
+        &self,original:&[u8],cap:usize,budget:&mut ReplaceBudget,
+        make:impl FnOnce()->Result<(P,O)>,
+    )->Result<Option<(Vec<u8>,O)>>{
+        budget.check()?;
+        if self.search_memory>budget.scratch{return Err(OperationError::ByteLimit.into())}
+        let input=Normalized::new(original,budget)?;
+        let mut caps=self.native.create_captures();let mut cache=self.native.create_cache();
+        if !self.search_captures(&input.text,0,&mut cache,&mut caps,budget)?{return Ok(None)}
+        let(program,owner)=make()?;let replacement=program.as_ref();
+        if !Arc::ptr_eq(&self.identity,&replacement.identity){return Err(OperationError::MatchInvariant.into())}
+        let mut named=vec![None;replacement.named.len()];
+        let mut output=Output{bytes:Vec::new(),cap,truncate:false};
+        replacement.append(original,&input,&caps,&mut named,&mut output,budget)?;
+        budget.check()?;Ok(Some((output.bytes,owner)))
     }
     pub(crate) fn replace_all(
         &self,

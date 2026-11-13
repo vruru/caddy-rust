@@ -53,32 +53,19 @@ impl Args {
             bytes: 0,
         })
     }
-    fn expand(&mut self, ctx: &Context, text: &str, known: bool) -> Result<Vec<u8>> {
-        let overflow = std::cell::Cell::new(false);
-        let out = replace_bytes_accounted(
-            text,
-            !known,
-            |name| {
-                if ctx.values.get(name).is_some_and(|v| v.len() > ops::CAP) {
-                    overflow.set(true);
-                    None
-                } else {
-                    ctx.lookup_bytes(name)
-                }
-            },
-            |n| {
-                self.leases.push(self.pool.reserve(n + 64)?);
-                Ok(())
-            },
-        )?;
-        ensure!(!overflow.get(), "rewrite placeholder exceeds limit");
-        self.bytes = self
-            .bytes
-            .checked_add(out.len())
-            .filter(|n| *n <= ops::CAP)
-            .ok_or_else(|| anyhow::anyhow!("rewrite expanded arguments exceed limit"))?;
+    async fn expand(&mut self,view:super::request::ReplacerView<'_>,text:&str,known:bool)->Result<Vec<u8>>{
+        let out=view.expand_resolved(text,!known).await?;
+        self.bytes=self.bytes.checked_add(out.len()).filter(|n|*n<=ops::CAP).ok_or_else(||anyhow::anyhow!("rewrite expanded arguments exceed limit"))?;
+        self.leases.push(self.pool.reserve(out.len().saturating_mul(2)+1024)?);
+        Ok(out.to_vec())
+    }
+    async fn pairs(&mut self,view:super::request::ReplacerView<'_>,list:&[RewriteArgument],skip_empty:bool)->Result<Vec<(Vec<u8>,Vec<u8>)>>{
+        self.leases.push(self.pool.reserve(list.len().saturating_mul(128)+1024)?);
+        let mut out=Vec::with_capacity(list.len());
+        for v in list{let key=self.expand(view,&v.key,false).await?;if skip_empty&&key.is_empty(){continue}out.push((key,self.expand(view,&v.val,false).await?));}
         Ok(out)
     }
+
 }
 enum Op {
     Identity,
@@ -247,7 +234,7 @@ async fn apply_plan(
     let original_uri = ctx.req().uri().clone();
     let original_projection = projection(ctx.req()).cloned();
     if !plan.method.is_empty() {
-        method = ctx.expand(&plan.method)?.to_uppercase().parse::<Method>()?;
+        method = ctx.expand_text_resolved(&plan.method,true).await?.to_uppercase().parse::<Method>()?;
         if !upstream {
             *ctx.req_mut().method_mut() = method.clone();
         }
@@ -265,7 +252,7 @@ async fn apply_plan(
     ] {
         if !pattern.is_empty() {
             let mut args = Args::new(ctx.resources.rewrite_bytes.clone())?;
-            let pattern = args.expand(ctx, pattern, false)?;
+            let pattern = args.expand(ctx.lookup_view(), pattern, false).await?;
             advance(
                 ctx,
                 &mut current,
@@ -281,8 +268,8 @@ async fn apply_plan(
             continue;
         }
         let mut args = Args::new(ctx.resources.rewrite_bytes.clone())?;
-        let find = args.expand(ctx, &rule.find, false)?;
-        let replace = args.expand(ctx, &rule.replace, false)?;
+        let find = args.expand(ctx.lookup_view(), &rule.find, false).await?;
+        let replace = args.expand(ctx.lookup_view(), &rule.replace, false).await?;
         let merge = !rule.find.contains("//");
         advance(
             ctx,
@@ -296,7 +283,7 @@ async fn apply_plan(
     for rule in &plan.path_regexp {
         let Some(regex) = &rule.regex else { continue };
         let mut args = Args::new(ctx.resources.rewrite_bytes.clone())?;
-        let replacement = args.expand(ctx, &rule.replace, false)?;
+        let replacement = args.expand(ctx.lookup_view(), &rule.replace, false).await?;
         advance(
             ctx,
             &mut current,
@@ -308,39 +295,20 @@ async fn apply_plan(
     }
     if let Some(query) = &plan.query {
         let mut args = Args::new(ctx.resources.rewrite_bytes.clone())?;
-        let (rename, set, add) = {
-            let mut pairs =
-                |list: &[RewriteArgument], skip_empty: bool| -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-                    let mut out = Vec::with_capacity(list.len());
-                    for v in list {
-                        let key = args.expand(ctx, &v.key, false)?;
-                        if skip_empty && key.is_empty() {
-                            continue;
-                        }
-                        out.push((key, args.expand(ctx, &v.val, false)?));
-                    }
-                    Ok(out)
-                };
-            (
-                pairs(&query.rename, false)?,
-                pairs(&query.set, true)?,
-                pairs(&query.add, true)?,
-            )
-        };
+        let rename=args.pairs(ctx.lookup_view(),&query.rename,false).await?;
+        let set=args.pairs(ctx.lookup_view(),&query.set,true).await?;
+        let add=args.pairs(ctx.lookup_view(),&query.add,true).await?;
         let mut replace = Vec::with_capacity(query.replace.len());
         for r in &query.replace {
             replace.push((
-                args.expand(ctx, &r.key, false)?,
-                args.expand(ctx, &r.search, true)?,
-                args.expand(ctx, &r.replace, true)?,
+                args.expand(ctx.lookup_view(), &r.key, false).await?,
+                args.expand(ctx.lookup_view(), &r.search, true).await?,
+                args.expand(ctx.lookup_view(), &r.replace, true).await?,
                 r.regex.clone(),
             ));
         }
-        let delete = query
-            .delete
-            .iter()
-            .map(|v| args.expand(ctx, v, false))
-            .collect::<Result<_>>()?;
+        let mut delete=Vec::with_capacity(query.delete.len());
+        for value in &query.delete{delete.push(args.expand(ctx.lookup_view(),value,false).await?);}
         advance(
             ctx,
             &mut current,
@@ -418,7 +386,7 @@ async fn setter(plan: &Arc<RewritePlan>, ctx: &mut Context) -> Result<Projection
                 !ctx.values.get(name).is_some_and(|v| v.len() > ops::CAP),
                 "rewrite placeholder exceeds limit"
             );
-            if let Some(value) = ctx.lookup_bytes(name) {
+            if let Some(value) = ctx.lookup_resolved(name).await? {
                 ensure!(value.len() <= ops::CAP, "rewrite placeholder exceeds limit");
                 args.bytes = args
                     .bytes
@@ -427,7 +395,7 @@ async fn setter(plan: &Arc<RewritePlan>, ctx: &mut Context) -> Result<Projection
                     .ok_or_else(|| anyhow::anyhow!("rewrite snapshot limit exceeded"))?;
                 args.leases
                     .push(pool.reserve(name.len() * 2 + value.len() * 2 + 1024)?);
-                values.insert(name.to_owned(), value);
+                values.insert(name.to_owned(), value.to_vec());
             }
         }
         at = end + 1;
