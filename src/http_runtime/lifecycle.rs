@@ -917,6 +917,7 @@ impl HttpRuntime {
         self.inner.tasks.close();
         self.inner.upgrades.close();
         self.inner.resources.close();
+        self.inner.resources.cancel_work();
     }
 }
 

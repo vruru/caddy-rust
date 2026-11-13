@@ -453,11 +453,11 @@ impl Resources {
         })
     }
     pub(crate) fn close(&self) {
-        // Listener/request admission closes here. Existing SSL records must
-        // remain usable while the outer HTTP tasks drain gracefully.
+        // The HTTP lifecycle has fenced incoming work. Existing requests may
+        // still produce DNS, template and crypto descendants while draining.
+        // Closing a tracker is non-cancelling; cancellation/admission fences
+        // for those resources belong after the outer requests have joined.
         self.cel_compile.tasks.close();
-        self.proxy_cleanup.close();
-        self.proxy_dns.close();
         self.auth_tasks.close();
         self.auth.tasks.close();
         self.metadata.tasks.close();
@@ -465,7 +465,6 @@ impl Resources {
         self.reads.tasks.close();
         self.fastcgi.tasks.close();
         self.compression.close();
-        self.templates.close();
         self.proxy_selection.tasks.close();
         self.request_regexp.tasks.close();
         self.directory_listing.tasks.close();
@@ -473,11 +472,19 @@ impl Resources {
         self.fastcgi_spool_io.tasks.close();
         self.fastcgi_admission.diagnostics.close();
     }
+    /// Called only after HTTP owners join, or immediately for explicit force.
+    /// It is idempotent, and does not refund a real worker's retained credit.
+    pub(crate) fn cancel_work(&self) {
+        self.ssl_verify.close();
+        self.proxy_cleanup.close();
+        self.proxy_dns.close();
+        self.templates.close();
+    }
     pub(crate) async fn wait(&self) {
         // shutdown_wait joins HTTP connections and upgrades before this call.
         // No outer transport can register a new crypto step after this fence;
         // cancelled/detached blocking results still carry their own tokens.
-        self.ssl_verify.close();
+        self.cancel_work();
         self.ssl_verify.wait().await;
         self.cel_compile.tasks.wait().await;
         self.proxy_cleanup.wait().await;

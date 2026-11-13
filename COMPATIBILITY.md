@@ -1147,3 +1147,18 @@ The SSL object moves through bounded CPU steps; socket I/O stays asynchronous. P
 The small native-openssl-src builder obtains unchanged OpenSSL C sources from exact openssl-src400.0.2+4.0.3. Its tls-deprecated-ec build feature makes legacy certificate curves such as P224 available without adding them to configured/default key-exchange groups or enabling TLS1.0/1.1. P224 certificates work when the peer explicitly advertises that curve. Native retains RFC8422's requirement that EC certificate curves respect the peer's supported groups. The pinned Go pair accepted P224 without advertising it; that observed difference is recorded separately and does not cause weaker SSL verification. Security policy is local to the explicit compatibility context; no global security level is changed.
 
 Isolated actual-main checks cover four suites, selection/preference, modern and TLS1.3 controls, Caddyfile, P224/P256/P384/P521/Ed25519 and RSA1024 through RSA8192, leaves above64KiB, same-connection exporters, mTLS and invalid CertificateVerify, modified CBC ciphertext, session/ticket rotation, real reason1 plus restart, real ACME TLS-ALPN-01 proof, parallel large keys, reload, graceful drain and hard-stop. Evidence and fixtures stay local. Remaining client_certificate_automate, issuer and PKIX work is separate; this addition does not claim complete TLS compatibility.
+
+
+Graceful in-flight resource retirement
+-------------------------------------
+
+Closing incoming HTTP admission no longer cancels the shared DNS or template
+resources needed by requests already executing. Their cancellation-bearing
+fences, proxy cleanup admission and crypto admission close after HTTP connection
+and upgrade owners have joined, then real workers and detached results retire.
+An in-flight dynamic-upstream DNS query or template include may finish within
+the configured grace period. New external requests remain fenced; a finite
+grace deadline still forces blocked requests to stop. Resource retirement does
+not substitute an artificial timeout for a configured unlimited drain.
+Explicit force shutdown and runtime drop close cancellation-bearing resources
+immediately, independently of whether the caller subsequently waits for joins.
