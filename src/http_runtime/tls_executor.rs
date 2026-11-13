@@ -167,7 +167,17 @@ struct TrackedHandshake<F> {
     // A closed executor cannot finish waiting while a spawn has been admitted
     // but not yet submitted. The actual payload and permits drop before this.
     _token: TaskTrackerToken,
+    // Exact connector receipt drops after the actual future, running permit,
+    // proof cleanup and executor tracker, including an abandoned spawn.
+    _connector: Option<crate::outgoing_tls::ConnectionLease>,
 }
+/// A closed connection handoff, not a generic destructor/callback extension.
+/// Admission cancellation must destroy the real input before its receipt.
+struct ConnectorInput<F> {
+    future: Option<F>,
+    receipt: Option<crate::outgoing_tls::ConnectionLease>,
+}
+impl<F> Drop for ConnectorInput<F> { fn drop(&mut self) {} }
 fn deadline_elapsed() -> anyhow::Error {
     io::Error::new(io::ErrorKind::TimedOut, "TLS handshake deadline elapsed").into()
 }
@@ -296,7 +306,7 @@ impl TlsExecutor {
         caller_cancel: CancellationToken,
         deadline: Option<Instant>,
     ) -> Result<T> {
-        self.execute_lane(future, caller_cancel, deadline, false)
+        self.execute_lane(ConnectorInput { future: Some(future), receipt: None }, caller_cancel, deadline, false)
             .await
     }
     /// CA validation has its own admission budget: ordinary clients waiting for
@@ -307,12 +317,20 @@ impl TlsExecutor {
         caller_cancel: CancellationToken,
         deadline: Option<Instant>,
     ) -> Result<T> {
-        self.execute_lane(future, caller_cancel, deadline, true)
+        self.execute_lane(ConnectorInput { future: Some(future), receipt: None }, caller_cancel, deadline, true)
             .await
+    }
+    pub(crate) async fn execute_connector<T: Send + 'static>(
+        &self,
+        future: impl Future<Output = Result<T>> + Send + 'static,
+        caller_cancel: CancellationToken,
+        receipt: crate::outgoing_tls::ConnectionLease,
+    ) -> Result<T> {
+        self.execute_lane(ConnectorInput { future: Some(future), receipt: Some(receipt) }, caller_cancel, None, false).await
     }
     async fn execute_lane<T: Send + 'static>(
         &self,
-        future: impl Future<Output = Result<T>> + Send + 'static,
+        input: ConnectorInput<impl Future<Output = Result<T>> + Send + 'static>,
         caller_cancel: CancellationToken,
         deadline: Option<Instant>,
         proof: bool,
@@ -417,13 +435,15 @@ impl TlsExecutor {
         };
         let shared = self.shared.clone();
         let worker_cancel = cancel.clone();
+        let mut input = input;
         let tracked = TrackedHandshake {
             job: HandshakeJob {
-                future: Some(Box::pin(future)),
+                future: Some(Box::pin(input.future.take().expect("owned connector input"))),
                 permit: Some(permit),
                 proof: None,
             },
             _token: token,
+            _connector: input.receipt.take(),
         };
         // Even a stopped runtime can drop the submitted future immediately.
         // Submit outside the fence and move the complete envelope so that an

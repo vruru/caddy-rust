@@ -67,7 +67,7 @@ fn maximum_children(minimum_loan: usize) -> Result<usize> {
         .checked_div(minimum_loan)
         .ok_or_else(|| crate::cert_transient::ResourceDenied.into())
 }
-fn minimum_connection_loan() -> Result<usize> {
+fn minimum_connection_payload() -> Result<usize> {
     // Every execute child is created only after both admission stages succeed.
     // Ignore positive Call/service/request/future/result sizes for this lower
     // bound, including calls that have not yet acquired an executor queue slot.
@@ -79,6 +79,16 @@ fn minimum_connection_loan() -> Result<usize> {
         128,
         EXECUTOR_HANDOFF,
     ])
+}
+fn physical_work_bytes() -> Result<usize> {
+    metadata_sum(&[
+        std::mem::size_of::<PhysicalWork>(),
+        2 * std::mem::size_of::<usize>(), // new physical Arc control block
+        2 * std::mem::size_of::<Option<ConnectionLease>>(), // input + tracked executor receipt
+    ])
+}
+fn minimum_connection_loan() -> Result<usize> {
+    metadata_sum(&[minimum_connection_payload()?, physical_work_bytes()?])
 }
 fn cancellation_children_bytes(children: usize) -> Result<usize> {
     // Rust 1.100 RawVec::grow_amortized: before growth oldcap < required <= N;
@@ -96,7 +106,19 @@ fn scope_metadata_bytes() -> Result<usize> {
         std::mem::size_of::<Scope>(),
         std::mem::size_of::<ScopeOwner>(),
         CHILD_PRIMITIVES,
+        physical_tracker_bytes()?,
         cancellation_children_bytes(maximum_children(minimum_connection_loan()?)?)?,
+    ])
+}
+// Pinned tokio-util 0.7.20 TaskTrackerInner is AtomicUsize + Notify;
+// include its Arc control block and maximum field alignment padding. This
+// second tracker has no task-spawn or cancellation-tree allocation of its own.
+fn physical_tracker_bytes() -> Result<usize> {
+    metadata_sum(&[
+        std::mem::size_of::<std::sync::atomic::AtomicUsize>(),
+        std::mem::size_of::<tokio::sync::Notify>(),
+        2 * std::mem::size_of::<usize>(),
+        std::mem::align_of::<tokio::sync::Notify>(),
     ])
 }
 fn master_metadata_bytes() -> Result<usize> {
@@ -200,6 +222,7 @@ impl Master {
             closed: Mutex::new(false),
             stop: self.stop.child_token(),
             tasks: TaskTracker::new(),
+            physical: TaskTracker::new(),
             _metadata: loan,
         };
         if self.stop.is_cancelled() {
@@ -274,6 +297,7 @@ pub(crate) struct Scope {
     closed: Mutex<bool>,
     stop: CancellationToken,
     tasks: TaskTracker,
+    physical: TaskTracker,
     _metadata: Loan,
 }
 impl Scope {
@@ -283,6 +307,14 @@ impl Scope {
         }
         self.stop.cancel();
         self.tasks.close();
+        self.physical.close();
+    }
+    /// Tested native Unix connector/DNS/result/IO work only. The scope must
+    /// first be closed; metadata-only retained errors intentionally do not
+    /// keep this fence alive. Existing wait() remains the full owner fence.
+    #[cfg(unix)]
+    pub(crate) async fn wait_physical(&self) {
+        self.physical.wait().await;
     }
     pub(crate) async fn wait(&self) {
         self.tasks.wait().await;
@@ -305,11 +337,12 @@ impl Scope {
     pub(crate) fn connection_with_issuer_owner(self: &Arc<Self>, bytes: usize, owner: crate::acme_wire::ClientOwner) -> Result<ConnectionLease> {
         // Every scope child pays this checked minimum, including callers that
         // have not entered the executor queue. Parent Vec bounds rely on it.
-        Ok(ConnectionLease(self.admit(metadata_sum(&[bytes, minimum_connection_loan()?])?,owner)?))
+        self.admit(metadata_sum(&[bytes, minimum_connection_payload()?])?,owner)
     }
-    fn admit(self: &Arc<Self>, bytes: usize,issuer_owner:crate::acme_wire::ClientOwner) -> Result<Arc<Life>> {
-        let loan = self.master.loan(bytes)?;
-        let (global, local) = {
+    fn admit(self: &Arc<Self>, bytes: usize,issuer_owner:crate::acme_wire::ClientOwner) -> Result<ConnectionLease> {
+        // Both connector and DNS callers use this same preallocation fence.
+        let loan = self.master.loan(metadata_sum(&[bytes, physical_work_bytes()?])?)?;
+        let (global, local, physical) = {
             let master = self
                 .master
                 .closed
@@ -322,16 +355,18 @@ impl Scope {
             if *master || *child || self.stop.is_cancelled() {
                 return Err(ConnectionControl::Stopped.into());
             }
-            (self.master.tasks.token(), self.tasks.token())
+            (self.master.tasks.token(), self.tasks.token(), self.physical.token())
         };
-        Ok(Arc::new(Life {
+        let life = Arc::new(Life {
             scope: self.clone(),
             input: loan,
             extra: Mutex::new(None),
             _issuer_owner:issuer_owner,
             _global: global,
             _local: local,
-        }))
+        });
+        let work = Arc::new(PhysicalWork { _life: life.clone(), _token: physical });
+        Ok(ConnectionLease { life, work })
     }
 }
 struct Life {
@@ -367,15 +402,33 @@ impl Life {
 }
 /// Concrete, finite connection credit and task residency. No Process or arbitrary
 /// callback is retained. Clones share the same actual allocation/credit owner.
+// Metadata is kept separately: errors own Life but never PhysicalWork.
+// Each real worker/result/IO keeps this complete lease until actual destruction.
+struct PhysicalWork {
+    _life: Arc<Life>,
+    _token: TaskTrackerToken,
+}
 #[derive(Clone)]
-pub(crate) struct ConnectionLease(Arc<Life>);
+pub(crate) struct ConnectionLease {
+    life: Arc<Life>,
+    work: Arc<PhysicalWork>,
+}
+/// A completed operation's error data may retain its original metadata loan.
+/// It cannot be used to start work, poll IO or fabricate a physical receipt.
+pub(crate) struct ConnectionMetadata(Arc<Life>);
 impl ConnectionLease {
-    pub(crate) fn grow(&self, bytes: usize) -> Result<()> { self.0.grow(bytes) }
-    pub(crate) fn cancellation(&self) -> CancellationToken { self.0.scope.stop.clone() }
-    pub(crate) fn error(&self, error: Error) -> Error { self.0.error(error) }
-    pub(crate) fn lifetime(&self) -> Lifetime { Lifetime::new(self.0.clone()) }
+    pub(crate) fn grow(&self, bytes: usize) -> Result<()> { self.life.grow(bytes) }
+    pub(crate) fn cancellation(&self) -> CancellationToken { self.life.scope.stop.clone() }
+    pub(crate) fn error(&self, error: Error) -> Error { self.life.error(error) }
+    pub(crate) fn lifetime(&self) -> Lifetime { Lifetime::new(self.clone()) }
     pub(crate) fn bytes(&self, bytes: usize) -> Result<ConnectionBytes> {
-        Ok(ConnectionBytes { loan: self.0.scope.master.loan(bytes)?, master: self.0.scope.master.clone() })
+        Ok(ConnectionBytes { loan: self.life.scope.master.loan(bytes)?, master: self.life.scope.master.clone() })
+    }
+    // Closed DNS completion path only; call after the real blocking Job joins.
+    pub(crate) fn into_metadata(self) -> ConnectionMetadata {
+        let Self { life, work } = self;
+        drop(work);
+        ConnectionMetadata(life)
     }
 }
 /// Mutable owned-buffer credit: only an exclusively owned worker grows it.
@@ -412,13 +465,13 @@ impl std::error::Error for RetainedError {
 }
 pub(crate) struct Lifetime {
     stopped: Pin<Box<dyn Future<Output = ()> + Send + Sync>>,
-    _life: Arc<Life>,
+    _lease: ConnectionLease,
 }
 impl Lifetime {
-    fn new(life: Arc<Life>) -> Self {
+    fn new(lease: ConnectionLease) -> Self {
         Self {
-            stopped: Box::pin(life.scope.stop.clone().cancelled_owned()),
-            _life: life,
+            stopped: Box::pin(lease.life.scope.stop.clone().cancelled_owned()),
+            _lease: lease,
         }
     }
     pub(crate) fn poll_stopped(&mut self, cx: &mut Context<'_>) -> bool {
@@ -456,7 +509,7 @@ pub(crate) struct ConnectService<S> {
 struct Call<S, R> {
     service: Option<S>,
     request: Option<R>,
-    life: Arc<Life>,
+    life: ConnectionLease,
 }
 impl<S, R> Drop for Call<S, R> {
     fn drop(&mut self) {}
@@ -466,7 +519,7 @@ where
     S: Service<R, Response = Connection, Error = Error>,
 {
     async fn run(mut self) -> Result<Connection, Error> {
-        if self.life.scope.stop.is_cancelled() {
+        if self.life.life.scope.stop.is_cancelled() {
             return Err(self.life.error(Box::new(ConnectionControl::Stopped)));
         }
         // Readiness belongs to this exact owned clone. Both poll_ready and
@@ -545,12 +598,13 @@ where
         let worker_size = std::mem::size_of_val(&future);
         let executor = self.executor.clone();
         let stop = self.scope.stop.clone();
-        let retained = life.clone();
+        let retained = life.life.clone();
+        let retirement = life.clone();
         let outcome = async move {
             // Preserve inner network/readiness errors as values. Only the
             // outer Err can originate in our local executor admission/control.
             match executor
-                .execute(async move { Ok(future.await) }, stop, None)
+                .execute_connector(async move { Ok(future.await) }, stop, retirement)
                 .await
             {
                 Ok(result) => result,

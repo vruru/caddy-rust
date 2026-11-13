@@ -1,7 +1,7 @@
 //! Scoped owned system DNS. Rust buffers are admitted before allocation;
 //! libc/NSS allocations stay provider-owned, not a claimed Rust/RSS allowance.
 use super::http_dial::{Family, FamilyAddrs};
-use crate::outgoing_tls::{ConnectionBytes, ConnectionLease};
+use crate::outgoing_tls::{ConnectionBytes, ConnectionLease, ConnectionMetadata};
 use hyper_util::client::legacy::connect::dns::Name;
 use std::{io, net::SocketAddr};
 const MAX_ANSWERS: usize = 4096;
@@ -53,9 +53,19 @@ impl Job {
         }
     }
 }
+struct ErrorResident {
+    _bytes: ConnectionBytes,
+    _metadata: ConnectionMetadata,
+}
+impl Resident {
+    fn into_error(self) -> ErrorResident {
+        let Self { _bytes, _lease } = self;
+        ErrorResident { _bytes, _metadata: _lease.into_metadata() }
+    }
+}
 struct LookupError {
     inner: io::Error,
-    _resident: Resident,
+    _resident: ErrorResident,
 }
 impl std::fmt::Debug for LookupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -109,7 +119,7 @@ async fn lookup_inner(name: SystemName, family: Family, lease: ConnectionLease) 
             inner.kind(),
             LookupError {
                 inner,
-                _resident: resident,
+                _resident: resident.into_error(),
             },
         )),
     }
