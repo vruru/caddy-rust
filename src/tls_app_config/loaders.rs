@@ -14,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 const MAX_MATERIAL: usize = 12 * 1024 * 1024;
+#[path = "loaders/manual_pem.rs"]
+mod manual_pem;
 
 #[derive(Default)]
 struct MaterialBudget {
@@ -51,29 +53,22 @@ fn material(
     tags: Vec<String>,
     budget: &MaterialBudget,
 ) -> Result<Material> {
+    // A certificate input may itself be a combined bundle containing a key.
+    let certificate = Zeroizing::new(certificate);
     ensure!(
         certificate.len() <= MAX_MATERIAL && key.len() <= MAX_MATERIAL,
         "configured certificate input exceeds size limit"
     );
-    // Go tls.X509KeyPair extracts certificate blocks and the first private
-    // key independently. Combined files and EC PARAMETERS wrappers must not
-    // become invalid merely because the same file supplies both arguments.
-    let certificate_blocks = crate::certmagic::pem_blocks(&certificate, "configured certificate")?;
-    let mut certificates = Vec::new();
-    for (tag, der) in certificate_blocks
-        .into_iter()
-        .filter(|(tag, _)| tag == "CERTIFICATE")
-    {
-        certificates.extend_from_slice(pem::encode(&pem::Pem::new(tag, der.as_slice())).as_bytes());
-    }
-    let private_blocks = crate::certmagic::pem_blocks(&key, "configured private key")?;
-    let (tag, der) = private_blocks
-        .into_iter()
-        .find(|(tag, _)| tag == "PRIVATE KEY" || tag.ends_with(" PRIVATE KEY"))
-        .ok_or_else(|| anyhow!("configured private key block missing"))?;
-    let encoded = Zeroizing::new(pem::encode(&pem::Pem::new(tag, der.as_slice())));
-    let mut material =
-        Material::from_pem(certificates, Zeroizing::new(encoded.as_bytes().to_vec()))?;
+    let (certificate, key) = manual_pem::pair(&certificate, &key)?;
+    prepared_material(certificate, key, tags, budget)
+}
+fn prepared_material(
+    certificate: Vec<u8>,
+    key: Zeroizing<Vec<u8>>,
+    tags: Vec<String>,
+    budget: &MaterialBudget,
+) -> Result<Material> {
+    let mut material = Material::from_pem(certificate, key)?;
     material.tags = tags;
     budget.reserve(&material)?;
     Ok(material)
@@ -152,12 +147,10 @@ pub(super) async fn load_manual(
                         tags,
                     } => {
                         loading(io, cpu, token, move || {
-                            Ok(vec![material(
-                                read(&absolute(&cwd, &certificate))?,
-                                Zeroizing::new(read(&absolute(&cwd, &key))?),
-                                tags,
-                                &budget,
-                            )?])
+                            let certificate = read(&absolute(&cwd, &certificate))?;
+                            let key = Zeroizing::new(read(&absolute(&cwd, &key))?);
+                            manual_pem::file_key(&key)?;
+                            Ok(vec![material(certificate, key, tags, &budget)?])
                         })
                         .await
                     }
@@ -179,6 +172,7 @@ pub(super) async fn load_manual(
                             .await?
                             .ok_or_else(|| anyhow!("configured storage private key missing"))?;
                         loading(io, cpu, token, move || {
+                            manual_pem::file_key(&key)?;
                             Ok(vec![material(certificate.to_vec(), key, tags, &budget)?])
                         })
                         .await
@@ -198,33 +192,8 @@ pub(super) async fn load_manual(
                                         "certificate loading cancelled"
                                     );
                                     let bundle = Zeroizing::new(read(&path)?);
-                                    let blocks = crate::certmagic::pem_blocks(
-                                        &bundle,
-                                        "configured folder certificate",
-                                    )?;
-                                    let mut certificate = Vec::new();
-                                    let mut key = Zeroizing::new(Vec::new());
-                                    let mut blocks=blocks.into_iter();
-                                    while let Some((tag,der))=blocks.next() {
-                                        if tag=="CERTIFICATE" {
-                                            certificate.extend_from_slice(pem::encode(&pem::Pem::new(tag,der.as_slice())).as_bytes());
-                                        } else if tag=="EC PARAMETERS" {
-                                            if key.is_empty() {
-                                                let (tag,der)=blocks.next().ok_or_else(||anyhow!("EC parameters must immediately precede private key"))?;
-                                                ensure!(tag=="EC PRIVATE KEY","EC parameters must immediately precede private key");
-                                                let encoded=Zeroizing::new(pem::encode(&pem::Pem::new(tag,der.as_slice())));
-                                                key.extend_from_slice(encoded.as_bytes());
-                                            }
-                                        } else if tag=="PRIVATE KEY"||tag.ends_with(" PRIVATE KEY") {
-                                            if key.is_empty() {
-                                                let encoded=Zeroizing::new(pem::encode(&pem::Pem::new(tag,der.as_slice())));
-                                                key.extend_from_slice(encoded.as_bytes());
-                                            }
-                                        } else {
-                                            return Err(anyhow!("unsupported configured folder PEM block"));
-                                        }
-                                    }
-                                    material(certificate, key, Vec::new(), &budget)
+                                    let (certificate, key) = manual_pem::bundle(&bundle)?;
+                                    prepared_material(certificate, key, Vec::new(), &budget)
                                 })
                                 .collect()
                         })
@@ -293,13 +262,17 @@ pub(super) fn read_root_input(
 ) -> Result<(Vec<u8>, crate::acme_wire::chain_memory::Scratch)> {
     let mut file = std::fs::File::open(path)
         .map_err(|_| anyhow!("configured certificate file unavailable"))?;
-    let metadata = file.metadata()
+    let metadata = file
+        .metadata()
         .map_err(|_| anyhow!("configured certificate metadata unavailable"))?;
-    ensure!(metadata.is_file() && metadata.len() <= MAX_MATERIAL as u64,
-        "configured certificate file exceeds size limit");
+    ensure!(
+        metadata.is_file() && metadata.len() <= MAX_MATERIAL as u64,
+        "configured certificate file exceeds size limit"
+    );
     let size = usize::try_from(metadata.len())
         .map_err(|_| anyhow!("configured certificate size overflow"))?;
-    let amount = size.checked_add(std::mem::size_of::<Vec<u8>>())
+    let amount = size
+        .checked_add(std::mem::size_of::<Vec<u8>>())
         .and_then(|n| n.checked_add(std::mem::size_of::<crate::acme_wire::chain_memory::Scratch>()))
         .and_then(|n| n.checked_add(64))
         .ok_or(crate::cert_transient::ResourceDenied)?;
@@ -308,9 +281,12 @@ pub(super) fn read_root_input(
     file.read_exact(&mut bytes)
         .map_err(|_| anyhow!("configured certificate file read failed"))?;
     let mut extra = Zeroizing::new([0u8; 1]);
-    ensure!(file.read(&mut *extra)
-        .map_err(|_| anyhow!("configured certificate file read failed"))? == 0,
-        "configured certificate changed during read");
+    ensure!(
+        file.read(&mut *extra)
+            .map_err(|_| anyhow!("configured certificate file read failed"))?
+            == 0,
+        "configured certificate changed during read"
+    );
     Ok((std::mem::take(&mut *bytes), memory))
 }
 fn collect(

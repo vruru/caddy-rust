@@ -24,6 +24,8 @@ src/caddyfile_adapter/stable_sort.rs follows Go sort/zsortfunc.go
 (Copyright 2009 The Go Authors).
 src/caddyfile_adapter/tls_pem.rs follows Go 1.27.3 encoding/pem/pem.go
 (Copyright 2009 The Go Authors).
+src/tls_app_config/loaders/manual_pem.rs follows the same Go byte-oriented
+PEM decoding behavior for bounded runtime manual certificate loading.
 src/caddyfile_adapter/proxy_addresses.rs follows Go 1.27.3 net/url/url.go
 (Copyright 2009 The Go Authors).
 src/caddyfile_adapter/pdqsort.rs follows Go 1.27.3 sort/zsortfunc.go and sort/sort.go

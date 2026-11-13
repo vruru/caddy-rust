@@ -1,0 +1,11 @@
+# Manual PEM inputs
+
+Runtime `load_files`, `load_pem`, `load_storage` and `load_folders` accept the byte-oriented PEM framing used by Go 1.27.3. OpenSSL Bag Attributes, surrounding text, non-UTF-8 surrounding bytes, ordinary headers and CRLF framing do not themselves invalidate a valid selected certificate/key. Malformed framing/base64 is skipped according to that decoder; a selected key with invalid DER is an error, never permission to use a later private key. The selected private-key DER determines its supported encoding, independent of a misleading PEM label.
+
+Pair loaders use every decoded CERTIFICATE and the first decoded PRIVATE KEY or PRIVATE KEY-suffixed block. Folder bundles still reject unknown decoded block types and retain the existing EC PARAMETERS adjacency behavior. File/storage loaders retain their encrypted-prefix check; encrypted private-key DER remains unsupported. Certificate parsing, supported cryptography and certificate/private-key matching still run through the existing Material validation. Shared persisted certificate storage keeps its stricter framing and integrity checks.
+
+Each input remains limited to 12MiB. A scan consumes at most 32 decoded blocks; the pair key scan stops once its first key is selected. Material count and aggregate limits remain unchanged. Input bundles and private-key/base64/DER temporaries are zeroized where owned by this manual loading path. This is a bounded input implementation, not a provider-heap or process-RSS limit.
+
+Isolated normal CLI comparison covers all four loaders, signed TLS presentation, raw configuration preservation, rejected reloads retaining the old route, successful reload and orderly exit on macOS and Linux ARM64 with all available CPUs and one CPU. Fixed header/footer cases and seeded structural cases were compared against the pinned Go reference. Go can accept more than the retained decoded-block budget; this deliberate resource boundary remains an explicit error.
+
+Global field placeholders, confined folder symlink compatibility, third-party storage modules and full-platform validation remain separate work. The existing Caddyfile-only decoder has a different admission/ownership interface and is not expanded by this change.
