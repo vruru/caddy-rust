@@ -1357,3 +1357,9 @@ This host-method change does not equate certificate parsing stages: some invalid
 URI SANs are rejected by the Go TLS certificate parser while the current native
 transport can reach a failing template projection. No authenticated facts are
 relaxed by this view adapter, and full PKIX equivalence is not established here.
+
+### Explicit native TLS in HTTP CA fetching
+
+Reqwest's explicitly prepared native TLS origin and HTTPS-proxy paths use the complete owned SSL engine. SSL construction, handshake crypto and authenticated records use its bounded CPU lane; socket IO remains asynchronous. Origin SNI, the HTTPS proxy's own SNI and empty CONNECT ALPN, verifier and client identity, renegotiation policy, timeout and connection facts are retained. Direct TlsInfo visits exact authenticated peer DER through the same Guard evidence outside its mutex; existing CONNECT TlsInfo=None behavior is unchanged. The older public ClientConfig/Stream API remains available. This does not move default Rustls CA/ACME/metrics handshakes or add CBC compatibility to these callers.
+
+Completed SSL CPU work returns its running permit from the real worker. Actual data, the existing admission ticket and tracker remain with an unconsumed result, preventing a single-slot nested-TLS wait cycle without returning data credit early. The process-shared admission limit (32..256, derived from available CPUs) now counts waiting, running and completed-unconsumed jobs together; it previously bounded only waiting jobs in addition to separately retained running slots. Full admission still returns an explicit WouldBlock error and recovers when an actual result owner drops. Worker cancellation does not return active CPU capacity early; spawn and payload/ticket destruction occur outside the scope admission mutex. These are bounded ownership/scheduling claims, not OpenSSL heap or process-RSS accounting.

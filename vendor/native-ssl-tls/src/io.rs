@@ -81,24 +81,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream<S> {
     /// Visits the exact peer DER bytes observed in the TLS Certificate message.
     /// No X509 re-encoding or claim about a reconstructed verified path is made.
     pub fn with_peer_certificates<T>(&self, f: impl FnOnce(&[&[u8]]) -> T) -> io::Result<T> {
-        self.guard.check()?;
-        let chain = {
-            let state = self
-                .guard
-                .certs
-                .lock()
-                .map_err(|_| io::Error::other("TLS observer state poisoned"))?;
-            state
-                .initial
-                .clone()
-                .ok_or_else(|| io::Error::other("peer certificate facts unavailable"))?
-        };
-        let mut refs = [&[][..]; 64];
-        let mut count = 0;
-        for cert in chain.certificates() {
-            refs[count] = cert;
-            count += 1;
-        }
-        Ok(f(&refs[..count]))
+        self.guard.with_peer_certificates(f)
     }
 }

@@ -228,3 +228,14 @@ their original I/O representation. With a capsule, kind, Display and the origina
 source chain remain available, while top-level raw OS error extraction is no
 longer the inline representation. This layer does not meter the OpenSSL heap or
 change certificate verification, cipher policy or application retry behavior.
+
+Reqwest explicitly configured native TLS now uses OwnedClientStream for origin
+and HTTPS CONNECT proxy legs. Peer-DER visitors clone the existing raw evidence
+under its short mutex, then invoke callers outside that mutex. The owned IO's
+private future uses an inline Mutex only for its Sync contract; exclusive poll
+uses get_mut without locking. Real SSL CPU work releases its running permit when
+the function finishes. The existing admission ticket and tracker follow the
+completed result, with data destroyed before those tickets. Admission therefore
+bounds waiting, executing and completed-unconsumed jobs together. This prevents
+a nested-TLS single-slot wait cycle; it neither releases data credits early nor
+adds a default Rustls executor or CBC retry to unrelated HTTPS clients.

@@ -13,7 +13,7 @@ use std::{
     future::Future,
     io,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc,Mutex},
     task::{Context, Poll, Wake, Waker},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -46,7 +46,9 @@ struct Frame {
 }
 struct Job {
     kind: Kind,
-    future: Pin<Box<dyn Future<Output = io::Result<Step>> + Send>>,
+    // Polling still requires exclusive &mut access. This inline cell provides
+    // Sync to connection containers without holding a mutex during poll/wake.
+    future: Mutex<Pin<Box<dyn Future<Output = io::Result<Step>> + Send>>>,
 }
 /// Only one owned SSL CPU step exists. Up to two separately prepaid output
 /// frames permit reading peer records while the socket's write side blocks.
@@ -274,7 +276,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin> ServerStream<I> {
         let waker: Waker = self.wake.clone().into();
         let mut fan = Context::from_waker(&waker);
         let kind = job.kind;
-        let step = match job.future.as_mut().poll(&mut fan) {
+        let step = match job.future.get_mut().unwrap_or_else(|e|e.into_inner()).as_mut().poll(&mut fan) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(result) => {
                 self.job = None;
@@ -390,7 +392,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin> ServerStream<I> {
         let scope = self.scope.clone();
         self.job = Some(Job {
             kind,
-            future: Box::pin(engine.step(scope, op, input)),
+            future: Mutex::new(Box::pin(engine.step(scope, op, input))),
         });
         Ok(())
     }

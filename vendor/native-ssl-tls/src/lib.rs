@@ -97,6 +97,26 @@ struct Guard {
     connection_credits: Option<Arc<ConnectionCredits>>,
 }
 impl Guard {
+    fn with_peer_certificates<T>(&self, f:impl FnOnce(&[&[u8]])->T)->stdio::Result<T> {
+        self.check()?;
+        let chain = {
+            let state = self
+                .certs
+                .lock()
+                .map_err(|_| stdio::Error::other("TLS observer state poisoned"))?;
+            state
+                .initial
+                .clone()
+                .ok_or_else(|| stdio::Error::other("peer certificate facts unavailable"))?
+        };
+        let mut refs = [&[][..]; 64];
+        let mut count = 0;
+        for cert in chain.certificates() {
+            refs[count] = cert;
+            count += 1;
+        }
+        Ok(f(&refs[..count]))
+    }
     fn retained_error(&self,error:stdio::Error)->stdio::Error {
         connection_credits::retain_error(error,&self.connection_credits)
     }

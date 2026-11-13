@@ -43,6 +43,10 @@ impl<S:AsyncRead+AsyncWrite+Unpin> OwnedClientStream<S>{
     pub fn selected_alpn_protocol(&self)->&[u8]{&self.alpn}
     pub fn ssl_if_idle(&self)->Option<&openssl::ssl::SslRef>{self.stream.ssl()}
     pub fn completed_handshakes(&self)->usize{self.guard.completed.load(Ordering::Acquire)}
+    /// Visit the exact authenticated peer DER, without X509 reconstruction.
+    pub fn with_peer_certificates<T>(&self,f:impl FnOnce(&[&[u8]])->T)->io::Result<T>{
+        self.guard.with_peer_certificates(f)
+    }
 }
 impl<S:AsyncRead+AsyncWrite+Unpin> AsyncRead for OwnedClientStream<S>{
     fn poll_read(self:Pin<&mut Self>,cx:&mut Context<'_>,buf:&mut ReadBuf<'_>)->Poll<io::Result<()>>{

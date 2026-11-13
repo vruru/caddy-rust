@@ -2185,12 +2185,12 @@ mod verbose {
 mod ssl_tls_conn{
     use super::*;
     use tokio::io::{AsyncRead,AsyncWrite};
-    pub(super) struct SslTlsConn<S>{pub(super) inner:TokioIo<native_ssl_tls::Stream<S>>}
-    pub(super) async fn connect<S:AsyncRead+AsyncWrite+Unpin>(config:&native_ssl_tls::ClientConfig,name:rustls_pki_types::ServerName<'static>,io:S,timeout:Option<Duration>)->Result<SslTlsConn<S>,BoxError>{
-        let stream=origin_handshake(timeout,config.connect(name,io)).await?;Ok(SslTlsConn{inner:TokioIo::new(stream)})
+    pub(super) struct SslTlsConn<S>{pub(super) inner:TokioIo<native_ssl_tls::OwnedClientStream<S>>}
+    pub(super) async fn connect<S:AsyncRead+AsyncWrite+Unpin>(config:&Arc<native_ssl_tls::ClientConfig>,name:rustls_pki_types::ServerName<'static>,io:S,timeout:Option<Duration>)->Result<SslTlsConn<S>,BoxError>{
+        let stream=origin_handshake(timeout,config.connect_owned_with_alpn(name,io,None)).await?;Ok(SslTlsConn{inner:TokioIo::new(stream)})
     }
     impl<S:AsyncRead+AsyncWrite+Unpin+Connection> Connection for SslTlsConn<S>{
-        fn connected(&self)->Connected{let connected=self.inner.inner().get_ref().connected();if self.inner.inner().ssl().selected_alpn_protocol()==Some(b"h2"){connected.negotiated_h2()}else{connected}}
+        fn connected(&self)->Connected{let connected=self.inner.inner().get_ref().connected();if self.inner.inner().selected_alpn_protocol()==b"h2"{connected.negotiated_h2()}else{connected}}
     }
     impl<S:AsyncRead+AsyncWrite+Unpin> Read for SslTlsConn<S>{
         fn poll_read(self:Pin<&mut Self>,cx:&mut Context<'_>,buf:ReadBufCursor<'_>)->Poll<io::Result<()>>{Pin::new(&mut self.get_mut().inner).poll_read(cx,buf)}
@@ -2199,6 +2199,8 @@ mod ssl_tls_conn{
         fn poll_write(self:Pin<&mut Self>,cx:&mut Context<'_>,buf:&[u8])->Poll<io::Result<usize>>{Pin::new(&mut self.get_mut().inner).poll_write(cx,buf)}
         fn poll_flush(self:Pin<&mut Self>,cx:&mut Context<'_>)->Poll<io::Result<()>>{Pin::new(&mut self.get_mut().inner).poll_flush(cx)}
         fn poll_shutdown(self:Pin<&mut Self>,cx:&mut Context<'_>)->Poll<io::Result<()>>{Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)}
+        fn is_write_vectored(&self)->bool{self.inner.is_write_vectored()}
+        fn poll_write_vectored(self:Pin<&mut Self>,cx:&mut Context<'_>,buf:&[io::IoSlice<'_>])->Poll<io::Result<usize>>{Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx,buf)}
     }
     #[derive(Clone)]
     pub(super) struct ProxyConnector{
@@ -2218,7 +2220,7 @@ mod ssl_tls_conn{
                     // reuse its SNI/hostname override for the HTTPS proxy.
                     let name=origin_name(&None,dst.host().ok_or("proxy TLS host missing")?)?;
                     let io=http.call(dst).await?;
-                    let ssl=native.connect_with_alpn(name,TokioIo::new(io),Some(&[])).await?;
+                    let ssl=native.connect_owned_with_alpn(name,TokioIo::new(io),Some(&[])).await?;
                     return Ok(Conn{inner:Box::new(SslTlsConn{inner:TokioIo::new(ssl)}),is_proxy:false,tls_info:false});
                 }}
                 let mut connector=hyper_rustls::HttpsConnector::from((http,tls));let io=connector.call(dst).await?;

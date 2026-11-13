@@ -24,7 +24,9 @@ fn budget() -> &'static Budget {
 }
 /// A runtime/service lifetime. CPU/queue capacity is process-shared, not created
 /// per config, connection, authority or scope. Close prevents new admission;
-/// wait includes real workers and abandoned completed outputs.
+/// wait includes real workers and abandoned completed outputs. The existing
+/// waiting tickets now bound waiting + running + completed-unconsumed work;
+/// actual CPU permits are returned only by the real worker, when its work ends.
 pub struct VerificationScope {
     tasks: TaskTracker,
     closed: Mutex<bool>,
@@ -67,35 +69,64 @@ impl VerificationScope {
         // so close+wait cannot miss late worker registration.
         let entry = self.enter()?;
         let b = budget();
+        let mut job = Work {
+            function: Some(f),
+            running: None,
+            queue: None,
+            token: Some(entry),
+        };
         let queue = b.waiting.clone().try_acquire_owned().map_err(|_| {
             io::Error::new(io::ErrorKind::WouldBlock, "TLS verification queue full")
         })?;
+        job.queue = Some(queue);
         let permit = tokio::select! {biased;_=self.stop.cancelled()=>return Err(io::Error::other("TLS verification scope closed")),p=b.running.clone().acquire_owned()=>p.map_err(io::Error::other)?};
-        drop(queue);
-        let worker = {
+        job.running = Some(permit);
+        {
             let c = self.closed.lock().unwrap_or_else(|e| e.into_inner());
             if *c {
                 return Err(io::Error::other("TLS verification scope closed"));
             }
-            // Move the *whole* envelope, not individual closure fields. Panic,
-            // unconsumed JoinHandle output and future drop keep real ownership.
-            tokio::task::spawn_blocking(move || {
-                let token = entry;
-                let permit = permit;
-                let value = f();
-                Output {
-                    value,
-                    _permit: permit,
-                    _token: token,
-                }
-            })
-        };
+        }
+        // Registration precedes the fence and survives a concurrent close.
+        // A stopped runtime can destroy its submitted payload synchronously;
+        // no spawn, payload Drop or ticket wake occurs under the closed mutex.
+        let worker = tokio::task::spawn_blocking(move || job.run());
         let output = worker.await.map_err(io::Error::other)?;
         Ok(output.value)
     }
 }
 struct Output<T> {
     value: T,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _queue: tokio::sync::OwnedSemaphorePermit,
     _token: TaskTrackerToken,
+}
+
+// All actual input data is destroyed before tickets/tokens on every early
+// return, cancellation, panic or unpolled-runtime path. Empty Drop makes the
+// spawn closure capture this complete envelope, never disjoint fields.
+struct Work<F> {
+    function: Option<F>,
+    running: Option<tokio::sync::OwnedSemaphorePermit>,
+    queue: Option<tokio::sync::OwnedSemaphorePermit>,
+    token: Option<TaskTrackerToken>,
+}
+impl<F> Drop for Work<F> {
+    fn drop(&mut self) {}
+}
+impl<F> Work<F> {
+    fn run<T>(mut self) -> Output<T>
+    where
+        F: FnOnce() -> T,
+    {
+        let value = self.function.take().expect("owned TLS CPU function")();
+        // A completed, unconsumed result is not active CPU work. Keeping the
+        // CPU permit there deadlocks nested TLS with a single running slot.
+        // Its data credit, queue ticket and tracker token remain with Output.
+        drop(self.running.take());
+        Output {
+            value,
+            _queue: self.queue.take().expect("TLS work ticket"),
+            _token: self.token.take().expect("TLS work tracker"),
+        }
+    }
 }
