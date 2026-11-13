@@ -837,6 +837,12 @@ async fn serve_connection(
     identity: QuicIdentity,
 ) {
     let QuicIdentity { leaf, sni, snapshot } = identity;
+    // Carry the completed QUIC handshake's actual facts into the same request
+    // extensions used by TCP TLS. HTTP fields are not a source of TLS metadata.
+    let tls_metadata = snapshot.metadata().ok();
+    let tls_log = tls_metadata
+        .map(|metadata| Arc::new(super::access_log::Tls::from_metadata(metadata)));
+    let tls_details = tls_metadata.map(super::fastcgi::TlsDetails::from_metadata);
     let client_cert_cache = super::client_cert_facts::Cache::new(snapshot.clone());
     let sni = server.plan.strict_sni_host.then_some(sni);
     let mut builder = ::h3::server::builder();
@@ -909,6 +915,7 @@ async fn serve_connection(
                 let leaf=leaf.clone();
                 let sni = sni.clone();
                 let snapshot = snapshot.clone();
+                let tls_log = tls_log.clone();
                 let client_cert_cache = client_cert_cache.clone();
                 let quic_for_stream=quic.clone();
                 streams.spawn(async move {
@@ -943,6 +950,12 @@ async fn serve_connection(
                     let head=request.method()==Method::HEAD;
                     let Ok(metadata)=trailer_policy::prepare_request(&mut request) else{return;};
                     request.extensions_mut().insert(metadata);
+                    if let Some(tls_log) = tls_log.filter(|_| server.plan.access_logs.is_some()) {
+                        request.extensions_mut().insert(tls_log);
+                    }
+                    if let Some(details) = tls_details {
+                        request.extensions_mut().insert(details);
+                    }
                     request.extensions_mut().insert(snapshot);
                     request.extensions_mut().insert(client_cert_cache);
                     let Some((interim, receiver)) = stream::interim_channel() else {

@@ -1292,3 +1292,17 @@ The HTTP transport supports `client_certificate_automate`, including the Caddyfi
 Default Rustls client handshakes use one lazily provisioned runtime per shared resource owner, created on the provisioning CPU lane. The existing OpenSSL once/freely engine performs its operations in the owned SSL CPU lane. Cancellation and forced stop close admission without waking callers under its fence; graceful shutdown joins HTTP owners before joining the client runtime. Deadline errors retain their timeout category. Selected client credentials retain leaf/SPKI vetoes through signing and application I/O, including reload and durable restart.
 
 Isolated actual-main evidence covers Internal and dual-purpose Native ACME issuance, ordinary renewal, manual-leaf expiry followed by managed takeover and another renewal, real CRI selection, live signed reason1, same-key sibling leaves, reload/drain/hard-stop, large-RSA CPU progress, Caddyfile, nested/error/response/named consumers and health probes. Frontend HTTP/1, HTTP/2 and HTTP/3 compose with the existing HTTP/1 and HTTP/2 upstream transports. Outgoing HTTP/3 and remaining issuer/PKIX capabilities are separate inventory items; this entry does not claim whole TLS compatibility or a process RSS bound. A serverAuth-only ACME certificate is not reinterpreted as clientAuth: the upstream's normal purpose and trust validation still applies.
+
+
+HTTP/3 TLS metadata consumers
+-----------------------------
+
+HTTP/3 requests carry the completed QUIC connection snapshot into the same
+access-log and FastCGI TLS extensions used by TCP TLS. Access logs report actual
+negotiated version, cipher, ALPN, SNI and resumption facts; FastCGI receives
+`HTTPS`, `SSL_PROTOCOL` and `SSL_CIPHER` from that snapshot. Request headers do
+not synthesize TLS facts, and reduced access-log capture retains its existing
+omission policy. Isolated real HTTP/2 and HTTP/3 TLS 1.3 mutual-authentication
+checks cover sequential and overlapping streams, including FastCGI backend
+environment observation, on macOS and Linux with automatic and single-CPU
+runtimes. This does not claim coverage of every cipher or resumed-session case.
