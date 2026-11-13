@@ -32,6 +32,7 @@ pub(super) struct Store {
 /// Root shares one resource object across policies and configuration generations.
 /// Storage and issuance pools are bounded independently of the runtime CPU count.
 pub struct CertificateResources {
+    pub(crate) acme_server:Arc<crate::acme_server::Shared>,
     stores: Mutex<HashMap<PathBuf, Arc<Store>>>,
     #[cfg(feature = "native-run")]
     pub(super) ticket_owners: TicketOwners,
@@ -59,6 +60,7 @@ impl CertificateResources {
         ocsp: Arc<OcspResources>,
     ) -> Result<Self> {
         Ok(Self {
+            acme_server:crate::acme_server::Shared::new(),
             stores: Mutex::new(HashMap::new()),
             #[cfg(feature = "native-run")]
             ticket_owners: TicketOwners::new(),

@@ -117,7 +117,7 @@ accepting their module name. Go plugins have no cross-language binary ABI;
 their configuration and behavior require native implementations.
 
 Known development gaps still include remaining listener/address combinations,
-the ACME server handler, remaining header-operation/push combinations and
+remaining header-operation/push combinations and
 remaining template receiver methods,
 TLS 1.2 CBC suites, full Go PKIX edge semantics and remaining issuer/trust-loader
 capabilities. This list is not a claim that all other field combinations are
@@ -1093,3 +1093,18 @@ Native explicit/Link push and its bounded protocol ownership are documented in
 interim heads, target/header behavior, backpressure and old/new generation
 separation through reload. Shared HeaderOps replacement and the other release
 gates remain tracked work; accepting a handler name is not full compatibility.
+
+
+Native ACME server
+------------------
+
+The native `acme_server` handler provides account/order/authorization lifecycle,
+three real challenge types, verified CSR issuance through the existing PKI,
+certificate download, persistent revocation and dual-signature key rollover.
+It reads and writes the original Bolt representation with checked snapshots,
+same-descriptor cooperative locking and bounded COW publication; no Go runtime
+or unchecked bbolt-rs backend is used. Existing unknown tables and record fields
+are retained. File/record/operation capacities, retained worker/output credits,
+correctness repairs and the distinction from Smallstep's non-Caddy APIs are
+described in [ACME-SERVER.md](docs/ACME-SERVER.md). This does not establish global
+TLS resolver support, all PKIX edge semantics or full-project acceptance.

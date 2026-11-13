@@ -333,6 +333,16 @@ struct Provider {
     state: Arc<OnDemand>,
 }
 impl ScopedCertificateProvider for Provider {
+    fn validate_acme_server(&self,config:&crate::acme_server::Config)->Result<()> {
+        self.service.upgrade().ok_or_else(||anyhow!("certificate services stopped"))?.validate_acme_server_config(config)
+    }
+    fn prepare_acme_server(&self,config:Arc<crate::acme_server::Config>,cancel:CancellationToken)
+        -> BoxFuture<'static,Result<Arc<crate::acme_server::Controller>>> {
+        let service=self.service.upgrade();Box::pin(async move {
+            let service=service.ok_or_else(||anyhow!("certificate services stopped"))?;
+            service.prepare_acme_server(config,cancel).await
+        })
+    }
     fn ensure_request(
         &self,
         request: crate::http_runtime::CertificateRequest,

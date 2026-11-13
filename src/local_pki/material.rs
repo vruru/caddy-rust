@@ -276,7 +276,7 @@ fn certificate_syntax(bytes: &[u8]) -> Result<()> {
     );
     Ok(())
 }
-fn csr_syntax(bytes: &[u8]) -> Result<()> {
+pub(super) fn csr_syntax(bytes: &[u8]) -> Result<()> {
     raw_der::validate(bytes)?;
     let outer = raw_der::parts(bytes, 0x30)?;
     ensure!(outer.len() == 3, "invalid CSR fields");
@@ -455,6 +455,12 @@ pub(super) fn issue(
     lifetime: Duration,
     include_signer: bool,
 ) -> Result<Vec<u8>> {
+    issue_profile(csr,signing,now,lifetime,include_signer,None)
+}
+pub(super) fn issue_acme(csr:&[u8],signing:&Pair,now:i64,include_signer:bool,profile:&super::AcmeProfile)->Result<Vec<u8>> {
+    issue_profile(csr,signing,now,Duration::from_secs(1),include_signer,Some(profile))
+}
+fn issue_profile(csr:&[u8],signing:&Pair,now:i64,lifetime:Duration,include_signer:bool,profile:Option<&super::AcmeProfile>)->Result<Vec<u8>> {
     ensure!(
         !csr.is_empty() && csr.len() <= 128 * 1024 && lifetime.as_secs() > 0,
         "invalid internal certificate request"
@@ -523,6 +529,12 @@ pub(super) fn issue(
         now.saturating_add(i64::try_from(lifetime.as_secs())?)
             .min(not_after),
     )?;
+    if let Some(profile)=profile {
+        params.not_before=OffsetDateTime::from_unix_timestamp(profile.not_before)?;
+        params.not_after=OffsetDateTime::from_unix_timestamp(profile.not_after.min(not_after))?;
+        ensure!(params.not_after>params.not_before,"ACME requested validity exceeds issuer lifetime");
+        if !profile.common_name.is_empty() {params.distinguished_name.push(DnType::CommonName,profile.common_name.clone());}
+    }
     params.is_ca = IsCa::NoCa;
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     if public.algorithm() == &rcgen::PKCS_RSA_SHA256 {
@@ -534,7 +546,7 @@ pub(super) fn issue(
     ];
     params.use_authority_key_identifier_extension = true;
     let mut saw_san = false;
-    if let Some(extensions) = request.requested_extensions() {
+    if profile.is_none() && let Some(extensions) = request.requested_extensions() {
         for extension in extensions {
             if let ParsedExtension::SubjectAlternativeName(san) = extension {
                 ensure!(!saw_san, "duplicate CSR SAN extension");
@@ -565,16 +577,24 @@ pub(super) fn issue(
             }
         }
     }
+    if let Some(profile)=profile {
+        for name in &profile.dns_names {params.subject_alt_names.push(rcgen::SanType::DnsName(name.clone().try_into()?));}
+        for ip in &profile.ip_addresses {params.subject_alt_names.push(rcgen::SanType::IpAddress(*ip));}
+    }
     if let Some((critical,feature))=requested_tls_feature {
         let mut extension=rcgen::CustomExtension::from_oid_content(&[1,3,6,1,5,5,7,1,24],feature);
         extension.set_criticality(critical);params.custom_extensions.push(extension);
     }
     let cert = params.signed_by(&public, &issuer)?;
+    let subject=if profile.is_some() {
+        let (_,generated)=x509_parser::parse_x509_certificate(cert.der()).map_err(|_|anyhow!("invalid generated ACME subject"))?;
+        generated.tbs_certificate.subject.as_raw()
+    } else {request.certification_request_info.subject.as_raw()};
     let der = bind_names(
         cert.der(),
         &issuer_der,
         Some((
-            request.certification_request_info.subject.as_raw(),
+            subject,
             request.certification_request_info.subject_pki.raw,
         )),
         issuer.key(),
@@ -585,7 +605,7 @@ pub(super) fn issue(
         x509_parser::parse_x509_certificate(&issuer_der).map_err(|_| anyhow!("invalid issuer"))?;
     ensure!(
         finished.public_key().raw == request.certification_request_info.subject_pki.raw
-            && finished.subject().as_raw() == request.certification_request_info.subject.as_raw()
+            && finished.subject().as_raw() == subject
             && finished.issuer().as_raw() == parent.subject().as_raw(),
         "generated leaf identity binding failed"
     );

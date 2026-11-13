@@ -80,6 +80,7 @@ pub(crate) struct DnsShared {
     config_io: super::resource_budget::BlockingBudget,
     global: GlobalExpand,
     hook: Option<EventHook>,
+    retained_owner:Option<Arc<dyn crate::cert_cpu::MaterialOwner>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +95,7 @@ pub(crate) struct HostSnapshot {
     order: super::proxy_nss::Order,
     /// Fallback for non-Unix systems (uses Hickory's Hosts implementation).
     fallback: Option<Arc<hickory_resolver::Hosts>>,
+    retained_owner:Option<Arc<dyn crate::cert_cpu::MaterialOwner>>,
 }
 
 /// Mimics Go's `net` hostname normalization for `/etc/hosts` lookup.
@@ -119,6 +121,7 @@ struct SysConf {
     servers: Arc<[SocketAddr]>,
     use_tcp: bool,
     rotate: Option<Arc<AtomicU32>>,
+    retained_owner:Option<Arc<dyn crate::cert_cpu::MaterialOwner>>,
 }
 
 #[derive(Clone)]
@@ -210,6 +213,7 @@ impl DnsShared {
             "dns limits: need 0 < lookup_concurrency <= max_queued"
         );
         Ok(Arc::new(Self {
+            retained_owner:None,
             tasks,
             stop,
             bg_slots,
@@ -222,6 +226,46 @@ impl DnsShared {
             global,
             hook,
         }))
+    }
+    pub(crate) fn with_retained_owner(mut self:Arc<Self>,owner:Arc<dyn crate::cert_cpu::MaterialOwner>)->Result<Arc<Self>> {
+        Arc::get_mut(&mut self).ok_or_else(||anyhow!("DNS owner must bind before sharing"))?.retained_owner=Some(owner);Ok(self)
+    }
+    async fn configuration<T,F>(&self,operation:F)->Result<T,super::resource_budget::BudgetError>
+    where T:Send+'static,F:FnOnce()->T+Send+'static {
+        if let Some(owner)=&self.retained_owner {
+            let held=self.config_io.run_retained(owner.clone(),operation).await?;
+            // This private handoff is only used below: persistent SysConf and
+            // HostSnapshot attach this same owner; scalar/address intermediates
+            // stay inside a retained lookup/transport future.
+            Ok(held.into_configuration())
+        }else {self.config_io.run(operation).await}
+    }
+    /// Closed ACME TXT consumer; it has independent lookup/background gates and
+    /// reuses the exact custom/system resolver, network and search semantics.
+    pub(crate) async fn lookup_txt(self:&Arc<Self>,name:&str,resolvers:&[String])->Result<Vec<Vec<u8>>> {
+        let _queued=self.queue_slots.clone().try_acquire_owned().map_err(|_|anyhow!("ACME DNS queue capacity exceeded"))?;
+        let _lookup=self.lookup_slots.acquire().await.map_err(|_|anyhow!(STOPPED))?;
+        let spec=DnsSpec{addrs:(!resolvers.is_empty()).then(||resolvers.to_vec()),dial_ns:30_000_000_000,fallback_ns:300_000_000};
+        let (resolver,sys)=self.resolver_for(&spec,IpVer::Any).await?;
+        let lookup=lookup_record(&resolver,&sys,name,RecordType::TXT).await?;
+        let owner=self.retained_owner.as_ref().ok_or_else(||anyhow!("ACME TXT material owner unavailable"))?;
+        owner.reserve(4096*std::mem::size_of::<Vec<u8>>())?;
+        let mut values=Vec::new();values.try_reserve_exact(4096)?;let mut total=0usize;
+        for record in lookup.answers() {if let RData::TXT(txt)=&record.data {
+            owner.reserve(0)?;
+            ensure!(values.len()<4096,"ACME DNS TXT count exceeded");let mut value=Vec::new();
+            for segment in &txt.txt_data {
+                total=total.checked_add(segment.len()).ok_or_else(||anyhow!("ACME DNS TXT capacity exceeded"))?;
+                let length=value.len().checked_add(segment.len()).ok_or_else(||anyhow!("ACME DNS TXT capacity exceeded"))?;
+                ensure!(length<=65535&&total<=1024*1024,"ACME DNS TXT size exceeded");
+                if length>value.capacity() {
+                    let capacity=length.max(value.capacity().saturating_mul(2)).max(256).min(65535);
+                    owner.reserve(capacity)?;value.try_reserve_exact(capacity-value.len())?;
+                }
+                value.extend_from_slice(segment);
+            }
+            values.push(value);
+        }}Ok(values)
     }
 
     pub(super) fn close(&self) {
@@ -259,6 +303,7 @@ impl DnsShared {
             self.bg_slots.clone(),
             self.bg_rejected.clone(),
         )
+        .with_retained_owner(self.retained_owner.clone())
         .with_dial_timeout(dial_ns)
         .with_custom(source)
         .with_exchange_leg(opts.timeout);
@@ -347,9 +392,11 @@ impl DnsShared {
             }
             (st.stamp, st.conf.clone())
         };
+        let retained_owner=self.retained_owner.clone();
+        // Closed owner mode prepays bounded resolv/NSS parse state before I/O.
+        if let Some(owner)=&retained_owner {owner.reserve(8*1024*1024)?;}
         let (stamp, read) =
-            self.config_io
-                .run(move || {
+            self.configuration(move || {
                     let mut stamp = ConfigStamp {
                         resolv: stat_resolv_conf(),
                         hosts: stat_hosts(),
@@ -380,8 +427,8 @@ impl DnsShared {
                             let (order, nss_retry) = read_nss();
                             if nss_retry { stamp.nss = Stamp::Unknown; }
                             let (mut hosts, hosts_retry) = if order == super::proxy_nss::Order::DnsOnly {
-                                (HostSnapshot { ordered: Some(HashMap::new()), fallback: None, order }, false)
-                            } else { read_hosts()? };
+                                (HostSnapshot { ordered: Some(HashMap::new()), fallback: None, order,retained_owner:retained_owner.clone() }, false)
+                            } else { read_hosts(retained_owner.as_ref())? };
                             if hosts_retry { stamp.hosts = Stamp::Unknown; }
                             hosts.order = order;
                             Ok((opts, go, Arc::new(hosts), rotate))
@@ -400,6 +447,7 @@ impl DnsShared {
                 .ok_or_else(|| anyhow!("system DNS configuration unavailable")),
             Some(Ok((opts, go, hosts, rotate))) => {
                 let conf = Arc::new(SysConf {
+                    retained_owner:self.retained_owner.clone(),
                     search: go.search.into(),
                     single_request: go.single_request,
                     no_reload: go.no_reload,
@@ -544,7 +592,7 @@ impl DnsShared {
 
     async fn ip_addresses(&self, ips: Vec<DnsIp>, port: u16, version: Option<u8>, zones: bool) -> Result<Vec<SocketAddr>> {
         if zones && ips.iter().any(|ip| ip.zone.is_some()) {
-            self.config_io.run(move || ips.into_iter().filter_map(|ip| {
+            self.configuration(move || ips.into_iter().filter_map(|ip| {
                 super::proxy_dns_dial::family(ip.socket(port), version)
             }).collect()).await.map_err(|_| anyhow!("DNS zone selection worker unavailable"))
         } else {
@@ -558,8 +606,7 @@ impl DnsShared {
         if addresses.len() < 2 {
             return Ok(addresses);
         }
-        self.config_io
-            .run(move || {
+        self.configuration(move || {
                 let mut entries: Vec<_> = addresses
                     .into_iter()
                     .map(|address| {
@@ -960,14 +1007,16 @@ fn stat_hosts() -> Stamp {
 }
 
 /// Called only by the bounded configuration I/O worker, never a reactor.
-fn read_hosts() -> Result<(HostSnapshot, bool)> {
+fn read_hosts(retained_owner:Option<&Arc<dyn crate::cert_cpu::MaterialOwner>>) -> Result<(HostSnapshot, bool)> {
     #[cfg(unix)]
     {
         const MAX: u64 = 1 << 20;
+        if let Some(owner)=retained_owner {owner.reserve(2*1024*1024)?;}
         let data = match super::proxy_dns_file::read("/etc/hosts", MAX) {
             Ok(data) => data,
             Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied) => {
                 return Ok((HostSnapshot {
+                    retained_owner:retained_owner.cloned(),
                     ordered: Some(HashMap::new()),
                     order: super::proxy_nss::Order::default(),
                     fallback: None,
@@ -975,6 +1024,10 @@ fn read_hosts() -> Result<(HostSnapshot, bool)> {
             }
             Err(error) => return Err(error.into()),
         };
+        // Includes simultaneous raw input, lowercased temporary key, HashMap
+        // growth/reallocation and per-alias address vectors. Zone strings are
+        // Arc-backed and cannot multiply their input length per alias.
+        if let Some(owner)=retained_owner {owner.reserve(data.len().checked_mul(256).and_then(|n|n.checked_add(65536)).ok_or_else(||anyhow!("hosts accounting overflow"))?)?;}
 
         let mut map: HashMap<String, Vec<DnsIp>> = HashMap::new();
 
@@ -1019,6 +1072,7 @@ fn read_hosts() -> Result<(HostSnapshot, bool)> {
         }
 
         Ok((HostSnapshot {
+            retained_owner:retained_owner.cloned(),
             ordered: Some(map),
             order: super::proxy_nss::Order::default(),
             fallback: None,
@@ -1029,6 +1083,7 @@ fn read_hosts() -> Result<(HostSnapshot, bool)> {
     {
         // Non-Unix: Use Hickory's standard system parsing
         Ok((HostSnapshot {
+            retained_owner:retained_owner.cloned(),
             ordered: None,
             order: super::proxy_nss::Order::default(),
             fallback: Some(Arc::new(hickory_resolver::Hosts::from_system()?)),
@@ -1063,6 +1118,9 @@ fn go_default_conf() -> (ResolverConfig, ResolverOpts) {
 }
 
 /// Internet `[network/]host[:port]` (default udp/53), or Unix network/path.
+pub(super) fn validate_acme_resolvers(addresses:&[String])->Result<()> {
+    for address in addresses {parse_net_addr(address)?;}Ok(())
+}
 fn parse_net_addr(addr: &str) -> Result<NetAddr> {
     let (net, rest) = match addr.split_once('/') {
         Some((n, r)) => (n.trim().to_ascii_lowercase(), r),

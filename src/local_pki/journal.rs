@@ -82,12 +82,14 @@ impl PairStore<'_> {
         let suffix = self
             .prefix
             .strip_prefix("pki/authorities/")
+            .or_else(|| (self.prefix == "pki/authorities").then_some(""))
             .ok_or_else(|| anyhow!("invalid PKI scope"))?;
         ensure!(
-            !suffix.is_empty()
-                && !matches!(suffix, "." | "..")
-                && !suffix.contains('/')
-                && suffix == crate::certstore::safe(suffix),
+            self.prefix == "pki/authorities"
+                || (!suffix.is_empty()
+                    && !matches!(suffix, "." | "..")
+                    && !suffix.contains('/')
+                    && suffix == crate::certstore::safe(suffix)),
             "invalid PKI authority scope"
         );
         ensure!(

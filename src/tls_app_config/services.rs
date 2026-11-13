@@ -351,6 +351,36 @@ impl CertificateServices {
     pub fn business_resolver(&self) -> Arc<HotCertificateResolver> {
         self.context.resolver.clone()
     }
+    pub(crate) fn validate_acme_server_config(&self,config:&crate::acme_server::Config)->Result<()> {
+        let authority=self.plan.authorities.get(&config.ca);
+        anyhow::ensure!(authority.is_some()||config.ca=="local","unknown ACME signing authority");
+        let custom=authority.is_some_and(|a|a.config.intermediate.is_some());
+        let lifetime=authority.map_or(std::time::Duration::from_secs(7*86400),|a|a.config.intermediate_lifetime);
+        anyhow::ensure!(custom||config.lifetime<lifetime,"ACME certificate lifetime must be below managed intermediate lifetime");
+        Ok(())
+    }
+    pub(crate) fn validate_acme_routes(&self,config:&crate::http_config::PreparedConfig)->Result<()> {
+        use crate::http_config::types::Handler;
+        let mut pending=Vec::new();for server in &config.servers {
+            pending.extend(server.routes.iter());pending.extend(server.errors.iter());pending.extend(server.named_routes.values());
+        }
+        while let Some(route)=pending.pop() {for handler in &route.handlers {match handler {
+            Handler::AcmeServer(config)=>self.validate_acme_server_config(config)?,
+            Handler::Subroute{routes,errors,..}=>{pending.extend(routes.iter());pending.extend(errors.iter());}
+            Handler::Intercept(responses)=>for response in responses {if let Some(routes)=&response.routes {pending.extend(routes.iter());}},
+            Handler::ReverseProxy(proxy)=>for response in &proxy.response_routes {if let Some(routes)=&response.routes {pending.extend(routes.iter());}},
+            _=>{}
+        }}}Ok(())
+    }
+    pub(crate) async fn prepare_acme_server(self:&Arc<Self>,config:Arc<crate::acme_server::Config>,cancel:CancellationToken)
+        ->Result<Arc<crate::acme_server::Controller>> {
+        self.validate_acme_server_config(&config)?;
+        self.owned(cancel,move|this,token|Box::pin(async move {
+            let pki=this.authority(&config.ca,token.clone()).await?;
+            let snapshot=pki.provision(&config.ca,token.clone()).await?;drop(snapshot);
+            this.context.resources.acme_server.prepare(config,pki,&this.context.paths.default_storage,token).await
+        })).await
+    }
     pub fn manual_certificates(&self) -> Result<ManualCertificates> {
         ensure!(
             self.prepared.initialized(),

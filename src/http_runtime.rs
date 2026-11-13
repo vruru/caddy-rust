@@ -95,6 +95,7 @@ mod proxy_dns_exchange;
 mod proxy_dns_runtime;
 mod proxy_dns_socket;
 mod proxy_dns_stream;
+pub(crate) mod acme_dns;
 #[path = "http_runtime/proxy_dynamic.rs"]
 mod proxy_dynamic;
 #[path = "http_runtime/proxy_flush.rs"]
@@ -273,6 +274,7 @@ impl Generation {
 #[derive(Clone)]
 struct ActiveServer {
     tracing: Option<Arc<crate::metrics::distributed_trace::provider::Provider>>,
+    acme_servers:Arc<HashMap<usize,Arc<crate::acme_server::Controller>>>,
     metrics: Arc<crate::metrics::Registry>,
     events: Option<Arc<crate::events::EventsApp>>,
     logging: Option<Arc<crate::logging::Logging>>,
@@ -723,6 +725,7 @@ async fn prepare_servers(
         for client in clients.values(){metrics.upstreams(client.metric_probes());}
         let active = ActiveServer {
             tracing: tracing.clone(),
+            acme_servers:prepare_acme_handlers(server,provider,validate_only).await?,
             metrics: metrics.clone(),
             events: config.events.clone(),
             logging: logging.cloned(),
@@ -797,6 +800,7 @@ async fn prepare_servers(
                 address,
                 Arc::new(ActiveServer {
                     tracing: tracing.clone(),
+                    acme_servers:existing.acme_servers.clone(),
                     metrics: metrics.clone(),
                     events: config.events.clone(),
                     logging: logging.cloned(),
@@ -847,6 +851,7 @@ async fn prepare_servers(
                     events: config.events.clone(),
                     logging: logging.cloned(),
                     plan: Arc::new(plan),
+                    acme_servers:Arc::new(HashMap::new()),
                     tls: None,
                     resolver: None,
                     tls_policies: Vec::new(),
@@ -870,6 +875,30 @@ fn plain_transport_compatible(old: &ServerConfig, next: &ServerConfig) -> bool {
         && old.protocols == next.protocols
         && old.listener_stack==next.listener_stack
         && old.request_head_limit() == next.request_head_limit()
+}
+async fn prepare_acme_handlers(server:&ServerConfig,provider:Option<&Arc<dyn ScopedCertificateProvider>>,validate_only:bool)
+    ->Result<Arc<HashMap<usize,Arc<crate::acme_server::Controller>>>> {
+    let mut pending=Vec::new();pending.extend(server.routes.iter());pending.extend(server.errors.iter());pending.extend(server.named_routes.values());
+    let mut output=HashMap::new();
+    while let Some(route)=pending.pop() {
+        for handler in &route.handlers {match handler {
+            Handler::AcmeServer(config)=>{
+                // Provision-only HTTP name planning deliberately has no
+                // provider. CertificateServices checks references beforehand.
+                if validate_only {continue;}
+                let provider=provider.ok_or_else(||anyhow::anyhow!("ACME server requires a generation signing capability"))?;
+                provider.validate_acme_server(config)?;
+                let identity=Arc::as_ptr(config)as usize;
+                if !output.contains_key(&identity) {
+                    output.insert(identity,provider.prepare_acme_server(config.clone(),CancellationToken::new()).await?);
+                }
+            }
+            Handler::Subroute{routes,errors,..}=>{pending.extend(routes.iter());pending.extend(errors.iter());}
+            Handler::Intercept(responses)=>for response in responses {if let Some(routes)=&response.routes {pending.extend(routes.iter());}},
+            Handler::ReverseProxy(proxy)=>for response in &proxy.response_routes {if let Some(routes)=&response.routes {pending.extend(routes.iter());}},
+            _=>{}
+        }}
+    }Ok(Arc::new(output))
 }
 fn dns_covers(pattern: &str, name: &str) -> bool {
     if pattern.eq_ignore_ascii_case(name) {

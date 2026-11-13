@@ -12,6 +12,7 @@ pub type BaseTcp = <TokioRuntimeProvider as RuntimeProvider>::Tcp;
 
 pub struct DnsStream {
     inner: Inner,
+    retained_owner:Option<std::sync::Arc<dyn crate::cert_cpu::MaterialOwner>>,
 }
 
 enum Inner {
@@ -27,6 +28,7 @@ impl DnsStream {
         stop: tokio_util::sync::CancellationToken,
     ) -> Self {
         Self {
+            retained_owner:None,
             inner: Inner::Exchange(super::proxy_dns_exchange::ExchangeStream::new(
                 dial, logical, timeout, stop,
             )),
@@ -37,8 +39,10 @@ impl DnsStream {
     pub fn direct(tcp: BaseTcp) -> Self {
         Self {
             inner: Inner::Direct(tcp),
+            retained_owner:None,
         }
     }
+    pub(super) fn with_retained_owner(mut self,owner:Option<std::sync::Arc<dyn crate::cert_cpu::MaterialOwner>>)->Self {self.retained_owner=owner;self}
 }
 
 impl AsyncRead for DnsStream {

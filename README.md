@@ -9,6 +9,7 @@ The project currently covers a specific subset of functionalities:
 *   **HTTP/Admin**: Transactional endpoints, Host/origin/remote authorization, conditional configurations, and ETag support.
 *   **Transports**: H1, H2, and H3 streaming uploads and downloads, range-conditional responses, compression, reverse proxying (including FastCGI and WebSocket), and load balancing with dynamic upstream health checks.
 *   **TLS & Certificates**: TLS 1.2/1.3, managed and manual certificate support, on-demand ACME (HTTP-01, TLS-ALPN-01), local PKI, OCSP, session tickets, external certificate retrieval (HTTP, Tailscale), generation-scoped Must-Staple requests and private-key reuse.
+*   **ACME Server**: Native account/order lifecycle, HTTP-01/DNS-01/TLS-ALPN-01 validation, CSR signing, persistent revocation and key rollover with checked Bolt-format state interoperability.
 *   **Metrics**: Generation-scoped Prometheus/OpenMetrics scraping, HTTP/protobuf and gRPC OTLP, console export, real runtime facts, and bounded observation/export lifetimes.
 *   **Resource Push & Rewrites**: Native bounded HTTP/2 push, independent child stream lifetimes, and ordered byte-preserving URI/query and upstream rewrites.
 *   **Tracing & Timeouts**: Generation-scoped OpenTelemetry tracing and actual stream/tunnel lifetimes; native server hard deadlines and scoped route progress limits across H1/H2/H3.
@@ -20,7 +21,7 @@ The project currently covers a specific subset of functionalities:
 *   **Compatibility**: Correct useful extensions remain supported even where the baseline rejects them. Resource bounds and repairs to upstream bugs are documented differences; accepting a configuration alone does not establish correct execution.
 
 **Known Gaps**:
-Remaining standard modules/fields, remaining listener/address combinations, ACME server, remaining header-operation/push combinations, complete template mutability and remaining host methods, TLS 1.2 CBC suites, Go PKIX edge cases, and full issuer/CA-loader capabilities are not yet implemented.
+Remaining standard modules/fields, remaining listener/address combinations, remaining header-operation/push combinations, complete template mutability and remaining host methods, TLS 1.2 CBC suites, Go PKIX edge cases, and full issuer/CA-loader capabilities are not yet implemented.
 
 ## Build
 
@@ -32,6 +33,7 @@ cargo build --locked --release --features native-run
 
 For compatibility details, refer to:
 *   `COMPATIBILITY.md`
+*   `docs/ACME-SERVER.md`
 *   `docs/SESSION-TICKETS.md`
 *   `docs/METRICS.md`
 *   `docs/TRACING.md`

@@ -23,6 +23,7 @@ pub(super) struct TrackedRuntime {
     stop: CancellationToken,
     slots: Arc<Semaphore>,
     rejected: Arc<AtomicU64>,
+    retained_owner:Option<Arc<dyn crate::cert_cpu::MaterialOwner>>,
 }
 
 impl TrackedRuntime {
@@ -46,6 +47,7 @@ impl TrackedRuntime {
         rejected: Arc<AtomicU64>,
     ) -> Self {
         Self {
+            retained_owner:None,
             base: TokioRuntimeProvider::default(),
             custom: None,
             dial_timeout_ns: 0,
@@ -56,6 +58,7 @@ impl TrackedRuntime {
             rejected,
         }
     }
+    pub(super) fn with_retained_owner(mut self,owner:Option<Arc<dyn crate::cert_cpu::MaterialOwner>>)->Self {self.retained_owner=owner;self}
 }
 
 #[derive(Clone)]
@@ -64,6 +67,7 @@ pub(super) struct TrackedHandle {
     stop: CancellationToken,
     slots: Arc<Semaphore>,
     rejected: Arc<AtomicU64>,
+    retained_owner:Option<Arc<dyn crate::cert_cpu::MaterialOwner>>,
 }
 
 impl RuntimeProvider for TrackedRuntime {
@@ -74,6 +78,7 @@ impl RuntimeProvider for TrackedRuntime {
 
     fn create_handle(&self) -> Self::Handle {
         TrackedHandle {
+            retained_owner:self.retained_owner.clone(),
             tasks: self.tasks.clone(),
             stop: self.stop.clone(),
             slots: self.slots.clone(),
@@ -87,17 +92,21 @@ impl RuntimeProvider for TrackedRuntime {
         bind_addr: Option<SocketAddr>,
         timeout: Option<Duration>,
     ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Tcp, io::Error>>>> {
+        if self.retained_owner.as_ref().is_some_and(|owner|owner.reserve(8192).is_err()) {
+            return Box::pin(async {Err(io::Error::other("owned DNS capacity exceeded"))});
+        }
         if let Some(source) = self.custom.clone() {
             let stop = self.stop.clone();
             let timeout = self.exchange_leg;
-            return Box::pin(async move {
+            let owner=self.retained_owner.clone();let credit=owner.clone();
+            return retain_io(Box::pin(async move {
                 Ok(super::proxy_dns_stream::DnsStream::exchange(
                     source,
                     server_addr,
                     timeout,
                     stop,
-                ))
-            });
+                ).with_retained_owner(credit))
+            }),owner);
         }
         let timeout = match dial_budget(self.dial_timeout_ns) {
             DialBudget::Expired => return Box::pin(async { Err(dial_expired()) }),
@@ -106,13 +115,14 @@ impl RuntimeProvider for TrackedRuntime {
         };
         let base_fut = self.base.connect_tcp(server_addr, bind_addr, timeout);
         let stop = self.stop.clone();
-        Box::pin(async move {
+        let owner=self.retained_owner.clone();let credit=owner.clone();
+        retain_io(Box::pin(async move {
             tokio::select! {
                 biased;
                 _ = stop.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "DNS runtime stopped")),
-                res = base_fut => res.map(super::proxy_dns_stream::DnsStream::direct),
+                res = base_fut => res.map(|tcp|super::proxy_dns_stream::DnsStream::direct(tcp).with_retained_owner(credit)),
             }
-        })
+        }),owner)
     }
 
     fn bind_udp(
@@ -120,6 +130,9 @@ impl RuntimeProvider for TrackedRuntime {
         local_addr: SocketAddr,
         server_addr: SocketAddr,
     ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Udp, io::Error>>>> {
+        // The owned path uses logical framed exchange; physical UDP/TCP/Unix
+        // sockets belong to that exchange. Refuse an unowned raw UDP result.
+        if self.retained_owner.is_some() {return Box::pin(async {Err(io::Error::other("retained DNS requires framed exchange"))});}
         let budget = dial_budget(self.dial_timeout_ns);
         if budget == DialBudget::Expired {
             return Box::pin(async { Err(dial_expired()) });
@@ -159,6 +172,11 @@ impl Spawn for TrackedHandle {
             }
         };
         let stop = self.stop.clone();
+        if let Some(owner)=&self.retained_owner {
+            if owner.reserve(std::mem::size_of_val(&future)+4096).is_err() {self.rejected.fetch_add(1,Ordering::Relaxed);drop(future);return;}
+            let future=async move {let _permit=permit;tokio::select! {biased;_=stop.cancelled()=>{},_=future=>{}}};
+            self.tasks.spawn(RetainedBackground{future:Box::pin(future),_owner:owner.clone()});return;
+        }
         self.tasks.spawn(async move {
             let _permit = permit;
             tokio::select! {
@@ -168,6 +186,20 @@ impl Spawn for TrackedHandle {
             }
         });
     }
+}
+struct RetainedBackground<F> {future:Pin<Box<F>>,_owner:Arc<dyn crate::cert_cpu::MaterialOwner>}
+impl<F:Future<Output=()>> Future for RetainedBackground<F> {
+    type Output=();
+    fn poll(self:Pin<&mut Self>,cx:&mut std::task::Context<'_>)->std::task::Poll<()> {self.get_mut().future.as_mut().poll(cx)}
+}
+struct RetainedIo<T> {future:Pin<Box<dyn Future<Output=io::Result<T>>+Send>>,_owner:Arc<dyn crate::cert_cpu::MaterialOwner>}
+impl<T> Future for RetainedIo<T> {
+    type Output=io::Result<T>;
+    fn poll(self:Pin<&mut Self>,cx:&mut std::task::Context<'_>)->std::task::Poll<Self::Output> {self.get_mut().future.as_mut().poll(cx)}
+}
+fn retain_io<T:'static>(future:Pin<Box<dyn Future<Output=io::Result<T>>+Send>>,owner:Option<Arc<dyn crate::cert_cpu::MaterialOwner>>)
+    ->Pin<Box<dyn Future<Output=io::Result<T>>+Send>> {
+    match owner {None=>future,Some(owner)=>Box::pin(RetainedIo{future,_owner:owner})}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

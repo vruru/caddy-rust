@@ -5,6 +5,8 @@
 mod journal;
 #[path = "local_pki/material.rs"]
 mod material;
+mod acme_profile;
+pub(crate) use acme_profile::{AcmeProfile,canonical_dns as canonical_acme_dns};
 #[path = "local_pki/raw_der.rs"]
 mod raw_der;
 #[path = "local_pki/signer.rs"]
@@ -186,6 +188,36 @@ pub struct LocalPki {
     shared: Arc<Shared>,
     authorities: Arc<Mutex<HashMap<String, Arc<Authority>>>>,
 }
+// Aggregate exists before first poll and before the accepted manager task.
+// Profile/name data retire before CSR bytes and the latter's final byte credit.
+struct RetainedIssue {profile:Option<AcmeProfile>,options:InternalIssuerOptions,csr:crate::cert_cpu::RetainedBytes}
+impl RetainedIssue {
+    async fn execute(self,authority:Arc<Authority>,shared:Arc<Shared>,owner:CancellationToken)->Result<crate::cert_cpu::RetainedBytes> {
+        let state=authority.ensure_usable(owner.clone()).await?;
+        let credit=self.csr.owner();
+        let chain_bytes=if self.options.sign_with_root {1024*1024}else{state.intermediate.chain_pem.len()};
+        let key_bytes=if self.options.sign_with_root {128*1024}else{state.intermediate.private_key_pem.as_ref().map_or(0,|key|key.len())};
+        let scratch=chain_bytes.checked_add(self.csr.as_bytes().len()).and_then(|n|n.checked_mul(64))
+            .and_then(|n|n.checked_add(key_bytes.checked_mul(32)?)).and_then(|n|n.checked_add(2*1024*1024))
+            .ok_or_else(||anyhow!("PKI material capacity exceeded"))?;
+        credit.reserve(scratch)?;
+        let signing=if self.options.sign_with_root {
+            let root=authority.root_key(owner.clone()).await?;
+            ensure!(material::chain(&root.chain_pem)?[0]==material::chain(&state.root.chain_pem)?[0],"root changed since issuance snapshot");root
+        }else{state.intermediate.clone()};
+        let now=(shared.clock)()?;
+        // The ACME server returns its configured signer chain even for a root
+        // signer. Ordinary internal issuance preserves its existing omission.
+        let include_signer=self.profile.is_some()||!self.options.sign_with_root;
+        let issued=crate::cert_cpu::run_retained(shared.cpu.clone(),owner.clone(),credit,move|| {
+            match &self.profile {
+                Some(profile)=>material::issue_acme(self.csr.as_bytes(),&signing,now,include_signer,profile),
+                None=>material::issue(self.csr.as_bytes(),&signing,now,self.options.lifetime,include_signer),
+            }
+        }).await?;
+        if owner.is_cancelled() {return Err(issued.into_error(anyhow!("PKI issuer stopped")));}Ok(issued)
+    }
+}
 /// CPU work and queued-operation admission shared across independent CAs and
 /// configuration generations. Cancellation, trust and task ownership remain
 /// local to each LocalPki instance.
@@ -265,7 +297,12 @@ impl LocalPki {
     }
     fn add(&self, config: CaConfig) -> Result<()> {
         let config = config.normalized()?;
-        let prefix = format!("pki/authorities/{}", crate::certstore::safe(&config.id));
+        let safe = crate::certstore::safe(&config.id);
+        let prefix = if safe.is_empty() {
+            "pki/authorities".to_owned()
+        } else {
+            format!("pki/authorities/{safe}")
+        };
         let mut authorities = self
             .authorities
             .lock()
@@ -425,6 +462,32 @@ impl LocalPki {
             Ok(issued)
         })
         .await
+    }
+    /// Private ACME path: CSR, real blocking work, result AND errors retain the
+    /// caller's material credit. The ordinary public issue API remains intact.
+    pub(crate) async fn issue_retained(
+        &self,id:&str,csr:crate::cert_cpu::RetainedBytes,options:InternalIssuerOptions,cancel:CancellationToken,
+    )->Result<crate::cert_cpu::RetainedBytes> {
+        self.issue_retained_job(id,RetainedIssue{profile:None,options,csr},cancel).await
+    }
+    pub(crate) fn issue_acme_retained<'a>(
+        &'a self,id:&'a str,csr:crate::cert_cpu::RetainedBytes,options:InternalIssuerOptions,profile:AcmeProfile,cancel:CancellationToken,
+    )->impl Future<Output=Result<crate::cert_cpu::RetainedBytes>>+Send+'a {
+        self.issue_retained_job(id,RetainedIssue{profile:Some(profile),options,csr},cancel)
+    }
+    fn issue_retained_job<'a>(&'a self,id:&'a str,mut input:RetainedIssue,cancel:CancellationToken)
+        ->impl Future<Output=Result<crate::cert_cpu::RetainedBytes>>+Send+'a {
+        async move {
+            let error_credit=input.csr.owner();
+            let result=async {
+                ensure!(!self.shared.closed.is_cancelled(),"PKI is stopped");
+                ensure!(input.csr.as_bytes().len()<=128*1024,"CSR size limit exceeded");
+                if input.options.lifetime.is_zero() {input.options.lifetime=InternalIssuerOptions::default().lifetime;}
+                let authority=self.authority(id)?;let owner=self.shared.closed.child_token();let shared=self.shared.clone();
+                self.accepted(cancel,input.execute(authority,shared,owner)).await
+            }.await;
+            result.map_err(|error|crate::cert_cpu::retained_error(error,error_credit))
+        }
     }
     pub async fn shutdown(&self) -> Result<()> {
         {

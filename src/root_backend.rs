@@ -753,6 +753,7 @@ impl Root {
             result
         };
         let (http, certificates) = tokio::join!(http, certificates);
+        let acme=self.resources.acme_server.shutdown().await;
         // The stopped HTTP snapshot still retains the server plan. All of
         // its request tasks are joined now, so close exact-generation log
         // admission before waiting for the registry's actual writers.
@@ -763,9 +764,11 @@ impl Root {
         let logging = self.logging_registry.shutdown(deadline).await;
         http.map_err(|_| AdminError::new(503, "http_shutdown_incomplete"))?;
         certificates?;
+        acme.map_err(|_|AdminError::new(503,"acme_server_shutdown_incomplete"))?;
         if !logging.complete {
             return Err(AdminError::new(503,"logging_shutdown_incomplete"));
         }
+        self.resources.acme_server.wait_for_retirement().await.map_err(|_|AdminError::new(503,"acme_server_owners_retained"))?;
         Ok(())
     }
 }

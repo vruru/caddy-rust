@@ -173,6 +173,17 @@ impl BlockingBudget {
         let permit = self.acquire().await?;
         run_owned(self.tasks.clone(), permit, f).await
     }
+    /// Closed native producers only. The actual closure and returned value
+    /// retain this credit independently of the waiting caller and this budget.
+    pub(crate) fn run_retained<T,F>(&self,owner:Arc<dyn crate::cert_cpu::MaterialOwner>,operation:F)
+        ->impl std::future::Future<Output=Result<RetainedBlockingOutput<T>,BudgetError>>+Send+'_
+    where T:Send+'static,F:FnOnce()->T+Send+'static {
+        let job=RetainedBlockingJob{operation,owner};
+        async move {
+            job.owner.reserve(std::mem::size_of::<F>()+std::mem::size_of::<T>()+2048).map_err(|_|BudgetError::Overloaded)?;
+            let permit=self.acquire().await?;run_owned(self.tasks.clone(),permit,move||job.execute()).await
+        }
+    }
 
     pub(crate) fn tasks(&self) -> TaskTracker {
         self.tasks.clone()
@@ -185,6 +196,21 @@ impl BlockingBudget {
             waiting: self.waiting_limit - self.waiting.available_permits(),
             rejected: self.rejected.load(Ordering::Relaxed),
         }
+    }
+}
+// Force the entire producer/owner into the real blocking closure. Both an
+// abandoned receiver and panic retire captured data before the byte credit.
+struct RetainedBlockingJob<F>{operation:F,owner:Arc<dyn crate::cert_cpu::MaterialOwner>}
+pub(crate) struct RetainedBlockingOutput<T>{value:T,_owner:Arc<dyn crate::cert_cpu::MaterialOwner>}
+impl<T> RetainedBlockingOutput<T> {
+    pub(crate) fn get(&self)->&T {&self.value}
+    // Only the DNS implementation can hand off the raw value into its own
+    // explicitly retained configuration graph or retained transport future.
+    pub(super) fn into_configuration(self)->T {self.value}
+}
+impl<F> RetainedBlockingJob<F> {
+    fn execute<T>(self)->RetainedBlockingOutput<T> where F:FnOnce()->T {
+        let Self{operation,owner}=self;RetainedBlockingOutput{value:operation(),_owner:owner}
     }
 }
 

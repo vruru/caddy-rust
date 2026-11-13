@@ -206,7 +206,7 @@ pub(super) fn parse(views: CertificateViews<'_>) -> Result<CertificatePlan> {
     let mut ca_paths = std::collections::HashSet::new();
     for id in plan.authorities.keys() {
         let safe = crate::certstore::safe(id);
-        if safe.is_empty() || !ca_paths.insert(safe) {
+        if !ca_paths.insert(safe) {
             return Err(ConfigError::invalid(pointer(
                 &pki.at("certificate_authorities"),
                 id,

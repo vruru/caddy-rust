@@ -86,6 +86,7 @@ pub(crate) enum Handler {
     Push(std::sync::Arc<PushConfig>),
     Tracing(std::sync::Arc<crate::metrics::distributed_trace::config::Config>),
     Timeouts(super::route_timeouts::RouteTimeouts),
+    AcmeServer(std::sync::Arc<crate::acme_server::Config>),
     Metrics { disable_openmetrics: bool },
     Templates(std::sync::Arc<crate::http_runtime::templates::TemplatePlan>),
     StaticError {

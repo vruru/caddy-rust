@@ -992,6 +992,7 @@ fn parse_handler(
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("handler ID required"))?;
     Ok(match handler {
+        "acme_server" => Handler::AcmeServer(std::sync::Arc::new(crate::acme_server::parse(value)?)),
         "error" => {
             deny_unknown(m, &["handler", "status_code", "error"], path)?;
             Handler::StaticError {

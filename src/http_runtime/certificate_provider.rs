@@ -61,6 +61,17 @@ pub struct CertificateRequest {
 /// Certificate validity, actual protocol/signature selection and shared leaf
 /// admission are still checked by the final certificate resolver.
 pub trait ScopedCertificateProvider: Send + Sync {
+    /// Pure ACME configuration/reference checks, without opening a database or
+    /// creating CA material. A generic name-only provider cannot validate one.
+    fn validate_acme_server(&self,_config:&crate::acme_server::Config)->Result<()> {
+        anyhow::bail!("ACME server signing capability unavailable")
+    }
+    /// Prepare an actual CA-backed ACME handler in this generation. The default
+    /// explicitly refuses; a name-only certificate capability cannot sign.
+    fn prepare_acme_server(&self,_config:Arc<crate::acme_server::Config>,_cancel:CancellationToken)
+        -> BoxFuture<'static,Result<Arc<crate::acme_server::Controller>>> {
+        Box::pin(async {anyhow::bail!("ACME server signing capability unavailable")})
+    }
     fn ensure_request(
         &self,
         request: CertificateRequest,

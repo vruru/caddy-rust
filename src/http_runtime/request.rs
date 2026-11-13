@@ -1054,6 +1054,13 @@ fn handlers<'a>(
                     if result.is_err() && super::route_timeouts::unwind(ctx,mark).is_err(){ctx.close_after_response=true;}
                     return result;
                 }
+                Handler::AcmeServer(config)=>{
+                    let controller=server.acme_servers.get(&(Arc::as_ptr(config)as usize))
+                        .ok_or_else(||anyhow::anyhow!("ACME server was not prepared"))?;
+                    if !controller.matches(ctx.req().uri().path()) {continue;}
+                    let response=controller.handle(ctx.request.as_mut().expect("request owned"),&ctx.authority,ctx.drain.child_token()).await?;
+                    return Ok(Flow::Response(response));
+                }
                 Handler::Metrics{disable_openmetrics}=>{
                     let mut response=server.metrics.scrape(ctx.req().headers(),!*disable_openmetrics).await;
                     response.extensions_mut().insert(crate::metrics::discarded::PreparedEntity);

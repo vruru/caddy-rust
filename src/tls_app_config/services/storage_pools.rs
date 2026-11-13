@@ -130,6 +130,7 @@ impl CertificateServices {
         config: crate::http_config::PreparedConfig,
         cancel: CancellationToken,
     ) -> Result<crate::http_config::PreparedConfig> {
+        self.validate_acme_routes(&config)?;
         let config = self.prepare_pki_pools(config, cancel.clone()).await?;
         self.owned(cancel, move |this, token| {
             Box::pin(async move {

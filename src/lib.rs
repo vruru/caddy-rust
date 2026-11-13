@@ -1,5 +1,6 @@
 pub mod process_path;
 pub mod acme_wire;
+pub mod acme_server;
 pub mod admin;
 pub mod admin_json;
 pub mod caddyfile_lexer;
