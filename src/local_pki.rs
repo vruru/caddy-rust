@@ -42,6 +42,13 @@ pub struct KeyPairFiles {
     /// Only the original empty/default or `pem_file` formats are accepted.
     pub format: String,
 }
+/// A valid configured authority has no root signer for this requested mode.
+/// Storage, malformed keys, mismatched identity and cancellation never use this marker.
+#[derive(Debug)]
+pub(crate) struct SignerUnavailable;
+impl std::fmt::Display for SignerUnavailable {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.write_str("root signing key unavailable")}}
+impl std::error::Error for SignerUnavailable {}
+
 #[derive(Clone)]
 pub struct CaConfig {
     pub id: String,
@@ -200,28 +207,52 @@ pub struct LocalPki {
 // Aggregate exists before first poll and before the accepted manager task.
 // Profile/name data retire before CSR bytes and the latter's final byte credit.
 struct RetainedIssue {profile:Option<AcmeProfile>,options:InternalIssuerOptions,csr:crate::cert_cpu::RetainedBytes}
+// A concrete CA-pair output keeps its prepaid buffers alive independently of
+// the task awaiting it. Error and result payloads retire before their owner.
+struct RetainedPair {pair:Pair,_owner:Arc<dyn crate::cert_cpu::MaterialOwner>}
+struct PairJob<F>{operation:F,owner:Arc<dyn crate::cert_cpu::MaterialOwner>}
+impl<F:FnOnce()->Result<Pair>> PairJob<F>{
+    fn execute(self)->Result<RetainedPair>{
+        let Self{operation,owner}=self;
+        operation().map(|pair|RetainedPair{pair,_owner:owner.clone()})
+            .map_err(|error|crate::cert_cpu::retained_error(error,owner))
+    }
+}
+fn pair_work(cpu:Arc<Semaphore>,cancel:CancellationToken,owner:Arc<dyn crate::cert_cpu::MaterialOwner>,
+    operation:impl FnOnce()->Result<Pair>+Send+'static)->impl Future<Output=Result<RetainedPair>>+Send {
+    let job=PairJob{operation,owner};
+    async move {let error_owner=job.owner.clone();
+        crate::cert_cpu::run(cpu,cancel,move||job.execute()).await
+            .map_err(|error|crate::cert_cpu::retained_error(error,error_owner))
+    }
+}
 impl RetainedIssue {
     async fn execute(self,authority:Arc<Authority>,shared:Arc<Shared>,owner:CancellationToken)->Result<crate::cert_cpu::RetainedBytes> {
         let state=authority.ensure_usable(owner.clone()).await?;
         let credit=self.csr.owner();
-        let chain_bytes=if self.options.sign_with_root {1024*1024}else{state.intermediate.chain_pem.len()};
-        let key_bytes=if self.options.sign_with_root {128*1024}else{state.intermediate.private_key_pem.as_ref().map_or(0,|key|key.len())};
+        let signing=if self.options.sign_with_root {
+            authority.root_key_retained(owner.clone(),credit.clone(),state.clone()).await?
+        }else{
+            let copies=state.intermediate.chain_pem.len().checked_add(state.intermediate.private_key_pem.as_ref().map_or(0,|key|key.len()))
+                .ok_or(crate::cert_transient::ResourceDenied)?;
+            credit.reserve(copies)?;
+            RetainedPair{pair:state.intermediate.clone(),_owner:credit.clone()}
+        };
+        let chain_bytes=signing.pair.chain_pem.len();
+        let key_bytes=signing.pair.private_key_pem.as_ref().map_or(0,|key|key.len());
+        ensure!(chain_bytes<=1024*1024&&key_bytes<=128*1024,"PKI retained signer exceeds input bounds");
         let scratch=chain_bytes.checked_add(self.csr.as_bytes().len()).and_then(|n|n.checked_mul(64))
             .and_then(|n|n.checked_add(key_bytes.checked_mul(32)?)).and_then(|n|n.checked_add(2*1024*1024))
             .ok_or_else(||anyhow!("PKI material capacity exceeded"))?;
         credit.reserve(scratch)?;
-        let signing=if self.options.sign_with_root {
-            let root=authority.root_key(owner.clone()).await?;
-            ensure!(material::chain(&root.chain_pem)?[0]==material::chain(&state.root.chain_pem)?[0],"root changed since issuance snapshot");root
-        }else{state.intermediate.clone()};
         let now=(shared.clock)()?;
         // The ACME server returns its configured signer chain even for a root
         // signer. Ordinary internal issuance preserves its existing omission.
         let include_signer=self.profile.is_some()||!self.options.sign_with_root;
         let issued=crate::cert_cpu::run_retained(shared.cpu.clone(),owner.clone(),credit,move|| {
             match &self.profile {
-                Some(profile)=>material::issue_acme(self.csr.as_bytes(),&signing,now,include_signer,profile),
-                None=>material::issue(self.csr.as_bytes(),&signing,now,self.options.lifetime,include_signer),
+                Some(profile)=>material::issue_acme(self.csr.as_bytes(),&signing.pair,now,include_signer,profile),
+                None=>material::issue(self.csr.as_bytes(),&signing.pair,now,self.options.lifetime,include_signer),
             }
         }).await?;
         if owner.is_cancelled() {return Err(issued.into_error(anyhow!("PKI issuer stopped")));}Ok(issued)
@@ -666,6 +697,85 @@ impl Authority {
         })
         .await
     }
+    /// Called after ensure_usable has settled the authority. Never sign through
+    /// an unresolved externally changed checkpoint using cached root facts.
+    async fn root_key_retained(&self,cancel:CancellationToken,credit:Arc<dyn crate::cert_cpu::MaterialOwner>,
+        expected:Arc<State>)->Result<RetainedPair> {
+        let lease=self.store.lock(&self.lock_name,cancel.clone()).await?;
+        let result=async {
+            let root=if let Some(files)=&self.config.root {
+                use std::os::unix::ffi::OsStrExt;
+                let paths=files.certificate.as_os_str().as_bytes().len()
+                    .checked_add(files.private_key.as_ref().map_or(0,|p|p.as_os_str().as_bytes().len()))
+                    .and_then(|n|n.checked_add(16384)).ok_or(crate::cert_transient::ResourceDenied)?;
+                credit.reserve(paths)?;
+                let files=files.clone();let read_credit=credit.clone();
+                pair_work(self.shared.cpu.clone(),cancel.clone(),credit.clone(),move||{
+                    fn read(path:PathBuf,limit:usize,credit:&dyn crate::cert_cpu::MaterialOwner)->Result<Zeroizing<Vec<u8>>>{
+                        use std::io::Read;use std::os::unix::fs::OpenOptionsExt;
+                        let mut file=std::fs::OpenOptions::new().read(true)
+                            .custom_flags(rustix::fs::OFlags::NONBLOCK.bits()as i32).open(path)?;
+                        let meta=file.metadata()?;let len=usize::try_from(meta.len())?;
+                        ensure!(meta.is_file()&&len<=limit,"invalid CA material file");
+                        credit.reserve(len.checked_mul(2).and_then(|n|n.checked_add(64)).ok_or(crate::cert_transient::ResourceDenied)?)?;
+                        let mut value=Zeroizing::new(Vec::new());value.try_reserve_exact(len).map_err(|_|crate::cert_transient::ResourceDenied)?;
+                        let mut chunk=[0u8;8192];loop{let n=file.read(&mut chunk)?;if n==0{break}
+                            ensure!(n<=len.saturating_sub(value.len()),"CA material grew during read");value.extend_from_slice(&chunk[..n]);}
+                        ensure!(value.len()==len,"CA material changed during read");Ok(value)
+                    }
+                    Ok(Pair{explicit_anchor:false,chain_pem:read(files.certificate,1024*1024,read_credit.as_ref())?.to_vec(),
+                        private_key_pem:files.private_key.map(|p|read(p,128*1024,read_credit.as_ref())).transpose()?})
+                }).await?
+            }else{
+                let job=journal::job_name(&self.prefix,"root");
+                credit.reserve(self.prefix.len()*2+lease.name().len()+4096)?;
+                let prefix=self.prefix.clone();let name=lease.name().to_owned();let owner=credit.clone();
+                let checkpoint=self.store.journal_decode_admitted(&job,move|raw|{
+                    #[derive(serde::Deserialize)]struct Check<'a>{version:u8,#[serde(borrow)]scope:&'a str,
+                        #[serde(borrow)]kind:&'a str,#[serde(borrow)]phase:&'a str,#[serde(borrow)]lease_name:&'a str,
+                        #[serde(borrow)]new_crt_sha256:&'a str,#[serde(borrow)]new_key_sha256:&'a str}
+                    let _owner=owner;let record:Check<'_>=serde_json::from_slice(raw)
+                        .map_err(|_|anyhow!("invalid CA root checkpoint"))?;
+                    ensure!(record.version==1&&record.scope==prefix&&record.kind=="root"&&record.phase=="done"
+                        &&record.lease_name==name,"CA root checkpoint is not settled");
+                    ensure!(record.new_crt_sha256.len()==64&&record.new_key_sha256.len()==64,"invalid CA root checkpoint fingerprints");
+                    Ok((record.new_crt_sha256.to_owned(),record.new_key_sha256.to_owned()))
+                }).await?;
+                let crt=self.store.load_ca_input(&format!("{}/root.crt",self.prefix)).await?
+                    .ok_or_else(||anyhow!("CA root missing"))?;
+                let key=self.store.load_ca_input(&format!("{}/root.key",self.prefix)).await?
+                    .ok_or_else(||anyhow!("CA root signing key missing"))?;
+                ensure!(crt.as_slice().len()<=1024*1024&&key.as_slice().len()<=128*1024,"CA root material exceeds input bounds");
+                credit.reserve(crt.as_slice().len().checked_add(key.as_slice().len())
+                    .and_then(|n|n.checked_add(256)).ok_or(crate::cert_transient::ResourceDenied)?)?;
+                pair_work(self.shared.cpu.clone(),cancel.clone(),credit.clone(),move||{
+                    if let Some((crt_hash,key_hash))=checkpoint {
+                        ensure!(journal::hash(crt.as_slice())==crt_hash&&journal::hash(key.as_slice())==key_hash,
+                            "completed CA root checkpoint encountered external material change");
+                    }
+                    Ok(Pair{explicit_anchor:false,chain_pem:crt.as_slice().to_vec(),
+                        private_key_pem:Some(Zeroizing::new(key.as_slice().to_vec()))})
+                }).await?
+            };
+            let key_bytes=root.pair.private_key_pem.as_ref().map_or(0,|p|p.len());
+            let shape=root.pair.chain_pem.len().checked_add(expected.root.chain_pem.len())
+                .and_then(|n|n.checked_mul(64)).and_then(|n|key_bytes.checked_mul(32).and_then(|k|n.checked_add(k)))
+                .and_then(|n|n.checked_add(2*1024*1024)).ok_or(crate::cert_transient::ResourceDenied)?;
+            credit.reserve(shape)?;
+            let now=(self.shared.clock)()?;let configured=self.config.root.is_some();let lost=lease.lost();
+            pair_work(self.shared.cpu.clone(),cancel.clone(),credit.clone(),move||{
+                ensure!(!lost.is_cancelled(),"CA root lease lost");
+                let pair=if configured{material::configured_anchor(root.pair)?}else{root.pair};
+                material::validate(&pair,None,now,false)?;
+                ensure!(pair.private_key_pem.is_some(),SignerUnavailable);
+                ensure!(material::chain(&pair.chain_pem)?[0]==material::chain(&expected.root.chain_pem)?[0],
+                    "root changed since issuance snapshot");
+                ensure!(!lost.is_cancelled(),"CA root lease lost");Ok(pair)
+            }).await
+        }.await;
+        let released=lease.release().await;
+        match result{Ok(pair)=>{released?;Ok(pair)},Err(error)=>{let _=released;Err(crate::cert_cpu::retained_error(error,credit))}}
+    }
     async fn root_key(&self, cancel: CancellationToken) -> Result<Pair> {
         let lease = self.store.lock(&self.lock_name, cancel.clone()).await?;
         let result = async {
@@ -699,7 +809,7 @@ impl Authority {
             .await?;
             ensure!(
                 root.private_key_pem.is_some(),
-                "root signing key unavailable"
+                SignerUnavailable
             );
             if let Some(state) = self
                 .state

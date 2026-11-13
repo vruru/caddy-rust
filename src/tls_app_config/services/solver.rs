@@ -10,7 +10,8 @@ pub(super) struct SolverBroker {
     staged: Vec<StagedAddress>,
     provider: Option<Arc<dyn ChallengeListenerProvider>>,
     leases: AsyncMutex<Vec<Box<dyn ChallengeListenerLease>>>,
-    // Binding directory strings can outlive the manager during group drop.
+    // Actual settings/leases/callbacks retire before their producer credit.
+    _memory:crate::acme_wire::chain_memory::Scratch,
     _issuer_values_credit:Option<Arc<crate::acme_wire::chain_memory::Lease>>,
 }
 struct BindingSettings {
@@ -26,17 +27,19 @@ impl SolverBroker {
         staged: Vec<StagedAddress>,
         provider: Option<Arc<dyn ChallengeListenerProvider>>,
     ) -> Result<Arc<Self>> {
-        let mut directories = std::collections::HashSet::new();
+        ensure!(settings.len()<=16,"challenge issuer binding limit");
+        let bytes=settings.iter().try_fold(8192usize,|n,s|{
+            let text=s.config.wire.directory.len().checked_mul(3).and_then(|a|s.bind_host.len().checked_mul(2).and_then(|b|a.checked_add(b))).ok_or(crate::cert_transient::ResourceDenied)?;
+            n.checked_add(text).and_then(|n|n.checked_add(std::mem::size_of::<BindingSettings>()+2048)).ok_or(crate::cert_transient::ResourceDenied)
+        })?.checked_add(staged.len().checked_mul(std::mem::size_of::<StagedAddress>()).ok_or(crate::cert_transient::ResourceDenied)?)
+            .ok_or(crate::cert_transient::ResourceDenied)?;
+        let memory=crate::cert_transient::reserve(bytes)?;
         let settings = settings
             .into_iter()
             .map(|settings| {
                 let directory = url::Url::parse(&settings.config.wire.directory)
                     .map_err(|_| anyhow!("invalid challenge issuer directory"))?
                     .to_string();
-                ensure!(
-                    directories.insert(directory.clone()),
-                    "duplicate challenge issuer directory requires separate policy"
-                );
                 let bind_address=if let Some(provider)=&provider {provider.resolve_bind_host(&settings.bind_host)?}else{crate::http_runtime::listener_lease::numeric_bind_host(&settings.bind_host)?};
                 Ok(BindingSettings {
                     directory,
@@ -52,12 +55,29 @@ impl SolverBroker {
             staged,
             provider,
             leases: AsyncMutex::new(Vec::new()),
+            _memory:memory,
             _issuer_values_credit:None,
         }))
     }
     pub(super) fn with_issuer_values_credit(mut self:Arc<Self>,credit:Option<Arc<crate::acme_wire::chain_memory::Lease>>)->Result<Arc<Self>>{
         Arc::get_mut(&mut self).ok_or_else(||anyhow!("challenge broker already shared"))?._issuer_values_credit=credit;
         Ok(self)
+    }
+    pub(super) fn callbacks(self:&Arc<Self>)->Result<Vec<SolverPreparation>>{
+        // Constructor prepaid this bounded vector/callback metadata. Every
+        // callback and invoked future keeps the concrete producer alive.
+        (0..self.settings.len()).map(|index|self.callback_for(index)).collect()
+    }
+    pub(super) fn callback_for(self:&Arc<Self>,index:usize)->Result<SolverPreparation>{
+        ensure!(index<self.settings.len(),"issuer proof binding index out of range");
+        let this=self.clone();
+        Ok(Arc::new(move|directory:String,kind,cancel|{
+            let this=this.clone();
+            Box::pin(async move {
+                ensure!(this.settings[index].directory==directory,"issuer proof binding changed");
+                this.prepare_index(index,kind,cancel).await
+            })
+        }))
     }
     pub(super) fn callback(self: &Arc<Self>) -> SolverPreparation {
         let this = self.clone();
@@ -76,11 +96,14 @@ impl SolverBroker {
             !cancel.is_cancelled(),
             "challenge listener preparation cancelled"
         );
-        let settings = self
-            .settings
-            .iter()
-            .find(|settings| settings.directory == directory)
-            .ok_or_else(|| anyhow!("challenge issuer binding is missing"))?;
+        let mut matches=self.settings.iter().enumerate().filter(|(_,s)|s.directory==directory);
+        let(index,_)=matches.next().ok_or_else(||anyhow!("challenge issuer binding is missing"))?;
+        ensure!(matches.next().is_none(),"ambiguous unbound challenge issuer directory");
+        self.prepare_index(index,kind,cancel).await
+    }
+    async fn prepare_index(&self,index:usize,kind:ChallengeType,cancel:CancellationToken)->Result<()> {
+        ensure!(!cancel.is_cancelled(),"challenge listener preparation cancelled");
+        let settings=self.settings.get(index).ok_or_else(||anyhow!("challenge issuer binding missing"))?;
         let port = match kind {
             ChallengeType::Http01 => settings.http_port,
             ChallengeType::TlsAlpn01 => settings.alpn_port,

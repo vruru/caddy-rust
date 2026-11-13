@@ -3,6 +3,15 @@ use super::AccountSigner;
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
 
+/// Only the closed invalid-credential sentinel emits this error. A real
+/// signer/CPU/storage failure never acquires this fallback permission.
+#[derive(Debug)]
+pub(crate) struct CredentialUnavailable;
+impl std::fmt::Display for CredentialUnavailable {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.write_str("invalid configured ACME account key")}
+}
+impl std::error::Error for CredentialUnavailable {}
+
 /// A prepared key retains its signer and public RFC 7638 identity, not a second
 /// PEM buffer. Parse on a bounded blocking lane when called from an async host.
 /// Deliberately has no Debug implementation.
@@ -26,7 +35,7 @@ impl ConfiguredAccountKey {
     pub(crate) fn signer(&self) -> Result<Arc<AccountSigner>> {
         self.signer
             .clone()
-            .ok_or_else(|| anyhow!("invalid configured ACME account key"))
+            .ok_or_else(|| CredentialUnavailable.into())
     }
     // Keep a known bad credential as an issuer-local failure, so an independent
     // configured fallback issuer remains available. It cannot sign anything.

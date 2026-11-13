@@ -365,3 +365,15 @@ pub(super) fn decode(raw:&[u8])->Result<Job>{
     job.restored_memory=Some(Arc::new(memory));
     drop(scratch);Ok(job)
 }
+
+/// Bounded typed journal record encoding; no intermediate Value/key copy.
+pub(super) fn encode_record(value:&impl Serialize,lease_name:&str)->Result<Encoded> {
+    #[derive(Serialize)] struct Record<'a,T:Serialize>{#[serde(flatten)] value:&'a T,lease_name:&'a str}
+    let record=Record{value,lease_name};let mut count=Count(0);
+    serde_json::to_writer(&mut count,&record).map_err(|_|crate::cert_transient::ResourceDenied)?;
+    let credit=chain_memory::try_scratch(count.0).map_err(|_|crate::cert_transient::ResourceDenied)?;
+    let mut bytes=Zeroizing::new(Vec::new());bytes.try_reserve_exact(count.0).map_err(|_|crate::cert_transient::ResourceDenied)?;
+    let mut writer=Writer{bytes,limit:count.0};serde_json::to_writer(&mut writer,&record)?;
+    ensure!(writer.bytes.len()==count.0,"journal record encoding changed");
+    Ok(Encoded{bytes:writer.bytes,_credit:credit})
+}

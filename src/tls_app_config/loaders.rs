@@ -285,6 +285,34 @@ pub(super) fn read(path: &Path) -> Result<Vec<u8>> {
     );
     Ok(std::mem::take(&mut *bytes))
 }
+/// Root-file bytes stay admitted through their actual constructor/manager
+/// owner. The data-first tuple also preserves that order if its caller stops
+/// while the file worker is still running or leaves its result unconsumed.
+pub(super) fn read_root_input(
+    path: &Path,
+) -> Result<(Vec<u8>, crate::acme_wire::chain_memory::Scratch)> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|_| anyhow!("configured certificate file unavailable"))?;
+    let metadata = file.metadata()
+        .map_err(|_| anyhow!("configured certificate metadata unavailable"))?;
+    ensure!(metadata.is_file() && metadata.len() <= MAX_MATERIAL as u64,
+        "configured certificate file exceeds size limit");
+    let size = usize::try_from(metadata.len())
+        .map_err(|_| anyhow!("configured certificate size overflow"))?;
+    let amount = size.checked_add(std::mem::size_of::<Vec<u8>>())
+        .and_then(|n| n.checked_add(std::mem::size_of::<crate::acme_wire::chain_memory::Scratch>()))
+        .and_then(|n| n.checked_add(64))
+        .ok_or(crate::cert_transient::ResourceDenied)?;
+    let memory = crate::cert_transient::reserve(amount)?;
+    let mut bytes = Zeroizing::new(vec![0; size]);
+    file.read_exact(&mut bytes)
+        .map_err(|_| anyhow!("configured certificate file read failed"))?;
+    let mut extra = Zeroizing::new([0u8; 1]);
+    ensure!(file.read(&mut *extra)
+        .map_err(|_| anyhow!("configured certificate file read failed"))? == 0,
+        "configured certificate changed during read");
+    Ok((std::mem::take(&mut *bytes), memory))
+}
 fn collect(
     path: &Path,
     depth: usize,

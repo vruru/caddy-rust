@@ -25,7 +25,7 @@ use serde_json::json;
 use std::{
     collections::HashMap,
     future::Future,
-    sync::atomic::{AtomicBool, AtomicI64, Ordering},
+    sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -95,6 +95,7 @@ struct RetainedMaterial {
     renew_at: i64,
     ari_after: i64,
     origin: String,
+    kind:Option<crate::cert_automation::ManagedKind>,
 }
 pub enum PrepareMode {
     Normal,
@@ -122,6 +123,7 @@ struct Group {
     store: Arc<Store>,
     resolver: Arc<HotCertificateResolver>,
     issuer: GroupIssuer,
+    selected_backend:Mutex<Option<cert_automation::BackendSelection>>,
     identity: bool,
     gate: AsyncMutex<()>,
     solver: Option<Arc<solver::SolverBroker>>,
@@ -140,6 +142,31 @@ struct Group {
     started: Mutex<bool>,
     _admission: tokio::sync::OwnedSemaphorePermit,
 }
+#[derive(Clone)]
+struct SelectedClass {text:String,_memory:Arc<crate::acme_wire::chain_memory::Scratch>}
+impl Group {
+    fn selection(&self)->Result<cert_automation::BackendSelection>{
+        self.selected_backend.lock().map_err(|_|anyhow!("selected issuer state unavailable"))?.clone()
+            .ok_or_else(||anyhow!("selected issuer not initialized"))
+    }
+    fn select(&self,value:cert_automation::BackendSelection)->Result<()> {
+        let old={let mut selected=self.selected_backend.lock().map_err(|_|anyhow!("selected issuer state unavailable"))?;selected.replace(value)};
+        drop(old);Ok(())
+    }
+    fn selected_class(&self)->Result<SelectedClass>{
+        let selection=self.selection()?;
+        let text=match &self.issuer {GroupIssuer::Acme(manager)=>manager.selection_class(&selection)?,GroupIssuer::Internal{ca,..}=>ca};
+        // Original, per-try packet and planner copies overlap. The packet is
+        // captured whole by the actual publication worker, including its loan.
+        let bytes=text.len().checked_mul(6).and_then(|n|n.checked_add(512)).ok_or(crate::cert_transient::ResourceDenied)?;
+        let memory=crate::cert_transient::reserve(bytes)?;
+        Ok(SelectedClass{text:text.to_owned(),_memory:Arc::new(memory)})
+    }
+    fn selected_kind(&self)->Result<crate::cert_automation::ManagedKind>{let selection=self.selection()?;match &self.issuer {
+        GroupIssuer::Acme(manager)=>manager.selection_kind(&selection),GroupIssuer::Internal{..}=>Ok(crate::cert_automation::ManagedKind::Internal),
+    }}
+}
+
 #[derive(Clone)]
 struct ResidencyBinding {
     slot: Arc<CertificateResidency>,
@@ -213,7 +240,7 @@ pub struct CertificateServices {
     #[cfg(feature="native-run")]
     outgoing_tls:Option<Arc<crate::outgoing_tls::Scope>>,
     ssl_verify:Arc<native_ssl_tls::VerificationScope>,
-    plan: CertificatePlan,
+    plan: Arc<CertificatePlan>,
     context: PrepareContext,
     restore: Option<RetainedCertificates>,
     identity_resolver: Arc<HotCertificateResolver>,
@@ -238,6 +265,7 @@ pub struct CertificateServices {
     cache_epoch: OnceCell<Arc<super::resident_cache::Epoch>>,
     effective_tls: AtomicBool,
     implicit_tailscale: std::sync::OnceLock<std::collections::HashSet<String>>,
+    _plan_memory:crate::acme_wire::chain_memory::Scratch,
 }
 
 impl CertificateServices {
@@ -298,10 +326,13 @@ impl CertificateServices {
         let cache_receiver = context.resources.resident_cache.subscribe();
         let on_demand = Arc::new(on_demand::OnDemand::new(cache_receiver,
             context.leaf_guard.key_deny().clone()));
+        let plan_memory=crate::cert_transient::reserve(std::mem::size_of::<CertificatePlan>()+64)?;
+        let plan=Arc::new(plan);
         let this = Arc::new(Self {
             #[cfg(feature="native-run")]
             outgoing_tls,
             ssl_verify:native_ssl_tls::VerificationScope::new(),
+            _plan_memory:plan_memory,
             plan,
             context,
             restore,
@@ -747,6 +778,7 @@ impl CertificateServices {
                 renew_at: 0,
                 ari_after: i64::MAX,
                 origin: String::new(),
+                kind:None,
             })
             .collect();
         self.manual_ocsp(cancel).await?;
@@ -952,7 +984,7 @@ impl CertificateServices {
         let mut groups = std::collections::HashSet::new();
         let mut aliases = std::collections::HashSet::new();
         for group in names {
-            let normalized = cert_automation::normalize_names(&group)?;
+            let normalized = cert_automation::normalize_managed_names(&group)?;
             let first = self.policy_index(&normalized[0]);
             ensure!(
                 normalized
@@ -960,6 +992,13 @@ impl CertificateServices {
                     .all(|name| self.policy_index(name) == first),
                 "SAN group crosses automation policies"
             );
+            // Internal issuers support IP and wildcard subjects. Do not run
+            // their groups through the ACME-only DNS preflight; each ACME leg
+            // still rejects unsupported subject types before creating orders.
+            if !self.policy(&normalized[0]).issuers.iter()
+                .any(|issuer| matches!(issuer, Issuer::Internal { .. })) {
+                cert_automation::normalize_names(&normalized)?;
+            }
             if groups.insert(normalized.clone()) {
                 ensure!(
                     normalized.iter().all(|name| aliases.insert(name.clone())),

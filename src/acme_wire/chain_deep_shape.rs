@@ -222,3 +222,120 @@ pub(crate) fn full_cost(der: &[u8]) -> Result<usize> {
     }
     Ok(cost)
 }
+
+
+// CSR admission deliberately uses a strict walker. Unlike certificate
+// full_cost's historical diagnostic pass, malformed constructed values must
+// not terminate counting early before the pinned CSR parser allocates.
+fn csr_next<'a>(input: &mut &'a [u8]) -> Result<Item<'a>> {
+    let bytes = *input;
+    let tag = *bytes.first().ok_or(FootprintError::Malformed("CSR tag"))?;
+    if tag == 0 { return Err(FootprintError::Malformed("CSR end-of-content")); }
+    let mut header = 1usize;
+    if tag & 31 == 31 {
+        let mut number = 0u32;
+        loop {
+            let byte = *bytes.get(header).ok_or(FootprintError::Malformed("CSR high tag"))?;
+            if header == 1 && byte & 127 == 0 {
+                return Err(FootprintError::Malformed("CSR nonminimal tag"));
+            }
+            number = number.checked_mul(128).and_then(|v| v.checked_add((byte & 127) as u32))
+                .ok_or(FootprintError::Malformed("CSR tag overflow"))?;
+            header += 1;
+            if byte & 128 == 0 { break; }
+        }
+        if number < 31 { return Err(FootprintError::Malformed("CSR nonminimal high tag")); }
+    }
+    let first = *bytes.get(header).ok_or(FootprintError::Malformed("CSR length"))?;
+    header += 1;
+    let length = if first < 128 { first as usize } else {
+        let count = (first & 127) as usize;
+        // Every admitted CSR is at most 64 KiB. Indefinite and nonminimal
+        // encodings are rejected here even if a nested BER helper accepts it.
+        if count == 0 || count > 4 {
+            return Err(FootprintError::Malformed("CSR indefinite/oversized length"));
+        }
+        let raw = bytes.get(header..header + count)
+            .ok_or(FootprintError::Malformed("CSR truncated length"))?;
+        if raw[0] == 0 { return Err(FootprintError::Malformed("CSR nonminimal length")); }
+        let mut value = 0usize;
+        for byte in raw {
+            value = value.checked_mul(256).and_then(|v| v.checked_add(*byte as usize))
+                .ok_or(FootprintError::Malformed("CSR length overflow"))?;
+        }
+        if value < 128 { return Err(FootprintError::Malformed("CSR long short-length")); }
+        header += count;
+        value
+    };
+    let end = header.checked_add(length).ok_or(FootprintError::Malformed("CSR length overflow"))?;
+    let body = bytes.get(header..end).ok_or(FootprintError::Malformed("CSR truncated body"))?;
+    *input = &bytes[end..];
+    Ok(Item { tag, body })
+}
+fn csr_take<'a>(input: &mut &'a [u8], tag: u8) -> Result<&'a [u8]> {
+    let item = csr_next(input)?;
+    if item.tag != tag { return Err(FootprintError::Malformed("CSR field tag")); }
+    Ok(item.body)
+}
+fn csr_nodes(mut input: &[u8], depth: usize) -> Result<usize> {
+    if depth > 128 { return Err(FootprintError::Resource("CSR AST depth")); }
+    let mut count = 0;
+    while !input.is_empty() {
+        let item = csr_next(&mut input)?;
+        count = add(count, 1)?;
+        if item.tag & 32 != 0 { count = add(count, csr_nodes(item.body, depth + 1)?)?; }
+    }
+    Ok(count)
+}
+/// Allocation bound for x509-parser 0.18.1's CSR AST, separate from retained
+/// input buffers and the private-key/signature CPU scratch. No heap allocation
+/// occurs in this borrowed shape pass. Unknown primitive payloads stay opaque.
+pub(crate) fn csr_cost(der: &[u8]) -> Result<usize> {
+    if der.is_empty() || der.len() > 65536 {
+        return Err(FootprintError::Resource("CSR encoded size"));
+    }
+    let records = csr_nodes(der, 0)?;
+    let slot = max_record()
+        .max(size_of::<x509_parser::cri_attributes::X509CriAttribute<'static>>())
+        .max(size_of::<X509Extension<'static>>());
+    // Attribute/extension, outer RDN and inner ATV Vecs each have their own
+    // corresponding DER nodes. Eight slots/node cover minimum-capacity four
+    // and overlapping geometric growth. The byte term covers owned
+    // challengePassword strings and generic primitive decoder buffers.
+    let mut cost = add(16384, add(mul(records, mul(8, slot)?)?, mul(der.len(), 4)?)?)?;
+    let mut outer = der;
+    let mut request = csr_take(&mut outer, 0x30)?;
+    if !outer.is_empty() { return Err(FootprintError::Malformed("CSR trailing data")); }
+    let mut info = csr_take(&mut request, 0x30)?;
+    csr_take(&mut info, 0x02)?;
+    csr_take(&mut info, 0x30)?;
+    csr_take(&mut info, 0x30)?;
+    let mut attributes = csr_take(&mut info, 0xa0)?;
+    if !info.is_empty() { return Err(FootprintError::Malformed("CSR info trailing data")); }
+    csr_take(&mut request, 0x30)?;
+    csr_take(&mut request, 0x03)?;
+    if !request.is_empty() { return Err(FootprintError::Malformed("CSR request trailing data")); }
+    while !attributes.is_empty() {
+        let mut attribute = csr_take(&mut attributes, 0x30)?;
+        let oid = csr_take(&mut attribute, 0x06)?;
+        let mut values = csr_take(&mut attribute, 0x31)?;
+        if !attribute.is_empty() { return Err(FootprintError::Malformed("CSR attribute trailing data")); }
+        if oid != OID_PKCS9_EXTENSION_REQUEST.as_bytes() { continue; }
+        while !values.is_empty() {
+            let mut extensions = csr_take(&mut values, 0x30)?;
+            while !extensions.is_empty() {
+                let mut ext = csr_take(&mut extensions, 0x30)?;
+                let oid = csr_take(&mut ext, 0x06)?;
+                if ext.first() == Some(&0x01) { csr_take(&mut ext, 0x01)?; }
+                let value = csr_take(&mut ext, 0x04)?;
+                if !ext.is_empty() { return Err(FootprintError::Malformed("CSR extension trailing data")); }
+                // Supported extension OCTET payloads allocate their own AST.
+                // SCT's nested payload is a length-prefixed byte list, whose
+                // concrete entry capacity is already counted by extension().
+                if supported(oid) { csr_nodes(value, 0)?; }
+                cost = add(cost, extension(oid, value)?)?;
+            }
+        }
+    }
+    Ok(cost)
+}

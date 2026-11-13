@@ -237,6 +237,62 @@ the issuer allowance retires or disclose that URL through the source error. `tes
 ZeroSSL API issuer and RFC 8738 IP-subject issuance remain separate work.
 
 
+Ordered native issuers and durable attempt recovery
+---------------------------------------------------
+
+Configured ACME and internal issuers share one fenced certificate attempt.
+New version-two attempts retain one CSR, private key and SPKI with typed
+backend/input bindings and a durable winner. A known legacy order keeps its
+original account, order URL, CSR and key; moving to another issuer does not
+retag or replay that order. Duplicate CA storage namespaces of the same issuer
+kind may use different configured credentials or options. Proof callbacks bind
+the actual ACME index and normalized directory, rather than the first matching
+URL. Historical certificate selection retains its actual issuer kind and class
+when an otherwise healthy reload changes the configured backend identity.
+
+Confirmed remote unavailability or a declined issuer can advance the ordered
+attempt. Local resource, persistence, key-denial, global cancellation and
+unclassified errors remain terminal. Hanging or uncertain timed-out legs also
+remain terminal: logical cancellation and a generation-wide scope wait are not
+proof that one leg's DNS, TLS or verification work has physically retired.
+Safe timeout failover, historical renewal/ARI coverage and the remaining issuer
+families remain separate implementation or acceptance work.
+
+Candidates must pass actual signed-material, subject, input-SPKI, current
+key-denial and validity checks before winner selection and publication. An
+expired pending candidate is archived under its held lease before retiring the
+attempt and issuing a new one. Its original order journal remains available.
+Input secrets retire only after a durable winner or validated retirement marker;
+interrupted finalization repeats idempotently. A candidate before notBefore
+stays pending for a bounded retry and can later recover the same certificate
+without another order. Invalid bindings or damaged journals do not authorize
+an issuer fallback.
+
+Legacy stored journals that predate typed input bindings retain only their
+persisted leaf fingerprint and stored material once the old implementation has
+cleared its CSR/key journal fields. Recovery cannot reconstruct an independent
+original CSR/SPKI proof from those records. It retains their existing material,
+name, fingerprint, key-denial and validity checks. An active legacy order adopted
+while its original CSR remains available gets a real LegacyJob binding from
+that CSR, including independent stored-candidate SPKI validation.
+
+The private version-two input journal uses a borrowed CSR shape pass and
+temporary parser-AST admission before parsing. Its AST and retained raw input
+have separate allowances. This private journal path rejects indefinite or
+nonminimal DER even where a nested parser accepts BER; it does not change the
+public CSR entry points. Internal subject preparation preserves DNS IDNA,
+wildcard and IP support without broadening individual ACME challenge policies.
+
+Manager identity/root hashing and constructor work run on the existing
+certificate CPU lane. Configured-value producer credit accompanies the actual
+queued input, returned manager and retained construction error. Root files use
+the same checked regular-file handle for metadata and reads, admitting their
+raw buffers before allocation and retaining that credit through construction.
+Additional constructor-copy allowance is separate. These are concrete input,
+parser and copy bounds, not whole-process RSS or arbitrary crypto-provider
+allocation guarantees.
+
+
 ACME requested validity and profiles
 -----------------------------------
 

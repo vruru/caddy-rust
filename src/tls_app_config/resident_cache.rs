@@ -94,6 +94,7 @@ pub(super) struct CacheEntry {
     pub(super) id: u64,
     pub(super) material: Arc<Material>,
     pub(super) issuer: String,
+    pub(super) kind:crate::cert_automation::ManagedKind,
     pub(super) origin: String,
     pub(super) renew_at: i64,
     pub(super) ari_after: i64,
@@ -117,6 +118,7 @@ impl CacheEntry {
 pub(super) struct Revision {
     pub(super) material: Arc<Material>,
     pub(super) issuer: String,
+    pub(super) kind:crate::cert_automation::ManagedKind,
     pub(super) origin: String,
     pub(super) renew_at: i64,
     pub(super) ari_after: i64,
@@ -160,10 +162,12 @@ fn bytes(entry: &CacheEntry) -> usize {
 
 pub(super) struct Epoch {
     pub(super) id: u64,
-    pub(super) registered: HashMap<String, String>,
+    pub(super) registered: HashMap<String, Arc<IssuerClasses>>,
     pub(super) blocked: HashSet<u64>,
-    pub(super) removed: HashMap<String, String>,
+    pub(super) removed: HashMap<String, Arc<IssuerClasses>>,
     pub(super) enabled: bool,
+    _registered_memory:Option<Scratch>,
+    _removed_memory:Option<Scratch>,
 }
 
 struct State {
@@ -189,7 +193,7 @@ fn is_eligible(epoch: &Epoch, entry: &CacheEntry) -> bool {
     }
     if entry.birth_epoch < epoch.id {
         for name in &entry.material.names {
-            if epoch.removed.get(name) == Some(&entry.issuer) {
+            if epoch.removed.get(name).is_some_and(|set|set.contains(&entry.issuer)) {
                 return false;
             }
         }
@@ -205,6 +209,7 @@ impl ResidentCache {
             blocked: HashSet::new(),
             removed: HashMap::new(),
             enabled: true,
+            _registered_memory:None,_removed_memory:None,
         });
         Self {
             events: tokio::sync::broadcast::channel(4096).0,
@@ -225,9 +230,10 @@ impl ResidentCache {
 
     pub(super) fn prepare(
         &self,
-        registered: HashMap<String, String>,
+        registrations: RegisteredIssuerClasses,
         enabled: bool,
     ) -> Result<(Arc<Epoch>, Vec<Arc<CacheEntry>>)> {
+        let RegisteredIssuerClasses{map:registered,memory:registered_memory}=registrations;
         let (old_epoch, entry_arcs, new_epoch_id) = {
             let mut st = self
                 .state
@@ -252,12 +258,24 @@ impl ResidentCache {
         // Only the current cache IDs are carried forward. Superseded issuers
         // cannot insert into this epoch, so no unbounded tombstone history is
         // needed to keep already removed material from reappearing.
-        let removed = old_epoch
-            .registered
-            .iter()
-            .filter(|(name, issuer)| registered.get(*name) != Some(*issuer))
-            .map(|(name, issuer)| (name.clone(), issuer.clone()))
-            .collect();
+        let count=old_epoch.registered.len();
+        let text=old_epoch.registered.keys().try_fold(0usize,|n,k|n.checked_add(k.len()).ok_or(cert_transient::ResourceDenied))?;
+        let bytes=count.checked_next_power_of_two().unwrap_or(1).max(4)
+            .checked_mul(4*(std::mem::size_of::<String>()+std::mem::size_of::<Arc<IssuerClasses>>()+32))
+            .and_then(|n|n.checked_add(text)).ok_or(cert_transient::ResourceDenied)?;
+        let removed_memory=cert_transient::reserve(bytes)?;
+        let mut removed=HashMap::new();removed.try_reserve(count).map_err(|_|cert_transient::ResourceDenied)?;
+        let mut differences=HashMap::<(usize,usize),Option<Arc<IssuerClasses>>>::new();
+        differences.try_reserve(count).map_err(|_|cert_transient::ResourceDenied)?;
+        for (name,old) in &old_epoch.registered {
+            let new=registered.get(name);let key=(Arc::as_ptr(old)as usize,new.map_or(0,|set|Arc::as_ptr(set)as usize));
+            let difference=if let Some(found)=differences.get(&key){found.clone()}else{
+                let diff=match new{None=>Some(old.clone()),Some(new)=>old.difference(Some(new))?};
+                differences.insert(key,diff.clone());diff
+            };
+            if let Some(set)=difference{removed.insert(name.clone(),set);}
+        }
+        drop(differences);
         let blocked = entry_arcs
             .iter()
             .filter(|entry| !is_eligible(&old_epoch, entry))
@@ -269,6 +287,7 @@ impl ResidentCache {
             blocked,
             removed,
             enabled,
+            _registered_memory:Some(registered_memory),_removed_memory:Some(removed_memory),
         });
         let candidates = entry_arcs
             .into_iter()
@@ -341,6 +360,7 @@ impl ResidentCache {
                 import_gate: tokio::sync::Mutex::new(()),
                 material: revision.material,
                 issuer: revision.issuer,
+                kind:revision.kind,
                 origin: revision.origin,
                 renew_at: revision.renew_at,
                 ari_after: revision.ari_after,
@@ -737,4 +757,126 @@ pub(super) fn random_index(len: usize) -> Result<usize> {
         }
     }
     Err(anyhow::anyhow!("managed cache random selection exhausted"))
+}
+
+// Issuer class allowances
+// Actual shared metadata owns its prepaid credit.
+
+use std::mem::size_of;
+
+
+use crate::acme_wire::chain_memory::Scratch;
+use crate::cert_transient;
+
+// ─── constants ───────────────────────────────────────────────────────────────
+const MAX_CLASSES: usize = 16;
+const MAX_STR_LEN: usize = 65536;
+const ARC_HEADER_BYTES: usize = 64;
+
+// ─── type ────────────────────────────────────────────────────────────────────
+
+pub(super) struct IssuerClasses {
+    values: Vec<String>,
+    _credit: Scratch, // declared last ⇒ dropped last; owns backing allocation
+}
+
+// ─── impl ────────────────────────────────────────────────────────────────────
+
+impl IssuerClasses {
+    /// Validate, reserve credit, then materialise.
+    pub(super) fn new(values: &[&str]) -> anyhow::Result<Arc<Self>> {
+        anyhow::ensure!(values.len() <= MAX_CLASSES, "too many issuer classes");
+
+        // ── checked byte budget ──────────────────────────────────────────
+        let mut str_bytes: usize = 0;
+        for v in values {
+            anyhow::ensure!(v.len() <= MAX_STR_LEN, "issuer class exceeds byte limit");
+            str_bytes = str_bytes
+                .checked_add(v.len())
+                .ok_or(cert_transient::ResourceDenied)?;
+        }
+        let n = values.len();
+        let vec_bytes = n
+            .checked_mul(size_of::<String>())
+            .ok_or(cert_transient::ResourceDenied)?;
+        let total = vec_bytes
+            .checked_add(str_bytes)
+            .and_then(|x| x.checked_add(size_of::<Self>()))
+            .and_then(|x| x.checked_add(ARC_HEADER_BYTES))
+            .ok_or(cert_transient::ResourceDenied)?;
+
+        // ── pay first ────────────────────────────────────────────────────
+        let scratch: Scratch =
+            cert_transient::reserve(total).map_err(|_| {
+                cert_transient::ResourceDenied
+            })?;
+
+        // ── allocate (credit already held) ───────────────────────────────
+        let mut out: Vec<String> = Vec::new();
+        out.try_reserve_exact(n).map_err(|_| {
+            cert_transient::ResourceDenied
+        })?;
+
+        // linear-scan dedup (≤ 16, no sort, empty-str kept)
+        for &v in values {
+            if !out.iter().any(|e| e.as_str() == v) {
+                // push allocates per-String heap; bytes covered by credit
+                let mut text=String::new();
+                text.try_reserve_exact(v.len()).map_err(|_|cert_transient::ResourceDenied)?;
+                text.push_str(v);out.push(text);
+            }
+        }
+
+        Ok(Arc::new(Self {
+            values: out,
+            _credit: scratch,
+        }))
+    }
+
+    // ── queries ──────────────────────────────────────────────────────────
+
+    pub(super) fn contains(&self, value: &str) -> bool {
+        self.values.iter().any(|v| v.as_str() == value)
+    }
+
+    /// Classes in `self` that are **not** in `new`.
+    /// Empty difference ⇒ `Ok(None)` (no allocation).
+    pub(super) fn difference(
+        &self,
+        new: Option<&Self>,
+    ) -> anyhow::Result<Option<Arc<Self>>> {
+        // collect borrows on the stack – no Vec, no String alloc yet
+        let mut stack: [&str; MAX_CLASSES] = [""; MAX_CLASSES];
+        let mut count: usize = 0;
+
+        for existing in &self.values {
+            let skip = match new {
+                Some(n) => n.contains(existing.as_str()),
+                None => false,
+            };
+            if !skip {
+                stack[count] = existing.as_str();
+                count += 1;
+            }
+        }
+
+        if count == 0 {
+            return Ok(None);
+        }
+
+        Self::new(&stack[..count]).map(Some)
+    }
+
+    // ── read-only view ───────────────────────────────────────────────────
+
+    pub(super) fn values(&self) -> impl Iterator<Item = &str> {
+        self.values.iter().map(|s| s.as_str())
+    }
+}
+
+
+/// The map backing is already paid before it is handed to a cache epoch.
+pub(super) struct RegisteredIssuerClasses {
+    pub(super) map:HashMap<String,Arc<IssuerClasses>>,
+    pub(super) memory:Scratch,
 }

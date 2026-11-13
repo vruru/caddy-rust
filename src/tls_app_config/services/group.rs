@@ -3,11 +3,82 @@ use super::*;
 use crate::cert_automation::AcmeIssuerConfig;
 use crate::local_pki::CaConfig;
 
+
+/// Additional concrete constructor copies/hash scratch. Original expanded-value
+/// producer credit is separate and must accompany the input/result as well.
+struct ManagerConstructionOwner {
+    _memory:crate::acme_wire::chain_memory::Scratch,
+    _root_inputs:Vec<crate::acme_wire::chain_memory::Scratch>,
+    _root_input_metadata:crate::acme_wire::chain_memory::Scratch,
+    // Keep producer credit through the actual queued worker and retained error
+    // or unconsumed manager; constructor admission does not replace this loan.
+    issuer_values_credit:Option<Arc<crate::acme_wire::chain_memory::Lease>>,
+}
+impl crate::cert_cpu::MaterialOwner for ManagerConstructionOwner {
+    fn reserve(&self,bytes:usize)->Result<()> {
+        ensure!(bytes==0,crate::cert_transient::ResourceDenied);Ok(())
+    }
+}
+struct ManagerBuildInput {
+    store:crate::certstore::FsStore,
+    registry:ChallengeRegistry,
+    resolver:Arc<HotCertificateResolver>,
+    options:AutomationOptions,
+    resources:Arc<cert_automation::AutomationResources>,
+    prepared:Vec<cert_automation::PreparedBackend>,
+    solvers:Vec<cert_automation::SolverPreparation>,
+    events:Option<Arc<crate::events::EventsApp>>,
+    key_type:crate::acme_wire::KeyType,
+    must_staple:bool,
+    reuse_private_keys:bool,
+    tasks:TaskTracker,
+    #[cfg(feature="native-run")]
+    scope:Option<Arc<crate::outgoing_tls::Scope>>,
+    // The actual queued closure and an unconsumed successful/error result keep
+    // the same owner; no waiting-future drop can retire input/copy credit early.
+    owner:Arc<ManagerConstructionOwner>,
+}
+impl ManagerBuildInput {
+    fn copy_cost(prepared:&[cert_automation::PreparedBackend])->Result<usize>{
+        let mut bytes=65536usize;
+        for item in prepared {
+            match item {
+                cert_automation::PreparedBackend::Internal{ca,..}=>{bytes=bytes.checked_add(ca.len().checked_mul(4).ok_or(crate::cert_transient::ResourceDenied)?).ok_or(crate::cert_transient::ResourceDenied)?;},
+                cert_automation::PreparedBackend::Acme(config)=>{
+                    let mut text=config.wire.directory.len().checked_add(config.email.len()).and_then(|n|n.checked_add(config.profile.len())).ok_or(crate::cert_transient::ResourceDenied)?;
+                    for value in &config.wire.extra_ca_pem {text=text.checked_add(value.len()).ok_or(crate::cert_transient::ResourceDenied)?;}
+                    for value in &config.wire.trusted_ca_origins {text=text.checked_add(value.len()).ok_or(crate::cert_transient::ResourceDenied)?;}
+                    if let Some(eab)=&config.eab{text=text.checked_add(eab.kid.len()).and_then(|n|n.checked_add(eab.hmac_key.len())).ok_or(crate::cert_transient::ResourceDenied)?;}
+                    bytes=bytes.checked_add(text.checked_mul(4).and_then(|n|n.checked_add(16384)).ok_or(crate::cert_transient::ResourceDenied)?).ok_or(crate::cert_transient::ResourceDenied)?;
+                },
+            }
+        }
+        Ok(bytes)
+    }
+    fn execute(self)->Result<CertificateManager>{
+        let owner=self.owner.clone();
+        match self.construct(){
+            Ok(manager)=>manager.with_construction_owner(owner),
+            Err(error)=>Err(crate::cert_cpu::retained_error(error,owner)),
+        }
+    }
+    fn construct(self)->Result<CertificateManager>{
+        let issuer_values_credit=self.owner.issuer_values_credit.clone();
+        let manager=CertificateManager::with_ordered_backends(self.store,self.registry,self.resolver,
+            self.options,self.resources,None,self.prepared,self.key_type)?
+            .with_issuer_values_credit(issuer_values_credit)?
+            .with_issuer_solvers(self.solvers)?.with_events(self.events)?;
+        #[cfg(feature="native-run")]
+        let manager=manager.with_client_tls_scope(self.scope)?;
+        manager.with_csr_options(self.must_staple,self.reuse_private_keys)?.with_chain_tasks(self.tasks)?.storage_only()
+    }
+}
+
 impl CertificateServices {
-    pub(super) fn current_renewal_time(&self, material: &Material, policy: &Policy) -> Result<i64> {
+    pub(super) fn current_renewal_time(&self, material: &Material, policy: &Policy,kind:cert_automation::ManagedKind) -> Result<i64> {
         let (begin, end) = material.times()?;
         let ordinary = cert_automation::renewal_time(begin, end, policy.renewal_ratio, None, "")?;
-        if !matches!(policy.issuers.as_slice(), [Issuer::Internal { .. }]) {
+        if kind!=cert_automation::ManagedKind::Internal {
             return Ok(ordinary);
         }
         // CertMagic's emergency window applies even to exceptionally short
@@ -341,92 +412,71 @@ impl CertificateServices {
             sum.checked_add(bytes).ok_or_else(||anyhow!("ACME configured value copy budget overflow"))
         })?;
         let issuer_values_credit=if copy_bytes==0{None}else{Some(Arc::new(self.context.resources.issuer_values.reserve(copy_bytes)?))};
-        let issuer = if policy
-            .issuers
-            .iter()
-            .all(|issuer| matches!(issuer, Issuer::Acme(_)))
-        {
-            let mut issuers = Vec::new();
-            let mut timeout = Duration::from_secs(1200);
-            for issuer in &policy.issuers {
-                let Issuer::Acme(settings) = issuer else {
-                    unreachable!()
-                };
-                let mut issuer = settings.config.clone();
-                if let Some(values)=&settings.values {values.get()?.apply(&mut issuer);}
-                if let Some(input) = &settings.account_key {
-                    issuer.account_key = Some(input.prepare(self.context.resources.cpu.clone(),cancel.clone()).await?);
-                }
-                issuer.leaf_key_type = policy.key_type;
-                for path in &settings.roots {
-                    let path = absolute(&self.context.paths.cwd, path);
-                    let root = loaders::blocking(
-                        self.context.resources.io.clone(),
-                        cancel.clone(),
-                        move || loaders::read(&path),
-                    )
-                    .await?;
-                    issuer.wire.extra_ca_pem.push(root);
-                }
-                if let Some(value) = settings.timeout {
-                    timeout = timeout.min(value);
-                }
-                issuers.push(issuer);
+        let root_count=policy.issuers.iter().try_fold(0usize,|sum,issuer|{
+            let Issuer::Acme(settings)=issuer else{return Ok::<_,anyhow::Error>(sum)};
+            let count=settings.roots.len();
+            ensure!(count.checked_add(settings.config.wire.extra_ca_pem.len())
+                .is_some_and(|n|n<=32),"ACME trust configuration exceeds bounds");
+            sum.checked_add(count).ok_or_else(||crate::cert_transient::ResourceDenied.into())
+        })?;
+        let root_metadata=root_count.checked_mul(std::mem::size_of::<crate::acme_wire::chain_memory::Scratch>())
+            .and_then(|n|n.checked_add(std::mem::size_of::<Vec<crate::acme_wire::chain_memory::Scratch>>()))
+            .ok_or(crate::cert_transient::ResourceDenied)?;
+        let root_input_metadata=crate::cert_transient::reserve(root_metadata)?;
+        let mut root_inputs=Vec::new();
+        root_inputs.try_reserve_exact(root_count)?;
+        let mut prepared=Vec::new();
+        let mut timeout=Duration::from_secs(1200);
+        for issuer in &policy.issuers {
+            match issuer {
+                Issuer::Internal{ca,options}=>prepared.push(cert_automation::PreparedBackend::Internal {
+                    pki:self.authority(ca,cancel.clone()).await?,ca:ca.clone(),options:options.clone(),
+                }),
+                Issuer::Acme(settings)=>{
+                    let mut issuer=settings.config.clone();
+                    if let Some(values)=&settings.values {values.get()?.apply(&mut issuer);}
+                    if let Some(input)=&settings.account_key {
+                        issuer.account_key=Some(input.prepare(self.context.resources.cpu.clone(),cancel.clone()).await?);
+                    }
+                    issuer.leaf_key_type=policy.key_type;
+                    for path in &settings.roots {
+                        let path=absolute(&self.context.paths.cwd,path);
+                        let (root,memory)=loaders::blocking(self.context.resources.io.clone(),
+                            cancel.clone(),move||loaders::read_root_input(&path)).await?;
+                        root_inputs.push(memory);
+                        issuer.wire.extra_ca_pem.push(root);
+                    }
+                    if let Some(value)=settings.timeout{timeout=timeout.min(value);}
+                    prepared.push(cert_automation::PreparedBackend::Acme(issuer));
+                },
             }
-            let settings = policy.issuers.iter().map(|issuer| {
-                if let Issuer::Acme(settings)=issuer {
-                    let mut settings=settings.as_ref().clone();
-                    if let Some(values)=&settings.values {settings.config.wire.directory=values.get()?.directory.clone();}
-                    Ok(Some(settings))
-                } else {Ok(None)}
-            }).collect::<Result<Vec<_>>>()?.into_iter().flatten().collect();
-            let broker = solver::SolverBroker::new(
-                settings,
-                bound.to_vec(),
-                self.context.listener_provider.clone(),
-            )?.with_issuer_values_credit(issuer_values_credit.clone())?;
-            let (max_concurrent, max_concurrent_per_ca) = self.context.resources.issuance.limits();
-            let options = AutomationOptions {
-                issuers,
-                renewal_window_ratio: policy.renewal_ratio,
-                max_concurrent,
-                max_concurrent_per_ca,
-                poll_interval: self.plan.renew_interval,
-                job_timeout: timeout,
-            };
-            let manager = CertificateManager::with_resources_and_solver(
-                store.fs.clone(),
-                self.context.challenges.clone(),
-                resolver.clone(),
-                options,
-                self.context.resources.issuance.clone(),
-                Some(broker.callback()),
-            )?
-            .with_issuer_values_credit(issuer_values_credit)?
-            // Caddy admin identity uses a separate certmagic.Config without
-            // tlsApp.onEvent; only business certificates join the TLS app.
-            .with_events((!identity).then(|| self.context.events.clone()).flatten())?;
-            #[cfg(feature="native-run")]
-            let manager=manager.with_client_tls_scope(self.outgoing_tls.clone())?;
-            let manager=manager
-            .with_csr_options(policy.must_staple,policy.reuse_private_keys)?
-            .with_chain_tasks(group_tasks.clone())?
-            .storage_only()?;
-            solver = Some(broker);
-            GroupIssuer::Acme(manager)
-        } else if policy.issuers.len() == 1 {
-            let Issuer::Internal { ca, options } = &policy.issuers[0] else {
-                return Err(anyhow!("mixed issuer fallback is not yet integrated"));
-            };
-            let pki = self.authority(ca, cancel.clone()).await?;
-            GroupIssuer::Internal {
-                pki,
-                ca: ca.clone(),
-                options: options.clone(),
-            }
-        } else {
-            return Err(anyhow!("mixed issuer fallback is not yet integrated"));
-        };
+        }
+        let settings=policy.issuers.iter().filter_map(|i|match i {
+            Issuer::Acme(settings)=>Some((||{
+                let mut settings=settings.as_ref().clone();
+                if let Some(values)=&settings.values {settings.config.wire.directory=values.get()?.directory.clone();}
+                Ok(settings)
+            })()),_=>None,
+        }).collect::<Result<Vec<_>>>()?;
+        if !settings.is_empty(){solver=Some(solver::SolverBroker::new(settings,bound.to_vec(),self.context.listener_provider.clone())?
+            .with_issuer_values_credit(issuer_values_credit.clone())?);}
+        let(max_concurrent,max_concurrent_per_ca)=self.context.resources.issuance.limits();
+        let options=AutomationOptions{issuers:Vec::new(),renewal_window_ratio:policy.renewal_ratio,
+            max_concurrent,max_concurrent_per_ca,poll_interval:self.plan.renew_interval,job_timeout:timeout};
+        let bytes=ManagerBuildInput::copy_cost(&prepared)?;
+        let owner=Arc::new(ManagerConstructionOwner{_memory:crate::cert_transient::reserve(bytes)?,
+            _root_inputs:root_inputs,_root_input_metadata:root_input_metadata,issuer_values_credit});
+        let input=ManagerBuildInput{store:store.fs.clone(),registry:self.context.challenges.clone(),resolver:resolver.clone(),
+            options,resources:self.context.resources.issuance.clone(),prepared,
+            solvers:solver.as_ref().map(|b|b.callbacks()).transpose()?.unwrap_or_default(),
+            events:(!identity).then(||self.context.events.clone()).flatten(),key_type:policy.key_type,
+            must_staple:policy.must_staple,reuse_private_keys:policy.reuse_private_keys,tasks:group_tasks.clone(),
+            #[cfg(feature="native-run")] scope:self.outgoing_tls.clone(),owner};
+        // Hashing full root sets, typed identity and cooldown construction all
+        // execute here, never after an async shell returns to the reactor.
+        let manager=loaders::blocking(self.context.resources.cpu.clone(),cancel.clone(),move||input.execute()).await?;
+        let issuer=GroupIssuer::Acme(manager);
+        let selected_backend=seed.as_ref().map(|entry|cert_automation::BackendSelection::historical(entry.kind,&entry.issuer)).transpose()?;
         let seed_identity = seed.as_ref().map(|entry| entry.material.identity);
         let retained = self
             .state
@@ -460,6 +510,7 @@ impl CertificateServices {
             store,
             resolver,
             issuer,
+            selected_backend:Mutex::new(selected_backend),
             identity,
             gate: AsyncMutex::new(()),
             solver,
@@ -691,6 +742,7 @@ impl CertificateServices {
                 certificate,
                 ari_after,
             } => {
+                group.select(manager.selection_for(&certificate.names,&certificate.issuer_key,&certificate.leaf_sha256).await?)?;
                 group
                     .renew_at
                     .store(certificate.renew_at_unix, Ordering::Release);
@@ -852,6 +904,7 @@ impl CertificateServices {
                 managed_names: Some(group.names.clone()), origin: group.origin.clone(),
                 renew_at: group.renew_at.load(Ordering::Acquire),
                 ari_after: group.ari_after.load(Ordering::Acquire),
+                kind:Some(group.selected_kind()?),
             });
         }
         let ocsp = group.publication.lock().ok().and_then(|receipt|
@@ -923,7 +976,9 @@ impl CertificateServices {
         }
         let bundle = match &group.issuer {
             GroupIssuer::Acme(manager) => {
-                match manager.probe_cached(&group.names, cancel.clone()).await? {
+                let(probe,index)=manager.probe_cached_selected(&group.names,cancel.clone()).await?;
+                if let Some(index)=index{group.select(index)?;}
+                match probe {
                     cert_automation::CachedProbe::Busy => {
                         let _ = self.events.send(CertificateEvent {
                             kind: "certificate_cache_busy",
@@ -1060,6 +1115,7 @@ impl CertificateServices {
                     Some(info) => info,
                     None => manager.ensure(&group.names, cancel.clone()).await?,
                 };
+                group.select(manager.selection_for(&info.names,&info.issuer_key,&info.leaf_sha256).await?)?;
                 // Manager released its native lease after producing the
                 // durable bundle. Pin that same storage scope through scoped
                 // publication; a different intervening winner must be retried.
@@ -1188,7 +1244,7 @@ impl CertificateServices {
                         if begin > now()? {
                             return Err(cert_automation::FutureCertificate(begin).into());
                         }
-                        let due = self.current_renewal_time(&material, &group.policy)?;
+                        let due = self.current_renewal_time(&material, &group.policy,cert_automation::ManagedKind::Internal)?;
                         let revoked = reject_revoked(&material, &self.context.leaf_guard, true).is_err();
                         if material.validate_at(now()?, false).is_ok()
                             && !revoked
@@ -1247,7 +1303,7 @@ impl CertificateServices {
                     } else {group.store.fs.save_certificate(ca,&key,&bundle,&lease).await?;}
                     lifecycle.obtained(events,ca,&group.names,&event_csr,&cancel).await;
                     lease.check().await?;
-                    let due = self.current_renewal_time(&material, &group.policy)?;
+                    let due = self.current_renewal_time(&material, &group.policy,cert_automation::ManagedKind::Internal)?;
                     self.publish_group(
                         group,
                         material.clone(),
@@ -1493,7 +1549,7 @@ impl CertificateServices {
 
 }
 
-fn internal_name(name: &str) -> bool {
+pub(super) fn internal_name(name: &str) -> bool {
     name == "localhost"
         || [".localhost", ".local", ".internal", ".home.arpa"]
             .iter()

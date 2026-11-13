@@ -32,6 +32,7 @@ struct Resident {
     next_check: AtomicI64,
     retry_after: AtomicI64,
     origin: String,
+    kind:cert_automation::ManagedKind,
 }
 #[derive(Clone, Copy)]
 enum PendingKind {
@@ -276,6 +277,7 @@ impl OnDemand {
         receipt: ScopedCertificate,
         schedule: (i64, i64),
         origin: String,
+        kind:cert_automation::ManagedKind,
     ) {
         let resident = Arc::new(Resident {
             material: material.clone(),
@@ -290,6 +292,7 @@ impl OnDemand {
             next_check: AtomicI64::new(schedule.0.min(schedule.1)),
             retry_after: AtomicI64::new(0),
             origin,
+            kind,
         });
         self.index(&resident);
     }
@@ -301,6 +304,7 @@ impl OnDemand {
         cache_entry: Option<Arc<super::super::resident_cache::CacheEntry>>,
         binding: ResidencyBinding,
         leaf: Arc<crate::leaf_guard::LeafState>,
+        kind:cert_automation::ManagedKind,
     ) {
         let at = now().unwrap_or(i64::MAX);
         let next_check = next_check(&group, at);
@@ -317,6 +321,7 @@ impl OnDemand {
             next_check: AtomicI64::new(next_check),
             retry_after: AtomicI64::new(0),
             origin: group.origin.clone(),
+            kind,
         });
         self.index(&resident);
     }
@@ -454,9 +459,9 @@ impl CertificateServices {
         let policy = self.policy_for_origin(origin);
         let scheduled = resident.next_check.load(Ordering::Acquire);
         if self.policy_index(origin) == self.policy_index(&resident.origin)
-            && !matches!(policy.issuers.as_slice(), [Issuer::Internal { .. }])
+            && resident.kind!=cert_automation::ManagedKind::Internal
         { return Ok(scheduled); }
-        let ordinary = self.current_renewal_time(&resident.material, &policy)?;
+        let ordinary = self.current_renewal_time(&resident.material, &policy,resident.kind)?;
         // Preserve an already selected ARI/refresh deadline across a policy
         // change; current-policy lifetime checks can only make it earlier.
         Ok(if resident.ari_after == i64::MAX { ordinary } else { ordinary.min(scheduled) })
@@ -584,6 +589,7 @@ impl CertificateServices {
         // Rollback capability retains in-process material and the shared
         // authenticated LeafGuard. This path must remain memory-only: status
         // handles and raw-store restoration start after actual activation.
+        let kind=retained.kind.ok_or_else(||anyhow!("retained managed issuer attribution missing"))?;
         let resolver = self.context.resolver.clone();
         let guard = self.context.leaf_guard.clone();
         let state = self.on_demand.clone();
@@ -627,6 +633,7 @@ impl CertificateServices {
                 receipt,
                 (retained.renew_at, retained.ari_after),
                 retained.origin,
+                kind,
             );
             changed.notify_one();
             Ok(())
@@ -656,19 +663,29 @@ impl CertificateServices {
                     self.on_demand
                         .set_configured_groups(names, &Default::default())?;
                 }
-                let registered = names
-                    .iter()
-                    .flat_map(|names| names.iter())
-                    .map(|name| (name.clone(), issuer_class(&self.policy(name))))
-                    .collect();
+                let bytes=names.iter().try_fold(8192usize,|n,group|{
+                    let n=n.checked_add(group.len()*std::mem::size_of::<String>()+std::mem::size_of::<Vec<String>>())
+                        .ok_or(crate::cert_transient::ResourceDenied)?;
+                    group.iter().try_fold(n,|n,name|n.checked_add(name.len()).ok_or(crate::cert_transient::ResourceDenied))
+                })?;
+                let memory=crate::cert_transient::reserve(bytes)?;
+                let mut copied=Vec::new();copied.try_reserve_exact(names.len()).map_err(|_|crate::cert_transient::ResourceDenied)?;
+                let mut batch=0usize;let mut items=0usize;
+                for group in names {
+                    let mut values=Vec::new();values.try_reserve_exact(group.len()).map_err(|_|crate::cert_transient::ResourceDenied)?;
+                    for name in group {
+                        values.push(name.clone());batch=batch.saturating_add(name.len());items+=1;
+                        if batch>=65536||items%128==0{ensure!(!cancel.is_cancelled(),"certificate registration cancelled");tokio::task::yield_now().await;batch=0;}
+                    }
+                    copied.push(values);
+                }
+                let input=RegistrationInput{names:copied,plan:self.plan.clone(),cancel:cancel.clone(),_memory:memory};
                 let cache = self.context.resources.resident_cache.clone();
                 let enabled = self.effective_tls.load(Ordering::Acquire);
                 let (epoch, entries) = super::super::loaders::blocking(
-                    self.context.resources.cpu.clone(),
-                    cancel.clone(),
-                    move || cache.prepare(registered, enabled),
-                )
-                .await?;
+                    self.context.resources.cpu.clone(),cancel.clone(),
+                    move || cache.prepare(input.execute()?, enabled),
+                ).await?;
                 if self.restore.is_none() {
                     for entry in entries {
                         self.import_shared_entry(epoch.clone(), entry, cancel.clone())
@@ -898,6 +915,7 @@ impl CertificateServices {
                     next_check: AtomicI64::new(entry.renew_at.min(entry.ari_after)),
                     retry_after: AtomicI64::new(0),
                     origin: entry.origin.clone(),
+                    kind:entry.kind,
                 });
                 state.index(&resident);
                 changed.notify_one();
@@ -933,6 +951,7 @@ impl CertificateServices {
                     origin: origin.clone(),
                     renew_at: pending_entry.renew_at,
                     ari_after: pending_entry.ari_after,
+                    kind:Some(pending_entry.kind),
                 });
                 Ok(true)
             }
@@ -1377,7 +1396,7 @@ impl CertificateServices {
         let typed = origin.is_empty() || name.parse::<std::net::IpAddr>().is_ok();
         let typed_allowed = self.policy_index(&origin).is_some()
             && policy.on_demand
-            && matches!(policy.issuers.as_slice(), [Issuer::Internal { .. }]);
+            && policy.issuers.iter().any(|issuer|matches!(issuer,Issuer::Internal{..}));
         let at = now()?;
         if !force_lookup && cached.is_none() && self.on_demand.manual(&name, at) {
             return Ok(None);
@@ -1786,7 +1805,7 @@ impl CertificateServices {
                     }
                 }
             } else if !resident.leaf.needs_renewal()
-                && self.current_renewal_time(&resident.material, &policy)? > now()? {
+                && self.current_renewal_time(&resident.material, &policy,resident.kind)? > now()? {
                 resident
                     .next_check
                     .store(next_check(&group, now()?), Ordering::Release);
@@ -2109,6 +2128,8 @@ impl CertificateServices {
         cancel: CancellationToken,
         lease: Option<&crate::certstore::StorageLease>,
     ) -> Result<()> {
+        let selected_class=group.selected_class()?;
+        let selected_kind=group.selected_kind()?;
         self.prime_material_status(material.clone(), group.identity, cancel.clone()).await?;
         reject_revoked(&material, &self.context.leaf_guard, true)?;
         if let Some(lease) = lease {
@@ -2128,6 +2149,7 @@ impl CertificateServices {
         let lost = lease.map(crate::certstore::StorageLease::lost);
         let mut last = None;
         for attempt in 0..4 {
+            let selected_class = selected_class.clone();
             let work_group = group.clone();
             let material = material.clone();
             let work_intent = intent.clone();
@@ -2143,6 +2165,7 @@ impl CertificateServices {
                 self.context.resources.cpu.clone(),
                 cancel.clone(),
                 move || {
+                    let selected_class=selected_class;
                     // Must outlive every resolver/capacity/cache lock in this
                     // publication, including an unwinding post-commit error.
                     let mut preparation_publication =
@@ -2216,7 +2239,8 @@ impl CertificateServices {
                             epoch,
                             super::super::resident_cache::Revision {
                                 material: material.clone(),
-                                issuer: issuer_class(&group.policy),
+                                issuer: selected_class.text.clone(),
+                                kind:selected_kind,
                                 renew_at,
                                 ari_after,
                                 origin: group.origin.clone(),
@@ -2328,7 +2352,7 @@ impl CertificateServices {
                     // Same/Merged target already has one exact resident projection.
                     // Preserve its original receipt, schedule, index order and OCSP context.
                     if borrowed.is_none() {
-                        state.record(group.clone(), material, receipt, cached, binding.clone(), leaf);
+                        state.record(group.clone(), material, receipt, cached, binding.clone(), leaf,selected_kind);
                     }
                     changed.notify_one();
                     if !binding.slot.live() {
@@ -2416,5 +2440,52 @@ fn issuer_class(policy: &Policy) -> String {
     match policy.issuers.as_slice() {
         [Issuer::Internal { ca, .. }] => ca.clone(),
         _ => String::new(),
+    }
+}
+
+// Payloads precede their temporary-copy allowance, including unpolled work.
+struct RegistrationInput {
+    names:Vec<Vec<String>>,
+    plan:Arc<CertificatePlan>,
+    cancel:CancellationToken,
+    _memory:crate::acme_wire::chain_memory::Scratch,
+}
+impl RegistrationInput {
+    fn execute(self)->Result<super::super::resident_cache::RegisteredIssuerClasses> {
+        use super::super::resident_cache::{IssuerClasses,RegisteredIssuerClasses};
+        let input=self;
+        let policies=input.plan.policies.len();
+        let _slots=crate::cert_transient::reserve((policies+2)*std::mem::size_of::<Arc<IssuerClasses>>()+128)?;
+        let mut sets=Vec::new();sets.try_reserve_exact(policies).map_err(|_|crate::cert_transient::ResourceDenied)?;
+        for policy in &input.plan.policies {
+            ensure!(!input.cancel.is_cancelled(),"certificate registration cancelled");
+            let mut values=["";16];let mut n=0;
+            if policy.issuers.is_empty(){n=1}else{
+                ensure!(policy.issuers.len()<=16,"issuer class count exceeds bounds");
+                for issuer in &policy.issuers {values[n]=match issuer{Issuer::Acme(_)=>"",Issuer::Internal{ca,..}=>ca};n+=1;}
+            }
+            sets.push(IssuerClasses::new(&values[..n])?);
+        }
+        let public=IssuerClasses::new(&[""])?;let internal=IssuerClasses::new(&["local"])?;
+        let mut count=0usize;let mut text=0usize;let mut longest_name=0usize;
+        for name in input.names.iter().flatten(){count=count.checked_add(1).ok_or(crate::cert_transient::ResourceDenied)?;
+            text=text.checked_add(name.len()).ok_or(crate::cert_transient::ResourceDenied)?;longest_name=longest_name.max(name.len());}
+        let longest_pattern=input.plan.policies.iter().flat_map(|p|&p.subjects).map(String::len).max().unwrap_or(0);
+        let _matcher=crate::cert_transient::reserve(longest_name.checked_add(longest_pattern)
+            .and_then(|n|n.checked_mul(32)).and_then(|n|n.checked_add(16384)).ok_or(crate::cert_transient::ResourceDenied)?)?;
+        let bytes=count.checked_next_power_of_two().unwrap_or(1).max(4)
+            .checked_mul(2*(std::mem::size_of::<String>()+std::mem::size_of::<Arc<IssuerClasses>>()+16))
+            .and_then(|n|n.checked_add(text)).and_then(|n|n.checked_add(256)).ok_or(crate::cert_transient::ResourceDenied)?;
+        let memory=crate::cert_transient::reserve(bytes)?;
+        let mut map=HashMap::new();map.try_reserve(count).map_err(|_|crate::cert_transient::ResourceDenied)?;
+        for (i,name) in input.names.iter().flatten().enumerate(){
+            if i%128==0{ensure!(!input.cancel.is_cancelled(),"certificate registration cancelled");}
+            let index=input.plan.policies.iter().position(|policy|policy.subjects.is_empty()
+                ||policy.subjects.iter().any(|pattern|matches_subject(name,pattern)));
+            let set=if let Some(index)=index{sets[index].clone()}
+                else if super::group::internal_name(name){internal.clone()}else{public.clone()};
+            map.insert(name.clone(),set);
+        }
+        Ok(RegisteredIssuerClasses{map,memory})
     }
 }
