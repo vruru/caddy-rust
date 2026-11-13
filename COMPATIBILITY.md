@@ -1185,3 +1185,21 @@ local differential coverage. Unsupported resolver networks are rejected during
 staging instead of deferred dial failure. This does not enable DNS-provider
 certificate issuance or redirect HTTP/TLS proofs and unrelated clients. See
 [global resolver scope](docs/GLOBAL-TLS-RESOLVERS.md).
+
+Accepted ACME issuance across HTTP retirement
+--------------------------------------------
+
+ACME handlers distinguish admission-drain notification from their business
+owner's hard-stop signal. An already accepted proof or CSR-finalize request
+may complete within the configured grace period; grace expiry or explicit
+force still cancels that request. A separate business-drained receipt keeps
+old certificate services available until that generation finishes or is
+forced. Publication completion still observes acceptance closure, so loading
+a new generation does not wait for old requests to finish.
+
+At process stop, HTTP owners from all generations join before root certificate
+cancellation and CA shutdown. Detached CPU/storage work still has its own
+supervised owners and join phase; a business-drained receipt alone does not
+claim those workers have retired. These dependencies do not serialize ordinary
+requests, separate generations or independent authority jobs, and do not add
+an artificial timeout to an unlimited grace period.

@@ -187,6 +187,7 @@ impl Drop for RetirementTaskGuard {
         if owner.group.signal.is_published() {
             owner.close();
             owner.group.activity.force();
+            owner.group.signal.finish_drain(super::RetirementDrainOutcome::Forced);
         } else {
             owner.group.signal.complete(RetirementOutcome::Aborted);
         }
@@ -219,6 +220,11 @@ async fn retire_generation(
     } else {
         activity.wait_idle().await;
     }
+    owner.group.signal.finish_drain(if activity.hard_stop.is_cancelled() {
+        super::RetirementDrainOutcome::Forced
+    } else {
+        super::RetirementDrainOutcome::Drained
+    });
     stop_observability(&owner.metrics, owner.tracing.as_ref()).await;
     if let Some(control) = control.upgrade() {
         let removed = {
@@ -1012,6 +1018,11 @@ async fn stop_runtime(inner: Arc<Inner>, lifecycle: Arc<Lifecycle>, signal: Http
         }
     };
     tokio::join!(finish_admission, drain_current);
+    signal.finish_drain(if current.activity.hard_stop.is_cancelled() {
+        super::RetirementDrainOutcome::Forced
+    } else {
+        super::RetirementDrainOutcome::Drained
+    });
     stop_observability(&current.metrics,current.tracing.as_ref()).await;
 }
 

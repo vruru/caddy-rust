@@ -920,7 +920,11 @@ fn handlers<'a>(
                     let controller=server.acme_servers.get(&(Arc::as_ptr(config)as usize))
                         .ok_or_else(||anyhow::anyhow!("ACME server was not prepared"))?;
                     if !controller.matches(ctx.req().uri().path()) {continue;}
-                    let response=controller.handle(ctx.request.as_mut().expect("request owned"),&ctx.authority,ctx.drain.child_token()).await?;
+                    // Admission drain only rejects new requests. An accepted
+                    // proof/signing request may continue until its real grace
+                    // deadline or explicit force closes this business owner.
+                    let cancel=ctx.business.generation().hard_stop.child_token();
+                    let response=controller.handle(ctx.request.as_mut().expect("request owned"),&ctx.authority,cancel).await?;
                     return Ok(Flow::Response(response));
                 }
                 Handler::Metrics{disable_openmetrics}=>{

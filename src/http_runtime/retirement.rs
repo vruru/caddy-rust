@@ -23,6 +23,13 @@ pub enum RetirementOutcome {
     Forced,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetirementDrainOutcome {
+    Drained,
+    Aborted,
+    Forced,
+}
+
 #[derive(Clone)]
 pub struct HttpRetirement {
     from_generation: u64,
@@ -34,6 +41,8 @@ struct Signals {
     done: CancellationToken,
     ready: CancellationToken,
     published: AtomicBool,
+    drain_state: AtomicU8,
+    drained: CancellationToken,
 }
 impl HttpRetirement {
     pub(super) fn staged(from_generation: u64, to_generation: Option<u64>) -> Self {
@@ -45,6 +54,8 @@ impl HttpRetirement {
                 done: CancellationToken::new(),
                 ready: CancellationToken::new(),
                 published: AtomicBool::new(false),
+                drain_state: AtomicU8::new(STAGED),
+                drained: CancellationToken::new(),
             }),
         }
     }
@@ -63,6 +74,28 @@ impl HttpRetirement {
             ABORTED => Ok(RetirementOutcome::Aborted),
             FORCED => Ok(RetirementOutcome::Forced),
             _ => anyhow::bail!("HTTP retirement completion state unavailable"),
+        }
+    }
+    /// Separate from publication/admission completion: old business work has
+    /// ended, or its configured grace/explicit force has terminated it. This
+    /// receipt does not claim that every detached CPU or storage owner joined.
+    pub async fn business_drained(&self) -> Result<RetirementDrainOutcome> {
+        self.signals.drained.cancelled().await;
+        match self.signals.drain_state.load(Ordering::Acquire) {
+            CLOSED => Ok(RetirementDrainOutcome::Drained),
+            ABORTED => Ok(RetirementDrainOutcome::Aborted),
+            FORCED => Ok(RetirementDrainOutcome::Forced),
+            _ => anyhow::bail!("HTTP business retirement state unavailable"),
+        }
+    }
+    pub(super) fn finish_drain(&self, outcome: RetirementDrainOutcome) {
+        let target = match outcome {
+            RetirementDrainOutcome::Drained => CLOSED,
+            RetirementDrainOutcome::Aborted => ABORTED,
+            RetirementDrainOutcome::Forced => FORCED,
+        };
+        if self.signals.drain_state.compare_exchange(STAGED,target,Ordering::AcqRel,Ordering::Acquire).is_ok() {
+            self.signals.drained.cancel();
         }
     }
     pub(super) async fn activated(&self) -> bool {
@@ -113,6 +146,11 @@ impl HttpRetirement {
         {
             self.signals.ready.cancel();
             self.signals.done.cancel();
+        }
+        match outcome {
+            RetirementOutcome::Aborted => self.finish_drain(RetirementDrainOutcome::Aborted),
+            RetirementOutcome::Forced => self.finish_drain(RetirementDrainOutcome::Forced),
+            RetirementOutcome::AcceptanceClosed => {},
         }
     }
 }

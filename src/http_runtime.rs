@@ -121,7 +121,7 @@ mod request_body;
 #[path = "http_runtime/retirement.rs"]
 mod retirement;
 use retirement::{BusinessGeneration, BusinessGuard};
-pub use retirement::{HttpRetirement, RetirementOutcome};
+pub use retirement::{HttpRetirement, RetirementOutcome, RetirementDrainOutcome};
 #[path = "http_runtime/resource_budget.rs"]
 pub(crate) mod resource_budget;
 pub use resource_budget::{BudgetSnapshot, ResourceDiagnostics, ResourceLimits};

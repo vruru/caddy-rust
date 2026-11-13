@@ -514,9 +514,9 @@ impl Root {
                 self.retirements.spawn(async move {
                     let _slot = slot;
                     if !matches!(
-                        retirement.acceptance_closed().await,
-                        Ok(crate::http_runtime::RetirementOutcome::AcceptanceClosed
-                            | crate::http_runtime::RetirementOutcome::Forced)
+                        retirement.business_drained().await,
+                        Ok(crate::http_runtime::RetirementDrainOutcome::Drained
+                            | crate::http_runtime::RetirementDrainOutcome::Forced)
                     ) && let Some(root) = root.upgrade()
                     {
                         root.force();
@@ -732,7 +732,10 @@ impl Root {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         self.retirements.close();
-        let http = self.http.shutdown_wait(None);
+        // Accepted HTTP handlers can still sign through the old local CA.
+        // Keep root/service cancellation open until every HTTP generation has
+        // actually drained. Publication still uses acceptance_closed above.
+        let http = self.http.shutdown_wait(None).await;
         let certificates = async {
             receipt
                 .acceptance_closed()
@@ -752,7 +755,7 @@ impl Root {
             self.retirements.wait().await;
             result
         };
-        let (http, certificates) = tokio::join!(http, certificates);
+        let certificates = certificates.await;
         let acme=self.resources.acme_server.shutdown().await;
         // The stopped HTTP snapshot still retains the server plan. All of
         // its request tasks are joined now, so close exact-generation log
