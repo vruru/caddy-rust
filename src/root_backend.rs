@@ -45,7 +45,21 @@ pub struct RootOptions {
 }
 #[derive(Clone)]
 pub struct NativeBackend {
+    // Drop this external owner before our Root strong reference. Internal tasks
+    // retain Root, never this handle, so idle IO cannot hide external abandonment.
+    _owner:Arc<BackendOwner>,
     inner: Arc<Root>,
+}
+struct BackendOwner(std::sync::Weak<Root>);
+impl Drop for BackendOwner {
+    fn drop(&mut self){
+        let Some(root)=self.0.upgrade() else{return};
+        let _=root.phase.compare_exchange(RUNNING,STOPPING,Ordering::AcqRel,Ordering::Acquire);
+        root.candidates.cancel();
+        // Existing owned stop preserves shutdown_delay/grace and accepted work.
+        // A closed/absent executor is the explicit force fallback.
+        if root.start_stop().is_err(){root.force();}
+    }
 }
 struct Root {
     options: RootOptions,
@@ -74,6 +88,7 @@ struct Active {
     tickets: TicketRuntime,
     client: Option<ClientIdentity>,
     logging: Arc<Logging>,
+    _client_tls_owner:crate::outgoing_tls::ScopeOwner,
 }
 #[derive(Clone)]
 struct Predecessor {
@@ -149,8 +164,7 @@ impl NativeBackend {
             CertificateResources::new()
                 .map_err(|_| failed("root_certificate_resources_invalid"))?,
         );
-        Ok(Self {
-            inner: Arc::new(Root {
+        let inner=Arc::new(Root {
                 options,
                 challenges,
                 guard,
@@ -168,8 +182,8 @@ impl NativeBackend {
                 cpu: Arc::new(Semaphore::new(16)),
                 retirement_slots: Arc::new(Semaphore::new(8)),
                 retirements: TaskTracker::new(),
-            }),
-        })
+            });
+        Ok(Self {_owner:Arc::new(BackendOwner(Arc::downgrade(&inner))),inner})
     }
     /// Provision a runtime configuration without binding, activating apps or
     /// obtaining administrative/business identities. The caller supplies the
@@ -189,7 +203,8 @@ impl NativeBackend {
             root.guard.clone(),
         ));
         let token = root.cancel.child_token();
-        let services = CertificateServices::new(
+        let client_tls_owner=root.resources.client_tls.scope().map_err(|_|failed("client_tls_scope_preparation_failed"))?.with_owner_cancel(token.clone());
+        let services = CertificateServices::new_with_client_tls_scope(
             prepared.certificates,
             PrepareContext {
                 events: Some(events.clone()),
@@ -204,10 +219,12 @@ impl NativeBackend {
                 listener_provider: None,
             },
             PrepareMode::Normal,
+            client_tls_owner.scope(),
         )
         .map_err(|_| failed("certificate_service_preparation_failed"))?;
         let mut cleanup = CandidateCleanup {
             root: root.clone(),
+            client_tls_owner:Some(client_tls_owner),
             services: services.clone(),
             token,
             slot: None,
@@ -303,6 +320,7 @@ impl Root {
         self.candidates.cancel();
         self.cancel.cancel();
         self.http.force_shutdown();
+        self.resources.client_tls.close();
     }
     async fn offload<T: Send + 'static>(
         &self,
@@ -369,7 +387,8 @@ impl Root {
         let token = self.cancel.child_token();
         let listener_plan=self.http.resolve_listener_plan(&prepared.http,prepared.certificates.challenge_bind_hosts(),self.candidates.child_token()).await
             .map_err(|_|failed("http_listener_resolution_failed"))?;
-        let services = CertificateServices::new(
+        let client_tls_owner=self.resources.client_tls.scope().map_err(|_|failed("client_tls_scope_preparation_failed"))?.with_owner_cancel(token.clone());
+        let services = CertificateServices::new_with_client_tls_scope(
             prepared.certificates,
             PrepareContext {
                 events: Some(events.clone()),
@@ -384,10 +403,12 @@ impl Root {
                 listener_provider: Some(self.http.challenge_listener_provider_for(listener_plan.clone())),
             },
             mode,
+            client_tls_owner.scope(),
         )
         .map_err(|_| failed("certificate_service_preparation_failed"))?;
         let mut cleanup = CandidateCleanup {
             root: self.clone(),
+            client_tls_owner:Some(client_tls_owner),
             services: services.clone(),
             token,
             slot: Some(slot),
@@ -485,6 +506,7 @@ impl Root {
                 tickets,
                 client: client.lock().unwrap_or_else(|e| e.into_inner()).clone(),
                 logging: logging.clone(),
+                _client_tls_owner:cleanup.client_tls_owner.take().expect("candidate TLS owner"),
             });
             if self.phase.load(Ordering::Acquire) != RUNNING || self.cancel.is_cancelled() {
                 return Err(stopping());
@@ -761,6 +783,7 @@ impl Root {
             result
         };
         let certificates = certificates.await;
+        let client_tls=self.resources.client_tls.shutdown().await;
         let acme=self.resources.acme_server.shutdown().await;
         // The stopped HTTP snapshot still retains the server plan. All of
         // its request tasks are joined now, so close exact-generation log
@@ -772,6 +795,7 @@ impl Root {
         let logging = self.logging_registry.shutdown(deadline).await;
         http.map_err(|_| AdminError::new(503, "http_shutdown_incomplete"))?;
         certificates?;
+        client_tls.map_err(|_|AdminError::new(503,"client_tls_shutdown_incomplete"))?;
         acme.map_err(|_|AdminError::new(503,"acme_server_shutdown_incomplete"))?;
         if !logging.complete {
             return Err(AdminError::new(503,"logging_shutdown_incomplete"));
@@ -783,6 +807,7 @@ impl Root {
 
 struct CandidateCleanup {
     root: Arc<Root>,
+    client_tls_owner:Option<crate::outgoing_tls::ScopeOwner>,
     services: Arc<CertificateServices>,
     token: CancellationToken,
     slot: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -799,11 +824,13 @@ impl Drop for CandidateCleanup {
             self.root.force();
         }
         let services = self.services.clone();
+        let owner=self.client_tls_owner.take();
         let slot = self.slot.take();
         if tokio::runtime::Handle::try_current().is_ok() {
             self.root.retirements.spawn(async move {
                 let _slot = slot;
                 let _ = services.shutdown().await;
+                drop(owner);
             });
         }
     }

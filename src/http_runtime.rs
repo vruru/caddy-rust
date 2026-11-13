@@ -61,7 +61,7 @@ mod fastcgi;
 #[path = "http_runtime/access_log.rs"]
 mod access_log;
 #[path = "http_runtime/tls_executor.rs"]
-mod tls_executor;
+pub(crate) mod tls_executor;
 use connection_identity::{TlsIdentity, TlsVerdict};
 pub use tls_executor::TlsHandshakeDiagnostics;
 mod h3;

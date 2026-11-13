@@ -432,6 +432,7 @@ dependencies = [
  "toml",
  "tonic",
  "tonic-types",
+ "tower-layer",
  "tower-service",
  "unsafe-libyaml",
  "url",

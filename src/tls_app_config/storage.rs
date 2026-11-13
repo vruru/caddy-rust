@@ -32,6 +32,8 @@ pub(super) struct Store {
 /// Root shares one resource object across policies and configuration generations.
 /// Storage and issuance pools are bounded independently of the runtime CPU count.
 pub struct CertificateResources {
+    #[cfg(feature="native-run")]
+    pub(crate) client_tls:crate::outgoing_tls::Resources,
     pub(crate) acme_server:Arc<crate::acme_server::Shared>,
     stores: Mutex<HashMap<PathBuf, Arc<Store>>>,
     #[cfg(feature = "native-run")]
@@ -59,7 +61,12 @@ impl CertificateResources {
         issuance: Arc<AutomationResources>,
         ocsp: Arc<OcspResources>,
     ) -> Result<Self> {
+        let external_bytes=Arc::new(Semaphore::new(256 * 1024 * 1024));
+        #[cfg(feature="native-run")]
+        let client_tls=crate::outgoing_tls::Resources::new(external_bytes.clone())?;
         Ok(Self {
+            #[cfg(feature="native-run")]
+            client_tls,
             acme_server:crate::acme_server::Shared::new(),
             stores: Mutex::new(HashMap::new()),
             #[cfg(feature = "native-run")]
@@ -75,7 +82,7 @@ impl CertificateResources {
             )?),
             io: Arc::new(Semaphore::new(8)),
             revoked: Notify::new(),
-            external_bytes: Arc::new(Semaphore::new(256 * 1024 * 1024)),
+            external_bytes,
             #[cfg(feature = "native-run")]
             ca_fetch: Arc::new(Semaphore::new(4)),
         })

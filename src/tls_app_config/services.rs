@@ -209,6 +209,8 @@ struct State {
 }
 
 pub struct CertificateServices {
+    #[cfg(feature="native-run")]
+    outgoing_tls:Option<Arc<crate::outgoing_tls::Scope>>,
     ssl_verify:Arc<native_ssl_tls::VerificationScope>,
     plan: CertificatePlan,
     context: PrepareContext,
@@ -247,6 +249,13 @@ impl CertificateServices {
         context: PrepareContext,
         mode: PrepareMode,
     ) -> Result<Arc<Self>> {
+        Self::new_inner(plan,context,mode,#[cfg(feature="native-run")] None)
+    }
+    #[cfg(feature="native-run")]
+    pub(crate) fn new_with_client_tls_scope(plan:CertificatePlan,context:PrepareContext,mode:PrepareMode,scope:Arc<crate::outgoing_tls::Scope>)->Result<Arc<Self>> {
+        Self::new_inner(plan,context,mode,Some(scope))
+    }
+    fn new_inner(plan:CertificatePlan,context:PrepareContext,mode:PrepareMode,#[cfg(feature="native-run")] outgoing_tls:Option<Arc<crate::outgoing_tls::Scope>>)->Result<Arc<Self>> {
         ensure!(
             Arc::ptr_eq(&context.leaf_guard, &context.resolver.leaf_guard()),
             "certificate resolver does not share the root leaf guard"
@@ -289,6 +298,8 @@ impl CertificateServices {
         let on_demand = Arc::new(on_demand::OnDemand::new(cache_receiver,
             context.leaf_guard.key_deny().clone()));
         let this = Arc::new(Self {
+            #[cfg(feature="native-run")]
+            outgoing_tls,
             ssl_verify:native_ssl_tls::VerificationScope::new(),
             plan,
             context,
@@ -523,10 +534,14 @@ impl CertificateServices {
         // invoke no external waker while either service mutex is held.
         self.context.cancel.cancel();
         self.ssl_verify.close();
+        #[cfg(feature="native-run")]
+        if let Some(scope)=&self.outgoing_tls{scope.close();}
         drop(activation);
         self.tasks.close();
         self.tasks.wait().await;
         self.ssl_verify.wait().await;
+        #[cfg(feature="native-run")]
+        if let Some(scope)=&self.outgoing_tls{scope.wait().await;}
         let pki = self
             .state
             .lock()

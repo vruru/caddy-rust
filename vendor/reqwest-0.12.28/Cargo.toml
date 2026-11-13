@@ -65,6 +65,7 @@ features = [
 ]
 
 [features]
+native-tls-scope = ["__rustls", "dep:tokio-util", "tokio-util/rt"]
 native-ssl = ["__rustls", "dep:native-ssl-tls"]
 __rustls = [
     "dep:hyper-rustls",

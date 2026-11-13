@@ -35,3 +35,6 @@ verifier after TLS configuration, before connector/HTTP3 clones, in both normal
 and preconfigured Rustls branches. It defaults to absent and preserves existing
 root, identity, CRL, provider, proxy and verification settings. The API does not
 force certificate policy on generic callers or replace the native TLS backend.
+
+
+The optional `native-tls-scope` feature exposes the existing sealed connection as a hidden IO-mapping seam plus its existing IO/TlsInfo traits and a borrowed URI view. `Conn::map_io` preserves the original proxy and TlsInfo flags; the host supplies its concrete bounded connection-lifetime wrapper. The host connector layer runs its actual owned service clone's readiness and call on its existing TLS executor, not in reqwest's general HTTP request path. No arbitrary Any/Drop credit hook, global executor, trust-store reconstruction, application retry or CBC fallback is added by this seam. The original default builder behavior remains unchanged unless the host explicitly installs that layer.

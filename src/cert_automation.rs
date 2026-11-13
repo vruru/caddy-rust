@@ -234,6 +234,8 @@ pub struct CertificateManager {
     inner: Arc<ManagerInner>,
 }
 struct ManagerInner {
+    #[cfg(feature="native-run")]
+    outgoing_tls:Option<Arc<crate::outgoing_tls::Scope>>,
     chain_memory:Arc<crate::acme_wire::ChainMemoryPools>,
     chain_cleanup:Arc<crate::acme_wire::ChainCleanup>,
     must_staple: bool,
@@ -795,6 +797,8 @@ impl CertificateManager {
                 must_staple:false,
                 reuse_private_keys:false,
                 lifecycle_events: None,
+                #[cfg(feature="native-run")]
+                outgoing_tls:None,
                 store,
                 registry,
                 resolver,
@@ -817,6 +821,10 @@ impl CertificateManager {
             .ok_or_else(|| anyhow!("certificate manager already shared"))?
             .lifecycle_events = events;
         Ok(self)
+    }
+    #[cfg(feature="native-run")]
+    pub(crate) fn with_client_tls_scope(mut self,scope:Option<Arc<crate::outgoing_tls::Scope>>)->Result<Self>{
+        Arc::get_mut(&mut self.inner).ok_or_else(||anyhow!("certificate manager already shared"))?.outgoing_tls=scope;Ok(self)
     }
     /// Generation-scoped leaf CSR behavior; account signing keys are unaffected.
     pub fn with_csr_options(mut self,must_staple:bool,reuse_private_keys:bool)->Result<Self> {
@@ -960,10 +968,12 @@ impl CertificateManager {
                     let wire = issuer
                         .wire
                         .get_or_try_init(|| {
-                            AcmeWire::connect_with_resources(
+                            AcmeWire::connect_with_client_tls_scope(
                                 issuer.config.wire.clone(),
                                 self.inner.local.clone(),
                                 self.inner.chain_memory.clone(),
+                                #[cfg(feature="native-run")]
+                                self.inner.outgoing_tls.clone(),
                                 &cancel,
                             )
                         })
@@ -1219,10 +1229,12 @@ impl CertificateManager {
             let wire = match issuer
                 .wire
                 .get_or_try_init(|| {
-                    AcmeWire::connect_with_resources(
+                    AcmeWire::connect_with_client_tls_scope(
                         issuer.config.wire.clone(),
                         self.inner.local.clone(),
                                 self.inner.chain_memory.clone(),
+                                #[cfg(feature="native-run")]
+                                self.inner.outgoing_tls.clone(),
                         &cancel,
                     )
                 })
@@ -1757,10 +1769,12 @@ impl CertificateManager {
                     let wire = issuer
                         .wire
                         .get_or_try_init(|| {
-                            AcmeWire::connect_with_resources(
+                            AcmeWire::connect_with_client_tls_scope(
                                 issuer.config.wire.clone(),
                                 self.inner.local.clone(),
                                 self.inner.chain_memory.clone(),
+                                #[cfg(feature="native-run")]
+                                self.inner.outgoing_tls.clone(),
                                 cancel,
                             )
                         })
@@ -2334,10 +2348,12 @@ impl CertificateManager {
         let wire = issuer
             .wire
             .get_or_try_init(|| {
-                AcmeWire::connect_with_resources(
+                AcmeWire::connect_with_client_tls_scope(
                     issuer.config.wire.clone(),
                     self.inner.local.clone(),
                                 self.inner.chain_memory.clone(),
+                                #[cfg(feature="native-run")]
+                                self.inner.outgoing_tls.clone(),
                     cancel,
                 )
             })

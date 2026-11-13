@@ -841,3 +841,14 @@ mod tests {
         assert_eq!(result.len(), 1);
     }
 }
+
+/// Native host connection-lifetime composition; disabled for ordinary builders.
+#[cfg(feature="native-tls-scope")]
+#[doc(hidden)]
+pub use crate::connect::{AsyncConnWithInfo as ConnectionIo,TlsInfoFactory as ConnectionTlsInfo};
+#[cfg(feature="native-tls-scope")]
+#[doc(hidden)]
+pub use crate::connect::sealed::Conn as ScopedConnection;
+#[cfg(feature="native-tls-scope")]
+#[doc(hidden)]
+pub fn scoped_connector_clone_bound()->usize {crate::connect::scoped_io_allocation_bound()}

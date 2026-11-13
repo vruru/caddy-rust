@@ -432,6 +432,8 @@ impl Context {
                     };
                     let cancel = self.cancel.clone();
                     let ssl_verify=self.services.ssl_verify.clone();
+                    #[cfg(feature="native-run")]
+                    let scope=self.services.outgoing_tls.clone();
                     let client = crate::cert_cpu::run(
                         self.services.context.resources.cpu.clone(),
                         cancel,
@@ -451,6 +453,10 @@ impl Context {
                                 .pool_max_idle_per_host(0)
                                 .http2_max_header_list_size(65536);
                             if let Some(native)=config.native{builder=builder.prepared_openssl_tls(native);}
+                            else {
+                                #[cfg(feature="native-run")]
+                                if let Some(scope)=scope{builder=builder.connector_layer(scope.layer()?);}
+                            }
                             if let Some(name) = tls.name {
                                 builder = builder.tls_server_name_override(name);
                             }

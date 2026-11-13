@@ -401,7 +401,10 @@ impl CertificateServices {
             )?
             // Caddy admin identity uses a separate certmagic.Config without
             // tlsApp.onEvent; only business certificates join the TLS app.
-            .with_events((!identity).then(|| self.context.events.clone()).flatten())?
+            .with_events((!identity).then(|| self.context.events.clone()).flatten())?;
+            #[cfg(feature="native-run")]
+            let manager=manager.with_client_tls_scope(self.outgoing_tls.clone())?;
+            let manager=manager
             .with_csr_options(policy.must_staple,policy.reuse_private_keys)?
             .with_chain_tasks(group_tasks.clone())?
             .storage_only()?;

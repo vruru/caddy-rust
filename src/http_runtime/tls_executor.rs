@@ -23,7 +23,7 @@ pub struct TlsExecutor {
 /// the runtime is synchronous and must be called on the provisioning CPU lane.
 /// Closing admission does not join: graceful owners call shutdown after business
 /// requests drain, while a force path may close immediately.
-pub(super) struct ClientTlsExecutor {
+pub(crate) struct ClientTlsExecutor {
     state: Mutex<ClientState>,
 }
 struct ClientState {
@@ -31,10 +31,10 @@ struct ClientState {
     executor: Option<Arc<TlsExecutor>>,
 }
 impl ClientTlsExecutor {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { state: Mutex::new(ClientState { closed: false, executor: None }) }
     }
-    pub(super) fn prepare(&self) -> io::Result<Arc<TlsExecutor>> {
+    pub(crate) fn prepare(&self) -> io::Result<Arc<TlsExecutor>> {
         let mut state = self.state.lock().map_err(|_| io::Error::other("client TLS executor state failed"))?;
         if state.closed {
             return Err(io::Error::other("client TLS executor stopped"));
@@ -47,7 +47,7 @@ impl ClientTlsExecutor {
         }
         Ok(state.executor.as_ref().expect("prepared client TLS executor").clone())
     }
-    pub(super) fn close(&self) {
+    pub(crate) fn close(&self) {
         let executor = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.closed = true;
@@ -55,7 +55,7 @@ impl ClientTlsExecutor {
         };
         if let Some(executor) = executor { executor.close(); }
     }
-    pub(super) async fn shutdown(&self) -> Result<()> {
+    pub(crate) async fn shutdown(&self) -> Result<()> {
         self.close();
         let executor = self.state.lock().map_err(|_| anyhow!("client TLS executor state failed"))?.executor.clone();
         if let Some(executor) = executor { executor.shutdown().await?; }

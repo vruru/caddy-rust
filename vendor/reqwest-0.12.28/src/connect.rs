@@ -1033,7 +1033,9 @@ impl Service<Uri> for ConnectorService {
 }
 
 #[cfg(feature = "__tls")]
-trait TlsInfoFactory {
+/// Prepared TLS facts supplied by a native connection transport.
+pub trait TlsInfoFactory {
+    /// Return the actual peer facts exposed by this transport.
     fn tls_info(&self) -> Option<crate::tls::TlsInfo>;
 }
 
@@ -1349,7 +1351,7 @@ impl TlsInfoFactory
     }
 }
 
-pub(crate) trait AsyncConn:
+pub trait AsyncConn:
     Read + Write + Connection + Send + Sync + Unpin + 'static
 {
 }
@@ -1357,7 +1359,8 @@ pub(crate) trait AsyncConn:
 impl<T: Read + Write + Connection + Send + Sync + Unpin + 'static> AsyncConn for T {}
 
 #[cfg(feature = "__tls")]
-trait AsyncConnWithInfo: AsyncConn + TlsInfoFactory {}
+/// Complete connection IO with the existing prepared TLS fact visitor.
+pub trait AsyncConnWithInfo: AsyncConn + TlsInfoFactory {}
 #[cfg(not(feature = "__tls"))]
 trait AsyncConnWithInfo: AsyncConn {}
 
@@ -1388,6 +1391,18 @@ pub(crate) mod sealed {
         }
     }
 
+    #[cfg(feature="native-tls-scope")]
+    impl Conn {
+        /// Preserve connection/proxy/TLS facts while the owner decorates IO.
+        pub fn map_io(self, wrap:impl FnOnce(BoxConn)->BoxConn)->Self {
+            let Self { inner,is_proxy,tls_info }=self;
+            Self { inner:wrap(inner),is_proxy,tls_info }
+        }
+    }
+    #[cfg(feature="native-tls-scope")]
+    impl AsRef<Uri> for Unnameable {
+        fn as_ref(&self)->&Uri { &self.0 }
+    }
     impl Connection for Conn {
         fn connected(&self) -> Connected {
             let connected = self.inner.connected().proxy(self.is_proxy);
@@ -2234,4 +2249,12 @@ mod ssl_tls_conn{
     impl<S:AsyncRead+AsyncWrite+Unpin> TlsInfoFactory for SslTlsConn<S>{
         fn tls_info(&self)->Option<crate::tls::TlsInfo>{self.inner.inner().with_peer_certificates(|certs|crate::tls::TlsInfo{peer_certificate:certs.first().map(|der|der.to_vec())}).ok()}
     }
+}
+
+#[cfg(feature="native-tls-scope")]
+pub(crate) fn scoped_io_allocation_bound()->usize {
+    // Extra clone made by the one native scope layer. Existing connector
+    // profile backing allocations retain their existing owners. DNS override
+    // clones are bounded by Rustls's253-byte DNS-name limit.
+    std::mem::size_of::<ConnectorService>()+2*253+256
 }

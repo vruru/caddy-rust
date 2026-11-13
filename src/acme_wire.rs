@@ -163,6 +163,22 @@ impl fmt::Display for ProtocolError {
 }
 impl std::error::Error for ProtocolError {}
 
+/// Evidence only of an explicit wire cancellation branch. It does not prove
+/// actual TLS worker retirement or authorize an issuer fallback.
+#[derive(Debug)]
+pub(crate) struct AcmeRequestCancelled {status:u16,before_send:bool,uncertain:bool}
+impl fmt::Display for AcmeRequestCancelled {
+    fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{
+        write!(f,"ACME protocol request failed (HTTP {}, {}, uncertain={})",self.status,
+            if self.before_send{"cancelledBeforeSend"}else{"cancelled"},self.uncertain)
+    }
+}
+impl std::error::Error for AcmeRequestCancelled {}
+fn cancelled_request(error:ProtocolError)->anyhow::Error{
+    let marker=AcmeRequestCancelled{status:error.status,before_send:error.kind=="cancelledBeforeSend",uncertain:error.uncertain};
+    anyhow::Error::new(error).context(marker)
+}
+
 #[derive(Clone)]
 pub struct AcmeWire {
     inner: Arc<WireInner>,
@@ -211,6 +227,9 @@ impl AcmeWire {
         Self::connect_with_resources(options,cpu,shared_chain_memory(),cancel).await
     }
     pub(crate) async fn connect_with_resources(options:WireOptions,cpu:Arc<Semaphore>,chain_memory:Arc<ChainMemoryPools>,cancel:&CancellationToken)->Result<Self> {
+        Self::connect_with_client_tls_scope(options,cpu,chain_memory,#[cfg(feature="native-run")] None,cancel).await
+    }
+    pub(crate) async fn connect_with_client_tls_scope(options:WireOptions,cpu:Arc<Semaphore>,chain_memory:Arc<ChainMemoryPools>,#[cfg(feature="native-run")] scope:Option<Arc<crate::outgoing_tls::Scope>>,cancel:&CancellationToken)->Result<Self> {
         ensure!(
             !options.request_timeout.is_zero()
                 && options.request_timeout <= Duration::from_secs(3600),
@@ -251,6 +270,8 @@ impl AcmeWire {
             ensure!(pem.len() <= 1024 * 1024, "ACME trust root exceeds bounds");
             builder = append_trusted_root_pem(builder, &pem)?;
         }
+        #[cfg(feature="native-run")]
+        if let Some(scope)=scope{builder=builder.connector_layer(scope.layer()?);}
         builder
             .build()
             .map_err(|_| anyhow!("ACME client construction failed"))
@@ -507,7 +528,7 @@ impl AcmeWire {
             let signer = signer.clone();
             let signed_bytes = format!("{protected}.{payload}");
             let signature = match crate::cert_cpu::run(self.inner.cpu.clone(),cancel.clone(),move || signer.sign(signed_bytes.as_bytes())).await {
-                Err(_) if cancel.is_cancelled() => return Err(ProtocolError { status:0,kind:"cancelledBeforeSend".into(),uncertain:false,retry_after:None }.into()),
+                Err(error) if cancel.is_cancelled() => return Err(error.context(ProtocolError { status:0,kind:"cancelledBeforeSend".into(),uncertain:false,retry_after:None })),
                 result => result?,
             };
             let body = serde_json::to_vec(
@@ -1010,19 +1031,18 @@ async fn send_with_type(
 async fn send_with_memory(client:&reqwest::Client,method:Method,url:Url,body:Option<Vec<u8>>,content_type:&str,memory:Option<Arc<ChainMemoryPools>>,body_credit:Option<ChainMemoryLease>,http_slots:Option<Arc<Semaphore>>,cancel:&CancellationToken)->Result<WireResponse> {
     let is_post = method == Method::POST;
     if cancel.is_cancelled() {
-        return Err(ProtocolError {
+        return Err(cancelled_request(ProtocolError {
             status: 0,
             kind: "cancelledBeforeSend".to_owned(),
             uncertain: false,
             retry_after: None,
-        }
-        .into());
+        }));
     }
     // Certificate concurrency covers only actual HTTP send/body collection.
     // JWS signing has already finished; no HTTP slot crosses CPU or recursion.
     let _http_slot=if let Some(slots)=http_slots {
         Some(tokio::select!{biased;
-            _=cancel.cancelled()=>return Err(ProtocolError{status:0,kind:"cancelledBeforeSend".into(),uncertain:false,retry_after:None}.into()),
+            _=cancel.cancelled()=>return Err(cancelled_request(ProtocolError{status:0,kind:"cancelledBeforeSend".into(),uncertain:false,retry_after:None})),
             permit=slots.acquire_owned()=>permit.map_err(|_|anyhow!("ACME certificate HTTP scheduling stopped"))?,
         })
     }else{None};
@@ -1034,8 +1054,8 @@ async fn send_with_memory(client:&reqwest::Client,method:Method,url:Url,body:Opt
     }
     let mut response = tokio::select! {
         biased;
-        _ = cancel.cancelled() => return Err(ProtocolError{status:0,kind:"cancelled".to_owned(),uncertain:is_post,retry_after:None}.into()),
-        response = request.send() => response.map_err(|_| ProtocolError {status:0,kind:"transport".to_owned(),uncertain:is_post,retry_after:None})?,
+        _ = cancel.cancelled() => return Err(cancelled_request(ProtocolError{status:0,kind:"cancelled".to_owned(),uncertain:is_post,retry_after:None})),
+        response = request.send() => response.map_err(|error| anyhow::Error::new(error).context(ProtocolError {status:0,kind:"transport".to_owned(),uncertain:is_post,retry_after:None}))?,
     };
     if response
         .content_length()
@@ -1053,7 +1073,7 @@ async fn send_with_memory(client:&reqwest::Client,method:Method,url:Url,body:Opt
     let headers = response.headers().clone();
     let mut body = chain_memory::Collector::new(memory,body_credit,response.content_length().map(|n|n as usize))?;
     loop {
-        let chunk = tokio::select! { biased; _=cancel.cancelled()=>return Err(ProtocolError{status:status.as_u16(),kind:"cancelled".to_owned(),uncertain:is_post,retry_after:None}.into()), chunk=response.chunk()=>chunk.map_err(|_| ProtocolError{status:status.as_u16(),kind:"responseTransport".to_owned(),uncertain:is_post,retry_after:None})? };
+        let chunk = tokio::select! { biased; _=cancel.cancelled()=>return Err(cancelled_request(ProtocolError{status:status.as_u16(),kind:"cancelled".to_owned(),uncertain:is_post,retry_after:None})), chunk=response.chunk()=>chunk.map_err(|error| anyhow::Error::new(error).context(ProtocolError{status:status.as_u16(),kind:"responseTransport".to_owned(),uncertain:is_post,retry_after:None}))? };
         let Some(chunk) = chunk else { break };
         if body.len() + chunk.len() > MAX_BODY {
             return Err(ProtocolError {
