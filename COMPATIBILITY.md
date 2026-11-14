@@ -1843,3 +1843,15 @@ RFC3339Nano text, preserving the time's offset and nanoseconds and omitting
 trailing fractional zeros. Years outside 0..9999 and offsets whose absolute
 hour reaches 24 return the corresponding method error. This adds that readonly
 receiver; other missing time receivers remain separate compatibility work.
+
+Readonly template calendar arithmetic
+-------------------------------------
+
+The `time.Time.AddDate` receiver takes three Go `int` arguments and normalizes
+civil years, months and days, retaining the original location and nanoseconds
+while stripping monotonic state. Month ends roll into the following month;
+calendar days account for local offset transitions rather than adding 24 hours.
+Checked wide intermediates reject results outside signed Unix seconds instead
+of reproducing extreme integer wraparound. The existing Local location display
+name does not yet reproduce every explicit `TZ` name; calendar retention and
+arithmetic acceptance do not establish complete location or time-method support.

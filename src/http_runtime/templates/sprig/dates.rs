@@ -39,6 +39,42 @@ fn add(time:&Time,nanos:i64)->gotmpl::Result<Time>{
     let monotonic=time.monotonic.and_then(|mono|{let next=mono+i128::from(nanos);((-2_682_288_000..=5_907_646_591).contains(&seconds)&&i64::try_from(next).is_ok()).then_some(next)});
     Ok(Time{stamp:Timestamp{seconds,nanosecond:total.rem_euclid(1_000_000_000)as u32},zone:time.zone.clone(),monotonic})
 }
+// Calendar arithmetic normalizes the civil month/day instead of clamping
+// month ends or treating every day as a fixed 24-hour duration.
+fn add_date(time: &Time, years: i64, months: i64, days: i64) -> gotmpl::Result<Time> {
+    let (offset, name) = zone_info(&time.zone, time.stamp.seconds);
+    let civil = time_components::at(time.stamp, offset, name)
+        .map_err(|e| err(e.to_string()))?;
+    let month = i128::from(civil.month) - 1 + i128::from(months);
+    let year = civil.year + i128::from(years) + month.div_euclid(12);
+    let month = month.rem_euclid(12) + 1;
+    // Invert time_components::at's March-based Gregorian conversion. i128
+    // intermediates also make extreme int arguments fail without wrapping.
+    let year = year - i128::from(month <= 2);
+    let era = year.div_euclid(400);
+    let era_year = year.rem_euclid(400);
+    let march_month = month + if month > 2 { -3 } else { 9 };
+    let absolute_day = era * 146_097 + era_year * 365 + era_year / 4
+        - era_year / 100 + (153 * march_month + 2) / 5
+        + i128::from(civil.day) - 1 + i128::from(days) - 719_468;
+    let naive = absolute_day * 86_400 + i128::from(civil.hour) * 3600
+        + i128::from(civil.minute) * 60 + i128::from(civil.second);
+    let naive = i64::try_from(naive)
+        .map_err(|_| err("time calendar addition exceeds signed seconds"))?;
+    // Like Go time.Date, first interpret the normalized civil instant as UTC,
+    // then recheck the offset at its shifted instant to select a gap/fold side.
+    let (first, _) = zone_info(&time.zone, naive);
+    let shifted = naive.checked_sub(i64::from(first))
+        .ok_or_else(|| err("time calendar addition exceeds signed seconds"))?;
+    let offset = if first == 0 { 0 } else { zone_info(&time.zone, shifted).0 };
+    let seconds = naive.checked_sub(i64::from(offset))
+        .ok_or_else(|| err("time calendar addition exceeds signed seconds"))?;
+    Ok(Time {
+        stamp: Timestamp { seconds, nanosecond: time.stamp.nanosecond },
+        zone: time.zone.clone(),
+        monotonic: None,
+    })
+}
 fn time_equal(a:&gotmpl::Object,b:&gotmpl::Object)->bool {
     let(Some(a),Some(b))=(a.host_data::<Time>("time.Time"),b.host_data::<Time>("time.Time"))else{return false;};
     let location=match(&a.zone,&b.zone){(Zone::Utc,Zone::Utc)|(Zone::Local,Zone::Local)=>true,(Zone::Named(a),Zone::Named(b))=>Arc::ptr_eq(a,b),(Zone::Fixed(a),Zone::Fixed(b))=>Arc::ptr_eq(a,b),_=>false};
@@ -95,6 +131,10 @@ static DURATION_SIG: gotmpl::Signature = gotmpl::Signature::from_static(
     None,
 );
 
+static ADD_DATE_SIG: gotmpl::Signature = gotmpl::Signature::from_static(
+    &[gotmpl::ArgKind::Int, gotmpl::ArgKind::Int, gotmpl::ArgKind::Int], None,
+);
+
 static TIME_TYPE: gotmpl::HostType = gotmpl::HostType {
     methods: &[
         gotmpl::HostMethod { name: "String", invoke: |o, a| time_call("String", o, a), signature: None },
@@ -118,6 +158,7 @@ static TIME_TYPE: gotmpl::HostType = gotmpl::HostType {
         gotmpl::HostMethod { name: "Local", invoke: |o, a| time_call("Local", o, a), signature: None },
         gotmpl::HostMethod { name: "Location", invoke: |o, a| time_call("Location", o, a), signature: None },
         gotmpl::HostMethod { name: "Add", invoke: |o, a| time_call("Add", o, a), signature: Some(&DURATION_SIG) },
+        gotmpl::HostMethod { name: "AddDate", invoke: |o, a| time_call("AddDate", o, a), signature: Some(&ADD_DATE_SIG) },
         gotmpl::HostMethod { name: "Sub", invoke: |o, a| time_call("Sub", o, a), signature: None },
         gotmpl::HostMethod { name: "Round", invoke: |o, a| time_call("Round", o, a), signature: Some(&DURATION_SIG) },
         gotmpl::HostMethod { name: "Truncate", invoke: |o, a| time_call("Truncate", o, a), signature: Some(&DURATION_SIG) },
@@ -140,6 +181,14 @@ fn time_call(name: &str, object: &gotmpl::Object, a: &[V]) -> R {
             arity(a, 1, 1)?;
             let nanos = a[0].as_go_signed().ok_or_else(|| err("expected time.Duration"))?;
             time_value(add(time, nanos)?)
+        },
+        "AddDate" => {
+            arity(a, 3, 3)?;
+            let value = |i| match a[i] {
+                V::Int(value) => Ok(value),
+                _ => Err(err("expected int calendar argument")),
+            };
+            time_value(add_date(time, value(0)?, value(1)?, value(2)?)?)
         },
         "Sub" => {
             arity(a, 1, 1)?;
