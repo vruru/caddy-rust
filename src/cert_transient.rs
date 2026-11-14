@@ -17,6 +17,10 @@ impl std::fmt::Display for ResourceDenied {
 }
 impl std::error::Error for ResourceDenied {}
 pub(crate) fn is_resource(error: &anyhow::Error) -> bool {
+    is_resource_direct(error)
+        || crate::acme_wire::chain_failure_cause(error).is_some_and(is_resource_direct)
+}
+fn is_resource_direct(error: &anyhow::Error) -> bool {
     // anyhow contexts are downcastable through Error, but are not exposed as
     // their payload type by the std::error::Error source iterator.
     error.is::<native_write_policy::Denied>()

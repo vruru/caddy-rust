@@ -91,7 +91,10 @@ impl ConnectionPolicy {
         if minimum <= ProtocolVersion::Tls12 {
             versions.push(&rustls::version::TLS12);
         }
-        let auth = super::client_auth::prepare(self.client_auth.as_ref())?;
+        let auth = match &self.prepared_client_auth {
+            Some(slot) => slot.material_for(self.identity,self.client_auth.as_ref())?.clone(),
+            None => super::client_auth::prepare(self.client_auth.as_ref())?,
+        };
         let native_verifier=auth.verifier.clone();
         let builder = ServerConfig::builder_with_provider(Arc::new(provider))
             .with_protocol_versions(&versions)?;

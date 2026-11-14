@@ -279,6 +279,26 @@ impl Job {
         })
     }
 }
+// The actual error may outlive Context/the waiter. Keep its closed output
+// envelope and credit; do not stringify it or drop its metadata owner early.
+struct SelectionFailure {
+    output: super::resource_budget::RetainedBlockingOutput<Result<Selection>>,
+}
+impl std::fmt::Debug for SelectionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MapSelectionFailure")
+    }
+}
+impl std::fmt::Display for SelectionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("map selection failed")
+    }
+}
+impl std::error::Error for SelectionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.output.get().as_ref().err().map(|error| error.as_ref())
+    }
+}
 pub(super) async fn select_until(
     resources: &Resources,
     map: &LazyMap,
@@ -305,17 +325,18 @@ pub(super) async fn select_until(
     };
     let result = resources
         .map_lookup
-        .run_retained(owner, move || job.execute())
+        .run_retained_checked(owner, move || job.execute())
         .await
-        .map_err(|_| super::request::failure(http::StatusCode::SERVICE_UNAVAILABLE))?;
+        .map_err(|error| super::request::failure_with_cause(http::StatusCode::SERVICE_UNAVAILABLE, error))?;
     match result.get() {
         Ok(value) => Ok(Selection {
             bytes: value.bytes.clone(),
             expand: value.expand,
             null: value.null,
         }),
-        Err(_) => Err(super::request::failure(
+        Err(_) => Err(super::request::failure_with_cause(
             http::StatusCode::SERVICE_UNAVAILABLE,
+            anyhow::Error::new(SelectionFailure { output: result }),
         )),
     }
 }
@@ -703,7 +724,7 @@ where
                     .saturating_add(std::mem::size_of::<T>())
                     .saturating_add(2048),
             )
-            .map_err(|_| super::request::failure(http::StatusCode::SERVICE_UNAVAILABLE))?;
+            .map_err(|error| super::request::failure_with_cause(http::StatusCode::SERVICE_UNAVAILABLE, error))?;
     }
     let job = TextWork { operation, owner };
     Ok(move || job.execute())

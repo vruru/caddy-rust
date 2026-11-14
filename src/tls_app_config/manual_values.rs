@@ -303,7 +303,10 @@ fn lookup(name: &str, cwd: &Path, cancel: &CancellationToken) -> Result<Option<P
     if let Some(key) = name.strip_prefix("env.") {
         return environment::bounded_bytes(key).map(Some);
     }
-    if let Some(path) = name.strip_prefix("file.") {
+    if let Some(path) = name.strip_prefix("file.") { return lookup_file(path, cwd); }
+    lookup_global(name)
+}
+pub(super) fn lookup_file(path:&str,cwd:&Path)->Result<Option<ProviderValue>> {
         use std::io::Read;
         let _path_memory = cert_transient::reserve(
             path.len()
@@ -336,8 +339,9 @@ fn lookup(name: &str, cwd: &Path, cancel: &CancellationToken) -> Result<Option<P
             len -= 1
         }
         bytes.truncate(len);
-        return Ok(Some(ProviderValue { bytes, memory }));
-    }
+        Ok(Some(ProviderValue { bytes, memory }))
+}
+pub(super) fn lookup_global(name:&str)->Result<Option<ProviderValue>> {
     let memory = cert_transient::reserve(FIELD)?;
     let Some(value) = crate::http_config::helpers::global_lookup(name) else {
         return Ok(None);

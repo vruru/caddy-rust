@@ -713,6 +713,12 @@ pub(super) fn failure(status: StatusCode) -> anyhow::Error {
     failure_with_message(status, None)
 }
 
+/// Keep both the existing HTTP status and the real local error source.
+#[track_caller]
+pub(super) fn failure_with_cause(status: StatusCode, cause: anyhow::Error) -> anyhow::Error {
+    cause.context(failure(status).downcast::<HttpError>().expect("structured HTTP error"))
+}
+
 #[track_caller]
 fn failure_with_message(status: StatusCode, message: Option<String>) -> anyhow::Error {
     let origin = std::panic::Location::caller();

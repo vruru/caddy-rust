@@ -237,7 +237,7 @@ impl CertificateManager {
                     if allowed>now(){return Err(RetryAfterError(allowed).into())}
                     let wire=issuer.wire.get_or_try_init(||async{
                         AcmeWire::connect_with_client_tls_scope(issuer.config.wire.clone(),self.inner.local.clone(),self.inner.chain_memory.clone(),
-                            #[cfg(feature="native-run")] self.inner.outgoing_tls.clone(),self.wire_client_owner(),cancel).await
+                            #[cfg(feature="native-run")] self.inner.outgoing_tls.clone(),self.wire_client_owner_for(issuer),cancel).await
                     }).await?;
                     let session=self.account(issuer,wire,old.as_ref().map(|record|record.job.account_location.as_str()),cancel).await?;
                     let candidate=self.issue_candidate(names,issuer,&session,lease,(replacement,None,attempt_id),None,cancel,Some(input),
@@ -254,7 +254,7 @@ impl CertificateManager {
             if allowed>now(){return Err(RetryAfterError(allowed).into())}
             let wire=primary.wire.get_or_try_init(||async{
                 AcmeWire::connect_with_client_tls_scope(primary.config.wire.clone(),self.inner.local.clone(),self.inner.chain_memory.clone(),
-                    #[cfg(feature="native-run")] self.inner.outgoing_tls.clone(),self.wire_client_owner(),cancel).await
+                    #[cfg(feature="native-run")] self.inner.outgoing_tls.clone(),self.wire_client_owner_for(primary),cancel).await
             }).await?;
             let current=self.read_reservation(names,primary).await?;
             let session=self.account(primary,wire,current.as_ref().map(|marker|marker.account_location.as_str()),cancel).await?;

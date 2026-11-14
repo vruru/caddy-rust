@@ -561,7 +561,8 @@ pub(super) async fn serve(
             guard.abort();
         }
         let error = result.err().expect("failed attempt");
-        if progress.response_received || error.is::<DownstreamFailure>() {
+        if progress.response_received || error.is::<DownstreamFailure>()
+            || super::http_dial::is_local_failure(&error) {
             return Err(error);
         }
         // Client upload, body limit and local spool failures do not describe

@@ -71,7 +71,7 @@ impl Buffer {
         for p in parts {
             sum = sum
                 .checked_add(p.len())
-                .ok_or_else(|| anyhow::anyhow!("overflow"))?;
+                .ok_or(crate::cert_transient::ResourceDenied)?;
         }
         const ASSEMBLE_LIMIT: usize = 4 * 1024 * 1024;
         if sum > ASSEMBLE_LIMIT {
@@ -80,7 +80,7 @@ impl Buffer {
         let lease = pool.reserve(sum)?;
         let mut vec = Vec::new();
         vec.try_reserve_exact(sum)
-            .map_err(|_| anyhow::anyhow!("alloc failed"))?;
+            .map_err(|error| anyhow::Error::new(error).context(crate::cert_transient::ResourceDenied))?;
         anyhow::ensure!(vec.capacity() == sum, "unexpected chain buffer capacity");
         for p in parts {
             vec.extend_from_slice(p);

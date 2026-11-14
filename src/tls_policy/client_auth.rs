@@ -16,19 +16,31 @@ const MAX_CERTIFICATES: usize = 4096;
 const MAX_MATERIAL: usize = 16 << 20;
 const MAX_ONE_CERTIFICATE: usize = 128 << 10;
 
-pub(super) struct PreparedAuth {
+#[derive(Clone)]
+pub(crate) struct PreparedAuth {
     pub verifier: Option<Arc<dyn ClientCertVerifier>>,
     pub digest: [u8; 32],
     pub retained_bytes: usize,
+    pub(super) credit_bytes: usize,
+    pub(super) material_credit: Option<Arc<super::prepared_auth::AuthMaterialCredit>>,
 }
 
 /// Run during bounded blocking provisioning, never in the async socket reactor.
 pub(super) fn prepare(config: Option<&ClientAuth>) -> Result<PreparedAuth> {
+    if let Some(raw)=config.filter(|v|v.is_active()){
+        let leaf=super::leaf_sources::prepare_sync(raw)?;
+        prepare_inner(config,None,Some(leaf.groups()),None)
+    }else{prepare_inner(config,None,None,None)}
+}
+fn prepare_inner(config: Option<&ClientAuth>, resolved_ca: Option<&serde_json::Value>,
+    prepared_leaf:Option<&[Vec<CertificateDer<'static>>]>,material_credit: Option<Arc<super::prepared_auth::AuthMaterialCredit>>) -> Result<PreparedAuth> {
     let Some(config) = config.filter(|config| config.is_active()) else {
         return Ok(PreparedAuth {
             verifier: None,
             digest: [0; 32],
             retained_bytes: 0,
+            credit_bytes: 0,
+            material_credit: None,
         });
     };
     ensure!(
@@ -51,7 +63,7 @@ pub(super) fn prepare(config: Option<&ClientAuth>) -> Result<PreparedAuth> {
     );
     let mut budget = Budget { count: 0, bytes: 0 };
     let mut roots = Vec::new();
-    if let Some(module) = &config.ca {
+    if let Some(module) = resolved_ca.or(config.ca.as_ref()) {
         load_pool(module, 0, &mut budget, &mut roots)?;
     } else {
         for raw in &config.trusted_ca_certs {
@@ -69,6 +81,9 @@ pub(super) fn prepare(config: Option<&ClientAuth>) -> Result<PreparedAuth> {
     if !deprecated_pins.is_empty() {
         pin_groups.push(deprecated_pins);
     }
+    if let Some(groups)=prepared_leaf{
+        for source in groups{let mut group=Vec::new();group.try_reserve_exact(source.len()).map_err(|_|crate::cert_transient::ResourceDenied)?;for cert in source{budget.accept(cert)?;group.push(cert.clone());}pin_groups.push(group);}
+    }else{
     for raw in &config.verifiers {
         let obj = super::require_object(raw)?;
         super::check_unknown(
@@ -112,6 +127,7 @@ pub(super) fn prepare(config: Option<&ClientAuth>) -> Result<PreparedAuth> {
         }
         // Each verifier must succeed; preserve each leaf verifier's own set.
         pin_groups.push(group);
+    }
     }
     let mut pool = RootCertStore::empty();
     let implicit_system = verify_chain
@@ -158,7 +174,7 @@ pub(super) fn prepare(config: Option<&ClientAuth>) -> Result<PreparedAuth> {
     let hint_bytes = hints
         .iter()
         .try_fold(0usize, |size, hint| {
-            size.checked_add(hint.as_ref().len() + 2)
+            size.checked_add(hint.as_ref().len().checked_add(2)?)
         })
         .ok_or_else(|| anyhow::anyhow!("client CA hint length overflow"))?;
     // Leave room for the signature schemes and extension framing in TLS1.3.
@@ -198,7 +214,7 @@ pub(super) fn prepare(config: Option<&ClientAuth>) -> Result<PreparedAuth> {
             root.subject.as_ref(),
             constraints,
         ] {
-            retained_root_bytes = retained_root_bytes.saturating_add(bytes.len());
+            retained_root_bytes = retained_root_bytes.checked_add(bytes.len()).ok_or(crate::cert_transient::ResourceDenied)?;
             anchor.update((bytes.len() as u64).to_be_bytes());
             anchor.update(bytes);
         }
@@ -209,13 +225,12 @@ pub(super) fn prepare(config: Option<&ClientAuth>) -> Result<PreparedAuth> {
         digest.update(anchor);
     }
     digest.update((pin_groups.len() as u64).to_be_bytes());
-    let mut pin_bytes = pin_groups.capacity() * std::mem::size_of::<Vec<CertificateDer<'static>>>();
+    let mut pin_bytes = pin_groups.capacity().checked_mul(std::mem::size_of::<Vec<CertificateDer<'static>>>()).ok_or(crate::cert_transient::ResourceDenied)?;
     for group in &pin_groups {
-        pin_bytes = pin_bytes
-            .saturating_add(group.capacity() * std::mem::size_of::<CertificateDer<'static>>());
+        pin_bytes = pin_bytes.checked_add(group.capacity().checked_mul(std::mem::size_of::<CertificateDer<'static>>()).ok_or(crate::cert_transient::ResourceDenied)?).ok_or(crate::cert_transient::ResourceDenied)?;
         digest.update((group.len() as u64).to_be_bytes());
         for cert in group {
-            pin_bytes = pin_bytes.saturating_add(cert.len().saturating_mul(2));
+            pin_bytes = pin_bytes.checked_add(cert.len().checked_mul(2).ok_or(crate::cert_transient::ResourceDenied)?).ok_or(crate::cert_transient::ResourceDenied)?;
             digest.update((cert.len() as u64).to_be_bytes());
             digest.update(cert.as_ref());
         }
@@ -223,22 +238,28 @@ pub(super) fn prepare(config: Option<&ClientAuth>) -> Result<PreparedAuth> {
     let digest = digest.finalize().into();
     let provider = crate::crypto::provider();
     let mut retained_bytes = pin_bytes
-        .saturating_add(hints.capacity() * std::mem::size_of::<DistinguishedName>())
-        .saturating_add(hint_bytes);
+        .checked_add(hints.capacity().checked_mul(std::mem::size_of::<DistinguishedName>()).ok_or(crate::cert_transient::ResourceDenied)?)
+        .and_then(|n|n.checked_add(hint_bytes)).ok_or(crate::cert_transient::ResourceDenied)?;
+    // root_ders is retained even by request/require modes which do not verify
+    // chains. Charge it independently from the optional RootCertStore.
+    retained_bytes = retained_bytes.checked_add(root_ders.capacity().checked_mul(std::mem::size_of::<CertificateDer<'static>>()).ok_or(crate::cert_transient::ResourceDenied)?).ok_or(crate::cert_transient::ResourceDenied)?;
+    for root in &root_ders { retained_bytes=retained_bytes.checked_add(root.len().checked_mul(2).ok_or(crate::cert_transient::ResourceDenied)?).ok_or(crate::cert_transient::ResourceDenied)?; }
     let roots = if verify_chain && !pool.is_empty() {
-        retained_bytes = retained_bytes.saturating_add(
-            pool.roots.capacity() * std::mem::size_of::<rustls::pki_types::TrustAnchor<'static>>())
-            .saturating_add(retained_root_bytes)
-            .saturating_add(root_ders.capacity() * std::mem::size_of::<CertificateDer<'static>>())
-            .saturating_add(root_ders.iter().map(|root| root.len()).sum::<usize>());
+        retained_bytes = retained_bytes.checked_add(pool.roots.capacity().checked_mul(std::mem::size_of::<rustls::pki_types::TrustAnchor<'static>>()).ok_or(crate::cert_transient::ResourceDenied)?).and_then(|n|n.checked_add(retained_root_bytes)).ok_or(crate::cert_transient::ResourceDenied)?;
         Some(Arc::new(pool))
     } else { None };
+    let credit_bytes=retained_bytes.checked_add(std::mem::size_of::<Verifier>())
+        .and_then(|n|n.checked_add(std::mem::size_of::<PreparedAuth>()))
+        .and_then(|n|n.checked_add(std::mem::size_of::<super::prepared_auth::AuthMaterialCredit>()))
+        .and_then(|n|n.checked_add(1024)).ok_or(crate::cert_transient::ResourceDenied)?;
     let platform_observation = (implicit_system || explicit_system)
         && cfg!(any(target_os="macos",target_os="ios",target_os="windows"))
         && ["SSL_CERT_FILE","SSL_CERT_DIR"].iter().all(|name|
             std::env::var_os(name).is_none_or(|value| value.is_empty()));
     Ok(PreparedAuth {
         retained_bytes,
+        credit_bytes,
+        material_credit: material_credit.clone(),
         digest,
         verifier: Some(Arc::new(Verifier {
             mode,
@@ -250,8 +271,42 @@ pub(super) fn prepare(config: Option<&ClientAuth>) -> Result<PreparedAuth> {
             hints,
             pin_groups,
             algorithms: provider.signature_verification_algorithms,
+            _material_credit: material_credit,
         })),
     })
+}
+
+/// Exact deep-clone preflight shared by input tables and concrete producers.
+pub(super) fn raw_clone_cost(config:&ClientAuth)->Result<usize>{
+    use crate::cert_transient::ResourceDenied;
+    let mut bytes=std::mem::size_of::<ClientAuth>();
+    for values in [&config.trusted_ca_certs,&config.trusted_ca_certs_pem_files,&config.trusted_leaf_certs]{
+        bytes=bytes.checked_add(values.len().checked_mul(std::mem::size_of::<String>()).ok_or(ResourceDenied)?).ok_or(ResourceDenied)?;
+        for text in values{bytes=bytes.checked_add(text.len()).ok_or(ResourceDenied)?;}
+    }
+    bytes=bytes.checked_add(config.verifiers.len().checked_mul(std::mem::size_of::<serde_json::Value>()).ok_or(ResourceDenied)?).ok_or(ResourceDenied)?;
+    for value in &config.verifiers{bytes=bytes.checked_add(crate::cert_json_shape::clone_cost(value)?).ok_or(ResourceDenied)?;}
+    if let Some(value)=&config.ca{bytes=bytes.checked_add(crate::cert_json_shape::clone_cost(value)?).ok_or(ResourceDenied)?;}
+    Ok(bytes)
+}
+
+pub(super) fn prepare_paid(config:&ClientAuth,resolved_ca:Option<&serde_json::Value>,leaf:Option<&[Vec<CertificateDer<'static>>]>,credit:Arc<super::prepared_auth::AuthMaterialCredit>)->Result<PreparedAuth>{
+    prepare_inner(Some(config),resolved_ca,leaf,Some(credit))
+}
+/// Root-only closed material construction, preserving existing per-policy DER
+/// bounds. Temporary source carriers have their own existing loans. This is
+/// not an opaque-provider or whole-process RSS promise.
+pub(super) fn paid_working_bound(config:&ClientAuth)->Result<usize>{
+    raw_clone_cost(config)?.checked_add(MAX_MATERIAL*4).and_then(|n|n.checked_add(1<<20)).ok_or_else(||crate::cert_transient::ResourceDenied.into())
+}
+pub(super) fn leaf_certificates(data:&[u8],file:bool)->Result<Vec<CertificateDer<'static>>>{
+    parse_pem(data,if file{PemSource::LeafFile}else{PemSource::InlineLeaf},&mut Budget{count:0,bytes:0})
+}
+pub(super) fn wipe_raw(raw:&mut ClientAuth){
+    use zeroize::Zeroize;
+    fn value(v:&mut serde_json::Value){match v{serde_json::Value::String(s)=>s.zeroize(),serde_json::Value::Array(a)=>for v in a{value(v)},serde_json::Value::Object(m)=>for v in m.values_mut(){value(v)},_=>{}}}
+    for group in [&mut raw.trusted_ca_certs,&mut raw.trusted_ca_certs_pem_files,&mut raw.trusted_leaf_certs]{for text in group{text.zeroize();}}
+    if let Some(ca)=&mut raw.ca{value(ca);}for v in &mut raw.verifiers{value(v);}
 }
 
 struct Budget {
@@ -551,6 +606,8 @@ struct Verifier {
     hints: Vec<DistinguishedName>,
     pin_groups: Vec<Vec<CertificateDer<'static>>>,
     algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+    // Keep LAST: all DER, hints and group containers retire before this loan.
+    _material_credit: Option<Arc<super::prepared_auth::AuthMaterialCredit>>,
 }
 impl std::fmt::Debug for Verifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

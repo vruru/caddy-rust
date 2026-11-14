@@ -505,7 +505,20 @@ impl Context {
 }
 impl CertificateServices {
     #[cfg(feature = "native-run")]
-    pub(crate) async fn prepare_client_pools(
+    pub(crate) async fn prepare_client_pools(self:&Arc<Self>,config:crate::http_config::PreparedConfig,cancel:CancellationToken)->Result<crate::http_config::PreparedConfig>{
+        self.owned(cancel,move|this,token|Box::pin(async move{
+            let _gate=this.client_pool_gate.lock().await;
+            let config=this.begin_outgoing_trust(config,token.clone()).await?;
+            let config=this.begin_front_auth(config,token.clone()).await?;
+            let budget=crate::tls_policy::prepared_auth::AuthBudget::Root(this.context.resources.external_bytes.clone());
+            let config=crate::cert_cpu::run(this.context.resources.cpu.clone(),token.clone(),move||{let mut config=config;super::ca_consumers::prepare_sources(&mut config,&budget)?;Ok(config)}).await?;
+            let config=this.prepare_client_pools_inner(config,token.clone()).await?;
+            let config=this.finish_front_auth(config,token.clone()).await?;
+            this.finish_outgoing_trust(config,token).await
+        })).await
+    }
+    #[cfg(feature="native-run")]
+    async fn prepare_client_pools_inner(
         self: &Arc<Self>,
         config: crate::http_config::PreparedConfig,
         cancel: CancellationToken,
@@ -572,13 +585,14 @@ impl CertificateServices {
                 };
                 crate::cert_cpu::run(this.context.resources.cpu.clone(), token, move || {
                     let mut values = prepared.into_iter();
-                    super::ca_consumers::each_root_mut(&mut config, &mut |value| {
+                    super::ca_consumers::each_root_mut_owned(&mut config, &mut |value,memory| {
                         let Prepared {
                             value: resolved,
                             _output,
                         } = values
                             .next()
                             .ok_or_else(|| anyhow!("CA consumer topology changed"))?;
+                        memory.reserve_value(&resolved)?;
                         *value = resolved;
                         drop(_output);
                         Ok(())

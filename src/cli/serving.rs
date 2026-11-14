@@ -20,6 +20,8 @@ mod file_limit;
 mod flags;
 #[path = "serve_pid.rs"]
 mod pid;
+#[path = "trust.rs"]
+mod trust;
 
 pub(super) fn specs(name: &str) -> Option<Vec<Flag>> {
     flags::specs(name)
@@ -141,7 +143,7 @@ fn run(parsed: args::Flags) -> Result<i32> {
             state_root: config_dir.join("native-state"),
             cwd: cwd.clone(),
         },
-        trust_installer: None,
+        trust_installer: Some(trust::installer()),
     })?);
     let runtime = caddy_compat_native::runtime::build()?;
     let result = runtime.block_on(supervise(

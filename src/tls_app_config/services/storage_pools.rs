@@ -267,7 +267,7 @@ impl CertificateServices {
                         let mut config = config;
                         let mut resolved = resolved.into_iter().peekable();
                         let mut consumer = 0usize;
-                        super::ca_consumers::each_mut(&mut config, &mut |value| {
+                        super::ca_consumers::each_mut_owned(&mut config, &mut |value,memory| {
                             while let Some(next) = resolved.peek() {
                                 if next.location.consumer != consumer {
                                     break;
@@ -279,6 +279,7 @@ impl CertificateServices {
                                 } = resolved.next().ok_or_else(|| {
                                     anyhow!("client trust output location changed")
                                 })?;
+                                memory.reserve_value(&module)?;
                                 *at(value, &location.path)? = module;
                                 // Actual inline assignment hands final control data to
                                 // the existing prepared-config output boundary.

@@ -1808,6 +1808,8 @@ fn parse_proxy(
                 let renegotiation=t.get("renegotiation").filter(|v|!v.is_null()).map(|v|string(v,path)).transpose()?.unwrap_or_default();
                 let renegotiation=native_ssl_tls::Renegotiation::parse(&renegotiation).map_err(anyhow::Error::msg)?;
                 tls = Some(ProxyTls {
+                    source_identity:crate::tls_policy::prepared_auth::json_binding(t)?,
+                    prepared_ca:None,prepared_trust:None,
                     renegotiation,
                     ca,
                     curves: t.get("curves").filter(|v|!v.is_null()).map(|v|strings(v,path)).transpose()?.unwrap_or_default(),
@@ -1931,9 +1933,13 @@ fn parse_proxy(
 }
 
 fn pending_placeholders(value: &Value) -> Result<()> {
-    pending_placeholders_depth(value, 0, false)
+    pending_placeholders_depth(value, 0, false, LeafPlace::Other)
 }
-fn pending_placeholders_depth(value: &Value, depth: usize, typed_expression: bool) -> Result<()> {
+#[derive(Clone,Copy)]
+enum LeafPlace {Other,Root,Apps,Http,Servers,Server,Policies,Policy,Auth,Verifiers,Verifier,Loaders,Loader,Fields}
+fn pending_placeholders_depth(value: &Value, depth: usize, typed_expression: bool, mut leaf:LeafPlace) -> Result<()> {
+    if depth==0 {leaf=LeafPlace::Root;}
+
     ensure!(depth <= 128, "configuration nesting exceeds limit");
     match value {
         Value::String(s) => {
@@ -1948,7 +1954,7 @@ fn pending_placeholders_depth(value: &Value, depth: usize, typed_expression: boo
                     && let Some(end) = close
                 {
                     let key = &s[i + 1..end];
-                    if key.starts_with("file.")
+                    if (key.starts_with("file.") && !matches!(leaf,LeafPlace::Fields))
                         || (!typed_expression && key.starts_with("http.request.tls.") && helpers::TlsScalar::from_name(key).is_none())
                         || (key.starts_with("http.reverse_proxy.")
                             && !matches!(
@@ -1975,7 +1981,8 @@ fn pending_placeholders_depth(value: &Value, depth: usize, typed_expression: boo
         }
         Value::Array(values) => {
             for value in values {
-                pending_placeholders_depth(value, depth + 1, typed_expression)?;
+                let next=match leaf{LeafPlace::Policies=>LeafPlace::Policy,LeafPlace::Verifiers=>LeafPlace::Verifier,LeafPlace::Loaders=>LeafPlace::Loader,LeafPlace::Fields=>LeafPlace::Fields,_=>LeafPlace::Other};
+                pending_placeholders_depth(value, depth + 1, typed_expression,next)?;
             }
         }
         Value::Object(values) => {
@@ -2002,7 +2009,16 @@ fn pending_placeholders_depth(value: &Value, depth: usize, typed_expression: boo
                 {
                     continue;
                 }
-                pending_placeholders_depth(value, depth + 1, typed_expression || key == "expression")?;
+                let next=match (leaf,key.as_str()){
+                    (LeafPlace::Root,"apps")=>LeafPlace::Apps,(LeafPlace::Apps,"http")=>LeafPlace::Http,
+                    (LeafPlace::Http,"servers")=>LeafPlace::Servers,(LeafPlace::Servers,_)=>LeafPlace::Server,
+                    (LeafPlace::Server,"tls_connection_policies")=>LeafPlace::Policies,(LeafPlace::Policy,"client_authentication")=>LeafPlace::Auth,
+                    (LeafPlace::Auth,"verifiers")=>LeafPlace::Verifiers,
+                    (LeafPlace::Verifier,"leaf_certs_loaders") if values.get("verifier").and_then(Value::as_str)==Some("leaf")=>LeafPlace::Loaders,
+                    (LeafPlace::Loader,"files") if values.get("loader").and_then(Value::as_str)==Some("file")=>LeafPlace::Fields,
+                    (LeafPlace::Loader,"certificates") if values.get("loader").and_then(Value::as_str)==Some("pem")=>LeafPlace::Fields,
+                    _=>LeafPlace::Other};
+                pending_placeholders_depth(value, depth + 1, typed_expression || key == "expression",next)?;
             }
         }
         _ => {}

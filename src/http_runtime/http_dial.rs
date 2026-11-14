@@ -159,6 +159,44 @@ impl FamilyAddrs {
 }
 impl Iterator for FamilyAddrs{type Item=SocketAddr;fn next(&mut self)->Option<SocketAddr>{self.values.next()}fn size_hint(&self)->(usize,Option<usize>){self.values.size_hint()}}
 
+/// Local admission/worker errors are distinct from an NSS remote lookup error.
+/// Formatting stays fixed: the retained cause is for typed classification, not
+/// a new path for logging names, addresses or configuration material.
+struct LocalDnsFailure(anyhow::Error);
+impl std::fmt::Debug for LocalDnsFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("LocalProxyDnsFailure") }
+}
+impl std::fmt::Display for LocalDnsFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("local proxy DNS operation failed") }
+}
+impl std::error::Error for LocalDnsFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(self.0.as_ref()) }
+}
+fn local_dns_error(error: anyhow::Error) -> io::Error { io::Error::other(LocalDnsFailure(error)) }
+struct LookupFailure {
+    output: super::resource_budget::RetainedBlockingOutput<io::Result<Vec<SocketAddr>>>,
+}
+impl std::fmt::Debug for LookupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ProxyDnsLookupFailure") }
+}
+impl std::fmt::Display for LookupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("proxy DNS lookup failed") }
+}
+impl std::error::Error for LookupFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.output.get().as_ref().err().map(|error| error as _)
+    }
+}
+/// Use before recording passive health or deciding on a replay. io::Error's
+/// source may bypass its custom error, so inspect that exact slot as well.
+pub(super) fn is_local_failure(error: &anyhow::Error) -> bool {
+    fn local(error: &(dyn std::error::Error + 'static)) -> bool {
+        error.is::<LocalDnsFailure>() || error.is::<super::mapped_dns::CopyFailure>()
+    }
+    error.chain().any(|cause| local(cause) || cause.downcast_ref::<io::Error>()
+        .and_then(io::Error::get_ref).is_some_and(|inner| local(inner)))
+}
+
 impl Service<Name> for FamilyResolver {
     type Response = FamilyAddrs;
     type Error = io::Error;
@@ -175,7 +213,7 @@ impl Service<Name> for FamilyResolver {
         }
         if let Some((budget,owner))=&self.retained{
             let task=match owner.dns_work(name.as_str().len()){
-                Ok(task)=>task,Err(error)=>return Box::pin(async move{Err(io::Error::other(error.to_string()))}),
+                Ok(task)=>task,Err(error)=>return Box::pin(async move{Err(local_dns_error(error))}),
             };
             let budget=budget.clone();
             return Box::pin(async move{
@@ -183,13 +221,16 @@ impl Service<Name> for FamilyResolver {
                 // Same synchronous NSS semantics as GaiResolver. The actual
                 // Name and result stay behind the closed retained envelope,
                 // including after a detached receiver is cancelled.
-                let output=budget.run_retained(task.clone(),move||{
+                let output=budget.run_retained_checked(task.clone(),move||{
                     (name.as_str(),0).to_socket_addrs()
                         .and_then(|addrs|super::mapped_dns::copy_admitted(addrs,|addr|family.admit(addr)))
-                }).await.map_err(|error|io::Error::other(format!("proxy DNS lane: {error:?}")))?;
-                let values=match output.get(){Ok(values)=>values,Err(error)=>return Err(io::Error::new(error.kind(),error.to_string()))};
+                }).await.map_err(local_dns_error)?;
+                let values=match output.get(){
+                    Ok(values)=>values,
+                    Err(error)=>{let kind=error.kind();return Err(io::Error::new(kind,LookupFailure{output}))},
+                };
                 if values.is_empty(){return Err(io::Error::new(io::ErrorKind::AddrNotAvailable,"no addresses admitted"))}
-                crate::cert_cpu::MaterialOwner::reserve(&*task,values.len().saturating_mul(std::mem::size_of::<SocketAddr>()*2).saturating_add(2048)).map_err(|error|io::Error::other(error.to_string()))?;
+                crate::cert_cpu::MaterialOwner::reserve(&*task,values.len().saturating_mul(std::mem::size_of::<SocketAddr>()*2).saturating_add(2048)).map_err(local_dns_error)?;
                 let values=values.clone().into_iter();Ok(FamilyAddrs{values,_retained:Some(output),_metrics:None})
             })
         }

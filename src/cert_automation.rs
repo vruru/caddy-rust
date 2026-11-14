@@ -443,6 +443,7 @@ pub(crate) struct OriginPermit {
     _issuer: tokio::sync::OwnedSemaphorePermit,
 }
 struct IssuerState {
+    custom_roots:Option<Arc<crate::tls_app_config::issuer_roots::CustomRoots>>,
     config: AcmeIssuerConfig,
     ca: Arc<CaState>,
     wire: OnceCell<AcmeWire>,
@@ -872,6 +873,7 @@ impl CertificateManager {
                 next_allowed_unix: resources.cooldown(&store, &config)?,
             });
             issuers.push(IssuerState {
+                custom_roots:None,
                 config,
                 ca: state,
                 wire: OnceCell::new(),
@@ -938,6 +940,12 @@ impl CertificateManager {
     }
     fn wire_client_owner(&self)->crate::acme_wire::ClientOwner {
         crate::acme_wire::ClientOwner::new(self.inner.issuer_values_credit.clone(),self.inner.construction_owner.clone())
+    }
+    fn wire_client_owner_for(&self,issuer:&IssuerState)->crate::acme_wire::ClientOwner{self.wire_client_owner().with_custom_roots(issuer.custom_roots.clone())}
+    pub(crate) fn with_issuer_custom_roots(mut self,roots:Vec<Option<Arc<crate::tls_app_config::issuer_roots::CustomRoots>>>)->Result<Self>{
+        let inner=Arc::get_mut(&mut self.inner).ok_or_else(||anyhow!("certificate manager already shared"))?;
+        ensure!(roots.len()==inner.issuers.len(),"ACME root issuer count differs");
+        for(issuer,roots)in inner.issuers.iter_mut().zip(roots){issuer.custom_roots=roots;}Ok(self)
     }
     /// Root pre-reserves this allowance before constructing/copying options.
     /// Public constructors preserve their existing uncredited caller contract.
@@ -1115,7 +1123,7 @@ impl CertificateManager {
                                 self.inner.chain_memory.clone(),
                                 #[cfg(feature="native-run")]
                                 self.inner.outgoing_tls.clone(),
-                                self.wire_client_owner(),
+                                self.wire_client_owner_for(issuer),
                                 &cancel,
                             ).await
                         })
@@ -1401,7 +1409,7 @@ impl CertificateManager {
                                 self.inner.chain_memory.clone(),
                                 #[cfg(feature="native-run")]
                                 self.inner.outgoing_tls.clone(),
-                                self.wire_client_owner(),
+                                self.wire_client_owner_for(issuer),
                         &cancel,
                     ).await
                 })
@@ -2002,7 +2010,7 @@ impl CertificateManager {
                                 self.inner.chain_memory.clone(),
                                 #[cfg(feature="native-run")]
                                 self.inner.outgoing_tls.clone(),
-                                self.wire_client_owner(),
+                                self.wire_client_owner_for(issuer),
                                 cancel,
                             ).await
                         })
@@ -2610,7 +2618,7 @@ impl CertificateManager {
                                 self.inner.chain_memory.clone(),
                                 #[cfg(feature="native-run")]
                                 self.inner.outgoing_tls.clone(),
-                                self.wire_client_owner(),
+                                self.wire_client_owner_for(issuer),
                     cancel,
                 ).await
             })

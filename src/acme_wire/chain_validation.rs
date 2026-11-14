@@ -10,6 +10,16 @@ pub(super) const CRYPTO_SCRATCH: usize = 4 * 1024 * 1024;
 pub(super) const SORT_SCRATCH: usize = 64 * 1024;
 const DECODE_OVERHEAD: usize = 8192;
 
+/// Wanted name metadata failed; this is not an ordinary CN non-match.
+#[derive(Debug)]
+pub(crate) struct NamesUnavailable;
+impl std::fmt::Display for NamesUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("certificate chain name metadata unavailable")
+    }
+}
+impl std::error::Error for NamesUnavailable {}
+
 pub(super) struct Names {
     pub values: Vec<String>,
     _memory: Lease,
@@ -24,7 +34,7 @@ pub(super) fn decode_cost(length: usize) -> Result<usize> {
     length
         .checked_mul(2)
         .and_then(|n| n.checked_add(DECODE_OVERHEAD + CRYPTO_SCRATCH))
-        .ok_or_else(|| anyhow!("ACME decode credit overflow"))
+        .ok_or_else(|| crate::cert_transient::ResourceDenied.into())
 }
 /// Equivalent strict certificate framing to certmagic::pem_blocks, but its
 /// base64/DER buffers are pre-sized. Header text is rejected before allocating.
@@ -55,17 +65,17 @@ pub(crate) fn decode(pem: &[u8]) -> Result<Vec<Vec<u8>>> {
         let mut encoded = Vec::new();
         encoded
             .try_reserve_exact(count)
-            .map_err(|_| anyhow!("ACME base64 allocation failed"))?;
+            .map_err(|error| anyhow::Error::new(error).context(crate::cert_transient::ResourceDenied))?;
         for ch in raw.chars().filter(|ch| !ch.is_whitespace()) {
             encoded.push(ch as u8);
         }
         let capacity = count
             .checked_add(3)
             .and_then(|n| (n / 4).checked_mul(3))
-            .ok_or_else(|| anyhow!("ACME decode size overflow"))?;
+            .ok_or(crate::cert_transient::ResourceDenied)?;
         let mut der = Vec::new();
         der.try_reserve_exact(capacity)
-            .map_err(|_| anyhow!("ACME DER allocation failed"))?;
+            .map_err(|error| anyhow::Error::new(error).context(crate::cert_transient::ResourceDenied))?;
         base64::engine::general_purpose::STANDARD
             .decode_vec(&encoded, &mut der)
             .map_err(|_| anyhow!("invalid ACME base64"))?;
@@ -111,31 +121,30 @@ fn link(
 fn names(
     certs: &[x509_parser::certificate::X509Certificate<'_>],
     pool: &Arc<Pool>,
-) -> Option<Arc<Names>> {
-    let mut memory = pool
-        .reserve(certs.len().checked_mul(std::mem::size_of::<String>())?)
-        .ok()?;
+) -> Result<Arc<Names>> {
+    let bytes = certs.len().checked_mul(std::mem::size_of::<String>())
+        .ok_or(crate::cert_transient::ResourceDenied)?;
+    let mut memory = pool.reserve(bytes)?;
     let mut values = Vec::new();
-    values.try_reserve_exact(certs.len()).ok()?;
-    memory
-        .resize(values.capacity() * std::mem::size_of::<String>())
-        .ok()?;
-    let mut output = Names {
-        values,
-        _memory: memory,
-    };
+    values.try_reserve_exact(certs.len())
+        .map_err(|error| anyhow::Error::new(error).context(crate::cert_transient::ResourceDenied))?;
+    memory.resize(values.capacity().checked_mul(std::mem::size_of::<String>())
+        .ok_or(crate::cert_transient::ResourceDenied)?)?;
+    let mut output = Names { values, _memory: memory };
     for cert in certs {
         let raw = cert.issuer().as_raw();
-        let cost = super::chain_shape::name_cost(raw).ok()?;
-        let _scratch = chain_memory::try_scratch(cost).ok()?;
-        let mut name = crate::http_runtime::client_cert_facts::parse_name(raw).ok()?;
+        let cost = super::chain_shape::name_cost(raw)?;
+        let _scratch = chain_memory::try_scratch(cost)?;
+        let mut name = crate::http_runtime::client_cert_facts::parse_name(raw)
+            .map_err(anyhow::Error::msg)?;
         let cn = std::mem::take(&mut name.common_name);
         drop(name);
-        let total = output._memory_bytes().checked_add(cn.capacity())?;
-        output._memory.resize(total).ok()?;
+        let total = output._memory_bytes().checked_add(cn.capacity())
+            .ok_or(crate::cert_transient::ResourceDenied)?;
+        output._memory.resize(total)?;
         output.values.push(cn);
     }
-    Some(Arc::new(output))
+    Ok(Arc::new(output))
 }
 impl Names {
     fn _memory_bytes(&self) -> usize {
@@ -147,7 +156,7 @@ pub(super) fn validate(pem: Arc<Buffer>, pool: Arc<Pool>, want_names: bool) -> R
     let mut blocks = decode(pem.as_slice())?;
     let meta = blocks.iter().try_fold(0usize, |n, b| {
         n.checked_add(super::chain_shape::shallow_cost(b)?)
-            .ok_or_else(|| anyhow!("ACME AST credit overflow"))
+            .ok_or_else(|| anyhow::Error::new(crate::cert_transient::ResourceDenied))
     })?;
     let _meta = chain_memory::try_scratch(meta)?;
     let mut certs = Vec::with_capacity(blocks.len());
@@ -158,7 +167,7 @@ pub(super) fn validate(pem: Arc<Buffer>, pool: Arc<Pool>, want_names: bool) -> R
         link(&pair[0], &pair[1])?;
     }
     let names = if want_names {
-        names(&certs, &pool)
+        Some(names(&certs, &pool).map_err(|error| error.context(NamesUnavailable))?)
     } else {
         None
     };
@@ -187,7 +196,7 @@ pub(super) fn validate(pem: Arc<Buffer>, pool: Arc<Pool>, want_names: bool) -> R
 pub(super) fn bridge(child: Arc<Buffer>, parent: Arc<Buffer>) -> Result<()> {
     let cost = super::chain_shape::shallow_cost(child.as_slice())?
         .checked_add(super::chain_shape::shallow_cost(parent.as_slice())?)
-        .ok_or_else(|| anyhow!("ACME bridge credit overflow"))?;
+        .ok_or(crate::cert_transient::ResourceDenied)?;
     let _meta = chain_memory::try_scratch(cost)?;
     let child = parser(child.as_slice())?;
     let parent = parser(parent.as_slice())?;

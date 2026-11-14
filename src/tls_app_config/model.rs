@@ -23,7 +23,7 @@ pub(super) struct AcmeSettings {
     pub values: Option<std::sync::Arc<super::issuer_values::Input>>,
     pub config: AcmeIssuerConfig,
     pub account_key: Option<std::sync::Arc<super::issuer_account_key::Input>>,
-    pub roots: Vec<PathBuf>,
+    pub roots: std::sync::Arc<super::issuer_roots::Input>,
     pub http_port: Option<u16>,
     pub alpn_port: Option<u16>,
     pub bind_host: String,

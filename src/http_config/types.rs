@@ -204,6 +204,9 @@ pub(crate) struct ProxyConfig {
 
 #[derive(Clone)]
 pub(crate) struct ProxyTls {
+    pub(crate) source_identity:[u8;32],
+    pub(crate) prepared_ca:Option<std::sync::Arc<crate::tls_policy::prepared_auth::PreparedCa>>,
+    pub(crate) prepared_trust:Option<std::sync::Arc<crate::http_runtime::PreparedOutgoingTrust>>,
     pub(crate) renegotiation: native_ssl_tls::Renegotiation,
     pub(crate) curves: Vec<String>,
     pub(crate) ca: Option<serde_json::Value>,

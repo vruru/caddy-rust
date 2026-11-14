@@ -17,6 +17,9 @@ mod compatibility;
 use compatibility::FirstAlertIo;
 #[path="upstream_tls/retained.rs"]
 mod retained;
+#[path="upstream_tls/material.rs"]
+mod material;
+pub(crate) use material::PreparedOutgoingTrust;
 
 use super::timeout_io::TimeoutIo;
 
@@ -187,6 +190,20 @@ fn read_material(path: &str, budget: &mut u64) -> Result<Vec<u8>> {
     *budget -= bytes.len() as u64;
     Ok(bytes)
 }
+/// Fixed-size guarded read avoids reallocating a buffer containing a private
+/// key. Keep the previous material total bound; reject a concurrently changed
+/// input rather than growing an unguarded secret allocation.
+fn read_secret_material(path:&str,budget:&mut u64)->Result<zeroize::Zeroizing<Vec<u8>>>{
+    use zeroize::Zeroizing;
+    let mut file=crate::http_config::helpers::open_regular_file(path).map_err(|_|anyhow::anyhow!("upstream TLS material cannot be opened"))?;
+    let size=file.metadata().map_err(|_|anyhow::anyhow!("upstream TLS material metadata unavailable"))?.len();
+    ensure!(size<=*budget,"upstream TLS material size limit exceeded");
+    let n=usize::try_from(size).map_err(|_|crate::cert_transient::ResourceDenied)?;
+    let mut bytes=Zeroizing::new(Vec::new());bytes.try_reserve_exact(n)?;bytes.resize(n,0);
+    file.read_exact(&mut bytes).map_err(|_|anyhow::anyhow!("upstream TLS material cannot be read"))?;
+    let mut extra=Zeroizing::new([0u8;1]);ensure!(file.read(&mut *extra)?==0,"upstream TLS material changed during read");
+    *budget-=size;Ok(bytes)
+}
 fn certificates(bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
     let certs = rustls_pemfile::certs(&mut std::io::Cursor::new(bytes))
         .collect::<std::io::Result<Vec<_>>>()
@@ -250,18 +267,11 @@ fn provider_roots(raw:&serde_json::Value,depth:usize,budget:&mut u64,count:&mut 
     }
     Ok(())
 }
-pub(crate) struct PreparedTls {pub(crate) rustls:ClientConfig,pub(crate) native:Option<Arc<native_ssl_tls::ClientConfig>>,fallback:Option<Arc<native_ssl_tls::ClientConfig>>,pub(crate) managed:Option<Arc<crate::tls_app_config::ManagedClientSource>>}
-fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool,scope:Option<&Arc<native_ssl_tls::VerificationScope>>,cbc_compat:bool) -> Result<PreparedTls> {
-    ensure!(
-        tls.client_certificate_file.is_some() == tls.client_certificate_key_file.is_some(),
-        "client_certificate_file and client_certificate_key_file must be set together"
-    );
-    ensure!(tls.client_certificate_automate.is_none()||tls.managed_client.is_some(),"managed client certificate source is not prepared");
-    let mut budget = 64 * 1024 * 1024;
+fn load_roots(tls:&ProxyTls,budget:&mut u64)->Result<rustls::RootCertStore>{
     let mut roots = rustls::RootCertStore::empty();
-    if let Some(module)=&tls.ca {
+    if let Some(module)=tls.prepared_ca.as_ref().map(|v|&v.value).or(tls.ca.as_ref()) {
         ensure!(tls.root_ca_pool.is_empty()&&tls.root_ca_pem_files.is_empty(),"conflicting upstream Root CA pool configuration");
-        provider_roots(module,0,&mut budget,&mut 0,&mut roots)?;
+        provider_roots(module,0,budget,&mut 0,&mut roots)?;
     } else if tls.root_ca_pool.is_empty() && tls.root_ca_pem_files.is_empty() {
         roots = native_roots()?.clone();
     } else {
@@ -280,17 +290,17 @@ fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool,
                 .decode(encoded)
                 .map_err(|_| anyhow::anyhow!("invalid upstream root CA encoding"))?;
             ensure!(
-                bytes.len() as u64 <= budget,
+                bytes.len() as u64 <= *budget,
                 "upstream TLS material size limit exceeded"
             );
-            budget -= bytes.len() as u64;
+            *budget -= bytes.len() as u64;
             crate::cert_uri_san::check_der(&bytes)?;
             roots
                 .add(CertificateDer::from(bytes))
                 .map_err(|_| anyhow::anyhow!("invalid upstream root CA certificate"))?;
         }
         for path in &tls.root_ca_pem_files {
-            let bytes = read_material(path, &mut budget)?;
+            let bytes = read_material(path, budget)?;
             // Go AppendCertsFromPEM skips unusable blocks but retains valid
             // anchors, including valid blocks after a malformed base64 block.
             for result in rustls_pemfile::certs(&mut std::io::Cursor::new(bytes)) {
@@ -304,11 +314,10 @@ fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool,
             }
         }
     }
-    ensure!(
-        allow_empty_default || tls.ca.is_some() || tls.insecure_skip_verify || !roots.is_empty(),
-        "upstream trust roots unavailable"
-    );
-    let provider = if tls.curves.is_empty() {
+    Ok(roots)
+}
+fn provider_for(tls:&ProxyTls)->Result<Arc<rustls::crypto::CryptoProvider>>{
+    Ok(if tls.curves.is_empty() {
         crate::crypto::client_provider()
     } else {
         let mut provider = (*crate::crypto::provider()).clone();
@@ -319,24 +328,29 @@ fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool,
         }
         provider.kx_groups = groups;
         Arc::new(provider)
+    })
+}
+pub(crate) struct PreparedTls {pub(crate) rustls:ClientConfig,pub(crate) native:Option<Arc<native_ssl_tls::ClientConfig>>,fallback:Option<Arc<native_ssl_tls::ClientConfig>>,pub(crate) managed:Option<Arc<crate::tls_app_config::ManagedClientSource>>}
+fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool,scope:Option<&Arc<native_ssl_tls::VerificationScope>>,cbc_compat:bool) -> Result<PreparedTls> {
+    ensure!(
+        tls.client_certificate_file.is_some() == tls.client_certificate_key_file.is_some(),
+        "client_certificate_file and client_certificate_key_file must be set together"
+    );
+    ensure!(tls.client_certificate_automate.is_none()||tls.managed_client.is_some(),"managed client certificate source is not prepared");
+    let provider=provider_for(tls)?;
+    let material=match &tls.prepared_trust{
+        Some(saved)=>{ensure!(saved.binding()==tls.source_identity,"outgoing accepted TLS input differs");saved.clone()},
+        None=>Arc::new(material::load(tls,provider.clone(),allow_empty_default)?),
     };
-    let verifier:Arc<dyn ServerCertVerifier>=if tls.insecure_skip_verify||roots.is_empty(){
-        Arc::new(InsecureVerifier{provider:provider.clone(),skip_chain:tls.insecure_skip_verify})
-    }else{rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots),provider.clone()).build()?};
-    let verifier = crate::cert_uri_san::wrap_server_verifier(verifier)?;
+    let verifier=material.verifier();
+    let identity=material.identity();
     let builder=ClientConfig::builder_with_provider(provider.clone()).with_safe_default_protocol_versions()?.dangerous().with_custom_certificate_verifier(verifier.clone());
-    let identity=if let(Some(cert),Some(key))=(&tls.client_certificate_file,&tls.client_certificate_key_file){
-        let certs=certificates(&read_material(cert,&mut budget)?)?;
-        let key=rustls_pemfile::private_key(&mut std::io::Cursor::new(read_material(key,&mut budget)?))
-            .map_err(|_|anyhow::anyhow!("invalid upstream client private key PEM"))?.ok_or_else(||anyhow::anyhow!("upstream client private key missing or encrypted"))?;
-        Some((certs,key))
-    }else{None};
     let alpn=if enable_http2{vec![b"h2".to_vec(),b"http/1.1".to_vec()]}else{Vec::new()};
     let (native,fallback)=if tls.renegotiation!=native_ssl_tls::Renegotiation::Never||cbc_compat{
         let groups=provider.kx_groups.iter().map(|g|match u16::from(g.name()){
             29=>Ok("X25519"),23=>Ok("P-256"),24=>Ok("P-384"),25=>Ok("P-521"),4588=>Ok("X25519MLKEM768"),4587=>Ok("SecP256r1MLKEM768"),4589=>Ok("SecP384r1MLKEM1024"),_=>Err(anyhow::anyhow!("TLS group is unavailable to renegotiation engine"))
         }).collect::<Result<Vec<_>>>()?.join(":");
-        let identity=identity.as_ref().map(|(c,k)|(c.as_slice(),k.secret_der()));
+        let identity=identity.as_ref().map(|v|(v.chain(),v.secret_der()));
         let config=if tls.renegotiation==native_ssl_tls::Renegotiation::Never {
             native_ssl_tls::ClientConfig::cbc_fallback(verifier,&alpn,&groups,identity)?
         } else if cbc_compat {
@@ -347,7 +361,7 @@ fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool,
         let config=Arc::new(match scope{Some(scope)=>config.with_verification_scope(scope.clone()),None=>config});
         if tls.renegotiation==native_ssl_tls::Renegotiation::Never{(None,Some(config))}else{(Some(config),None)}
     }else{(None,None)};
-    let mut config=match identity{Some((certs,key))=>builder.with_client_auth_cert(certs,key).map_err(|_|anyhow::anyhow!("invalid upstream client certificate/key pair"))?,None=>builder.with_no_client_auth()};
+    let mut config=match identity{Some(identity)=>builder.with_client_cert_resolver(identity),None=>builder.with_no_client_auth()};
     // Go HTTPTransport leaves ClientSessionCache nil, so it does not resume.
     config.resumption = rustls::client::Resumption::disabled();
     config.alpn_protocols = if enable_http2 {
@@ -579,7 +593,7 @@ impl Service<Uri> for FixedDialConnector {
 /// TLS policy as proxy traffic, with no client identity or per-port exception.
 pub(crate) fn ca_source_client_tls(ca:Option<serde_json::Value>,insecure:bool)->Result<ClientConfig>{Ok(ca_source_prepared_tls(ca,insecure,native_ssl_tls::Renegotiation::Never,None)?.rustls)}
 pub(crate) fn ca_source_prepared_tls(ca:Option<serde_json::Value>,insecure:bool,renegotiation:native_ssl_tls::Renegotiation,scope:Option<&Arc<native_ssl_tls::VerificationScope>>)->Result<PreparedTls>{
-    let options=ProxyTls{client_certificate_automate:None,managed_client:None,renegotiation,curves:Vec::new(),ca,except_ports:Vec::new(),server_name:None,insecure_skip_verify:insecure,root_ca_pem_files:Vec::new(),root_ca_pool:Vec::new(),client_certificate_file:None,client_certificate_key_file:None,handshake_timeout:None};
+    let options=ProxyTls{source_identity:[0;32],prepared_ca:None,prepared_trust:None,client_certificate_automate:None,managed_client:None,renegotiation,curves:Vec::new(),ca,except_ports:Vec::new(),server_name:None,insecure_skip_verify:insecure,root_ca_pem_files:Vec::new(),root_ca_pool:Vec::new(),client_certificate_file:None,client_certificate_key_file:None,handshake_timeout:None};
     provision_inner(&options,true,true,scope,false)
 }
 

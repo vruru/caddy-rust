@@ -99,6 +99,15 @@ pub(crate) enum BudgetError {
     Overloaded,
     WorkerFailed,
 }
+impl std::fmt::Display for BudgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Overloaded => "blocking operation admission exhausted",
+            Self::WorkerFailed => "blocking operation worker unavailable",
+        })
+    }
+}
+impl std::error::Error for BudgetError {}
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct BudgetSnapshot {
@@ -182,6 +191,20 @@ impl BlockingBudget {
         async move {
             job.owner.reserve(std::mem::size_of::<F>()+std::mem::size_of::<T>()+2048).map_err(|_|BudgetError::Overloaded)?;
             let permit=self.acquire().await?;run_owned(self.tasks.clone(),permit,move||job.execute()).await
+        }
+    }
+
+    /// Same closed envelope and physical worker tracker as run_retained.
+    /// This Result-facing entry preserves the producer's typed reserve cause.
+    pub(crate) fn run_retained_checked<T, F>(
+        &self, owner: Arc<dyn crate::cert_cpu::MaterialOwner>, operation: F,
+    ) -> impl std::future::Future<Output = anyhow::Result<RetainedBlockingOutput<T>>> + Send + '_
+    where T: Send + 'static, F: FnOnce() -> T + Send + 'static {
+        let job = RetainedBlockingJob { operation, owner };
+        async move {
+            job.owner.reserve(std::mem::size_of::<F>() + std::mem::size_of::<T>() + 2048)?;
+            let permit = self.acquire().await?;
+            Ok(run_owned(self.tasks.clone(), permit, move || job.execute()).await?)
         }
     }
 

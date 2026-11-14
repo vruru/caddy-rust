@@ -124,6 +124,7 @@ fn acme(value: &Value, path: &str) -> Result<Issuer> {
         .into_iter()
         .map(Into::into)
         .collect();
+    let roots=super::issuer_roots::Input::new(roots).map_err(|_|ConfigError::invalid(object.at("trusted_roots_pem_files")))?;
     let mut test_ca=Some(object.string("test_ca")?.to_owned());
     let values=super::issuer_values::Input::take_with_test(&mut config,&mut test_ca).map_err(|_|ConfigError::invalid(path.into()))?;
     let mut settings = AcmeSettings {

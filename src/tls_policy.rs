@@ -1,6 +1,8 @@
 //! Typed ordered TLS connection policies; provisioning performs no hot-path I/O.
 pub(crate) mod certificate_selection;
 mod client_auth;
+pub(crate) mod leaf_sources;
+pub(crate) mod prepared_auth;
 pub(crate) use client_auth::{source_certificates,source_inline,source_append_certificates};
 mod client_paths;
 mod provision;
@@ -169,6 +171,8 @@ pub struct ConnectionPolicy {
     pub alpn: Option<Vec<String>>,
     pub drop: bool,
     pub client_auth: Option<ClientAuth>,
+    pub(crate) prepared_ca:Option<Arc<prepared_auth::PreparedCa>>,
+    pub(crate) prepared_client_auth: Option<Arc<prepared_auth::PreparedSlot>>,
     pub default_sni: Option<String>,
     pub fallback_sni: Option<String>,
     pub insecure_secrets_log: Option<String>,
@@ -251,6 +255,7 @@ impl ConnectionPolicy {
             alpn: None,
             drop: false,
             client_auth: None,
+            prepared_ca:None, prepared_client_auth: None,
             default_sni: None,
             fallback_sni: None,
             insecure_secrets_log: None,
@@ -397,6 +402,7 @@ fn parse_one_policy(v: &Value) -> Result<ConnectionPolicy> {
         alpn,
         drop,
         client_auth,
+        prepared_ca:None, prepared_client_auth: None,
         default_sni,
         fallback_sni,
         insecure_secrets_log,

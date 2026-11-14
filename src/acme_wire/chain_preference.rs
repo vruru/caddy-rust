@@ -72,6 +72,11 @@ impl ChainPreference {
             return Err(anyhow!("too many certificate chains (max 16)"));
         }
 
+        if self.wants_names() && chains.iter().any(|chain|
+            chain.names.is_empty() || chain.names.iter().any(Option::is_none)) {
+            return Err(super::chain_validation::NamesUnavailable.into());
+        }
+
         // Single chain: return it directly.
         if chains.len() == 1 {
             return Ok(chains.remove(0));

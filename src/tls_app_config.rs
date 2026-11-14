@@ -11,6 +11,8 @@ mod external;
 mod issuer_account_key;
 #[path = "tls_app_config/issuer_values.rs"]
 mod issuer_values;
+#[path="tls_app_config/issuer_roots.rs"]
+pub(crate) mod issuer_roots;
 #[path = "tls_app_config/subject_values.rs"]
 mod subject_values;
 pub(crate) use subject_values::ExplicitSubjects;
@@ -22,6 +24,8 @@ mod loaders;
 mod material;
 #[path = "tls_app_config/manual_values.rs"]
 mod manual_values;
+#[path = "tls_app_config/leaf_values.rs"]
+pub(crate) mod leaf_values;
 #[path = "tls_app_config/model.rs"]
 mod model;
 #[path = "tls_app_config/parse.rs"]

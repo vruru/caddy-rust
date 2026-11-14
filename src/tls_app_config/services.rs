@@ -33,6 +33,10 @@ use tokio::sync::{Mutex as AsyncMutex, OnceCell, broadcast, oneshot};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 #[path = "services/ca_pools.rs"]
 mod ca_pools;
+#[path="services/front_auth.rs"]
+mod front_auth;
+#[path="services/outgoing_trust.rs"]
+mod outgoing_trust;
 #[path = "services/ca_consumers.rs"]
 mod ca_consumers;
 #[path = "services/storage_pools.rs"]
@@ -79,7 +83,10 @@ pub struct PrepareContext {
 /// Opaque, in-memory rollback capability; never constructible from JSON.
 #[derive(Clone)]
 pub struct RetainedCertificates {
+    outgoing_trust:Option<Arc<outgoing_trust::Retained>>,
+    client_auth:Option<Arc<crate::tls_policy::prepared_auth::RetainedAuth>>,
     issuer_values:Option<Arc<super::issuer_values::Retained>>,
+    issuer_roots:Arc<super::issuer_roots::Retained>,
     subjects:Arc<super::subject_values::Retained>,
     digest: [u8; 32],
     material: Vec<RetainedMaterial>,
@@ -251,6 +258,11 @@ pub struct CertificateServices {
     plan: Arc<CertificatePlan>,
     context: PrepareContext,
     restore: Option<RetainedCertificates>,
+    client_pool_gate:AsyncMutex<()>,
+    outgoing_inputs:OnceCell<Option<Arc<outgoing_trust::Inputs>>>,
+    outgoing_accepted:OnceCell<Option<Arc<outgoing_trust::Retained>>>,
+    client_auth_inputs:OnceCell<Option<Arc<crate::tls_policy::prepared_auth::AuthInputs>>>,
+    client_auth_accepted:OnceCell<Option<Arc<crate::tls_policy::prepared_auth::RetainedAuth>>>,
     identity_resolver: Arc<HotCertificateResolver>,
     manual_resolver: Arc<HotCertificateResolver>,
     manual_inventory: arc_swap::ArcSwap<ManualCertificates>,
@@ -291,7 +303,7 @@ impl CertificateServices {
     }
     #[cfg(feature="native-run")]
     pub(crate) fn new_with_client_tls_scope(plan:CertificatePlan,context:PrepareContext,mode:PrepareMode,scope:Arc<crate::outgoing_tls::Scope>)->Result<Arc<Self>> {
-        Self::new_inner(plan,context,mode,Some(scope))
+        Self::new_inner(plan,context,mode,Some(scope) )
     }
     fn new_inner(plan:CertificatePlan,context:PrepareContext,mode:PrepareMode,#[cfg(feature="native-run")] outgoing_tls:Option<Arc<crate::outgoing_tls::Scope>>)->Result<Arc<Self>> {
         ensure!(
@@ -345,6 +357,11 @@ impl CertificateServices {
             plan,
             context,
             restore,
+            client_pool_gate:AsyncMutex::new(()),
+            outgoing_inputs:OnceCell::new(),
+            outgoing_accepted:OnceCell::new(),
+            client_auth_inputs:OnceCell::new(),
+            client_auth_accepted:OnceCell::new(),
             identity_resolver,
             manual_resolver,
             manual_inventory,
@@ -613,6 +630,9 @@ impl CertificateServices {
         );
         let state = self.state.lock().await;
         Ok(RetainedCertificates {
+            outgoing_trust:self.outgoing_accepted.get().cloned().flatten(),
+            client_auth:self.client_auth_accepted.get().cloned().flatten(),
+            issuer_roots:super::issuer_roots::retain(&self.plan,&crate::tls_policy::prepared_auth::AuthBudget::Root(self.context.resources.external_bytes.clone()))?,
             issuer_values:super::issuer_values::retain(&self.plan,&self.context.resources.issuer_values)?,
             subjects:super::subject_values::retain(&self.plan,&self.context.resources.issuer_values)?,
             digest: self.context.configuration_digest,
@@ -724,6 +744,7 @@ impl CertificateServices {
             };
             Ok::<_,anyhow::Error>(explicit)
         }).await?;
+        if let Some(retained)=&self.restore{super::issuer_roots::restore(&self.plan,&retained.issuer_roots)?;}else{super::issuer_roots::prepare_all(&self.plan,&self.context,cancel.clone()).await?;}
         self.prepare_permission(cancel.clone()).await?;
         if let Some(retained) = &self.restore {
             self.context.leaf_guard.key_deny().require_loaded()?;

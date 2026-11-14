@@ -24,9 +24,10 @@ fn acquisition_frame<F:std::future::Future>(future:F)->Result<AcquisitionFrame<F
 /// producer credit is separate and must accompany the input/result as well.
 struct ManagerConstructionOwner {
     _memory:crate::acme_wire::chain_memory::Scratch,
-    _root_inputs:Vec<crate::acme_wire::chain_memory::Scratch>,
     _test_inputs:crate::acme_wire::chain_memory::Scratch,
-    _root_input_metadata:crate::acme_wire::chain_memory::Scratch,
+    // Ready-source loans do not pay these independent legacy identity copies.
+    // This Group allowance follows actual constructor/config/client owners.
+    _root_copies:crate::acme_wire::chain_memory::Scratch,
     // Keep producer credit through the actual queued worker and retained error
     // or unconsumed manager; constructor admission does not replace this loan.
     issuer_values_credit:Option<Arc<crate::acme_wire::chain_memory::Lease>>,
@@ -43,6 +44,7 @@ struct ManagerBuildInput {
     options:AutomationOptions,
     resources:Arc<cert_automation::AutomationResources>,
     prepared:Vec<cert_automation::PreparedBackend>,
+    custom_roots:Vec<Option<Arc<super::super::issuer_roots::CustomRoots>>>,
     solvers:Vec<cert_automation::SolverPreparation>,
     test_directories:Vec<Option<String>>,
     test_solvers:Vec<Option<cert_automation::SolverPreparation>>,
@@ -94,6 +96,7 @@ impl ManagerBuildInput {
             self.options,self.resources,None,self.prepared,self.key_type)?
             .with_construction_owner(self.owner.clone())?
             .with_issuer_values_credit(issuer_values_credit)?
+            .with_issuer_custom_roots(self.custom_roots)?
             .with_prepared_test_cas(self.test_directories,&resources)?
             .with_test_ca_solvers(self.test_solvers)?
             .with_issuer_solvers(self.solvers)?.with_events(self.events)?;
@@ -396,7 +399,7 @@ impl CertificateServices {
                     values:None,
                     config: AcmeIssuerConfig::lets_encrypt(),
                     account_key: None,
-                    roots: Vec::new(),
+                    roots: super::super::issuer_roots::Input::empty(),
                     http_port: None,
                     alpn_port: None,
                     bind_host: String::new(),
@@ -457,19 +460,16 @@ impl CertificateServices {
                 Ok(if let Some(values)=&settings.values {values.get()?.test_ca.clone()}else{settings.test_ca.clone()})
             })()),_=>None,
         }).collect::<Result<Vec<_>>>()?;
-        let root_count=policy.issuers.iter().try_fold(0usize,|sum,issuer|{
+        let root_copy_bytes=policy.issuers.iter().try_fold(0usize,|sum,issuer|{
             let Issuer::Acme(settings)=issuer else{return Ok::<_,anyhow::Error>(sum)};
-            let count=settings.roots.len();
-            ensure!(count.checked_add(settings.config.wire.extra_ca_pem.len())
-                .is_some_and(|n|n<=32),"ACME trust configuration exceeds bounds");
-            sum.checked_add(count).ok_or_else(||crate::cert_transient::ResourceDenied.into())
+            let Some(roots)=settings.roots.get()? else{return Ok(sum)};
+            sum.checked_add(roots.identity_copy_upper(settings.config.wire.extra_ca_pem.len())?)
+                .ok_or_else(||crate::cert_transient::ResourceDenied.into())
         })?;
-        let root_metadata=root_count.checked_mul(std::mem::size_of::<crate::acme_wire::chain_memory::Scratch>())
-            .and_then(|n|n.checked_add(std::mem::size_of::<Vec<crate::acme_wire::chain_memory::Scratch>>()))
-            .ok_or(crate::cert_transient::ResourceDenied)?;
-        let root_input_metadata=crate::cert_transient::reserve(root_metadata)?;
-        let mut root_inputs=Vec::new();
-        root_inputs.try_reserve_exact(root_count)?;
+        // Prepay all PEM copies before a mixed Internal issuer can await and
+        // before any append. Declared before prepared: error drops data first.
+        let root_copies=crate::cert_transient::reserve(root_copy_bytes)?;
+        let mut custom_roots=Vec::new();
         let mut prepared=Vec::new();
         let mut timeout=Duration::from_secs(1200);
         for issuer in &policy.issuers {
@@ -484,13 +484,9 @@ impl CertificateServices {
                         issuer.account_key=Some(input.prepare(self.context.resources.cpu.clone(),cancel.clone()).await?);
                     }
                     issuer.leaf_key_type=policy.key_type;
-                    for path in &settings.roots {
-                        let path=absolute(&self.context.paths.cwd,path);
-                        let (root,memory)=loaders::blocking(self.context.resources.io.clone(),
-                            cancel.clone(),move||loaders::read_root_input(&path)).await?;
-                        root_inputs.push(memory);
-                        issuer.wire.extra_ca_pem.push(root);
-                    }
+                    let roots=settings.roots.get()?;
+                    if let Some(roots)=&roots{roots.append_identity_pems(&mut issuer.wire.extra_ca_pem,&root_copies)?;}
+                    custom_roots.push(roots);
                     if let Some(value)=settings.timeout{timeout=timeout.min(value);}
                     prepared.push(cert_automation::PreparedBackend::Acme(issuer));
                 },
@@ -510,9 +506,9 @@ impl CertificateServices {
             max_concurrent,max_concurrent_per_ca,poll_interval:self.plan.renew_interval,job_timeout:timeout};
         let bytes=ManagerBuildInput::copy_cost(&prepared,&test_directories,self.context.resources.issuance.client_build_input_upper())?;
         let owner=Arc::new(ManagerConstructionOwner{_memory:crate::cert_transient::reserve(bytes)?,
-            _root_inputs:root_inputs,_test_inputs:test_inputs,_root_input_metadata:root_input_metadata,issuer_values_credit});
+            _test_inputs:test_inputs,_root_copies:root_copies,issuer_values_credit});
         let input=ManagerBuildInput{store:store.fs.clone(),registry:self.context.challenges.clone(),resolver:resolver.clone(),
-            options,resources:self.context.resources.issuance.clone(),prepared,
+            options,resources:self.context.resources.issuance.clone(),prepared,custom_roots,
             solvers:solver.as_ref().map(|b|b.callbacks()).transpose()?.unwrap_or_default(),
             test_solvers:solver.as_ref().map(|b|b.test_callbacks()).transpose()?.unwrap_or_default(),test_directories,
             events:(!identity).then(||self.context.events.clone()).flatten(),key_type:policy.key_type,

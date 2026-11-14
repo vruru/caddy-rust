@@ -97,7 +97,7 @@ impl CertificateManager {
             let mut hash=Sha256::new();hash.update(b"test-ca-policy-v1");
             for value in [&owner.id,&id] {let BackendId::Acme{directory,config_identity}=value else{bail!("test CA owner kind changed")};for text in [directory,config_identity]{hash.update(u64::try_from(text.len())?.to_be_bytes());hash.update(text.as_bytes());}}
             let policy=format!("{:x}",hash.finalize());
-            policies.push(TestPolicy::Separate(TestIssuer{state:IssuerState{config,ca,wire:OnceCell::new(),solver_override:None},id,policy}));
+            policies.push(TestPolicy::Separate(TestIssuer{state:IssuerState{custom_roots:inner.issuers[index].custom_roots.clone(),config,ca,wire:OnceCell::new(),solver_override:None},id,policy}));
         }
         inner.test_policies=policies;Ok(self)
     }

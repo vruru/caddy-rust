@@ -1925,3 +1925,84 @@ The optional context does not change clients that leave it unset, HTTP/2 negotia
 ### Joined certificate job deadlines
 
 A whole-job deadline cancels and joins the actual certificate operation. If that operation completes its real durable/publication path successfully while cancellation is being joined, its `ManagedCertificate` result is preserved rather than replaced with a deadline error. Failed operations remain errors with the deadline context and original cause. This does not change parent-cancellation, lost-storage-lease, issuer fallback or retry policy, and is not a claim that the broader per-issuer physical-retirement integration is complete.
+
+### Certificate selection and local failure contracts
+
+Requested issuer Common Name metadata is fallible. A valid name with no CN
+remains an ordinary non-match; parsing, local memory admission and execution
+failures must remain errors. Optional remote certificate branches may still be
+unavailable or invalid without invalidating an otherwise usable chain. This
+does not authorize treating local failures as absent alternate/UP branches,
+skipping signature checks, or changing issuer fallback and uncertain-order
+classification.
+
+Map selection preserves its existing HTTP error status while retaining the
+underlying local cause and actual result owner. Mapped proxy DNS preserves the
+original NSS error kind/source. Local DNS admission, worker and bounded-result
+copy failures terminate that attempt before passive-health accounting or replay;
+remote DNS failures retain the configured retry behavior. The ordinary GAI path,
+existing resource pools and physical worker tracking are unchanged. These are
+specific error-contract boundaries, not a claim that all heap allocation or
+all cancellation paths have complete accounting.
+
+
+### Normal CLI local-PKI trust installation
+
+The normal `run`/`start` process supplies the existing system/Java/NSS trust
+installer through a lazy CLI adapter. The local CA's default or explicit
+`install_trust: true` still controls the installation attempt; explicit false
+never enters discovery or installation. Validation and candidates rejected
+before activation do not install trust. Once activation has begun, later
+configuration compensation does not promise to undo an installation already
+started. Discovery and installation failures are nonfatal: the
+service continues, while stderr records a fixed failure kind, operation phase
+and safe IO class/code without certificate or private-key contents. The original
+error remains available to the existing LocalPki event path. A successful
+adapter return describes that actual adapter operation, not an unconditional
+claim that every host trust store was modified.
+
+Library callers retain their explicit `RootOptions.trust_installer` capability.
+The CLI does not add a new command framework, change store targets or weaken
+privileged-path checks. Normal-main QA on a developer host must set
+`install_trust: false` for every local/internal CA unless that host installation
+is explicitly intended and authorized. Automatic-installation QA uses isolated
+Linux container stores and observable command fixtures, never the user's real
+system trust stores.
+
+
+### Accepted business TLS material across failed reloads
+
+Native configuration preparation binds each client-authentication policy and
+upstream TLS consumer to its original occurrence and raw inputs. Successfully
+prepared client-authentication verifiers, upstream trust and static client
+certificate/key material are retained as immutable in-memory material. Failed
+configuration compensation installs that material before source visitors run,
+then constructs new-generation clients and verification scopes. It neither
+reopens the accepted source files nor revives a retired connection pool. A new
+Normal configuration prepares its new sources. Raw admin configuration remains
+unchanged, and global key-veto/revocation facts are not rolled back.
+
+Supported leaf file and PEM inputs use the shared Provision-time ReplaceKnown
+scanner: known values expand, unknown placeholders remain literal, and known
+empty values remain empty. Folder and storage leaf loaders remain unsupported.
+Explicit Caddy ACME root files are prepared once per configured issuer, including
+on-demand policies. Subsequent groups and compensation use the prepared custom
+trust pool, replacing built-in roots. Original PEM order remains part of the
+existing backend and durable-order identity. Per-Group identity copies are
+admitted before allocation and retained through their actual constructor owner.
+
+The public SDK extra_ca_pem contract remains additive. The private Caddy policy
+does not append those legacy identity copies into the custom-only pool. Default
+ACME trust retains the existing reqwest WebPKI construction behavior; OS-root
+parity is not claimed. Permission checks, external certificate retrieval and
+admin polling retain their separate live source-consumption phases. Legacy
+version-1 manual ambiguous-order attachment still identifies an issuer by its
+directory-first contract, so same-directory historical leg identity is not
+claimed to be reconstructed exactly.
+
+Targeted combined acceptance covers real Controller permission-commit failure
+after publication, deleted/replaced sources, strict TLS client identities and
+fresh upstream mTLS; explicit roots across delayed on-demand groups; HTTP,
+storage and PKI CA consumers; normal CLI trust-installer dispatch; and existing
+chain, Map, session and multi-protocol transfer regressions. The feature inventory
+and remaining release boundaries are in docs/COMPATIBILITY-STATUS.md.

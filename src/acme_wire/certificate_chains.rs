@@ -31,6 +31,43 @@ impl std::fmt::Display for SharedFailure{fn fmt(&self,f:&mut std::fmt::Formatter
 impl std::error::Error for SharedFailure{fn source(&self)->Option<&(dyn std::error::Error+'static)>{Some(&**self.0)}}
 type NodeOutcome=Result<Arc<Node>,SharedFailure>;
 
+/// SharedFailure owns an anyhow table whose context payloads are not all
+/// downcastable through std::error::Error::source. Unwrap only this closed type.
+pub(crate) fn shared_cause(error:&anyhow::Error)->Option<&anyhow::Error>{
+    error.downcast_ref::<SharedFailure>()
+        .or_else(||error.chain().find_map(|cause|cause.downcast_ref::<SharedFailure>()))
+        .map(|failure|failure.0.as_ref())
+}
+#[derive(Debug)]
+struct GraphExecutionFailure;
+impl std::fmt::Display for GraphExecutionFailure{
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{
+        f.write_str("ACME certificate graph execution unavailable")
+    }
+}
+impl std::error::Error for GraphExecutionFailure{}
+fn local_failure(error:&anyhow::Error)->bool{
+    fn local(error:&anyhow::Error)->bool{
+        if error.is::<validation::NamesUnavailable>() || error.is::<GraphExecutionFailure>()
+            || error.is::<super::AcmeRequestCancelled>() {return true}
+        #[cfg(feature="native-run")]
+        if error.is::<crate::outgoing_tls::ConnectionControl>()
+            || error.chain().any(|cause|cause.is::<crate::outgoing_tls::ConnectionControl>()) {return true}
+        false
+    }
+    crate::cert_transient::is_resource(error) || local(error)
+        || shared_cause(error).is_some_and(local)
+}
+/// Remote optional branches may be unavailable or invalid. Local execution,
+/// resource and wanted-metadata errors must never become an absent branch.
+fn optional_branch<T>(result:Result<T>,cancel:&CancellationToken)->Result<Option<T>>{
+    match result{
+        Ok(value)=>Ok(Some(value)),
+        Err(error) if cancel.is_cancelled() || local_failure(&error)=>Err(error),
+        Err(_)=>Ok(None),
+    }
+}
+
 /// The local manager owns abandoned-graph joins; its existing native group
 /// tracker also owns that same future, so retirement waits for real completion.
 pub(crate) struct Cleanup{local:TaskTracker,parent:Option<TaskTracker>}
@@ -102,7 +139,7 @@ async fn admit(context:&Context)->Result<Admission>{
         ensure!(!context.cancel.is_cancelled(),"ACME chain download cancelled");
         let notified=context.progress.notify.notified();tokio::pin!(notified);notified.as_mut().enable();
         let credit={
-            let mut active=context.progress.active.lock().map_err(|_|anyhow!("ACME memory scheduling unavailable"))?;
+            let mut active=context.progress.active.lock().map_err(|_|anyhow!("ACME memory scheduling unavailable").context(GraphExecutionFailure))?;
             match context.wire.inner.chain_memory.payload.reserve(super::MAX_BODY){
                 Ok(credit)=>{*active+=1;Some(credit)}
                 Err(error)=>{if *active==0{return Err(error)}None}
@@ -126,16 +163,16 @@ impl Owner{
     fn spawn(&self,future:impl Future<Output=()>+Send+'static)->Result<()>{
         // Reap completed () records so long graphs do not retain task handles.
         loop{
-            let completed={self.tasks.lock().map_err(|_|anyhow!("ACME graph task state unavailable"))?.try_join_next()};
+            let completed={self.tasks.lock().map_err(|_|anyhow!("ACME graph task state unavailable").context(GraphExecutionFailure))?.try_join_next()};
             if completed.is_none(){break}drop(completed);
         }
-        self.tasks.lock().map_err(|_|anyhow!("ACME graph task state unavailable"))?.spawn_on(future,&self.runtime);
+        self.tasks.lock().map_err(|_|anyhow!("ACME graph task state unavailable").context(GraphExecutionFailure))?.spawn_on(future,&self.runtime);
         Ok(())
     }
     async fn node(&self,endpoint:&Endpoint)->Result<Arc<Node>>{
         let key=endpoint.url.to_string();
         let(mut receiver,sender)={
-            let mut cache=self.cache.lock().map_err(|_|anyhow!("ACME graph cache unavailable"))?;
+            let mut cache=self.cache.lock().map_err(|_|anyhow!("ACME graph cache unavailable").context(GraphExecutionFailure))?;
             if let Some(receiver)=cache.get(&key){(receiver.clone(),None)}else{
                 ensure!(cache.len()<MAX_REQUESTS,"ACME certificate request budget exhausted");
                 let(sender,receiver)=watch::channel(None);cache.insert(key,receiver.clone());(receiver,Some(sender))
@@ -153,14 +190,19 @@ impl Owner{
             if let Some(result)=ready{return result.map_err(anyhow::Error::new)}
             tokio::select!{biased;
                 _=self.context.cancel.cancelled()=>return Err(anyhow!("ACME chain download cancelled")),
-                changed=receiver.changed()=>{changed.map_err(|_|anyhow!("ACME certificate fetch task ended without a result"))?;},
+                changed=receiver.changed()=>{changed.map_err(|_|anyhow!("ACME certificate fetch task ended without a result").context(GraphExecutionFailure))?;},
             }
         }
     }
     async fn cpu<T:Send+'static>(&self,operation:impl FnOnce()->Result<T>+Send+'static)->Result<T>{
         let(sender,receiver)=oneshot::channel();let cpu=self.context.wire.inner.cpu.clone();let cancel=self.context.cancel.clone();
-        self.spawn(async move{let result=crate::cert_cpu::run(cpu,cancel,operation).await;let _=sender.send(result);})?;
-        receiver.await.map_err(|_|anyhow!("ACME graph CPU task ended without a result"))?
+        self.spawn(async move{
+            // Separate dispatch failure from the operation's remote validation error.
+            let result=crate::cert_cpu::run(cpu,cancel,move||Ok(operation())).await
+                .map_err(|error|error.context(GraphExecutionFailure)).and_then(|result|result);
+            let _=sender.send(result);
+        })?;
+        receiver.await.map_err(|_|anyhow!("ACME graph CPU task ended without a result").context(GraphExecutionFailure))?
     }
     fn take_tasks(&self)->JoinSet<()>{
         let mut guard=self.tasks.lock().unwrap_or_else(|e|e.into_inner());std::mem::take(&mut *guard)
@@ -186,12 +228,12 @@ async fn raw_node(context:Arc<Context>,url:Url)->Result<Arc<Node>>{
         if let Ok(raw)=header.to_str(){links.extend(certificate_links::parse(raw).into_iter().take(64-links.len()));}
         if links.len()==64{break}
     }
-    let body=Arc::new(memory::Buffer::adopt(response.body,response.body_memory.ok_or_else(||anyhow!("ACME response memory credit missing"))?)?);
+    let body=Arc::new(memory::Buffer::adopt(response.body,response.body_memory.ok_or_else(||anyhow!("ACME response memory credit missing").context(GraphExecutionFailure))?)?);
     let decode=memory::scratch(validation::decode_cost(body.len())?,context.cancel.clone()).await?;
     let input=body.clone();let pool=context.wire.inner.chain_memory.payload.clone();let want_names=context.want_names;
     let info=crate::cert_cpu::run(context.wire.inner.cpu.clone(),context.cancel.clone(),move||{
-        let _decode=decode;validation::validate(input,pool,want_names)
-    }).await?;
+        let _decode=decode;Ok(validation::validate(input,pool,want_names))
+    }).await.map_err(|error|error.context(GraphExecutionFailure))??;
     Ok(Arc::new(Node{body,info,links}))
 }
 impl AccountSession{
@@ -229,13 +271,15 @@ impl AccountSession{
         if !has_up{chains.push(CertificateChain{url:key.clone(),chain_pem:node.body.clone(),first:node.info.first.clone(),last:node.info.last.clone(),count:node.info.count,names:vec![node.info.names.clone()]});}
         else{
             let mut targets=HashSet::new();
-            let endpoints=node.links.iter().filter(|link|link.up).filter_map(|link|
-                Endpoint::declared(&endpoint.url,&link.target,endpoint.require_https,self.wire.inner.allow_loopback,self.wire.inner.allowed_http_origin.as_deref()).ok())
-                .filter(|endpoint|targets.insert(endpoint.url.to_string())).collect::<Vec<_>>();
+            let mut endpoints=Vec::new();
+            for link in node.links.iter().filter(|link|link.up){
+                if let Some(target)=optional_branch(Endpoint::declared(&endpoint.url,&link.target,endpoint.require_https,self.wire.inner.allow_loopback,self.wire.inner.allowed_http_origin.as_deref()),&owner.context.cancel)?
+                    && targets.insert(target.url.to_string()){endpoints.push(target);}
+            }
             let parents=stream::iter(endpoints).map(|issuer|self.fetch_chains(issuer,owner,path.clone(),depth+1,want_alternates)).buffered(CONCURRENCY);
             tokio::pin!(parents);
             while let Some(result)=parents.next().await{
-                if let Ok(parents)=result{for parent in parents{
+                if let Some(parents)=optional_branch(result,&owner.context.cancel)?{for parent in parents{
                     if chains.len()==MAX_CHAINS{break}
                     let count=node.info.count+parent.count;if count>32{continue}
                     let bridge=memory::scratch(validation::CRYPTO_SCRATCH,owner.context.cancel.clone()).await?;
@@ -245,7 +289,7 @@ impl AccountSession{
                         let separator=if input.as_slice().ends_with(b"\n"){&b""[..]}else{&b"\n"[..]};
                         Ok(Arc::new(memory::Buffer::assemble(&pool,&[input.as_slice(),separator,suffix.as_slice()])?))
                     }).await;
-                    if let Ok(chain_pem)=result{let mut names=vec![node.info.names.clone()];names.extend(parent.names);
+                    if let Some(chain_pem)=optional_branch(result,&owner.context.cancel)?{let mut names=vec![node.info.names.clone()];names.extend(parent.names);
                         chains.push(CertificateChain{url:key.clone(),chain_pem,first:node.info.first.clone(),last:parent.last,count,names});}
                 }}
                 if chains.len()==MAX_CHAINS{break}
@@ -255,13 +299,15 @@ impl AccountSession{
         // mandatory UP path still permits a complete same-leaf alternate.
         if (want_alternates||chains.is_empty())&&chains.len()<MAX_CHAINS{
             let mut targets=HashSet::new();
-            let endpoints=node.links.iter().filter(|link|link.alternate).filter_map(|link|
-                Endpoint::declared(&endpoint.url,&link.target,endpoint.require_https,self.wire.inner.allow_loopback,self.wire.inner.allowed_http_origin.as_deref()).ok())
-                .filter(|endpoint|targets.insert(endpoint.url.to_string())).collect::<Vec<_>>();
+            let mut endpoints=Vec::new();
+            for link in node.links.iter().filter(|link|link.alternate){
+                if let Some(target)=optional_branch(Endpoint::declared(&endpoint.url,&link.target,endpoint.require_https,self.wire.inner.allow_loopback,self.wire.inner.allowed_http_origin.as_deref()),&owner.context.cancel)?
+                    && targets.insert(target.url.to_string()){endpoints.push(target);}
+            }
             let alternates=stream::iter(endpoints).map(|alternate|self.fetch_chains(alternate,owner,path.clone(),depth+1,want_alternates)).buffered(CONCURRENCY);
             tokio::pin!(alternates);
             while let Some(result)=alternates.next().await{
-                if let Ok(alternates)=result{for candidate in alternates{
+                if let Some(alternates)=optional_branch(result,&owner.context.cancel)?{for candidate in alternates{
                     if chains.len()==MAX_CHAINS{break}
                     if candidate.first.as_slice()==node.info.first.as_slice(){chains.push(candidate);}
                 }}

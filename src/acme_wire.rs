@@ -12,6 +12,7 @@ mod order_parameters;
 mod chain_preference;
 mod certificate_links;
 mod certificate_chains;
+pub(crate) use certificate_chains::shared_cause as chain_failure_cause;
 pub(crate) use certificate_chains::Cleanup as ChainCleanup;
 pub(crate) mod chain_memory;
 pub(crate) mod chain_deep_shape;

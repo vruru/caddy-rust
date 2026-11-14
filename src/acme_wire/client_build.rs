@@ -3,12 +3,14 @@
 use super::*;
 #[derive(Clone,Default)]
 pub(crate) struct ClientOwner {
+    custom_roots:Option<Arc<crate::tls_app_config::issuer_roots::CustomRoots>>,
     values:Option<Arc<chain_memory::Lease>>,
     material:Option<Arc<dyn crate::cert_cpu::MaterialOwner>>,
     additional_values:Option<Arc<chain_memory::Lease>>,
 }
 impl ClientOwner {
-    pub(crate) fn new(values:Option<Arc<chain_memory::Lease>>,material:Option<Arc<dyn crate::cert_cpu::MaterialOwner>>)->Self {Self{values,material,additional_values:None}}
+    pub(crate) fn new(values:Option<Arc<chain_memory::Lease>>,material:Option<Arc<dyn crate::cert_cpu::MaterialOwner>>)->Self {Self{custom_roots:None,values,material,additional_values:None}}
+    pub(crate) fn with_custom_roots(mut self,roots:Option<Arc<crate::tls_app_config::issuer_roots::CustomRoots>>)->Self{self.custom_roots=roots;self}
     pub(crate) fn with_additional_values_credit(mut self,credit:Arc<chain_memory::Lease>)->Result<Self>{
         ensure!(self.additional_values.is_none(),"additional client credit is already installed");
         self.additional_values=Some(credit);Ok(self)
@@ -34,9 +36,14 @@ impl Input {
     pub fn build(mut self)->Result<Built> {
         let mut builder=configured_base_builder(self.options.request_timeout,"Caddy-Rust-ACME/0.1");
         if let Some(proxy)=self.options.network_proxy.take(){builder=proxy.apply(builder)?;}
+        if let Some(roots)=&self.owner.custom_roots{
+            builder=builder.tls_built_in_root_certs(false);
+            for cert in roots.certificates(){builder=builder.add_root_certificate(reqwest::Certificate::from_der(cert.as_ref()).map_err(|_|anyhow!("ACME custom root construction failed"))?);}
+        }else{
         for pem in std::mem::take(&mut self.options.extra_ca_pem) {
             ensure!(pem.len()<=1024*1024,"ACME trust root exceeds bounds");
             builder=append_trusted_root_pem(builder,&pem)?;
+        }
         }
         #[cfg(feature="native-run")]
         if let Some(scope)=self.scope.as_ref(){

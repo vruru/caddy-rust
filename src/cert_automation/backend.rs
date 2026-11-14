@@ -298,7 +298,7 @@ impl CertificateManager {
                     let wire=issuer.wire.get_or_try_init(||async {
                         AcmeWire::connect_with_client_tls_scope(
                             issuer.config.wire.clone(),self.inner.local.clone(),self.inner.chain_memory.clone(),
-                            #[cfg(feature="native-run")] self.inner.outgoing_tls.clone(),self.wire_client_owner(),&cancel)
+                            #[cfg(feature="native-run")] self.inner.outgoing_tls.clone(),self.wire_client_owner_for(issuer),&cancel)
                             .await
                     }).await?;
                     let marker=self.read_reservation(&names,issuer).await?;
