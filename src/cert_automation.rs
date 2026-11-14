@@ -1293,7 +1293,9 @@ impl CertificateManager {
         tokio::select! {
             result=&mut operation=>result,
             _=tokio::time::sleep(self.inner.options.job_timeout)=>{
-                cancel.cancel();let _=operation.await;Err(anyhow!("ACME job deadline exceeded"))
+                // Join cancellation through the real operation. A completed store/
+                // publication remains success if its receipt races this timer.
+                cancel.cancel();operation.await.map_err(|error|error.context("ACME job deadline exceeded"))
             }
         }
     }
