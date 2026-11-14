@@ -528,6 +528,41 @@ impl FsStore {
         .map_err(|_| anyhow!("storage worker task failed"))?
     }
 
+    /// Check the selected data root, in one admitted and tracked real worker.
+    /// A cancelled waiter joins; a dropped waiter transfers that exact join.
+    /// The worker never returns its buffers, receipt, path or file descriptors.
+    pub(crate) async fn check_read_write(&self,cancel:CancellationToken,cleanup:Arc<crate::acme_wire::ChainCleanup>)->Result<()>{
+        ensure!(self.scope.is_none(),"storage check requires the configured data root");
+        ensure!(!cancel.is_cancelled(),"storage check cancelled");
+        let memory=Arc::new(crate::cert_transient::reserve(io::STORAGE_CHECK_CREDIT)?);
+        let work=cancel.child_token();
+        let _cancel_on_drop=work.clone().drop_guard();
+        let registration=cleanup.storage_registration();
+        let permit=tokio::select!{biased;
+            _=work.cancelled()=>return Err(anyhow!("storage check cancelled")),
+            permit=self.core.gate.clone().acquire_owned()=>permit.map_err(|_|anyhow!("storage worker pool closed"))?,
+        };
+        ensure!(!work.is_cancelled(),"storage check cancelled");
+        let job=StorageCheckWorker{core:self.core.clone(),cancel:work.clone(),_permit:permit,
+            _memory:memory.clone(),_registration:registration};
+        // A second concrete registration closes the handoff gap even if the
+        // worker finishes before its caller is dropped. Drop adopts the join
+        // before this original caller-side registration can retire.
+        let join_registration=cleanup.storage_registration();
+        let worker=tokio::task::spawn_blocking(move||job.execute());
+        let mut join=StorageCheckJoin{worker:Some(worker),cancel:work.clone(),cleanup,
+            runtime:tokio::runtime::Handle::current(),memory:Some(memory),_registration:join_registration};
+        tokio::select!{biased;
+            _=work.cancelled()=>{
+                let result=join.wait().await;
+                // Cleanup failures remain observable even when cancellation
+                // requested the join; no known IO failure becomes success.
+                match result{Ok(())=>Err(anyhow!("storage check cancelled")),Err(error)=>Err(error)}
+            },
+            result=join.wait()=>result,
+        }
+    }
+
     async fn group(&self, key: &str) -> Result<OwnedMutexGuard<()>> {
         let lock = {
             let mut map = self
@@ -2317,4 +2352,42 @@ fn pending_core(core: &Core, key: &str) -> Result<bool> {
             .state
             .load(&key.replace(".json", ".quarantine"), true)?
             .is_some())
+}
+
+
+/// Drop order: the descriptor/input and worker permit retire before metadata
+/// credit and the final physical registrations. No manager or user callbacks.
+struct StorageCheckWorker{
+    core:Arc<Core>,cancel:CancellationToken,
+    _permit:tokio::sync::OwnedSemaphorePermit,
+    _memory:Arc<crate::acme_wire::chain_memory::Scratch>,
+    _registration:(tokio_util::task::task_tracker::TaskTrackerToken,Option<tokio_util::task::task_tracker::TaskTrackerToken>),
+}
+impl StorageCheckWorker{
+    fn execute(self)->Result<()>{
+        ensure!(!self.cancel.is_cancelled(),"storage check cancelled");
+        self.core.data.check_read_write(&self.cancel)
+    }
+}
+struct StorageCheckJoin{
+    worker:Option<tokio::task::JoinHandle<Result<()>>>,cancel:CancellationToken,
+    cleanup:Arc<crate::acme_wire::ChainCleanup>,runtime:tokio::runtime::Handle,
+    memory:Option<Arc<crate::acme_wire::chain_memory::Scratch>>,
+    _registration:(tokio_util::task::task_tracker::TaskTrackerToken,Option<tokio_util::task::task_tracker::TaskTrackerToken>),
+}
+impl StorageCheckJoin{
+    async fn wait(&mut self)->Result<()>{
+        let result=self.worker.as_mut().expect("owned storage check join").await;
+        self.worker.take();
+        result.map_err(|_|anyhow!("storage check worker failed"))?
+    }
+}
+impl Drop for StorageCheckJoin{
+    fn drop(&mut self){
+        self.cancel.cancel();
+        if let Some(worker)=self.worker.take(){
+            let memory=self.memory.take().expect("owned storage check credit");
+            self.cleanup.adopt_storage_worker(worker,memory,&self.runtime);
+        }
+    }
 }

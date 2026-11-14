@@ -344,6 +344,9 @@ impl Root {
         self.load_pinned_with_credit(key,private,Some(lifetime))
     }
     fn load_pinned_with_credit(&self, key:&str,private:bool,lifetime:Option<crate::cert_transient::Lifetime>)->Result<Option<PinnedRead>> {
+        self.load_pinned_bounded(key,private,lifetime,MAX_FILE)
+    }
+    fn load_pinned_bounded(&self,key:&str,private:bool,lifetime:Option<crate::cert_transient::Lifetime>,maximum:usize)->Result<Option<PinnedRead>> {
         let Some((parent, name)) = self.parent(key, false)? else {
             return Ok(None);
         };
@@ -360,7 +363,7 @@ impl Root {
         let st = fs::fstat(&fd).map_err(|_| anyhow!("file metadata unavailable"))?;
         validate_file(&st, self.uid, private)?;
         ensure!(
-            st.st_size >= 0 && st.st_size as u64 <= MAX_FILE as u64,
+            st.st_size >= 0 && st.st_size as u64 <= maximum.min(MAX_FILE) as u64,
             "storage file size limit exceeded"
         );
         let file = File::from(fd);
@@ -419,6 +422,9 @@ impl Root {
     }
 
     fn store_atomic(&self, key: &str, bytes: &[u8], no_replace: bool) -> Result<bool> {
+        self.store_atomic_receipted(key,bytes,no_replace,None)
+    }
+    fn store_atomic_receipted(&self,key:&str,bytes:&[u8],no_replace:bool,mut receipt:Option<&mut StoreReceipt>)->Result<bool>{
         ensure!(bytes.len() <= MAX_FILE, "storage value size limit exceeded");
         let (parent, name) = self
             .parent(key, true)?
@@ -433,6 +439,8 @@ impl Root {
             super::hash(name.to_bytes()),
             random_id()?
         ))?;
+        // Allocate opt-in receipt text BEFORE creating anything on disk.
+        let mut receipt_temp=receipt.as_ref().map(|_|temp.clone());
         let fd = fs::openat(
             &parent,
             &temp,
@@ -440,12 +448,27 @@ impl Root {
             Mode::from_raw_mode(0o600),
         )
         .map_err(|_| anyhow!("temporary storage file creation failed"))?;
-        let operation = || -> Result<bool> {
-            let mut file = File::from(fd);
-            file.write_all(bytes)
-                .map_err(|_| anyhow!("storage write failed"))?;
-            file.sync_all()
-                .map_err(|_| anyhow!("storage file synchronization failed"))?;
+        // The fd is ours before any write/sync can fail. Only this opt-in check
+        // retains the exact temporary component; normal writers do not clone it.
+        let mut opened=Some(File::from(fd));
+        if let Some(receipt)=receipt.as_deref_mut(){
+            // Retain both name and actual fd with no allocation after create.
+            receipt.temporary=receipt_temp.take();
+            // Retain the actual inode, not only a guess based on its name.
+            // Keeping this fd open also prevents unlink/reuse of the inode id.
+            receipt.file=opened.take();
+            let st=fs::fstat(receipt.file.as_ref().expect("owned check fd"))
+                .map_err(|_|anyhow!("storage check inode metadata unavailable"))?;
+            receipt.identity=Some(CheckIdentity::from_stat(&st));
+        }
+        let mut operation = || -> Result<bool> {
+            {
+                let file=receipt.as_deref().and_then(|r|r.file.as_ref()).or(opened.as_ref())
+                    .expect("owned atomic storage fd");
+                let mut writer=file;
+                writer.write_all(bytes).map_err(|_|anyhow!("storage write failed"))?;
+                file.sync_all().map_err(|_|anyhow!("storage file synchronization failed"))?;
+            }
             if no_replace {
                 match fs::renameat_with(&parent, &temp, &parent, &name, fs::RenameFlags::NOREPLACE) {
                     Ok(()) => {}
@@ -456,23 +479,33 @@ impl Root {
                 fs::renameat(&parent, &temp, &parent, &name)
                     .map_err(|_| anyhow!("storage atomic replacement failed"))?;
             }
+            // rename has physically succeeded. Record ownership BEFORE fsync:
+            // Err from the subsequent sync must not hide a published test key.
+            if let Some(receipt)=receipt.as_deref_mut(){receipt.published=true;receipt.temporary=None;}
             fs::fsync(&parent).map_err(|_| anyhow!("storage directory synchronization failed"))?;
             Ok(true)
         };
         match operation() {
             Ok(true) => Ok(true),
+            // The dedicated checker must verify the retained inode before
+            // unlinking. Do not run the ordinary name-only cleanup first.
+            Ok(false) if receipt.is_some()=>Ok(false),
+            Err(error) if receipt.is_some()=>Err(error),
             Ok(false) => {
                 match fs::unlinkat(&parent, &temp, AtFlags::empty()) {
                     Ok(()) | Err(rustix::io::Errno::NOENT) => {}
                     Err(_) => bail!("storage temporary cleanup failed"),
                 }
+                if let Some(receipt)=receipt.as_deref_mut(){receipt.temporary=None;}
                 fs::fsync(&parent).map_err(|_| anyhow!("storage directory synchronization failed"))?;
                 Ok(false)
             }
             Err(error) => {
                 // Preserve the operation's first failure even if cleanup fails.
                 // Successful publication already removed temp; NOENT is benign.
-                let _ = fs::unlinkat(&parent, &temp, AtFlags::empty());
+                if matches!(fs::unlinkat(&parent,&temp,AtFlags::empty()),Ok(())|Err(rustix::io::Errno::NOENT)){
+                    if let Some(receipt)=receipt.as_deref_mut(){receipt.temporary=None;}
+                }
                 Err(error)
             }
         }
@@ -739,3 +772,119 @@ fn ensure_local(fd: &OwnedFd) -> Result<()> {
     }
     Ok(())
 }
+
+
+pub(super) const STORAGE_CHECK_BYTES:usize=10*1024;
+/// Both 10KiB buffers plus bounded single-component paths/receipt and worker
+/// bookkeeping. The dedicated caller acquires this before any producer.
+pub(super) const STORAGE_CHECK_CREDIT:usize=32*1024;
+#[derive(Clone,Copy,PartialEq,Eq)]
+struct CheckIdentity{dev:u64,ino:u64}
+impl CheckIdentity{fn from_stat(st:&fs::Stat)->Self{Self{dev:device_id(st),ino:st.st_ino}}}
+#[derive(Default)]
+struct StoreReceipt{
+    temporary:Option<CString>,published:bool,identity:Option<CheckIdentity>,
+    // Last actual descriptor prevents inode-number reuse until cleanup ends.
+    file:Option<File>,
+}
+#[derive(Debug)]
+struct CheckFailure{primary:anyhow::Error,cleanup:anyhow::Error}
+impl std::fmt::Display for CheckFailure{
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{
+        write!(f,"{}; storage check cleanup also failed: {}",self.primary,self.cleanup)
+    }
+}
+impl std::error::Error for CheckFailure{
+    fn source(&self)->Option<&(dyn std::error::Error+'static)>{Some(self.primary.as_ref())}
+}
+impl Root{
+    /// Only the prepaid FsStore worker calls this; no buffers or relative names
+    /// escape its small Result. A receipt owns only our EXCL temp and the target
+    /// after successful rename, never the target of a no-replace collision.
+    pub(super) fn check_read_write(&self,cancel:&tokio_util::sync::CancellationToken)->Result<()>{
+        let key=format!("rw_test_{}",random_id()?);
+        let mut receipt=StoreReceipt::default();
+        let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||->Result<()>{
+            ensure!(!cancel.is_cancelled(),"storage check cancelled");
+            let mut expected=crate::cert_transient::Bytes::allocate(STORAGE_CHECK_BYTES,None)?;
+            getrandom::fill(expected.as_mut_slice()).map_err(|_|anyhow!("storage check entropy unavailable"))?;
+            ensure!(self.store_atomic_receipted(&key,expected.as_slice(),true,Some(&mut receipt))?,"storage check key collision");
+            ensure!(!cancel.is_cancelled(),"storage check cancelled");
+            let loaded=self.load_pinned_bounded(&key,true,None,STORAGE_CHECK_BYTES)?
+                .ok_or_else(||anyhow!("storage check value disappeared"))?;
+            let identity=receipt.identity.ok_or_else(||anyhow!("storage check inode receipt missing"))?;
+            ensure!(CheckIdentity{dev:loaded.signature.dev,ino:loaded.signature.ino}==identity,
+                "storage check read inode changed");
+            ensure!(loaded.bytes.as_slice()==expected.as_slice(),"storage check loaded different bytes");
+            loaded.verify()?;
+            ensure!(!cancel.is_cancelled(),"storage check cancelled");
+            Ok(())
+        }));
+        let result=match result{Ok(result)=>result,Err(payload)=>{
+            // Preserve bounded diagnostics, then destroy arbitrary payloads on
+            // this real worker while its permit/credit are still retained.
+            let evidence=CheckPanic::from_payload(&*payload);drop(payload);Err(evidence.into())
+        }};
+        // Cleanup is not gated by a cancelled token. Keep the first failure and
+        // expose secondary cleanup failure without stringifying its cause.
+        let cleanup=self.cleanup_check_receipt(&key,&mut receipt);
+        match(result,cleanup){
+            (Ok(()),Ok(()))=>Ok(()),
+            (Err(error),Ok(()))=>Err(error),
+            (Ok(()),Err(error))=>Err(error.context("storage check cleanup failed")),
+            (Err(primary),Err(cleanup))=>Err(CheckFailure{primary,cleanup}.into()),
+        }
+    }
+    fn cleanup_check_receipt(&self,key:&str,receipt:&mut StoreReceipt)->Result<()>{
+        let mut failure=None;
+        let identity=match receipt.identity{
+            Some(identity)=>identity,
+            None=>match receipt.file.as_ref(){
+                Some(file)=>CheckIdentity::from_stat(&fs::fstat(file)
+                    .map_err(|_|anyhow!("storage check cleanup inode unavailable"))?),
+                None=>return Ok(()), // creation never succeeded; own no name
+            }
+        };
+        if receipt.published{
+            match self.delete_check_inode(key,identity){Ok(())=>receipt.published=false,Err(error)=>failure=Some(error)}
+        }
+        if let Some(temp)=receipt.temporary.as_ref(){
+            let deletion=temp.to_str().map_err(|_|anyhow!("invalid storage check temporary component"))
+                .and_then(|name|self.delete_check_inode(name,identity));
+            match deletion{Ok(())=>receipt.temporary=None,Err(error)=>{
+                failure=Some(match failure{None=>error,Some(primary)=>CheckFailure{primary,cleanup:error}.into()});
+            }}
+        }
+        failure.map_or(Ok(()),Err)
+    }
+    fn delete_check_inode(&self,key:&str,expected:CheckIdentity)->Result<()>{
+        let Some((parent,name))=self.parent(key,false)?else{return Ok(())};
+        let st=match fs::statat(&parent,&name,AtFlags::SYMLINK_NOFOLLOW){
+            Ok(st)=>st,Err(rustix::io::Errno::NOENT)=>return Ok(()),
+            Err(_)=>bail!("storage check cleanup metadata unavailable"),
+        };
+        validate_file(&st,self.uid,true)?;
+        ensure!(CheckIdentity::from_stat(&st)==expected,"storage check cleanup inode changed");
+        match fs::unlinkat(&parent,&name,AtFlags::empty()){
+            Ok(())|Err(rustix::io::Errno::NOENT)=>{},Err(_)=>bail!("storage check deletion failed"),
+        }
+        fs::fsync(&parent).map_err(|_|anyhow!("storage check deletion synchronization failed"))?;Ok(())
+    }
+}
+#[derive(Debug)]
+struct CheckPanic{kind:&'static str,bytes:Option<usize>,digest:Option<[u8;32]>}
+impl CheckPanic{
+    fn from_payload(payload:&(dyn std::any::Any+Send))->Self{
+        use sha2::{Digest,Sha256};
+        let text=payload.downcast_ref::<String>().map(String::as_bytes)
+            .or_else(||payload.downcast_ref::<&'static str>().map(|s|s.as_bytes()));
+        Self{kind:if text.is_some(){"text"}else{"opaque"},bytes:text.map(<[u8]>::len),
+            digest:text.map(|text|Sha256::digest(text).into())}
+    }
+}
+impl std::fmt::Display for CheckPanic{
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{
+        write!(f,"storage check worker panicked ({}, bytes={:?}, sha256={:02x?})",self.kind,self.bytes,self.digest)
+    }
+}
+impl std::error::Error for CheckPanic{}

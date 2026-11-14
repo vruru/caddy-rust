@@ -1855,3 +1855,12 @@ Checked wide intermediates reject results outside signed Unix seconds instead
 of reproducing extreme integer wraparound. The existing Local location display
 name does not yet reproduce every explicit `TZ` name; calendar retention and
 arithmetic acceptance do not establish complete location or time-method support.
+
+File-server status and certificate storage checks
+-------------------------------------------------
+
+File-server content status overrides are described in
+[docs/FILE-SERVER-STATUS.md](docs/FILE-SERVER-STATUS.md), including conditional
+and range responses, informational writer ordering and safe invalid-code errors.
+
+The optional business automatic-certificate read/write probe and `disable_storage_check` behavior are specified in [STORAGE-CHECK.md](STORAGE-CHECK.md). It does not bypass real persistence or enable certificate cleaning.

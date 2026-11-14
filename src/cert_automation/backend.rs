@@ -225,10 +225,10 @@ impl CertificateManager {
                 input_id:Some(format!("input-v2-{id}")),current_backend:None,current_input:None,acme_phase:None,_phase_memory:None,_memory:Some(memory)})
         }).await
     }
-    pub(super) async fn ensure_unified(&self,names:Vec<String>,cancel:CancellationToken,round:retry_operation::AcmeRound<'_>)->Result<ManagedCertificate> {
+    pub(super) async fn ensure_unified(&self,names:Vec<String>,cancel:CancellationToken,round:retry_operation::AcmeRound<'_>,storage_check:&mut storage_check::CheckState)->Result<ManagedCertificate> {
         let lease=self.inner.store.lock(&format!("issue_cert_{}",names[0]),cancel.clone()).await?;
         let initial=async {
-            let (ready,previous)=self.load_state_for_round(&names,&lease,&cancel,round).await?;
+            let (ready,previous)=self.load_state_for_round(&names,&lease,&cancel,round,storage_check).await?;
             if let Some(ready)=ready{return Ok((Some(ready),previous,None,None,None))}
             round.enter();
             let old=self.load_attempt(&names).await?;
@@ -315,7 +315,7 @@ impl CertificateManager {
             let work=cancel.child_token();let lost=lease.lost();
             let result={
             let operation=async {
-                let (ready,replacement)=self.load_state(&names,&lease,&work).await?;
+                let (ready,replacement)=self.load_state(&names,&lease,&work,storage_check).await?;
                 if let Some(ready)=ready{return Ok(ready)}
                 if replacement.is_some(){previous=replacement}
                 let active=self.load_attempt(&names).await?.ok_or_else(||anyhow!("certificate attempt disappeared"))?;

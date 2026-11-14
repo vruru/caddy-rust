@@ -46,7 +46,7 @@ pub(super) struct Context {
     pub original_uri: Uri,
     request_content_length:i64,
     original_method: Method,
-    error_status: Option<StatusCode>,
+    pub(super) error_status: Option<StatusCode>,
     access_start: Option<std::time::Instant>,
     log_fields: Option<Box<log_append::LogFields>>,
     pub values: HashMap<String, String>,
@@ -640,6 +640,9 @@ pub(super) struct RenderedTemplateHead;
 
 #[derive(Clone, Copy)]
 struct StaticInterimStatus(u16);
+#[derive(Clone, Copy)]
+pub(super) struct FileInterimStatus(pub(super) StatusCode);
+
 pub(super) fn descriptor_exhausted(error: &std::io::Error) -> bool {
     #[cfg(unix)]
     {
@@ -1296,6 +1299,7 @@ fn handlers<'a>(
                     }
                 }
                 Handler::FileServer {
+                    status,
                     root,
                     hide,
                     index_names,
@@ -1307,6 +1311,7 @@ fn handlers<'a>(
                     ctx,
                     inner,
                     server,
+                    status,
                     root.as_deref(),
                     hide,
                     index_names,
@@ -1316,7 +1321,9 @@ fn handlers<'a>(
                 )
                 .await?
                 {
-                    Some(response) => return Ok(Flow::Response(response)),
+                    Some(mut response) => return Ok(if response.extensions_mut().remove::<super::files::FileResponseImplicit>().is_some() {
+                        Flow::ImplicitResponse(response)
+                    } else { Flow::Response(response) }),
                     None if *pass_thru => {}
                     None => return Err(failure(StatusCode::NOT_FOUND)),
                 },
@@ -1735,6 +1742,21 @@ pub(super) fn accepts_informational(ctx: &Context) -> bool {
     }
 }
 
+// File serving and net/http share a writer header map across interim heads.
+// Proxy forwarding intentionally uses a snapshot instead.
+pub(super) async fn file_informational(
+    ctx: &mut Context,
+    status: StatusCode,
+    response: &mut Response<Body>,
+) -> Result<()> {
+    let mut fields = take_writer_headers(response, ctx);
+    apply_deferred_headers(&mut fields, status, ctx).await?;
+    write_informational(ctx, status, fields.clone()).await?;
+    *response.headers_mut() = fields;
+    response.extensions_mut().insert(FileInterimStatus(status));
+    Ok(())
+}
+
 pub(super) async fn forward_informational(
     ctx: &mut Context,
     status: StatusCode,
@@ -2027,30 +2049,54 @@ fn finalize_transforms<'a>(
             .extensions()
             .get::<StaticInterimStatus>()
             .map(|code| code.0);
+        let mut file_interim = response.extensions().get::<FileInterimStatus>().map(|code| code.0);
+        let mut file_write = explicit;
         let mut body = std::mem::replace(response.body_mut(), full(Bytes::new()));
         let deferred = if start == 0 {
             std::mem::take(&mut ctx.deferred)
         } else {
             ctx.deferred.split_off(start)
         };
-        for entry in deferred.iter().rev() {
+        for (index, entry) in deferred.iter().enumerate().rev() {
             match entry {
                 DeferredResponse::Push(push)=>{
                     if headers.contains_key(http::header::LINK)&&push_links_unseen(ctx){
                         mark_push_links(ctx);push.links(headers,&ctx.authority).await;
                     }
                 }
-                DeferredResponse::Headers(ops) if explicit => {
+                DeferredResponse::Headers(ops) if explicit || (file_interim.is_some() && file_write) => {
                     apply_response_headers(headers, status.as_u16(), ops, ctx).await?;
+                    // This writer's body Write first calls WriteHeader(200),
+                    // replacing an outer encoder's stored informational code.
+                    if file_interim.is_some() { file_interim = Some(status); }
                 }
                 DeferredResponse::Headers(_) => {}
-                DeferredResponse::Encode(encoding) if explicit => {
+                DeferredResponse::Encode(encoding) if explicit || file_interim.is_some() => {
                     // Async codecs are not a prepared in-memory entity. A
                     // discarded representation must not start extra work.
                     response.extensions_mut().remove::<crate::metrics::discarded::PreparedEntity>();
+                    let was_encoded = headers.get(http::header::CONTENT_ENCODING).is_some_and(|value| !value.is_empty());
                     body = encoding
-                        .finish_observed(status, interim, headers, body, &ctx.resources.compression,observed_head)
+                        .finish_observed(status, file_interim.filter(|code| code.is_informational()).map(|code| code.as_u16()).or(interim), headers, body, &ctx.resources.compression,observed_head)
                         .await;
+                    if let Some(code) = file_interim.filter(|code| code.is_informational()) {
+                        // Go's encoder forwards the stored code again at its
+                        // first Write or Close. Only outer writers observe it.
+                        for outer in deferred[..index].iter().rev() {
+                            if let DeferredResponse::Headers(ops) = outer {
+                                apply_response_headers(headers, code.as_u16(), ops, ctx).await?;
+                            }
+                        }
+                        write_informational(ctx, code, headers.clone()).await?;
+                    }
+                    // A newly initialized encoder writes its footer at Close,
+                    // even when the underlying HEAD writer discards the bytes.
+                    // Outer header writers still observe that body Write.
+                    if file_interim.is_some() && !was_encoded
+                        && headers.get(http::header::CONTENT_ENCODING).is_some_and(|value| !value.is_empty())
+                    {
+                        file_write = true;
+                    }
                 }
                 DeferredResponse::Encode(_) => {}
                 DeferredResponse::LogBody(index) => {

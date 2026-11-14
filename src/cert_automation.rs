@@ -11,6 +11,7 @@ mod acme_candidate;
 mod acme_probe;
 mod acme_journal;
 mod test_ca_driver;
+mod storage_check;
 pub(crate) mod retry_operation;
 pub(crate) mod test_ca;
 mod internal;
@@ -253,6 +254,7 @@ struct ManagerInner {
     chain_cleanup:Arc<crate::acme_wire::ChainCleanup>,
     must_staple: bool,
     reuse_private_keys: bool,
+    disable_storage_check: bool,
     lifecycle_events: Option<Arc<crate::events::EventsApp>>,
     store: FsStore,
     registry: ChallengeRegistry,
@@ -712,8 +714,8 @@ impl CertificateManager {
         let inner=Arc::get_mut(&mut self.inner).ok_or_else(||anyhow!("certificate manager is already shared"))?;
         inner.chain_cleanup=Arc::new(crate::acme_wire::ChainCleanup::with_parent(parent));Ok(self)
     }
-    /// After cancelling/joining callers, wait for graph cleanup transferred by
-    /// dropped ensure futures. This does not cancel independent issuance work.
+    /// After cancelling/joining callers, wait for graph cleanup and actual
+    /// storage workers transferred by dropped ensure futures. This does not cancel independent issuance work.
     pub async fn drain_chain_cleanup(&self){self.inner.chain_cleanup.drain().await;}
     async fn net_permit<'a>(
         &'a self,
@@ -909,6 +911,7 @@ impl CertificateManager {
                 chain_cleanup:Arc::new(crate::acme_wire::ChainCleanup::default()),
                 must_staple:false,
                 reuse_private_keys:false,
+                disable_storage_check:false,
                 lifecycle_events: None,
                 #[cfg(feature="native-run")]
                 outgoing_tls:None,
@@ -1284,7 +1287,8 @@ impl CertificateManager {
         // Only per-name queueing is outside the execution deadline. Network
         // queues are issuer-scoped first, so a busy issuer cannot occupy the
         // global budget while its requests merely wait for that issuer.
-        let operation = self.ensure_active(names,cancel.clone(),round);
+        let mut storage_check=if self.inner.disable_storage_check{storage_check::CheckState::Disabled}else{storage_check::CheckState::Needed};
+        let operation = self.ensure_active(names,cancel.clone(),round,&mut storage_check);
         tokio::pin!(operation);
         tokio::select! {
             result=&mut operation=>result,
@@ -1298,8 +1302,9 @@ impl CertificateManager {
         names: Vec<String>,
         cancel: CancellationToken,
         round:retry_operation::AcmeRound<'_>,
+        storage_check:&mut storage_check::CheckState,
     ) -> Result<ManagedCertificate> {
-        if self.inner.unified_key.is_some(){return self.ensure_unified(names,cancel,round).await;}
+        if self.inner.unified_key.is_some(){return self.ensure_unified(names,cancel,round,storage_check).await;}
         let lease = self
             .inner
             .store
@@ -1308,7 +1313,7 @@ impl CertificateManager {
         let initial = async {
             // Recover a previously completed local leg before deciding that any
             // network request is necessary. Keep registration/domain lock order.
-            let (ready, previous) = self.load_state_for_round(&names,&lease,&cancel,round).await?;
+            let (ready, previous) = self.load_state_for_round(&names,&lease,&cancel,round,storage_check).await?;
             if ready.is_some() {
                 return Ok((ready, previous, None, None, None));
             }
@@ -1442,7 +1447,7 @@ impl CertificateManager {
             let result = {
                 let lost = lease.lost();
                 let operation = async {
-                    let (ready, replaces) = self.load_state(&names, &lease, &leg_cancel).await?;
+                    let (ready, replaces) = self.load_state(&names, &lease, &leg_cancel,storage_check).await?;
                     if let Some(ready) = ready {
                         return Ok(ready);
                     }
@@ -1577,12 +1582,16 @@ impl CertificateManager {
         names: &[String],
         lease: &StorageLease,
         cancel: &CancellationToken,
+        storage_check:&mut storage_check::CheckState,
     ) -> Result<(Option<ManagedCertificate>, Option<Replacement>)> {
-        self.load_state_for_round(names,lease,cancel,retry_operation::AcmeRound::default()).await
+        self.load_state_for_round(names,lease,cancel,retry_operation::AcmeRound::default(),storage_check).await
     }
-    async fn load_state_for_round(&self,names:&[String],lease:&StorageLease,cancel:&CancellationToken,round:retry_operation::AcmeRound<'_>)->Result<(Option<ManagedCertificate>,Option<Replacement>)>{
+    async fn load_state_for_round(&self,names:&[String],lease:&StorageLease,cancel:&CancellationToken,round:retry_operation::AcmeRound<'_>,storage_check:&mut storage_check::CheckState)->Result<(Option<ManagedCertificate>,Option<Replacement>)>{
         if self.inner.unified_key.is_some() {
             if let Some(state)=self.load_attempt(names).await? {
+                // Recovery of an unfinished leg can save/claim before the
+                // ordinary cache decision. Probe before that mutation too.
+                if !state.retired&&state.winner.is_none(){self.check_storage_once(storage_check,cancel).await?;}
                 if !state.retired&&state.winner.is_none()&&(state.current_job_id.is_some()||state.acme_phase.is_some()){round.enter();}
                 if state.unified() {
                     if !state.retired && let Err(error)=self.recover_unified(names,&state,lease,cancel).await {
@@ -1604,10 +1613,16 @@ impl CertificateManager {
                     }
                 }
             }
-            return self.load_existing(names,Some(lease),cancel,LoadMode::Online).await
-                .map(|(ready,previous,_)|(ready,previous));
+            let (ready,previous,_)=self.load_existing(names,Some(lease),cancel,LoadMode::Online).await?;
+            if ready.is_none(){self.check_storage_once(storage_check,cancel).await?;}
+            return Ok((ready,previous));
         }
         let legacy=self.load_attempt(names).await?;
+        // Outside the legacy best-effort recovery catch: a local probe failure
+        // must never be swallowed or reclassified as an unavailable issuer.
+        if legacy.as_ref().is_some_and(|state|!state.retired&&state.winner.is_none()){
+            self.check_storage_once(storage_check,cancel).await?;
+        }
         if legacy.as_ref().is_some_and(|attempt|!attempt.retired&&attempt.winner.is_none()&&attempt.current_job_id.is_some()){round.enter();}
         if let Some(attempt) = legacy
             && let Some(job_id) = attempt.current_job_id.as_ref()
@@ -1628,9 +1643,9 @@ impl CertificateManager {
                 recovery_issue: None,
             });
         }
-        self.load_existing(names, Some(lease), cancel, LoadMode::Online)
-            .await
-            .map(|(ready, previous, _)| (ready, previous))
+        let (ready,previous,_)=self.load_existing(names,Some(lease),cancel,LoadMode::Online).await?;
+        if ready.is_none(){self.check_storage_once(storage_check,cancel).await?;}
+        Ok((ready,previous))
     }
     async fn read_reservation(
         &self,

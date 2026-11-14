@@ -38,7 +38,23 @@ impl Default for Cleanup{fn default()->Self{Self{local:TaskTracker::new(),parent
 impl Cleanup{
     pub(crate) fn with_parent(parent:TaskTracker)->Self{Self{local:TaskTracker::new(),parent:Some(parent)}}
     pub(crate) async fn drain(&self){self.local.close();self.local.wait().await;}
-    fn registration(&self)->Registration{Registration{_local:self.local.token(),_parent:self.parent.as_ref().map(TaskTracker::token)}}
+    fn registration(&self)->Registration{let(local,parent)=self.storage_registration();Registration{_local:local,_parent:parent}}
+    /// Concrete tokens follow actual storage IO, including a caller that is dropped.
+    pub(crate) fn storage_registration(&self)->(TaskTrackerToken,Option<TaskTrackerToken>){
+        (self.local.token(),self.parent.as_ref().map(TaskTracker::token))
+    }
+    /// Adopt exactly one already admitted worker; do not release its real join
+    /// merely because the async waiter was aborted. Existing parent retirement
+    /// waits for the same reaper, independently of the worker's own tokens.
+    pub(crate) fn adopt_storage_worker(&self,worker:tokio::task::JoinHandle<Result<()>>,memory:Arc<super::chain_memory::Scratch>,runtime:&Handle){
+        // Consuming the whole concrete envelope prevents disjoint closure
+        // capture from discarding credit before the actual join/result drop.
+        let future=StorageJoinReaper{worker,_memory:memory}.join();
+        match &self.parent{
+            Some(parent)=>{self.local.spawn_on(parent.track_future(future),runtime);}
+            None=>{self.local.spawn_on(future,runtime);}
+        }
+    }
     fn spawn_reaper(&self,mut tasks:JoinSet<()>,runtime:&Handle){
         if tasks.is_empty(){return}
         let future=async move{while let Some(result)=tasks.join_next().await{drop(result);}};
@@ -52,6 +68,11 @@ impl Cleanup{
 // This field is last in Owner: Drop registers any reaper before these tokens
 // can release the last count observed by close()+wait().
 struct Registration{_local:TaskTrackerToken,_parent:Option<TaskTrackerToken>}
+struct StorageJoinReaper{worker:tokio::task::JoinHandle<Result<()>>,_memory:Arc<super::chain_memory::Scratch>}
+impl StorageJoinReaper{
+    async fn join(self){drop(self.worker.await);}
+}
+
 struct JoinGuard{tasks:Option<JoinSet<()>>,cancel:CancellationToken,cleanup:Arc<Cleanup>,runtime:Handle}
 impl JoinGuard{
     async fn join_all(mut self){

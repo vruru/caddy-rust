@@ -130,6 +130,7 @@ pub(crate) enum Handler {
         cache: Option<std::sync::Arc<crate::http_runtime::auth_cache::AuthCache>>,
     },
     FileServer {
+        status: String,
         root: Option<String>,
         hide: Vec<String>,
         index_names: Vec<String>,

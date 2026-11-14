@@ -1309,6 +1309,7 @@ fn parse_handler(
                 m,
                 &[
                     "handler",
+                    "status_code",
                     "root",
                     "hide",
                     "index_names",
@@ -1322,6 +1323,7 @@ fn parse_handler(
                 path,
             )?;
             Handler::FileServer {
+                status: m.get("status_code").map(crate::module_json::weak_string).transpose()?.unwrap_or_default(),
                 root: m.get("root").map(|v| string(v, path)).transpose()?,
                 hide: m
                     .get("hide")

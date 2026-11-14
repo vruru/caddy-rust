@@ -50,6 +50,7 @@ struct ManagerBuildInput {
     key_type:crate::acme_wire::KeyType,
     must_staple:bool,
     reuse_private_keys:bool,
+    disable_storage_check:bool,
     tasks:TaskTracker,
     #[cfg(feature="native-run")]
     scope:Option<Arc<crate::outgoing_tls::Scope>>,
@@ -98,7 +99,8 @@ impl ManagerBuildInput {
             .with_issuer_solvers(self.solvers)?.with_events(self.events)?;
         #[cfg(feature="native-run")]
         let manager=manager.with_client_tls_scope(self.scope)?;
-        manager.with_csr_options(self.must_staple,self.reuse_private_keys)?.with_chain_tasks(self.tasks)?.storage_only()
+        manager.with_storage_check_disabled(self.disable_storage_check)?
+            .with_csr_options(self.must_staple,self.reuse_private_keys)?.with_chain_tasks(self.tasks)?.storage_only()
     }
 }
 
@@ -514,7 +516,10 @@ impl CertificateServices {
             solvers:solver.as_ref().map(|b|b.callbacks()).transpose()?.unwrap_or_default(),
             test_solvers:solver.as_ref().map(|b|b.test_callbacks()).transpose()?.unwrap_or_default(),test_directories,
             events:(!identity).then(||self.context.events.clone()).flatten(),key_type:policy.key_type,
-            must_staple:policy.must_staple,reuse_private_keys:policy.reuse_private_keys,tasks:group_tasks.clone(),
+            must_staple:policy.must_staple,reuse_private_keys:policy.reuse_private_keys,
+            // The application switch governs business automation. Admin's
+            // independently managed identity keeps its default probe enabled.
+            disable_storage_check:!identity&&self.plan.disable_storage_check,tasks:group_tasks.clone(),
             #[cfg(feature="native-run")] scope:self.outgoing_tls.clone(),owner};
         // Hashing full root sets, typed identity and cooldown construction all
         // execute here, never after an async shell returns to the reactor.

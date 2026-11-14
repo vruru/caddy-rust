@@ -14,6 +14,7 @@ pub(super) async fn serve(
     ctx: &mut Context,
     inner: &Arc<super::Inner>,
     server: &Arc<super::ActiveServer>,
+    configured_status: &str,
     root: Option<&str>,
     hide: &[String],
     indices: &[String],
@@ -232,6 +233,21 @@ pub(super) async fn serve(
         }
         inferred
     };
+    // Match Caddy's writer installation point: earlier missing, browse,
+    // canonical redirect, open and method branches never evaluate this value.
+    let override_status = match content_status(ctx, configured_status).await {
+        Ok(status) => status,
+        Err(error) => {
+            // Caddy installs these before parsing the configured status;
+            // Last-Modified belongs to ServeContent, which has not run yet.
+            for name in [http::header::ETAG, http::header::CONTENT_TYPE] {
+                if let Some(value) = common.get(&name) {
+                    ctx.immediate.insert(name, value.clone());
+                }
+            }
+            return Err(error);
+        }
+    };
     if let Some(status) = super::file_preconditions::evaluate(
         ctx.req().headers(),
         ctx.req().method(),
@@ -255,7 +271,7 @@ pub(super) async fn serve(
                 r.headers_mut().remove(http::header::LAST_MODIFIED);
             }
         }
-        return Ok(Some(r));
+        return content_response(ctx, override_status, r, false).await;
     }
     let mut ranges = None;
     let mut range_selected = false;
@@ -311,7 +327,7 @@ pub(super) async fn serve(
                             HeaderValue::from_str(&format!("bytes */{size}"))?,
                         );
                     }
-                    return Ok(Some(r));
+                    return content_response(ctx, override_status, r, true).await;
                 }
             }
         }
@@ -328,17 +344,12 @@ pub(super) async fn serve(
         }
     });
     let partial = range_selected;
-    let error_status = ctx
-        .values
-        .get("http.error.status_code")
-        .and_then(|s| s.parse::<u16>().ok())
-        .and_then(|s| StatusCode::from_u16(s).ok());
     if ranges.is_empty() {
-        let mut r = simple(error_status.unwrap_or(StatusCode::OK), Bytes::new());
+        let mut r = simple(StatusCode::OK, Bytes::new());
         *r.headers_mut() = common;
         r.headers_mut()
             .insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
-        return Ok(Some(r));
+        return content_response(ctx, override_status, r, false).await;
     }
     let multipart = ranges.len() > 1;
     let boundary = if multipart {
@@ -367,11 +378,11 @@ pub(super) async fn serve(
     } else {
         ranges[0].end() - ranges[0].start() + 1
     };
-    let status = error_status.unwrap_or(if partial || multipart {
+    let status = if partial || multipart {
         StatusCode::PARTIAL_CONTENT
     } else {
         StatusCode::OK
-    });
+    };
     if multipart {
         ctx.immediate.remove(http::header::CONTENT_TYPE);
         common.insert(
@@ -396,7 +407,7 @@ pub(super) async fn serve(
     if ctx.req().method() == Method::HEAD {
         let mut r = simple(status, Bytes::new());
         *r.headers_mut() = common;
-        return Ok(Some(r));
+        return content_response(ctx, override_status, r, false).await;
     }
     let initial = if multipart {
         Mode::Header
@@ -490,8 +501,103 @@ pub(super) async fn serve(
     let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.headers_mut() = common;
-    Ok(Some(response))
+    content_response(ctx, override_status, response, true).await
 }
+
+// Go emits the final 200 only from net/http after this handler returns when
+// ServeContent made no body Write after an informational WriteHeader.
+#[derive(Clone, Copy)]
+pub(super) struct FileResponseImplicit;
+
+fn content_status<'a>(
+    ctx: &'a Context,
+    configured: &'a str,
+) -> impl std::future::Future<Output = Result<Option<StatusCode>>> + Send + 'a {
+    use futures_util::future::{Either, ready};
+    if configured.is_empty() {
+        return Either::Left(ready(Ok(ctx.error_status)));
+    }
+    if configured.len() <= 32
+        && !configured.as_bytes().iter().any(|byte| matches!(byte, b'{' | b'}'))
+    {
+        return Either::Left(ready(parse_content_status(configured)));
+    }
+    Either::Right(expanded_content_status(ctx, configured))
+}
+
+#[cold]
+fn expanded_content_status<'a>(
+    ctx: &'a Context,
+    configured: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<StatusCode>>> + Send + 'a>> {
+    // Construct the existing Send lookup-view future before boxing; Context
+    // itself contains a request Body and is intentionally not Sync.
+    let expanded = ctx.expand_text_resolved(configured, true);
+    Box::pin(async move {
+        let expanded = expanded.await?;
+        parse_content_status(&expanded)
+    })
+}
+
+fn parse_content_status(expanded: &str) -> Result<Option<StatusCode>> {
+    // Native-width signed decimal parsing has strconv.Atoi's sign, ASCII,
+    // overflow and whitespace rules. Empty expanded text is a syntax error.
+    let code = expanded.parse::<isize>()
+        .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR))?;
+    if code <= 0 {
+        return Ok(None);
+    }
+    // Go panics on an out-of-range positive WriteHeader code. Fail this
+    // request safely, preserving service for other connections.
+    u16::try_from(code).ok().and_then(|code| StatusCode::from_u16(code).ok())
+        .map(Some).ok_or_else(|| failure(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+fn content_response<'a>(
+    ctx: &'a mut Context,
+    override_status: Option<StatusCode>,
+    mut response: Response<Body>,
+    body_written: bool,
+) -> impl std::future::Future<Output = Result<Option<Response<Body>>>> + Send + 'a {
+    use futures_util::future::{Either, ready};
+    let Some(status) = override_status else {
+        return Either::Left(ready(Ok(Some(response))));
+    };
+    if status == StatusCode::SWITCHING_PROTOCOLS && ctx.req().version() != http::Version::HTTP_11 {
+        return Either::Left(ready(Err(failure(StatusCode::INTERNAL_SERVER_ERROR))));
+    }
+    if status.is_informational() && status != StatusCode::SWITCHING_PROTOCOLS {
+        return Either::Right(informational_content_response(ctx, status, response, body_written));
+    }
+    *response.status_mut() = status;
+    if status == StatusCode::NOT_MODIFIED {
+        // net/http suppresses Content-Type for a final 304 even if
+        // ServeContent itself selected a normal body representation.
+        ctx.immediate.remove(http::header::CONTENT_TYPE);
+        response.headers_mut().remove(http::header::CONTENT_TYPE);
+    }
+    Either::Left(ready(Ok(Some(response))))
+}
+
+// Keep the rare interim writer's HeaderMap/deferred suspension state out of
+// the ordinary file response future, as for static_informational.
+#[cold]
+fn informational_content_response<'a>(
+    ctx: &'a mut Context,
+    status: StatusCode,
+    mut response: Response<Body>,
+    body_written: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Response<Body>>>> + Send + 'a>> {
+    Box::pin(async move {
+        super::request::file_informational(ctx, status, &mut response).await?;
+        *response.status_mut() = StatusCode::OK;
+        if !body_written {
+            response.extensions_mut().insert(FileResponseImplicit);
+        }
+        Ok(Some(response))
+    })
+}
+
 enum Mode {
     Header,
     Body(u64),
