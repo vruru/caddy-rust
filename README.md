@@ -1,6 +1,6 @@
 # Caddy-Rust
 
-`vruru/caddy-rust` is an independent, native Rust implementation whose behavioral baseline is Caddy 2.11.7 and CertMagic 0.25.6. It is licensed under Apache 2.0. The project is currently in active development. It has not undergone full feature acceptance testing nor is it validated as a production-ready replacement. Application control and network I/O run natively in Rust and invoke no Go processes. Cryptography and explicit TLS compatibility use the pinned providers documented below.
+`vruru/caddy-rust` is an independent, native Rust implementation whose behavioral baseline is Caddy 2.11.7 and CertMagic 0.25.6. It is licensed under Apache 2.0. The fixed standard capability suite has completed combined acceptance, followed by a guarded Linux deployment. The project remains in active development; this establishes the tested contracts, not universal compatibility with every plugin, field combination or platform. Application control and network I/O run natively in Rust and invoke no Go processes. Cryptography and explicit TLS compatibility use the pinned providers documented below.
 
 ## Current Status
 
@@ -24,7 +24,7 @@ The project currently covers a specific subset of functionalities:
 *   **Compatibility**: Correct useful extensions remain supported even where the baseline rejects them. Resource bounds and repairs to upstream bugs are documented differences; accepting a configuration alone does not establish correct execution.
 
 **Known Gaps**:
-The known finite standard capability gaps have native runtime consumers. Final combined feature/performance/production acceptance, remaining edge-case verification, optional provider bindings and unverified platforms are tracked in `docs/COMPATIBILITY-STATUS.md`. Targeted feature checks do not establish complete replacement readiness.
+The known finite standard capability gaps have native runtime consumers. The completed combined acceptance, deployment boundaries, remaining edge-case verification, optional provider bindings and unverified platforms are tracked in `docs/COMPATIBILITY-STATUS.md`. A passing deployment does not remove the need to validate another site's configuration and traffic.
 
 ## Build
 

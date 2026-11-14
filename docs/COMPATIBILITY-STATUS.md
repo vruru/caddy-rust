@@ -1,10 +1,37 @@
 # Compatibility status and release boundaries
 
 The behavioral baseline is Caddy 2.11.7 and CertMagic 0.25.6. This is an
-independent native Rust implementation, **not yet a production-ready complete
-replacement**. See the README for implemented feature families and
+independent native Rust implementation with combined acceptance of the fixed
+standard capability suite and a guarded Linux deployment. This is **not a
+blanket all-platform or arbitrary-plugin compatibility claim**. See the README for implemented feature families and
 COMPATIBILITY.md for their detailed contracts. A feature accepting syntax,
 a component passing, and the complete executable passing are distinct states.
+
+## Combined acceptance, 2026-11-15
+
+The release executables were built from the same frozen functional source
+`352ca2b`, lockfile and official stable Rust 1.100.0 toolchain. The combined
+checks covered the enumerated feature gaps together with proxy/template/CEL,
+certificate issue and recovery, incoming/outgoing trust, ticket rotation,
+listener/ECH, metrics/tracing, server/route deadlines, CLI and real trust tools.
+Failed test setup attempts remain separate from the corrected results; a
+different executable's historical success is not counted for this release.
+
+macOS and Linux ARM checks included applicable full-CPU and single-CPU profiles.
+The local Linux x86 protocol matrix used emulation; native x86 Linux separately
+verified certificate compensation, concurrent transfers, offset recovery,
+large Range positions and reload during active transfers. Throughput, CPU,
+latency and memory were recorded separately: Rust was not faster than the
+reference in every profile. These workloads do not establish universal
+capacity or full TUS conformance.
+
+One Linux installation then passed a guarded live trial, with executable
+identity verification, browser cold/warm loads and business-page checks,
+configuration reload retaining a real HTTPS connection, private loopback
+administration, and actual bounded log rotation. The original executable and
+configuration remain available for manual rollback. Initial process replacement
+is distinct from retaining connections across an in-process reload. Further
+deployments still require their own authorization and site acceptance.
 
 ## Cross-cutting remediation
 
@@ -15,8 +42,8 @@ These are different from capabilities which have not yet been implemented.
 
 The following grouped remediation passed its targeted normal-program and
 component acceptance on macOS and Linux, including all-CPU and single-CPU Linux
-business regressions. This closes the workflows described here; it does not
-complete the full release gates or the missing capabilities listed below:
+business regressions. These workflows were also included in the combined
+release acceptance above; they do not remove the remaining boundaries below:
 
 - Retain accepted business incoming/outgoing trust and static client identity;
   reconstruct new-generation clients without reopening the accepted sources.
@@ -36,13 +63,13 @@ must not start that installation.
 ## Capability and verification boundaries
 
 The enumerated standard feature gaps now have typed plans and actual native
-runtime consumers. The final combined candidate still needs the release gates
-below. Unsupported extension inputs remain explicit errors; accepting or
+runtime consumers. The frozen candidate completed the applicable combined
+release gates below. Unsupported extension inputs remain explicit errors; accepting or
 ignoring a field is not evidence of compatibility.
 
 | Area | Missing fields or legal branches |
 | --- | --- |
-| Edge-case verification | Template receivers and certificate paths require the combined regression; private Go reflection/layout equivalence is not promised |
+| Edge-case verification | Fixed template and certificate contracts passed combined regression; unenumerated combinations and private Go reflection/layout equivalence are not promised |
 | Optional providers | DNS publication/validation and non-default filesystem backends require actual provider implementations; the inspected standard inventory contains none of those plugins |
 | Platforms | Windows CLI/service/native trust and other unverified OS branches; macOS/Linux verification does not establish all-platform readiness |
 
