@@ -1876,3 +1876,17 @@ existing queue without permanently disabling future signing. Scope, cancellation
 retained-result and standalone-constructor boundaries are documented in
 [`docs/ACME-SIGNING.md`](docs/ACME-SIGNING.md). These changes do not complete
 whole-operation issuer fallback, all trust loaders or final production acceptance.
+
+
+Readonly template time wire formats
+-----------------------------------
+
+`time.Time.MarshalJSON` returns a typed `[]uint8` containing quoted RFC3339Nano,
+with method-specific errors for years or zone hours outside that format.
+`MarshalBinary` and `GobEncode` return Go's stable big-endian time encoding:
+seconds since year 1, nanoseconds, signed offset minutes, and the version 2 tail
+for second-resolution offsets. UTC's marker remains distinct from a local zero
+offset. Reserved or out-of-range binary offsets fail explicitly. Monotonic state
+is omitted. Native macOS and Linux all-CPU/single-CPU results match the pinned
+Go oracle across valid outputs and error cases. Mutable decoding, append
+receivers and remaining location semantics are separate compatibility work.

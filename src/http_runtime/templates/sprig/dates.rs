@@ -139,6 +139,9 @@ static TIME_TYPE: gotmpl::HostType = gotmpl::HostType {
     methods: &[
         gotmpl::HostMethod { name: "String", invoke: |o, a| time_call("String", o, a), signature: None },
         gotmpl::HostMethod { name: "MarshalText", invoke: |o, a| time_call("MarshalText", o, a), signature: None },
+        gotmpl::HostMethod { name: "MarshalJSON", invoke: |o, a| time_call("MarshalJSON", o, a), signature: None },
+        gotmpl::HostMethod { name: "MarshalBinary", invoke: |o, a| time_call("MarshalBinary", o, a), signature: None },
+        gotmpl::HostMethod { name: "GobEncode", invoke: |o, a| time_call("GobEncode", o, a), signature: None },
         gotmpl::HostMethod { name: "Unix", invoke: |o, a| time_call("Unix", o, a), signature: None },
         gotmpl::HostMethod { name: "UnixMilli", invoke: |o, a| time_call("UnixMilli", o, a), signature: None },
         gotmpl::HostMethod { name: "UnixMicro", invoke: |o, a| time_call("UnixMicro", o, a), signature: None },
@@ -253,15 +256,15 @@ fn time_call(name: &str, object: &gotmpl::Object, a: &[V]) -> R {
             arity(a, 0, 0)?;
             match name {
                 "String" => output(display.to_owned()),
-                "MarshalText" => {
+                "MarshalText" | "MarshalJSON" => {
                     let (offset, zone) = zone_info(&time.zone, time.stamp.seconds);
                     let components = time_components::at(time.stamp, offset, zone)
                         .map_err(|e| err(e.to_string()))?;
                     if !(0..=9999).contains(&components.year) {
-                        return Err(err("Time.MarshalText: year outside of range [0,9999]"));
+                        return Err(err(format!("Time.{name}: year outside of range [0,9999]")));
                     }
                     if !(-86_399..=86_399).contains(&offset) {
-                        return Err(err("Time.MarshalText: timezone hour outside of range [0,23]"));
+                        return Err(err(format!("Time.{name}: timezone hour outside of range [0,23]")));
                     }
                     // A validated RFC3339Nano value has at most 35 bytes. Keep
                     // Go's []uint8 result rather than a string or JSON quotes.
@@ -269,7 +272,33 @@ fn time_call(name: &str, object: &gotmpl::Object, a: &[V]) -> R {
                     if text.len() > 35 {
                         return Err(err("time text exceeds RFC3339 capacity"));
                     }
-                    Ok(V::Slice(gotmpl::TypedSlice::bytes(Some(Arc::from(text.into_bytes())))))
+                    let bytes = if name == "MarshalJSON" {
+                        let mut bytes = Vec::with_capacity(text.len() + 2);
+                        bytes.push(b'"'); bytes.extend_from_slice(text.as_bytes()); bytes.push(b'"');
+                        bytes
+                    } else { text.into_bytes() };
+                    Ok(V::Slice(gotmpl::TypedSlice::bytes(Some(Arc::from(bytes)))))
+                },
+                "MarshalBinary" | "GobEncode" => {
+                    // Go Time's stable binary format uses seconds since year 1,
+                    // big-endian nanoseconds, and signed offset minutes. UTC
+                    // has a distinct -1 marker; seconds need the version 2 tail.
+                    let offset = zone_info(&time.zone, time.stamp.seconds).0;
+                    let minutes = if matches!(time.zone, Zone::Utc) { -1 } else {
+                        let minutes = offset / 60;
+                        if !(-32768..=32767).contains(&minutes) || minutes == -1 {
+                            return Err(err("Time.MarshalBinary: unexpected zone offset"));
+                        }
+                        minutes
+                    };
+                    let remainder = if matches!(time.zone, Zone::Utc) { 0 } else { offset % 60 };
+                    let mut bytes = Vec::with_capacity(16);
+                    bytes.push(if remainder == 0 { 1 } else { 2 });
+                    bytes.extend_from_slice(&time.stamp.seconds.wrapping_add(62_135_596_800).to_be_bytes());
+                    bytes.extend_from_slice(&time.stamp.nanosecond.to_be_bytes());
+                    bytes.extend_from_slice(&(minutes as i16).to_be_bytes());
+                    if remainder != 0 { bytes.push(remainder as i8 as u8); }
+                    Ok(V::Slice(gotmpl::TypedSlice::bytes(Some(Arc::from(bytes)))))
                 },
                 "Unix" => Ok(V::Int64(time.stamp.seconds)),
                 "UnixNano" => Ok(V::Int64(time_components::unix_nano(time.stamp))),
