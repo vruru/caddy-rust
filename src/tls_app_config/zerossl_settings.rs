@@ -57,7 +57,10 @@ impl Input {
   ensure!(raw.len()<=FIELD&&host.len()<=FIELD,"ZeroSSL configured field exceeds limit");
   let validity=object.integer("validity_days")?.unwrap_or(0);let port=object.integer("alternate_http_port")?.unwrap_or(0);
   let cname=Object::new(object.value("cname_validation"),ObjectKind::DnsChallenge,&object.at("cname_validation"))?;
-  if object.value("cname_validation").is_some(){return Err(UnsupportedCnameProvider.into())}
+  // Go provisions DNS only for a present RawMessage provider. Explicit
+  // provider:null is still present and must not silently select HTTP.
+  let cname_configured=cname.raw_value("provider").is_some();
+  if cname_configured{return Err(UnsupportedCnameProvider.into())}
   let ttl=cname.duration_ns("ttl")?;let delay=cname.duration_ns("propagation_delay")?;let timeout=cname.duration_ns("propagation_timeout")?;
   let over=cname.string("override_domain")?;ensure!(over.len()<=FIELD,"ZeroSSL configured field exceeds limit");
   let array=cname.array("resolvers")?;ensure!(array.len()<=1024,"ZeroSSL resolver count exceeds limit");
@@ -75,7 +78,7 @@ impl Input {
   }
   let mut hash=HashWrite(Sha256::new());serde_json::to_writer(&mut hash,value)?;let id=hash.0.finalize().into();
   Ok(Arc::new(Self{id,raw:Zeroizing::new(copy_text(raw)?),settings:HttpSettings{listen_host:copy_text(host)?,validity_days:validity,alternate_http_port:port,
-   cname_configured:object.value("cname_validation").is_some(),ttl,propagation_delay:delay,propagation_timeout:timeout,resolvers,override_domain:copy_text(over)?},
+   cname_configured,ttl,propagation_delay:delay,propagation_timeout:timeout,resolvers,override_domain:copy_text(over)?},
    pool,ready:OnceCell::new(),_memory:memory}))
  }
  pub(crate) fn listen_host(&self)->&str{&self.settings.listen_host}

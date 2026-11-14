@@ -101,7 +101,9 @@ shared CSR/key, persistent create intent, known-ID recovery, HTTP proof,
 validation/download and publication CAS. An uncertain create is not replayed.
 Only demonstrably uncreated or closed ZeroSSL attempts permit a corrected
 credential configuration to replace the old attempt. Shared proof readers select
-the first matching accepted policy and stop with their generation.
+the first matching accepted policy and stop with their generation. Providerless
+CNAME-validation metadata retains the HTTP validation path; an explicit provider
+RawMessage remains a rejected extension dependency, including provider:null.
 
 Revocation binds to the stored backend and exact leaf rather than current issuer
 order. Authenticated API confirmations are stored only in instance-private state;
@@ -114,8 +116,10 @@ previous working leaf.
 
 Template multipart Read/ReadAt mutate the existing typed-byte COW view. Request
 Body Read/Close and form parsing share the actual asynchronous body owner and
-consumption position; ordinary Read does not collect an entire slow upload. The
-bridge has capacity one and uses the existing template work/memory budget. Close
+consumption position; ordinary Read does not collect an entire slow upload. Unread DATA prefixes remain owned by the actual request Body through nested
+renders, template failures and cancellation. Each actual render installs one
+narrow prefix wrapper without a request-extension identity shortcut. The bridge
+has capacity one and uses the existing template work/memory budget. Close
 retires the read half promptly instead of adding an extra compatibility drain of
 an unknown slow source. Memory, disk/section, EOF, alias and concurrent-upload
 checks belong to the same combined candidate gates.

@@ -7,7 +7,9 @@ use http_body_util::BodyExt;
 use hyper::body::Body as _;
 use std::{
     collections::BTreeMap,
-    sync::{Arc, OnceLock},
+    pin::Pin,
+    sync::{Arc, Mutex, OnceLock},
+    task::{Context, Poll},
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -150,10 +152,76 @@ pub(crate) fn value(form: &Arc<super::Form>, control: &Arc<Control>) -> RenderRe
     })))
 }
 
-/// Owned by the same async future that owns Context. Only an unconsumed piece
-/// of a real DATA Bytes frame is retained. No new IO task or secondary stream.
+/// The unread DATA prefix belongs to the actual Body, independently of the
+/// render future. A failed/cancelled renderer never has to restore this prefix.
+/// Each render installs one owner (not one per Read/frame). A later render may
+/// wrap the existing Body; unlike a request extension this cannot accidentally
+/// attach a parent's prefix to a replacement or virtual request Body.
+struct Pending(Mutex<Bytes>);
+impl Pending {
+    fn len(&self) -> usize {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn put(&self, bytes: Bytes) {
+        let old = std::mem::replace(
+            &mut *self.0.lock().unwrap_or_else(|p| p.into_inner()),
+            bytes,
+        );
+        drop(old);
+    }
+    fn take(&self) -> Bytes {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+    fn copy_into(&self, out: &mut Vec<u8>, n: usize) {
+        let consumed = {
+            let mut bytes = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            // The destination capacity and CPU budget were admitted first.
+            out.extend_from_slice(&bytes[..n]);
+            bytes.split_to(n)
+        };
+        drop(consumed);
+    }
+}
+struct PrefixBody {
+    // Actual source IO is retired before the shared unread DATA owner.
+    inner: crate::http_runtime::Body,
+    pending: Arc<Pending>,
+}
+impl hyper::body::Body for PrefixBody {
+    type Data = Bytes;
+    type Error = crate::http_runtime::BoxError;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        let bytes = self.pending.take();
+        if !bytes.is_empty() {
+            return Poll::Ready(Some(Ok(hyper::body::Frame::data(bytes))));
+        }
+        Pin::new(&mut self.inner).poll_frame(cx)
+    }
+    fn is_end_stream(&self) -> bool {
+        self.pending.is_empty() && self.inner.is_end_stream()
+    }
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        let n = self.pending.len() as u64;
+        let source = self.inner.size_hint();
+        let mut hint = hyper::body::SizeHint::new();
+        hint.set_lower(source.lower().saturating_add(n));
+        if let Some(upper) = source.upper().and_then(|upper| upper.checked_add(n)) {
+            hint.set_upper(upper);
+        }
+        hint
+    }
+}
+
+/// The cursor owns no unread bytes exclusively: PrefixBody remains in Context
+/// through normal completion, template errors and cancellation alike.
 pub(crate) struct Cursor {
-    pending: Bytes,
+    pending: Arc<Pending>,
     remaining: Option<u64>,
     source_end: bool,
     eof: bool,
@@ -161,15 +229,31 @@ pub(crate) struct Cursor {
     eager_eof: bool,
 }
 impl Cursor {
-    pub(crate) fn new(body: &crate::http_runtime::Body, h1: bool) -> Self {
-        Self {
-            pending: Bytes::new(),
-            remaining: body.size_hint().exact(),
+    pub(crate) fn new(
+        body: &mut crate::http_runtime::Body,
+        h1: bool,
+        control: &Arc<Control>,
+    ) -> RenderResult<Self> {
+        // Arc/Mutex, erased wrapper and cursor metadata; frame payload retains
+        // its original Bytes owner and is never copied by this wrapper.
+        control.reserve_host_bytes(1024)?;
+        let remaining = body.size_hint().exact();
+        let eof = body.is_end_stream();
+        let pending = Arc::new(Pending(Mutex::new(Bytes::new())));
+        let inner = std::mem::replace(body, crate::http_runtime::full(Bytes::new()));
+        *body = PrefixBody {
+            inner,
+            pending: pending.clone(),
+        }
+        .boxed_unsync();
+        Ok(Self {
+            pending,
+            remaining,
             source_end: false,
-            eof: body.is_end_stream(),
+            eof,
             closed: false,
             eager_eof: h1,
-        }
+        })
     }
     fn consume(&mut self, n: usize) {
         if let Some(left) = &mut self.remaining {
@@ -187,7 +271,9 @@ impl Cursor {
                 Some(Ok(frame)) => {
                     if let Ok(data) = frame.into_data() {
                         self.source_end = body.is_end_stream();
-                        self.pending = data;
+                        // This follows the Ready frame in the same poll, before any
+                        // fallible charge/allocation or another await.
+                        self.pending.put(data);
                         if self.pending.is_empty() && self.source_end {
                             self.eof = true;
                         }
@@ -221,7 +307,7 @@ impl Cursor {
         control.check()?;
         if matches!(operation, Operation::Close) {
             self.closed = true;
-            self.pending = Bytes::new();
+            drop(self.pending.take());
             // Retire the real read half here, on its original async owner.
             // Do not download an unbounded source merely to implement Close.
             let old = std::mem::replace(body, crate::http_runtime::full(Bytes::new()));
@@ -250,7 +336,7 @@ impl Cursor {
             bytes
                 .try_reserve_exact(n)
                 .map_err(|_| error("template body read allocation failed"))?;
-            bytes.extend_from_slice(&self.pending.split_to(n));
+            self.pending.copy_into(&mut bytes, n);
             self.consume(n);
             // H1's declared-length body can return its last data with EOF.
             // H2/H3 buffered readers finish that read before the next EOF read.
@@ -270,8 +356,6 @@ impl Cursor {
             let n = self.pending.len();
             control.charge_bytes(n)?;
             if n > crate::http_runtime::templates::BODY_LIMIT.saturating_sub(bytes.len()) {
-                self.pending = Bytes::new();
-                self.consume(n);
                 return Ok(BodyRead::TooLarge);
             }
             if bytes.capacity().saturating_sub(bytes.len()) < n {
@@ -286,7 +370,7 @@ impl Cursor {
                     .try_reserve_exact(n)
                     .map_err(|_| error("template form body allocation failed"))?;
             }
-            bytes.extend_from_slice(&self.pending.split_to(n));
+            self.pending.copy_into(&mut bytes, n);
             self.consume(n);
         }
     }

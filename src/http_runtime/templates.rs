@@ -92,7 +92,8 @@ pub(super) async fn browse(ctx:&mut Context,inner:&Arc<super::Inner>,server:&Arc
     let depth=inherited.as_ref().map_or(0,|i|i.depth);
     let virtual_include=virtual_request::make(inner.clone(),server.clone(),ctx.business.clone(),request.clone(),tree.clone(),depth,ctx.local.clone());
     let mut reads=request.form.attach(&control).map_err(|_|broken())?;
-    let mut request_body=render::forms::request_body::Cursor::new(ctx.req().body(),ctx.req().version()<http::Version::HTTP_2);
+    let h1=ctx.req().version()<http::Version::HTTP_2;
+    let mut request_body=render::forms::request_body::Cursor::new(ctx.req_mut().body_mut(),h1,&control).map_err(|_|broken())?;
     let reading_control=control.clone();let resources=ctx.resources.clone();let mut output_headers=headers.clone();
     let owner=tree.clone();
     let job=resources.templates.run(tree,super::map_runtime::text_job(ctx.text_owner(),move||{
@@ -187,7 +188,8 @@ pub(super) async fn finish(
     let depth=inherited.as_ref().map_or(0,|inherited|inherited.depth);
     let virtual_include=virtual_request::make(inner.clone(),server.clone(),ctx.business.clone(),request.clone(),tree.clone(),depth,ctx.local.clone());
     let mut form_reads=request.form.attach(&control).map_err(|_|broken())?;
-    let mut request_body=render::forms::request_body::Cursor::new(ctx.req().body(),ctx.req().version()<http::Version::HTTP_2);
+    let h1=ctx.req().version()<http::Version::HTTP_2;
+    let mut request_body=render::forms::request_body::Cursor::new(ctx.req_mut().body_mut(),h1,&control).map_err(|_|broken())?;
     let resources=ctx.resources.clone();let reading_control=control.clone();
     let plan=plan.clone();let owner=tree.clone();let name=request.uri.path().to_owned();
     let job=resources.templates.run(tree,super::map_runtime::text_job(ctx.text_owner(),move||{
