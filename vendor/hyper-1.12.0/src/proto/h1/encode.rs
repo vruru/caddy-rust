@@ -290,20 +290,20 @@ impl Encoder {
         }
     }
 
-    pub(super) fn encode_and_end<B>(&self, msg: B, dst: &mut WriteBuf<EncodedBuf<B>>) -> bool
+    pub(super) fn encode_and_end<B>(&self, msg: B, dst: &mut WriteBuf<EncodedBuf<B>>) -> std::io::Result<bool>
     where
         B: Buf,
     {
         let len = msg.remaining();
         debug_assert!(len > 0, "encode() called with empty buf");
 
-        match self.kind {
+        Ok(match self.kind {
             Kind::Chunked(_) => {
                 trace!("encoding chunked {}B", len);
                 let buf = ChunkSize::new(len)
                     .chain(msg)
                     .chain(b"\r\n0\r\n\r\n" as &'static [u8]);
-                dst.buffer(buf);
+                dst.buffer(buf)?;
                 !self.is_last
             }
             Kind::Length(remaining) => {
@@ -312,16 +312,16 @@ impl Encoder {
                 trace!("sized write, len = {}", len);
                 match (len as u64).cmp(&remaining) {
                     Ordering::Equal => {
-                        dst.buffer(msg);
+                        dst.buffer(msg)?;
                         !self.is_last
                     }
                     #[allow(clippy::cast_possible_truncation)]
                     Ordering::Greater => {
-                        dst.buffer(msg.take(remaining as usize));
+                        dst.buffer(msg.take(remaining as usize))?;
                         !self.is_last
                     }
                     Ordering::Less => {
-                        dst.buffer(msg);
+                        dst.buffer(msg)?;
                         false
                     }
                 }
@@ -329,10 +329,10 @@ impl Encoder {
             #[cfg(feature = "server")]
             Kind::CloseDelimited => {
                 trace!("close delimited write {}B", len);
-                dst.buffer(msg);
+                dst.buffer(msg)?;
                 false
             }
-        }
+        })
     }
 }
 

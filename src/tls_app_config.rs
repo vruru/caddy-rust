@@ -70,3 +70,6 @@ impl CertificatePlan {
 #[path="tls_app_config/managed_client.rs"]
 mod managed_client;
 pub(crate) use managed_client::{ManagedClientSource,ClientBinding,BoundClientIo};
+
+#[allow(dead_code,reason="Stage A ZeroSSL settings; runtime issuer parse stays closed until backend completion")]
+pub(crate) mod zerossl_settings;

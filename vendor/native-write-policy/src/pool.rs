@@ -19,6 +19,13 @@ impl Pool{
  pub fn used(&self)->usize{self.0.used.load(Ordering::Acquire)}
 }
 #[derive(Debug)]pub struct Lease{pool:Pool,bytes:usize}
-impl Lease{pub fn bytes(&self)->usize{self.bytes} pub fn pool(&self)->Pool{self.pool.clone()}}
+impl Lease{
+ /// Resize atomically; a failed growth leaves the original credit unchanged.
+ pub fn resize(&mut self,new_bytes:usize)->Result<(),Denied>{
+  if new_bytes>self.bytes{let mut extra=self.pool.reserve(new_bytes-self.bytes)?;extra.bytes=0;}
+  else if new_bytes<self.bytes{let previous=self.pool.0.used.fetch_sub(self.bytes-new_bytes,Ordering::AcqRel);debug_assert!(previous>=self.bytes-new_bytes);}
+  self.bytes=new_bytes;Ok(())
+ }
+ pub fn bytes(&self)->usize{self.bytes} pub fn pool(&self)->Pool{self.pool.clone()}}
 impl AsRef<[u8]> for Lease{fn as_ref(&self)->&[u8]{&[]}}
 impl Drop for Lease{fn drop(&mut self){let previous=self.pool.0.used.fetch_sub(self.bytes,Ordering::AcqRel);debug_assert!(previous>=self.bytes,"write policy allocation accounting underflow");}}

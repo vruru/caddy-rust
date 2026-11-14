@@ -1,5 +1,4 @@
 use anyhow::{Result, bail};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -37,94 +36,22 @@ pub(crate) fn shared() -> Arc<Pools> {
         .clone()
 }
 
-pub(crate) struct Pool {
-    limit: usize,
-    used: AtomicUsize,
-}
-
+pub(crate) struct Pool { inner: native_write_policy::Pool }
 impl Pool {
-    pub(crate) fn new(limit: usize) -> Arc<Self> {
-        Arc::new(Pool {
-            limit,
-            used: AtomicUsize::new(0),
-        })
+    pub(crate) fn new(limit:usize)->Arc<Self>{Arc::new(Self{inner:native_write_policy::Pool::new(limit)})}
+    pub(crate) fn reserve(self:&Arc<Self>,bytes:usize)->Result<Lease>{
+        let inner=self.inner.reserve(bytes).map_err(|_|MemoryDenied)?;
+        Ok(Lease{pool:self.clone(),inner})
     }
-
-    fn claim(self: &Arc<Self>, n: usize) -> Result<()> {
-        if n > self.limit {
-            bail!(MemoryDenied);
-        }
-        let mut current = self.used.load(Ordering::Acquire);
-        loop {
-            let next = match current.checked_add(n) {
-                Some(v) if v <= self.limit => v,
-                _ => bail!(MemoryDenied),
-            };
-            match self.used.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(c) => current = c,
-            }
-        }
-    }
-
-    fn refund(self: &Arc<Self>, n: usize) {
-        self.used.fetch_sub(n, Ordering::AcqRel);
-    }
-
-    pub(crate) fn reserve(self: &Arc<Self>, n: usize) -> Result<Lease> {
-        self.claim(n)?;
-        Ok(Lease {
-            pool: self.clone(),
-            bytes: n,
-        })
-    }
-
-    pub(crate) fn used_bytes(&self) -> usize {
-        self.used.load(Ordering::Acquire)
-    }
+    pub(crate) fn used_bytes(&self)->usize{self.inner.used()}
+    /// A clone of the same atomic counter, never a second budget.
+    pub(crate) fn allocation_pool(&self)->native_write_policy::Pool{self.inner.clone()}
 }
-
-pub(crate) struct Lease {
-    pool: Arc<Pool>,
-    bytes: usize,
-}
-
+pub(crate) struct Lease { pool:Arc<Pool>, inner:native_write_policy::Lease }
 impl Lease {
-    pub(super) fn covers(&self,pool:&Arc<Pool>,bytes:usize)->bool {
-        Arc::ptr_eq(&self.pool,pool)&&self.bytes>=bytes
-    }
-    pub(crate) fn bytes(&self) -> usize {
-        self.bytes
-    }
-    pub(crate) fn resize(&mut self, new_bytes: usize) -> Result<()> {
-        if new_bytes > self.pool.limit {
-            bail!(MemoryDenied);
-        }
-        if new_bytes > self.bytes {
-            // Grow: claim the delta atomically before updating self.bytes.
-            let delta = new_bytes - self.bytes;
-            self.pool.claim(delta)?;
-            self.bytes = new_bytes;
-        } else if new_bytes < self.bytes {
-            // Shrink: refund the unused pre-paid portion.
-            // Caller must have proven the existing buffer is already covered by new_bytes.
-            let delta = self.bytes - new_bytes;
-            self.pool.refund(delta);
-            self.bytes = new_bytes;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for Lease {
-    fn drop(&mut self) {
-        self.pool.refund(self.bytes);
-    }
+    pub(super) fn covers(&self,pool:&Arc<Pool>,bytes:usize)->bool{Arc::ptr_eq(&self.pool,pool)&&self.inner.bytes()>=bytes}
+    pub(crate) fn bytes(&self)->usize{self.inner.bytes()}
+    pub(crate) fn resize(&mut self,bytes:usize)->Result<()>{self.inner.resize(bytes).map_err(|_|MemoryDenied.into())}
 }
 
 pub(crate) struct Buffer {

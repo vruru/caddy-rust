@@ -48,8 +48,15 @@ where
     T: Http1Transaction,
 {
     pub(crate) fn new(io: I) -> Conn<I, B, T> {
+        Self::with_buffered(Buffered::new(io))
+    }
+    #[cfg(feature="client")]
+    pub(crate) fn new_with_encoding_budget(io:I,budget:crate::ext::NativeEncodingBudget)->io::Result<Self>{
+        Ok(Self::with_buffered(Buffered::new_with_encoding_budget(io,budget)?))
+    }
+    fn with_buffered(io:Buffered<I,EncodedBuf<B>>)->Self{
         Conn {
-            io: Buffered::new(io),
+            io,
             state: State {
                 allow_half_close: false,
                 #[cfg(feature = "server")]
@@ -735,7 +742,7 @@ where
     pub(crate) fn write_observed_bytes(&mut self,chunk:Bytes)->io::Result<()> {
         let raw=chunk.clone();
         let Writing::Body(encoder)=&mut self.state.writing else{return Err(io::Error::other("HTTP/1 response not writing body"))};
-        let (encoded,start,payload)=encoder.encode_bytes::<B>(chunk);if encoded.has_remaining(){self.io.buffer(encoded);}
+        let (encoded,start,payload)=encoder.encode_bytes::<B>(chunk);if encoded.has_remaining(){self.io.buffer(encoded)?;}
         self.response_write_begin(start,payload,raw)?;
         if let Writing::Body(encoder)=&self.state.writing{if encoder.is_eof(){self.state.writing=if encoder.is_last(){Writing::Closed}else{Writing::KeepAlive};}}
         Ok(())
@@ -775,10 +782,11 @@ where
 
         self.enforce_version(&mut head);
 
-        let buf = self.io.headers_buf();
+        let (buf,encoding_budget) = self.io.headers_with_budget();
         match super::role::encode_headers::<T>(
             Encode {
                 head: &mut head,
+                encoding_budget,
                 body,
                 #[cfg(feature = "server")]
                 keep_alive: self.state.wants_keep_alive(),
@@ -872,17 +880,17 @@ where
         // the user's headers be.
     }
 
-    pub(crate) fn write_body(&mut self, chunk: B) {
+    pub(crate) fn write_body(&mut self, chunk: B) -> crate::Result<()> {
         debug_assert!(self.can_write_body() && self.can_buffer_body());
         // empty chunks should be discarded at Dispatcher level
         debug_assert!(chunk.remaining() != 0);
 
         let state = match &mut self.state.writing {
             Writing::Body(encoder) => {
-                self.io.buffer(encoder.encode(chunk));
+                self.io.buffer(encoder.encode(chunk)).map_err(crate::Error::new_io)?;
 
                 if !encoder.is_eof() {
-                    return;
+                    return Ok(());
                 }
 
                 if encoder.is_last() {
@@ -895,6 +903,7 @@ where
         };
 
         self.state.writing = state;
+        Ok(())
     }
 
     pub(crate) fn write_trailers(&mut self, trailers: HeaderMap) -> crate::Result<()> {
@@ -919,7 +928,7 @@ where
                     }
                 };
                 if let Some(enc_buf) = encoded {
-                    self.io.buffer(enc_buf);
+                    self.io.buffer(enc_buf).map_err(crate::Error::new_io)?;
 
                     self.state.writing = if encoder.is_last() || encoder.is_close_delimited() {
                         Writing::Closed
@@ -933,14 +942,14 @@ where
         Ok(())
     }
 
-    pub(crate) fn write_body_and_end(&mut self, chunk: B) {
+    pub(crate) fn write_body_and_end(&mut self, chunk: B) -> crate::Result<()> {
         debug_assert!(self.can_write_body() && self.can_buffer_body());
         // empty chunks should be discarded at Dispatcher level
         debug_assert!(chunk.remaining() != 0);
 
         let state = match &mut self.state.writing {
             Writing::Body(encoder) => {
-                let can_keep_alive = encoder.encode_and_end(chunk, self.io.write_buf());
+                let can_keep_alive = encoder.encode_and_end(chunk, self.io.write_buf()).map_err(crate::Error::new_io)?;
                 if can_keep_alive {
                     Writing::KeepAlive
                 } else {
@@ -951,6 +960,7 @@ where
         };
 
         self.state.writing = state;
+        Ok(())
     }
 
     pub(crate) fn end_body(&mut self) -> crate::Result<()> {
@@ -965,7 +975,7 @@ where
         match encoder.end() {
             Ok(end) => {
                 if let Some(end) = end {
-                    self.io.buffer(end);
+                    self.io.buffer(end).map_err(crate::Error::new_io)?;
                 }
 
                 self.state.writing = if encoder.is_last() || encoder.is_close_delimited() {

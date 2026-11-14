@@ -19,13 +19,18 @@ impl std::error::Error for ResourceDenied {}
 pub(crate) fn is_resource(error: &anyhow::Error) -> bool {
     // anyhow contexts are downcastable through Error, but are not exposed as
     // their payload type by the std::error::Error source iterator.
-    error.is::<ResourceDenied>()
+    error.is::<native_write_policy::Denied>()
+        || error.is::<ResourceDenied>()
         || error.is::<chain_memory::MemoryDenied>()
         || error.is::<crate::acme_wire::chain_shape::Resource>()
         || error.downcast_ref::<chain_deep_shape::FootprintError>()
             .is_some_and(|value| matches!(value, chain_deep_shape::FootprintError::Resource(_)))
         || error.chain().any(|cause| {
-        cause.is::<ResourceDenied>()
+        cause.is::<native_write_policy::Denied>()
+            || cause.downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::get_ref)
+                .is_some_and(|inner| inner.is::<native_write_policy::Denied>())
+            || cause.is::<ResourceDenied>()
             || cause.is::<chain_memory::MemoryDenied>()
             || cause.is::<crate::acme_wire::chain_shape::Resource>()
             || cause

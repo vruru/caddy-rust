@@ -219,6 +219,7 @@ struct Config {
     #[cfg(feature = "__tls")]
     tls: TlsBackend,
     connector_layers: Vec<BoxedConnectorLayer>,
+    native_http1_encoding_budget:Option<hyper::ext::NativeEncodingBudget>,
     http_version_pref: HttpVersionPref,
     http09_responses: bool,
     http1_title_case_headers: bool,
@@ -293,6 +294,11 @@ impl Default for ClientBuilder {
 }
 
 impl ClientBuilder {
+    /// Optional accounting for actual HTTP/1 encoding capacity; other protocols are unchanged.
+    pub fn native_http1_encoding_budget(mut self,budget:Option<hyper::ext::NativeEncodingBudget>)->Self{
+        self.config.native_http1_encoding_budget=budget;self
+    }
+
     /// Constructs a new `ClientBuilder`.
     ///
     /// This is the same as `Client::builder()`.
@@ -358,6 +364,7 @@ impl ClientBuilder {
                 #[cfg(feature = "__tls")]
                 tls: TlsBackend::default(),
                 connector_layers: Vec::new(),
+                native_http1_encoding_budget:None,
                 http_version_pref: HttpVersionPref::All,
                 http09_responses: false,
                 http1_title_case_headers: false,
@@ -1060,6 +1067,7 @@ impl ClientBuilder {
             Some(format!("{:?}", &config.redirect_policy))
         };
 
+        builder.native_http1_encoding_budget(config.native_http1_encoding_budget);
         let hyper_client = builder.build(connector_builder.build(config.connector_layers));
         let hyper_service = HyperService {
             hyper: hyper_client,

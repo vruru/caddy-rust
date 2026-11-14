@@ -65,3 +65,6 @@ mod cert_uri_san;
 mod cert_json_shape;
 
 pub(crate) mod outgoing_tls;
+
+#[allow(dead_code,reason="Stage A ZeroSSL wire; no production issuer routing is enabled")]
+pub(crate) mod zerossl_wire;

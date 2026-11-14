@@ -1907,3 +1907,17 @@ unauthorized endpoint. Existing remote account-response errors, HTTP failures
 and proven pre-TLS connection refusals retain their classifications. This does
 not extend fallback permission to generic request timeouts or establish the
 remaining per-issuer physical-retirement and late-commit acceptance gates.
+
+
+### ZeroSSL REST client: Stage A only
+
+The independent ZeroSSL API issuer remains rejected by the runtime parser. The staged settings/REST client does not implement issuance, validation proof publication, recovery, renewal or a management/revocation route. Its Caddyfile `validity_days` reader consumes the actual numeric argument rather than repeating the pinned adapter's keyword-parsing defect. The client uses a fixed HTTPS endpoint and does not add a production endpoint or TLS-verification bypass.
+
+Configured-client ownership is separate from concurrent protocol encoding: real blocked connections retain distinct encoded ApiKey headers. HTTP/1 buffer admission is covered below; HTTP/2 HPACK/frame accounting remains a separate enablement gate. Existing ACME clients retain their user agent, proxy, root and constructor behavior through the shared thin builder functions.
+
+
+### Staged ZeroSSL HTTP/1 encoding accounting
+
+The staged REST client opts into an outgoing HTTP/1 encoding-buffer budget using the existing aggregate 32 MiB certificate payload counter. This covers the initial reusable WriteBuf Vec, request-head capacity and Flatten copies. Growth admits both old and new allocations before copying. Clearing or pooling a connection retains its capacity credit until the actual buffer is destroyed. A local admission failure propagates the original typed allocation error through the transport error chain; it is not a remote CA status or successful send.
+
+The optional context does not change clients that leave it unset, HTTP/2 negotiation, connection pooling, or the standalone ACME builder defaults. This stage does not meter every HeaderMap copy, response/parser allocation, trailer-encoding temporary, or HTTP/2 HPACK allocation. The ZeroSSL issuer remains disabled in runtime parsing; this transport component is not complete issuer support. The earlier fixed-client-loan negative result remains valid historical evidence.

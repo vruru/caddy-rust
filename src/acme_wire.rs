@@ -6,7 +6,7 @@
 mod signer;
 mod network_proxy;
 mod client_build;
-pub(crate) use client_build::ClientOwner;
+pub(crate) use client_build::{ClientOwner,configured_base_builder,attach_owned_scope};
 pub(crate) mod directory_url;
 mod order_parameters;
 mod chain_preference;

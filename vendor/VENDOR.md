@@ -266,3 +266,17 @@ operation for an already queued task after a failed thread creation. Locked and
 sharded pools preserve cap, idle and shutdown behavior; no retry task is added
 and public `spawn_blocking` is unchanged. The certificate signing driver owns
 its bounded retry policy. See `tokio-1.54.1/PATCH-NOTES.md`.
+
+
+## Optional HTTP/1 encoding capacity admission
+
+Hyper, hyper-util and reqwest carry an optional atomic allocation context to
+HTTP/1 connection construction. The native certificate payload counter is shared
+with the existing chain-memory wrapper; it is not a second limit. Opted-in
+WriteBuf capacity is admitted before allocation, retained across clear/flush and
+idle reuse, and returned only after the actual byte buffer is destroyed. Growth
+holds both old and new capacity loans. Flatten body/end admission errors are
+fallible through the existing dispatcher rather than deferred success flags.
+Clients without the context keep their protocol and pooling behavior. HTTP/2
+encoding, HeaderMap/parser storage and full heap accounting are separate work.
+The original dependency licenses and package versions remain unchanged.

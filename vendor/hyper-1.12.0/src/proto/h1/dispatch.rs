@@ -534,7 +534,7 @@ where
                                         self.request_ended = self.send_completion.is_some()
                                             && self.conn.can_complete_body_with(chunk.remaining());
                                     }
-                                    self.conn.write_body_and_end(chunk);
+                                    self.conn.write_body_and_end(chunk)?;
                                     continue;
                                 }
                                 #[cfg(feature = "client")]
@@ -546,7 +546,7 @@ where
                                     trace!("discarding empty chunk");
                                     continue;
                                 }
-                                self.conn.write_body(chunk);
+                                self.conn.write_body(chunk)?;
                             }
                         } else if frame.is_trailers() {
                             *clear_body = true;

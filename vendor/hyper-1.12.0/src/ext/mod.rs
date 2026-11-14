@@ -328,3 +328,10 @@ pub struct NativeConnectBody{
     /// Validated request-target serialized on the HTTP/1 wire.
     pub target:http::Uri,
 }
+
+#[cfg(feature="http1")]
+mod encoding_budget;
+#[cfg(feature="http1")]
+pub use encoding_budget::NativeEncodingBudget;
+#[cfg(feature="http1")]
+pub(crate) use encoding_budget::BufferBudget;

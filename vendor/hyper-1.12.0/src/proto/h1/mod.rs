@@ -87,6 +87,7 @@ pub(crate) struct ParseContext<'ctx> {
 /// Passed to `Http1Transaction::encode`.
 pub(crate) struct Encode<'encode, T> {
     head: &'encode mut MessageHead<T>,
+    encoding_budget:Option<&'encode mut crate::ext::BufferBudget>,
     body: Option<BodyLength>,
     #[cfg(feature = "server")]
     keep_alive: bool,

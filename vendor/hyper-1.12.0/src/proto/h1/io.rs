@@ -69,7 +69,19 @@ where
         } else {
             WriteStrategy::Flatten
         };
-        let write_buf = WriteBuf::new(strategy);
+        Self::with_write_buf(io,WriteBuf::new(strategy))
+    }
+    pub(crate) fn new_with_encoding_budget(io:T,budget:crate::ext::NativeEncodingBudget)->io::Result<Self>{
+        let strategy=if io.is_write_vectored(){WriteStrategy::Queue}else{WriteStrategy::Flatten};
+        let credit=crate::ext::BufferBudget::new(budget,INIT_BUFFER_SIZE)?;
+        let mut bytes=Vec::new();
+        bytes.try_reserve_exact(INIT_BUFFER_SIZE).map_err(|e|io::Error::new(io::ErrorKind::OutOfMemory,e))?;
+        if bytes.capacity()!=INIT_BUFFER_SIZE{return Err(io::Error::new(io::ErrorKind::Other,"unexpected encoding capacity"))}
+        let mut write_buf=WriteBuf::new_empty(strategy);
+        write_buf.headers=Cursor::new(bytes);write_buf.encoding_budget=Some(credit);
+        Ok(Self::with_write_buf(io,write_buf))
+    }
+    fn with_write_buf(io:T,write_buf:WriteBuf<B>)->Self{
         Buffered {
             flush_pipeline: false,
             io,
@@ -148,12 +160,19 @@ where
         &mut buf.bytes
     }
 
+    pub(crate) fn headers_with_budget(&mut self)->(&mut Vec<u8>,Option<&mut crate::ext::BufferBudget>){
+        let write=&mut self.write_buf;
+        // Match headers_mut's reset/queue invariant before splitting the fields.
+        write.headers_mut();
+        (&mut write.headers.bytes,write.encoding_budget.as_mut())
+    }
+
     pub(super) fn write_buf(&mut self) -> &mut WriteBuf<B> {
         &mut self.write_buf
     }
 
-    pub(crate) fn buffer<BB: Buf + Into<B>>(&mut self, buf: BB) {
-        self.write_buf.buffer(buf);
+    pub(crate) fn buffer<BB: Buf + Into<B>>(&mut self, buf: BB) -> io::Result<()> {
+        self.write_buf.buffer(buf)
     }
 
     /// Whether there are bytes waiting in the write buffer to be flushed.
@@ -568,15 +587,22 @@ pub(super) struct WriteBuf<B> {
     /// Deque of user buffers if strategy is `Queue`.
     queue: BufList<B>,
     strategy: WriteStrategy,
+    // Last fields: bytes/queue are destroyed before their pure atomic credit.
+    encoding_budget: Option<crate::ext::BufferBudget>,
 }
 
 impl<B: Buf> WriteBuf<B> {
-    fn new(strategy: WriteStrategy) -> WriteBuf<B> {
+    fn new(strategy:WriteStrategy)->Self{
+        let mut value=Self::new_empty(strategy);
+        value.headers=Cursor::new(Vec::with_capacity(INIT_BUFFER_SIZE));value
+    }
+    fn new_empty(strategy: WriteStrategy) -> WriteBuf<B> {
         WriteBuf {
-            headers: Cursor::new(Vec::with_capacity(INIT_BUFFER_SIZE)),
+            headers: Cursor::new(Vec::new()),
             max_buf_size: DEFAULT_MAX_BUFFER_SIZE,
             queue: BufList::new(),
             strategy,
+            encoding_budget:None,
         }
     }
 
@@ -584,8 +610,18 @@ impl<B: Buf> WriteBuf<B> {
         self.strategy = strategy;
     }
 
-    pub(super) fn buffer<BB: Buf + Into<B>>(&mut self, mut buf: BB) {
+    pub(super) fn buffer<BB: Buf + Into<B>>(&mut self, mut buf: BB) -> io::Result<()> {
         debug_assert!(buf.has_remaining());
+        if self.encoding_budget.is_some() && matches!(self.strategy,WriteStrategy::Flatten){
+            // Unshift cannot allocate. Guard the full append before any copying.
+            self.headers_mut().maybe_unshift(buf.remaining());
+            if let Some(budget)=self.encoding_budget.as_mut(){
+                let result=self.headers.bytes.len().checked_add(buf.remaining())
+                    .ok_or_else(||io::Error::new(io::ErrorKind::OutOfMemory,native_write_policy::Denied))
+                    .and_then(|n|budget.reserve(&mut self.headers.bytes,n));
+                result?;
+            }
+        }
         match self.strategy {
             WriteStrategy::Flatten => {
                 let head = self.headers_mut();
@@ -602,7 +638,7 @@ impl<B: Buf> WriteBuf<B> {
                     let adv = {
                         let slice = buf.chunk();
                         if slice.is_empty() {
-                            return;
+                            return Ok(());
                         }
                         head.bytes.extend_from_slice(slice);
                         slice.len()
@@ -619,6 +655,7 @@ impl<B: Buf> WriteBuf<B> {
                 self.queue.push(buf.into());
             }
         }
+        Ok(())
     }
 
     fn can_buffer(&self) -> bool {

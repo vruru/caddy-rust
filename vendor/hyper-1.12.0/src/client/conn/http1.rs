@@ -129,6 +129,7 @@ pub struct Builder {
     h09_responses: bool,
     h1_parser_config: ParserConfig,
     h1_writev: Option<bool>,
+    encoding_budget:Option<crate::ext::NativeEncodingBudget>,
     h1_obsolete_trailer_folding: bool,
     h1_max_trailer_size: Option<usize>,
     h1_allow_undeclared_trailers: bool,
@@ -352,6 +353,7 @@ impl Builder {
         Builder {
             h09_responses: false,
             h1_writev: None,
+            encoding_budget:None,
             h1_read_buf_exact_size: None,
             h1_parser_config: ParserConfig::default(),
             h1_obsolete_trailer_folding: false,
@@ -448,6 +450,9 @@ impl Builder {
             .ignore_invalid_headers_in_responses(enabled);
         self
     }
+
+    /// Opt in to accounting for the real HTTP/1 reusable encoding Vec.
+    pub fn native_encoding_budget(&mut self,budget:Option<crate::ext::NativeEncodingBudget>)->&mut Self{self.encoding_budget=budget;self}
 
     /// Set whether HTTP/1 connections should try to use vectored writes,
     /// or always flatten into a single buffer.
@@ -622,7 +627,9 @@ impl Builder {
             trace!("client handshake HTTP/1");
 
             let (tx, rx) = dispatch::channel();
-            let mut conn = proto::Conn::new(io);
+            let mut conn = if let Some(budget)=opts.encoding_budget{
+                proto::Conn::new_with_encoding_budget(io,budget).map_err(crate::Error::new_io)?
+            }else{proto::Conn::new(io)};
             conn.set_h1_parser_config(opts.h1_parser_config);
             if let Some(writev) = opts.h1_writev {
                 if writev {

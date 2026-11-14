@@ -1225,6 +1225,12 @@ impl Builder {
         self
     }
 
+    /// Optional HTTP/1 encoding capacity accounting. HTTP/2 is unchanged.
+    #[cfg(feature="http1")]
+    pub fn native_http1_encoding_budget(&mut self,budget:Option<hyper::ext::NativeEncodingBudget>)->&mut Self{
+        self.h1_builder.native_encoding_budget(budget);self
+    }
+
     /// Set whether HTTP/1 connections should try to use vectored writes,
     /// or always flatten into a single buffer.
     ///

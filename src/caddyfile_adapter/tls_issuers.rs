@@ -322,20 +322,16 @@ fn parse_zerossl(d: &mut Dispenser) -> Result<IssuerDef> {
     set_str(&mut config, "api_key", &api_key);
 
     let mut validity_days: i64 = 0;
+    let mut validity_days_seen = false;
 
     while d.next_block(0) {
         match d.val() {
             "validity_days" => {
-                if validity_days != 0 {
-                    bail!("validity days is already specified: {validity_days}");
-                }
-                // BUG preserved from source: strconv.Atoi(d.Val()) with keyword
-                // d.Val() is "validity_days" (no NextArg), always fails.
-                let days: i64 = d
-                    .val()
-                    .parse()
-                    .map_err(|e| d.error(format!("invalid number of days {}: {e}", d.val())))?;
-                validity_days = days;
+                if validity_days_seen {bail!("validity days is already specified: {validity_days}");}
+                if !d.next_arg(){return Err(d.arg_err());}
+                validity_days=d.val().parse().map_err(|e|d.error(format!("invalid number of days: {e}")))?;
+                if d.next_arg(){return Err(d.arg_err());}
+                validity_days_seen=true;
             }
             "alt_http_port" => {
                 if !d.next_arg() {
@@ -406,8 +402,7 @@ fn parse_zerossl(d: &mut Dispenser) -> Result<IssuerDef> {
         }
     }
 
-    // validity_days: omitempty (0 removed). Bug means this line is unreachable
-    // in valid configs (always errors above), preserved for completeness.
+    // Read the actual numeric argument; the pinned Go adapter parses its keyword.
     set_i64(&mut config, "validity_days", validity_days);
 
     Ok(IssuerDef::ZeroSsl(config))

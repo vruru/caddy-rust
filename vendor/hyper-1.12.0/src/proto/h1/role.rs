@@ -1271,8 +1271,27 @@ impl Http1Transaction for Client {
 
         let body = Client::set_length(msg.head, msg.body);
 
-        let init_cap = 30 + msg.head.headers.len() * AVERAGE_HEADER_SIZE;
-        dst.reserve(init_cap);
+        if let Some(budget)=msg.encoding_budget{
+            struct Count(usize);
+            impl fmt::Write for Count{fn write_str(&mut self,s:&str)->fmt::Result{self.0=self.0.checked_add(s.len()).ok_or(fmt::Error)?;Ok(())}}
+            let target=if ordinary_connect{&msg.head.extensions.get::<crate::ext::NativeConnectBody>().expect("native CONNECT marker checked").target}else{&msg.head.subject.1};
+            let denied=||crate::Error::new_io(std::io::Error::new(std::io::ErrorKind::OutOfMemory,native_write_policy::Denied));
+            let mut count=Count(dst.len());
+            write!(&mut count,"{} {} HTTP/1.1\r\n",msg.head.subject.0,target).map_err(|_|denied())?;
+            let original=msg.head.extensions.get::<HeaderCaseMap>();
+            for name in msg.head.headers.keys(){
+                let mut names=original.map(|map|map.get_all(name));
+                for value in msg.head.headers.get_all(name){
+                    let n=names.as_mut().and_then(|names|names.next()).map_or(name.as_str().len(),|n|n.as_ref().len());
+                    count.0=count.0.checked_add(n).and_then(|n|n.checked_add(value.as_bytes().len())).and_then(|n|n.checked_add(4)).ok_or_else(denied)?;
+                }
+            }
+            count.0=count.0.checked_add(2).ok_or_else(denied)?;
+            budget.reserve(dst,count.0).map_err(crate::Error::new_io)?;
+        }else{
+            let init_cap = 30 + msg.head.headers.len() * AVERAGE_HEADER_SIZE;
+            dst.reserve(init_cap);
+        }
 
         extend(dst, msg.head.subject.0.as_str().as_bytes());
         extend(dst, b" ");

@@ -5,9 +5,14 @@ use super::*;
 pub(crate) struct ClientOwner {
     values:Option<Arc<chain_memory::Lease>>,
     material:Option<Arc<dyn crate::cert_cpu::MaterialOwner>>,
+    additional_values:Option<Arc<chain_memory::Lease>>,
 }
 impl ClientOwner {
-    pub(crate) fn new(values:Option<Arc<chain_memory::Lease>>,material:Option<Arc<dyn crate::cert_cpu::MaterialOwner>>)->Self {Self{values,material}}
+    pub(crate) fn new(values:Option<Arc<chain_memory::Lease>>,material:Option<Arc<dyn crate::cert_cpu::MaterialOwner>>)->Self {Self{values,material,additional_values:None}}
+    pub(crate) fn with_additional_values_credit(mut self,credit:Arc<chain_memory::Lease>)->Result<Self>{
+        ensure!(self.additional_values.is_none(),"additional client credit is already installed");
+        self.additional_values=Some(credit);Ok(self)
+    }
 }
 pub(super) struct Input {
     options:WireOptions,
@@ -27,27 +32,44 @@ impl Input {
     // A consuming method captures the complete input envelope, including its
     // last loan field, through queued/unstarted/started worker destruction.
     pub fn build(mut self)->Result<Built> {
-        let mut builder=reqwest::Client::builder()
-            .tls_crypto_provider(crate::crypto::client_provider())
-            .rustls_certificate_verifier_wrapper(crate::cert_uri_san::wrap_server_verifier)
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(self.options.request_timeout)
-            .user_agent("Caddy-Rust-ACME/0.1");
+        let mut builder=configured_base_builder(self.options.request_timeout,"Caddy-Rust-ACME/0.1");
         if let Some(proxy)=self.options.network_proxy.take(){builder=proxy.apply(builder)?;}
         for pem in std::mem::take(&mut self.options.extra_ca_pem) {
             ensure!(pem.len()<=1024*1024,"ACME trust root exceeds bounds");
             builder=append_trusted_root_pem(builder,&pem)?;
         }
         #[cfg(feature="native-run")]
-        if let Some(scope)=self.scope.take(){
+        if let Some(scope)=self.scope.as_ref(){
             scope.prepare_sign_driver(self.cpu.clone())?;
-            #[cfg(unix)]
-            {builder=builder.dns_resolver(crate::http_runtime::acme_client_dns::Resolver::new(scope.clone(),self.owner.clone())?);}
-            builder=builder.connector_layer(scope.layer()?.with_issuer_owner(self.owner.clone()));
         }
+        builder=attach_owned_scope(builder,#[cfg(feature="native-run")] self.scope.take(),&self.owner)?;
         let client=builder.build().map_err(|_|anyhow!("ACME client construction failed"))?;
         let built=Built{client,owner:std::mem::take(&mut self.owner)};
         Ok(built)
     }
+}
+
+/// Shared constructor defaults only; callers retain their protocol-specific inputs.
+pub(crate) fn configured_base_builder(timeout:Duration,user_agent:&'static str)->reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .tls_crypto_provider(crate::crypto::client_provider())
+        .rustls_certificate_verifier_wrapper(crate::cert_uri_san::wrap_server_verifier)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(timeout)
+        .user_agent(user_agent)
+}
+#[allow(unused_mut)]
+pub(crate) fn attach_owned_scope(mut builder:reqwest::ClientBuilder,
+    #[cfg(feature="native-run")] scope:Option<Arc<crate::outgoing_tls::Scope>>,
+    owner:&ClientOwner)->Result<reqwest::ClientBuilder> {
+    #[cfg(not(feature="native-run"))]
+    let _=owner;
+    #[cfg(feature="native-run")]
+    if let Some(scope)=scope {
+        #[cfg(unix)]
+        {builder=builder.dns_resolver(crate::http_runtime::acme_client_dns::Resolver::new(scope.clone(),owner.clone())?);}
+        builder=builder.connector_layer(scope.layer()?.with_issuer_owner(owner.clone()));
+    }
+    Ok(builder)
 }
