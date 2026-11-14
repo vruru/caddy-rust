@@ -1295,12 +1295,15 @@ where
 {
     let registry = inner.registry.clone();
     let service = service_fn(move |request: Request<Incoming>| {
-        let response = match request::proof_response(&registry, &request) {
+        let registry=registry.clone();
+        async move {
+        let response = match request::proof_response(&registry, &request).await {
             Ok(Some(response)) => response,
             Ok(None) => simple(StatusCode::NOT_FOUND, "Not Found\n"),
             Err(()) => simple(StatusCode::BAD_REQUEST, "Bad Request\n"),
         };
-        async { Ok::<_, Infallible>(response) }
+        Ok::<_, Infallible>(response)
+        }
     });
     let mut builder = Builder::new(TokioExecutor::new()).http1_only();
     builder
@@ -1447,7 +1450,7 @@ async fn serve_connection<I>(
             };
             // Pin this lookup once: an expired proof cannot later fall through
             // to business routes while still using the proof connection pool.
-            let proof = request::proof_response(&inner.registry, &request).unwrap_or_default();
+            let proof = request::proof_response(&inner.registry, &request).await.unwrap_or_default();
             let classified = if proof.is_some() {
                 connection_budget::classify_proof(&admission, None).await
             } else {

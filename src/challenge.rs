@@ -17,6 +17,12 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+mod zerossl;
+mod zerossl_storage;
+pub(crate) use zerossl_storage::cleanup_lease as zerossl_cleanup_lease;
+pub(crate) use zerossl_storage::{Source as ZeroSslSource,Reader as ZeroSslReader,ReaderPolicy as ZeroSslReaderPolicy};
+pub(crate) use zerossl::Lease as ZeroSslProofLease;
+
 pub const ACME_ALPN: &[u8] = b"acme-tls/1";
 const MAX_HTTP: usize = 8192;
 const MAX_TLS: usize = 4096;
@@ -26,6 +32,8 @@ const MAX_TTL: Duration = Duration::from_secs(3600);
 #[derive(Clone, Default)]
 pub struct ChallengeRegistry {
     inner: Arc<Inner>,
+    zerossl: zerossl::Registry,
+    zero_stores: Arc<zerossl_storage::Sources>,
 }
 
 #[derive(Default)]
@@ -86,6 +94,24 @@ impl fmt::Debug for ChallengeLease {
 }
 
 impl ChallengeRegistry {
+    /// ZeroSSL's file content is independent of ACME token authorization.
+    pub(crate) fn register_zerossl(&self, owner: &str, domain: &str, path: &str,
+        body: &[u8], ttl: Duration) -> Result<ZeroSslProofLease> {
+        self.zerossl.register(owner, domain, path, body, ttl)
+    }
+
+    pub(crate) fn zerossl_source(&self,store:crate::certstore::FsStore,cpu:Arc<tokio::sync::Semaphore>)->Result<Arc<ZeroSslSource>> {
+        self.zero_stores.register(store,cpu)
+    }
+    pub(crate) fn zerossl_reader(&self,policies:Vec<ZeroSslReaderPolicy>,cancel:tokio_util::sync::CancellationToken,memory:crate::acme_wire::chain_memory::Scratch)->Result<Arc<ZeroSslReader>> {
+        self.zero_stores.reader(policies,cancel,memory)
+    }
+    pub(crate) async fn lookup_zerossl(&self, authority: &str, path: &str) -> Option<Option<crate::cert_transient::Bytes>> {
+        match self.zerossl.lookup(authority,path){
+            Some(Some(proof))=>Some(Some(proof)),
+            local=>self.zero_stores.lookup(authority,path).await.or(local),
+        }
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -438,6 +464,19 @@ pub(crate) fn normalize_domain(raw: &str) -> Result<String> {
     Ok(domain)
 }
 
+pub(crate) fn normalize_zerossl_host(raw:&str)->Result<String>{
+    let host=raw.strip_prefix('[').and_then(|s|s.strip_suffix(']')).unwrap_or(raw);
+    if let Ok(ip)=host.parse::<std::net::IpAddr>(){return Ok(crate::tls_resolver::canonical_certificate_ip(ip))}
+    if let Some(suffix)=host.strip_prefix("*."){return Ok(format!("*.{}",normalize_domain(suffix)?))}
+    normalize_domain(host)
+}
+fn normalize_zerossl_authority(raw:&str)->Result<String>{
+    ensure!(!raw.is_empty()&&raw.len()<=300&&!raw.bytes().any(|b|b<=32||b==127||matches!(b,b'@'|b'/'|b'?'|b'#'|b',')),"invalid ZeroSSL HTTP authority");
+    if raw.parse::<std::net::IpAddr>().is_ok(){return normalize_zerossl_host(raw)}
+    let authority=raw.parse::<http::uri::Authority>().map_err(|_|anyhow!("invalid ZeroSSL HTTP authority"))?;
+    ensure!(authority.port().is_none()||authority.port_u16().is_some(),"invalid ZeroSSL HTTP port");
+    normalize_zerossl_host(authority.host())
+}
 fn normalize_authority(raw: &str) -> Result<String> {
     ensure!(
         raw.len() <= 260 && !raw.is_empty(),

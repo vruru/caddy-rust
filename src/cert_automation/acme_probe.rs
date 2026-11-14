@@ -21,6 +21,7 @@ pub(super) struct PhaseBinding {
     pub step:PhaseStep,
 }
 fn backend_text(id:&BackendId)->Result<usize>{match id {
+    BackendId::ZeroSsl{config_identity}=>Some(config_identity.len()),
     BackendId::Acme{directory,config_identity}=>directory.len().checked_add(config_identity.len()),
     BackendId::Internal{ca,options_identity}=>ca.len().checked_add(options_identity.len()),
 }.ok_or_else(||crate::cert_transient::ResourceDenied.into())}

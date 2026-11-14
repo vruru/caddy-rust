@@ -10,6 +10,7 @@ use tokio::sync::{Mutex, OnceCell, Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 
 mod registry;
+pub(crate) mod issuer_receipts;
 pub use registry::{KeyState, KeyRegistryError};
 const MAX_KEY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RECORD: usize = 3 * 1024 * 1024;
@@ -31,6 +32,10 @@ impl std::fmt::Display for KeyCompromiseNotDurable {
 impl std::error::Error for KeyCompromiseNotDurable {}
 struct State {
     registry: registry::Registry,
+    issuer_facts:HashMap<crate::leaf_guard::LeafId,Arc<issuer_receipts::Fact>>,
+    issuer_pending:HashSet<crate::leaf_guard::LeafId>,
+    issuer_pending_bytes:usize,
+    issuer_durable_bytes:usize,
     durable: HashSet<[u8; 32]>,
     pending: HashMap<[u8; 32], Arc<KeyCompromiseProof>>,
     pending_bytes: usize,
@@ -51,6 +56,7 @@ impl KeyDeny {
     pub fn new() -> Self {
         let owner=Arc::new(());
         Self { state: RwLock::new(State { registry:registry::Registry::new(MAX_KEY_BYTES,owner.clone()),
+            issuer_facts:HashMap::new(),issuer_pending:HashSet::new(),issuer_pending_bytes:0,issuer_durable_bytes:0,
             durable:HashSet::new(),pending:HashMap::new(),pending_bytes:0,durable_bytes:0 }),
             owner,store: OnceCell::new(),io: Mutex::new(()),changed: watch::channel(0).0 }
     }
@@ -129,7 +135,7 @@ impl KeyDeny {
                 .context(format!("historical proof unavailable: {error}"))),
             Ok(proof) => if !state.durable.contains(&id) && !state.pending.contains_key(&id) {
             let bytes = proof.retained_bytes();
-            if state.pending_bytes.saturating_add(bytes) > MAX_PENDING_BYTES {
+            if state.pending_bytes.saturating_add(state.issuer_pending_bytes).saturating_add(bytes) > MAX_PENDING_BYTES {
                 Err(KeyCompromiseNotDurable.into())
             } else {
                 state.pending_bytes += bytes;
@@ -176,6 +182,7 @@ impl KeyDeny {
             state.durable.insert(id);
         }
         self.state.write().map_err(|_| anyhow!("key compromise state unavailable"))?.durable_bytes = total;
+        self.load_issuer_history(&store,cpu,cancel,total).await?;
         self.store.set(store).map_err(|_| anyhow!("key compromise history initialized concurrently"))?;
         Ok(())
     }
@@ -183,6 +190,7 @@ impl KeyDeny {
     pub async fn flush(&self, cpu: Arc<Semaphore>, cancel: CancellationToken) -> Result<()> {
         let _io = self.io.lock().await;
         let store = self.store.get().ok_or_else(|| anyhow!("key compromise history is not loaded"))?;
+        self.flush_issuer_history(store,cpu.clone(),cancel.clone()).await?;
         let pending = self.state.read().map_err(|_| anyhow!("key compromise state unavailable"))?
             .pending.iter().map(|(id, proof)| (*id, proof.clone())).collect::<Vec<_>>();
         if pending.is_empty() { return Ok(()); }
@@ -220,7 +228,7 @@ impl KeyDeny {
                 } else {
                     {
                         let state = self.state.read().map_err(|_| anyhow!("key compromise state unavailable"))?;
-                        ensure!(state.durable_bytes.saturating_add(bytes.len()) <= MAX_HISTORY_BYTES,
+                        ensure!(state.durable_bytes.saturating_add(state.issuer_durable_bytes).saturating_add(bytes.len()) <= MAX_HISTORY_BYTES,
                             "key compromise history size exceeded");
                     }
                     store.store_fenced(&path, &bytes, &lease).await?;

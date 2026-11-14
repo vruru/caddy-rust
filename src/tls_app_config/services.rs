@@ -66,6 +66,8 @@ mod on_demand;
 #[path = "services/solver.rs"]
 mod solver;
 #[path="services/ech.rs"]mod ech;
+#[path="services/zerossl_sources.rs"]
+mod zerossl_sources;
 
 pub struct PrepareContext {
     pub events: Option<Arc<crate::events::EventsApp>>,
@@ -88,6 +90,7 @@ pub struct RetainedCertificates {
     outgoing_trust:Option<Arc<outgoing_trust::Retained>>,
     client_auth:Option<Arc<crate::tls_policy::prepared_auth::RetainedAuth>>,
     issuer_values:Option<Arc<super::issuer_values::Retained>>,
+    zerossl_values:Option<Arc<super::zerossl_values::Retained>>,
     issuer_roots:Arc<super::issuer_roots::Retained>,
     subjects:Arc<super::subject_values::Retained>,
     digest: [u8; 32],
@@ -274,6 +277,7 @@ pub struct CertificateServices {
     client_automate_names:std::sync::OnceLock<Vec<String>>,
     prepared: OnceCell<()>,
     explicit_subjects: OnceCell<Arc<super::subject_values::ExplicitSubjects>>,
+    zerossl_sources:OnceCell<zerossl_sources::Sources>,
     ensure_gate: AsyncMutex<()>,
     staged_publication: AsyncMutex<()>,
     state: AsyncMutex<State>,
@@ -374,6 +378,7 @@ impl CertificateServices {
             client_automate_names:std::sync::OnceLock::new(),
             prepared: OnceCell::new(),
             explicit_subjects: OnceCell::new(),
+            zerossl_sources:OnceCell::new(),
             ensure_gate: AsyncMutex::new(()),
             staged_publication: AsyncMutex::new(()),
             state: AsyncMutex::new(State {
@@ -600,11 +605,14 @@ impl CertificateServices {
         // invoke no external waker while either service mutex is held.
         self.context.cancel.cancel();
         self.ssl_verify.close();
-        #[cfg(feature="native-run")]
-        if let Some(scope)=&self.outgoing_tls{scope.close();}
         drop(activation);
         self.tasks.close();
+        // Caller cancellation stops accepted acquisitions. Their bounded known
+        // ZeroSSL order cancellation still needs this generation's real client.
+        // Join cleanup before retiring its network capability; never reopen it.
         self.tasks.wait().await;
+        #[cfg(feature="native-run")]
+        if let Some(scope)=&self.outgoing_tls{scope.close();}
         self.ssl_verify.wait().await;
         #[cfg(feature="native-run")]
         if let Some(scope)=&self.outgoing_tls{scope.wait().await;}
@@ -639,6 +647,7 @@ impl CertificateServices {
             client_auth:self.client_auth_accepted.get().cloned().flatten(),
             issuer_roots:super::issuer_roots::retain(&self.plan,&crate::tls_policy::prepared_auth::AuthBudget::Root(self.context.resources.external_bytes.clone()))?,
             issuer_values:super::issuer_values::retain(&self.plan,&self.context.resources.issuer_values)?,
+            zerossl_values:super::zerossl_values::retain(&self.plan,&self.context.resources.issuer_values)?,
             subjects:super::subject_values::retain(&self.plan,&self.context.resources.issuer_values)?,
             digest: self.context.configuration_digest,
             material: state
@@ -741,16 +750,19 @@ impl CertificateServices {
             let explicit = if let Some(retained)=&self.restore {
                 super::subject_values::restore(&self.plan,&retained.subjects)?;
                 super::issuer_values::restore(&self.plan,retained.issuer_values.as_deref())?;
+                super::zerossl_values::restore(&self.plan,retained.zerossl_values.as_deref())?;
                 super::subject_values::explicit(self.plan.clone(),self.context.resources.cpu.clone(),self.context.resources.issuer_values.clone(),cancel.clone()).await?
             } else {
                 let explicit=super::subject_values::prepare_all(self.plan.clone(),self.context.resources.cpu.clone(),self.context.resources.issuer_values.clone(),cancel.clone()).await?;
                 super::issuer_values::prepare_all(&self.plan,self.context.resources.cpu.clone(),self.context.resources.issuer_values.clone(),cancel.clone()).await?;
+                super::zerossl_values::prepare(&self.plan,self.context.resources.io.clone(),self.context.resources.issuer_values.clone(),&self.context.paths.cwd,cancel.clone()).await?;
                 explicit
             };
             Ok::<_,anyhow::Error>(explicit)
         }).await?;
         if let Some(retained)=&self.restore{super::issuer_roots::restore(&self.plan,&retained.issuer_roots)?;}else{super::issuer_roots::prepare_all(&self.plan,&self.context,cancel.clone()).await?;}
         self.prepare_ech(cancel.clone()).await?;
+        self.prepare_zerossl_sources(cancel.clone()).await?;
         self.prepare_permission(cancel.clone()).await?;
         if let Some(retained) = &self.restore {
             self.context.leaf_guard.key_deny().require_loaded()?;
@@ -1152,7 +1164,7 @@ fn group_key(names: &[String], identity: bool) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
-fn matches_subject(name: &str, pattern: &str) -> bool {
+pub(super) fn matches_subject(name: &str, pattern: &str) -> bool {
     let name = name.to_lowercase();
     let pattern = pattern.to_lowercase();
     if name == pattern {

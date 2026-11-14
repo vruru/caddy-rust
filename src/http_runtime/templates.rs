@@ -91,7 +91,8 @@ pub(super) async fn browse(ctx:&mut Context,inner:&Arc<super::Inner>,server:&Arc
     let tree=if let Some(i)=&inherited{i.tree.clone()}else{root_owner.as_ref().ok_or_else(broken)?.tree()};
     let depth=inherited.as_ref().map_or(0,|i|i.depth);
     let virtual_include=virtual_request::make(inner.clone(),server.clone(),ctx.business.clone(),request.clone(),tree.clone(),depth,ctx.local.clone());
-    let mut reads=request.form.attach().map_err(|_|broken())?;
+    let mut reads=request.form.attach(&control).map_err(|_|broken())?;
+    let mut request_body=render::forms::request_body::Cursor::new(ctx.req().body(),ctx.req().version()<http::Version::HTTP_2);
     let reading_control=control.clone();let resources=ctx.resources.clone();let mut output_headers=headers.clone();
     let owner=tree.clone();
     let job=resources.templates.run(tree,super::map_runtime::text_job(ctx.text_owner(),move||{
@@ -101,7 +102,7 @@ pub(super) async fn browse(ctx:&mut Context,inner:&Arc<super::Inner>,server:&Arc
     }).map_err(|_|unavailable())?);
     tokio::pin!(job);
     let result=loop{tokio::select!{
-        Some(read)=reads.recv()=>{let result=read_form_body(ctx.req_mut().body_mut(),&reading_control).await;let _=read.reply.send(result);}
+        Some(read)=reads.recv()=>{let result=request_body.respond(ctx.req_mut().body_mut(),&reading_control,read.operation).await;let _=read.reply.send(result);}
         result=&mut job=>break result,
     }};
     if let Some(owner)=&root_owner{owner.finish();}
@@ -185,7 +186,8 @@ pub(super) async fn finish(
     let tree=if let Some(inherited)=&inherited{inherited.tree.clone()}else{root_owner.as_ref().ok_or_else(broken)?.tree()};
     let depth=inherited.as_ref().map_or(0,|inherited|inherited.depth);
     let virtual_include=virtual_request::make(inner.clone(),server.clone(),ctx.business.clone(),request.clone(),tree.clone(),depth,ctx.local.clone());
-    let mut form_reads=request.form.attach().map_err(|_|broken())?;
+    let mut form_reads=request.form.attach(&control).map_err(|_|broken())?;
+    let mut request_body=render::forms::request_body::Cursor::new(ctx.req().body(),ctx.req().version()<http::Version::HTTP_2);
     let resources=ctx.resources.clone();let reading_control=control.clone();
     let plan=plan.clone();let owner=tree.clone();let name=request.uri.path().to_owned();
     let job=resources.templates.run(tree,super::map_runtime::text_job(ctx.text_owner(),move||{
@@ -195,7 +197,7 @@ pub(super) async fn finish(
     tokio::pin!(job);
     let result=loop{tokio::select!{
         Some(read)=form_reads.recv()=>{
-            let result=read_form_body(ctx.req_mut().body_mut(),&reading_control).await;
+            let result=request_body.respond(ctx.req_mut().body_mut(),&reading_control,read.operation).await;
             let _=read.reply.send(result);
         }
         result=&mut job=>break result,
@@ -221,25 +223,4 @@ pub(super) fn finish_empty(headers:&mut HeaderMap)->Body{
     headers.insert(header::CONTENT_LENGTH,HeaderValue::from_static("0"));
     for field in [header::ACCEPT_RANGES,header::LAST_MODIFIED,header::ETAG]{headers.remove(field);}
     full(Bytes::new())
-}
-
-async fn read_form_body(body:&mut Body,control:&Arc<render::Control>)->gotmpl::Result<render::forms::BodyRead>{
-    use render::forms::BodyRead;
-    let read=async{
-        let mut bytes=Vec::new();
-        while let Some(frame)=body.frame().await{
-            let frame=match frame{Ok(frame)=>frame,Err(error)=>return Ok(BodyRead::Io(if super::request_body::limit_error(error.as_ref()){"http: request body too large".into()}else{error.to_string()}))};
-            if let Ok(data)=frame.into_data(){
-                control.charge_bytes(data.len())?;
-                if data.len()>BODY_LIMIT.saturating_sub(bytes.len()){return Ok(BodyRead::TooLarge);}
-                bytes.extend_from_slice(&data);
-            }
-        }
-        Ok(BodyRead::Bytes(bytes))
-    };
-    tokio::select!{
-        result=read=>result,
-        _=control.cancel.cancelled()=>Err(gotmpl::TemplateError::Exec("template body read cancelled".into())),
-        _=tokio::time::sleep_until(tokio::time::Instant::from_std(control.deadline()))=>{control.cancel.cancel();Err(gotmpl::TemplateError::Exec("template body read timed out".into()))},
-    }
 }

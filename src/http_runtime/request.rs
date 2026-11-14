@@ -258,18 +258,32 @@ fn strict_host_matches(authority:&[u8],sni:&str)->bool{
 
 fn request_authority<B>(request:&Request<B>)->Result<Bytes,()>{super::request_host::authority(request)}
 
-pub(super) fn proof_response<B>(
+pub(super) async fn proof_response<B>(
     registry: &ChallengeRegistry,
     request: &Request<B>,
 ) -> Result<Option<Response<Body>>, ()> {
     let authority = request_authority(request)?;
-    Ok(proof_for_authority(registry, request, &authority))
+    Ok(proof_for_authority(registry, request, &authority).await)
 }
-fn proof_for_authority<B>(
+async fn proof_for_authority<B>(
     registry: &ChallengeRegistry,
     request: &Request<B>,
     authority: &[u8],
 ) -> Option<Response<Body>> {
+    if request.method() == http::Method::GET
+        && request.uri().path().starts_with("/.well-known/pki-validation/")
+        && let Ok(authority)=std::str::from_utf8(authority)
+        && let Some(proof) = registry.lookup_zerossl(authority, request.uri().path()).await
+    {
+        let (status, body) = match proof {
+            Some(body) => (StatusCode::OK, bytes::Bytes::from_owner(body)),
+            None => (StatusCode::NOT_FOUND, bytes::Bytes::new()),
+        };
+        let mut response = simple(status, body);
+        response.headers_mut().insert(http::header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        if matches!(request.version(),http::Version::HTTP_10|http::Version::HTTP_11){response.headers_mut().insert(http::header::CONNECTION, HeaderValue::from_static("close"));}
+        return Some(response);
+    }
     if let Some(token) = request
         .uri()
         .path()

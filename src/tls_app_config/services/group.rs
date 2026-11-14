@@ -66,6 +66,7 @@ impl ManagerBuildInput {
         let mut bytes=65536usize.checked_add(cert_automation::test_ca::plan_metadata_cost(test_directories.len())?).ok_or(crate::cert_transient::ResourceDenied)?;
         for item in prepared {
             match item {
+                cert_automation::PreparedBackend::ZeroSsl{..}=>{},
                 cert_automation::PreparedBackend::Internal{ca,..}=>{bytes=bytes.checked_add(ca.len().checked_mul(4).ok_or(crate::cert_transient::ResourceDenied)?).ok_or(crate::cert_transient::ResourceDenied)?;},
                 cert_automation::PreparedBackend::Acme(config)=>{
                     let mut text=config.wire.directory.len().checked_add(config.email.len()).and_then(|n|n.checked_add(config.profile.len())).ok_or(crate::cert_transient::ResourceDenied)?;
@@ -475,6 +476,7 @@ impl CertificateServices {
         let mut timeout=Duration::from_secs(1200);
         for issuer in &policy.issuers {
             match issuer {
+                Issuer::ZeroSsl(input)=>prepared.push(cert_automation::PreparedBackend::ZeroSsl{settings:input.get()?,prepare:None}),
                 Issuer::Internal{ca,options}=>prepared.push(cert_automation::PreparedBackend::Internal {
                     pki:self.authority(ca,cancel.clone()).await?,ca:ca.clone(),options:options.clone(),
                 }),
@@ -500,8 +502,14 @@ impl CertificateServices {
                 Ok(settings)
             })()),_=>None,
         }).collect::<Result<Vec<_>>>()?;
-        if !settings.is_empty(){solver=Some(solver::SolverBroker::new(settings,bound.to_vec(),self.context.listener_provider.clone())?
+        let zeros=policy.issuers.iter().filter_map(|i|match i{Issuer::ZeroSsl(input)=>Some(input.get()),_=>None}).collect::<Result<Vec<_>>>()?;
+        if !settings.is_empty()||!zeros.is_empty(){solver=Some(solver::SolverBroker::new(settings,zeros,80,bound.to_vec(),self.context.listener_provider.clone())?
             .with_issuer_values_credit(issuer_values_credit.clone())?);}
+        if let Some(broker)=&solver{
+            let mut callbacks=broker.zerossl_callbacks().into_iter();
+            for item in &mut prepared{if let cert_automation::PreparedBackend::ZeroSsl{prepare,..}=item{*prepare=Some(callbacks.next().ok_or_else(||anyhow!("ZeroSSL solver occurrence changed"))?);}}
+            ensure!(callbacks.next().is_none(),"extra ZeroSSL solver binding");
+        }
         let(max_concurrent,max_concurrent_per_ca)=self.context.resources.issuance.limits();
         let options=AutomationOptions{issuers:Vec::new(),renewal_window_ratio:policy.renewal_ratio,
             max_concurrent,max_concurrent_per_ca,poll_interval:self.plan.renew_interval,job_timeout:timeout};

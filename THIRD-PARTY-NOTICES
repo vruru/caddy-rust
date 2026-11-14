@@ -596,3 +596,10 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+Template request and multipart reader methods
+--------------------------------------------
+The native request-body and multipart file methods follow Go 1.27.3
+net/http/transfer.go, mime/multipart/formdata.go and io/io.go behavior.
+Copyright The Go Authors. The Go BSD-3-Clause terms reproduced above apply
+to these modified Rust behavioral ports. No Go runtime is invoked.

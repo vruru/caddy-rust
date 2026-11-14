@@ -12,11 +12,22 @@ mod external;
 mod issuer_account_key;
 #[path = "tls_app_config/issuer_values.rs"]
 mod issuer_values;
+mod zerossl_values;
 #[path="tls_app_config/issuer_roots.rs"]
 pub(crate) mod issuer_roots;
 #[path = "tls_app_config/subject_values.rs"]
 mod subject_values;
 pub(crate) use subject_values::ExplicitSubjects;
+/// Read-only accepted subject capability for distributed validation routing.
+pub(crate) struct PreparedSubjectMatcher(std::sync::Arc<subject_values::Prepared>);
+impl PreparedSubjectMatcher {
+    fn new(value: std::sync::Arc<subject_values::Prepared>) -> Self { Self(value) }
+    pub(crate) fn matches(&self, name: &str) -> bool {
+        let names = self.0.names();
+        names.is_empty() || names.iter().any(|pattern| services::matches_subject(name, pattern))
+    }
+}
+
 #[path = "tls_app_config/issuer_parse.rs"]
 mod issuer_parse;
 #[path = "tls_app_config/loaders.rs"]
@@ -64,7 +75,8 @@ pub struct CertificateViews<'a> {
 impl CertificatePlan {
     pub(crate) fn challenge_bind_hosts(&self)->impl Iterator<Item=&str>+Clone {
         self.policies.iter().flat_map(|policy|policy.issuers.iter()).chain(self.identity.iter().flat_map(|identity|identity.issuers.iter())).filter_map(|issuer|match issuer {
-            model::Issuer::Acme(settings) if !settings.bind_host.is_empty() && !settings.config.challenge_types.is_empty()=>Some(settings.bind_host.as_str()),_=>None,
+            model::Issuer::Acme(settings) if !settings.bind_host.is_empty() && !settings.config.challenge_types.is_empty()=>Some(settings.bind_host.as_str()),
+            model::Issuer::ZeroSsl(input) if !input.listen_host().is_empty()=>Some(input.listen_host()),_=>None,
         })
     }
     pub fn parse(views: CertificateViews<'_>) -> Result<Self, ConfigError> {
@@ -76,5 +88,4 @@ impl CertificatePlan {
 mod managed_client;
 pub(crate) use managed_client::{ManagedClientSource,ClientBinding,BoundClientIo};
 
-#[allow(dead_code,reason="Stage A ZeroSSL settings; runtime issuer parse stays closed until backend completion")]
 pub(crate) mod zerossl_settings;

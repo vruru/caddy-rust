@@ -11,7 +11,7 @@ impl Disk{
     }
 }
 pub(super) enum Backing {Memory(Arc<[u8]>),Disk{disk:Arc<Disk>,offset:u64,shared:bool}}
-pub(super) struct FileHeader {pub filename:Vec<u8>,pub header:HeaderMap,pub size:i64,pub backing:Backing,cached:Mutex<std::sync::Weak<gotmpl::Object>>}
+pub(super) struct FileHeader {pub filename:Vec<u8>,pub header:HeaderMap,pub size:i64,pub backing:Backing,control:std::sync::Weak<Control>,cached:Mutex<std::sync::Weak<gotmpl::Object>>}
 pub(super) struct Parsed {pub values:Arc<super::forms::Values>,pub files:BTreeMap<gotmpl::GoKey,Vec<Arc<FileHeader>>>,pub disk:Option<Arc<Disk>>}
 struct Part {headers:HeaderMap,name:Vec<u8>,filename:Vec<u8>,bytes:Vec<u8>}
 fn basename(mut raw:&[u8])->Vec<u8>{
@@ -99,7 +99,7 @@ pub(super) fn read_form(body:&[u8],boundary:&[u8],max_memory:i64,control:Option<
     let mut parsed=BTreeMap::new();
     for(key,entries)in files{let mut headers=Vec::new();for(filename,header,size,content,offset)in entries{
         let backing=match content{Some(content)=>Backing::Memory(content),None=>Backing::Disk{disk:disk.as_ref().ok_or_else(||error("multipart disk storage absent"))?.clone(),offset,shared:disk_count>1}};
-        headers.push(Arc::new(FileHeader{filename,header,size,backing,cached:Mutex::new(std::sync::Weak::new())}));
+        headers.push(Arc::new(FileHeader{filename,header,size,backing,control:control.map(Arc::downgrade).unwrap_or_default(),cached:Mutex::new(std::sync::Weak::new())}));
     }parsed.insert(key,headers);}
     Ok(Ok(Arc::new(Parsed{values:Arc::new(values),files:parsed,disk})))
 }
@@ -120,6 +120,9 @@ fn file_header_value(header:&Arc<FileHeader>)->RenderResult<gotmpl::Value>{
 struct FileHandle {position:i64,size:i64,closed:bool,file:Option<std::fs::File>,path:Option<std::path::PathBuf>,_memory:Option<Arc<[u8]>>,_offset:u64,is_disk:bool}
 fn open_value(header:&Arc<FileHeader>)->RenderResult<gotmpl::Value>{
     use gotmpl::{Object,Value,ValueFunc};
+    let control=header.control.upgrade().ok_or_else(||error("multipart reader control retired"))?;
+    let path_size=match &header.backing{Backing::Disk{disk,..}=>disk.path.as_os_str().len(),_=>0};
+    control.reserve_host_bytes(path_size.checked_mul(2).and_then(|n|n.checked_add(4096)).ok_or_else(||error("multipart reader allocation overflow"))?)?;
     let(file,path,is_file,memory,offset)=match &header.backing{
         Backing::Memory(bytes)=>(None,None,false,Some(bytes.clone()),0),
         Backing::Disk{disk,shared,offset}=>{let file=std::fs::File::open(&disk.path).map_err(|e|error(format!("open {}: {e}",disk.path.display())))?;(Some(file),Some(disk.path.clone()),!*shared,None,*offset)}
@@ -127,7 +130,7 @@ fn open_value(header:&Arc<FileHeader>)->RenderResult<gotmpl::Value>{
     let data_bytes=256+memory.as_ref().map_or(0,|bytes|bytes.len());
     let state=Arc::new(Mutex::new(FileHandle{position:0,size:header.size,closed:false,is_disk:file.is_some(),file,path,_memory:memory,_offset:offset}));
     let mut methods=BTreeMap::<Arc<str>,ValueFunc>::new();
-    for name in ["Close","Seek","Read","ReadAt","WriteTo","Outer"]{let state=state.clone();methods.insert(name.into(),Arc::new(move|args|{
+    for name in ["Close","Seek","Read","ReadAt","WriteTo","Outer"]{let state=state.clone();let control=Arc::downgrade(&control);methods.insert(name.into(),Arc::new(move|args|{
         if name=="Outer"{return Err(error("invalid function signature for Outer: expected one or two return values"));}
         let mut handle=lock(&state)?;
         if name=="Close"{super::arity(args,0,0)?;if !handle.is_disk{return Ok(Value::NilError);}if handle.closed{return Ok(path_error("close",&handle,"file already closed"));}handle.closed=true;handle.file=None;return Ok(Value::NilError);}
@@ -135,8 +138,14 @@ fn open_value(header:&Arc<FileHeader>)->RenderResult<gotmpl::Value>{
         match name{
             "Seek"=>{super::arity(args,2,2)?;let offset=args[0].as_go_signed().ok_or_else(||error("expected int64 offset"))?;let whence=args[1].as_int().ok_or_else(||error("expected int whence"))?;
                 let base=match whence{0=>0,1=>handle.position,2=>handle.size,_=>return Err(error("Seek: invalid whence"))};let position=base.checked_add(offset).filter(|n|*n>=0).ok_or_else(||error("Seek: invalid offset"))?;handle.position=position;Ok(Value::Int64(position))},
-            "Read"=>{super::arity(args,1,1)?;if !matches!(args[0],Value::Nil|Value::NilError){return Err(error("expected []uint8 buffer"));}if handle.is_disk&&handle.closed{return Err(error("file already closed"));}if !is_file&&handle.position>=handle.size{return Err(error("EOF"));}Ok(Value::Int(0))},
-            "ReadAt"=>{super::arity(args,2,2)?;if !matches!(args[0],Value::Nil|Value::NilError){return Err(error("expected []uint8 buffer"));}let offset=args[1].as_go_signed().ok_or_else(||error("expected int64 offset"))?;if offset<0||offset>=handle.size{return Err(error("EOF"));}Ok(Value::Int(0))},
+            "Read"|"ReadAt"=>{
+                super::arity(args,if name=="Read"{1}else{2},if name=="Read"{1}else{2})?;
+                let control=control.upgrade().ok_or_else(||error("multipart reader control retired"))?;
+                let buffer=super::forms::request_body::ByteBuffer::new(&args[0])?;
+                buffer.prepay(&control,false)?;
+                let offset=if name=="ReadAt"{Some(args[1].as_go_signed().ok_or_else(||error("expected int64 offset"))?)}else{None};
+                read_handle(&mut handle,is_file,&buffer,offset,&control)
+            },
             _=>Err(error("expected io.Writer")),
         }
     }));}
@@ -153,8 +162,55 @@ fn open_value(header:&Arc<FileHeader>)->RenderResult<gotmpl::Value>{
     }else{
         let size=header.size;methods.insert("Size".into(),Arc::new(move|args|{super::arity(args,0,0)?;Ok(Value::Int64(size))}));
     }
-    let method_signatures=BTreeMap::from([("Seek".into(),gotmpl::Signature::new(vec![gotmpl::ArgKind::Int64,gotmpl::ArgKind::Int],None)),("ReadAt".into(),gotmpl::Signature::new(vec![gotmpl::ArgKind::Any,gotmpl::ArgKind::Int64],None))]);
+    let method_signatures=BTreeMap::from([("Read".into(),gotmpl::Signature::new(vec![gotmpl::ArgKind::Any],None)),("Seek".into(),gotmpl::Signature::new(vec![gotmpl::ArgKind::Int64,gotmpl::ArgKind::Int],None)),("ReadAt".into(),gotmpl::Signature::new(vec![gotmpl::ArgKind::Any,gotmpl::ArgKind::Int64],None))]);
     Ok(Value::Object(Arc::new(Object{go_type:Some(if is_file{"*os.File"}else{"multipart.sectionReadCloser"}),methods,method_signatures,equal:if is_file{None}else{Some(reader_equal)},data:Some(Arc::new(state)),data_bytes,..Object::default()})))
+}
+
+
+/// Both sequential reads and positional reads use the same view and real file.
+/// Positional disk IO never changes the logical (or OS) sequential offset.
+fn read_handle(handle:&mut FileHandle,is_file:bool,buffer:&super::forms::request_body::ByteBuffer<'_>,at:Option<i64>,control:&Arc<Control>)->RenderResult<gotmpl::Value>{
+    use gotmpl::Value;
+    use std::os::unix::fs::FileExt;
+    if handle.closed{return Err(error("file already closed"));}
+    control.charge(1)?;
+    let position=at.unwrap_or(handle.position);
+    if position<0{return Err(error(if is_file{"readat: negative offset"}else{"EOF"}));}
+    if !is_file&&position>=handle.size{return Err(error("EOF"));}
+    if buffer.len()==0{return Ok(Value::Int(0));}
+    let wanted=buffer.len();
+    let allowed=if is_file{wanted}else{wanted.min(usize::try_from(handle.size-position).map_err(|_|error("multipart section length overflow"))?)};
+    let offset=handle._offset.checked_add(position as u64).ok_or_else(||error("multipart read offset overflow"))?;
+    if let Some(memory)=&handle._memory{
+        let start=usize::try_from(offset).map_err(|_|error("multipart memory offset overflow"))?;
+        let end=start.checked_add(allowed).ok_or_else(||error("multipart memory range overflow"))?;
+        let bytes=memory.get(start..end).ok_or_else(||error("invalid multipart memory section"))?;
+        let n=buffer.write(bytes)?;
+        if at.is_none(){handle.position=position.checked_add(n as i64).ok_or_else(||error("multipart reader position overflow"))?;}
+        if at.is_some()&&n<wanted{return Err(error("EOF"));}
+        return Ok(Value::Int(n as i64));
+    }
+    control.reserve_host_bytes(allowed.checked_add(128).ok_or_else(||error("multipart read allocation overflow"))?)?;
+    let mut bytes=Vec::new();
+    bytes.try_reserve_exact(allowed).map_err(|_|error("multipart read allocation failed"))?;
+    bytes.resize(allowed,0);
+    let file=handle.file.as_ref().ok_or_else(||error("file already closed"))?;
+    let mut n=0;
+    let mut failure=None;
+    while n<allowed{
+        let offset=offset.checked_add(n as u64).ok_or_else(||error("multipart read offset overflow"))?;
+        match file.read_at(&mut bytes[n..],offset){
+            Ok(0)=>break,
+            Ok(count)=>{n+=count;if at.is_none(){break;}},
+            Err(cause)if cause.kind()==std::io::ErrorKind::Interrupted=>continue,
+            Err(cause)=>{failure=Some(cause);break;},
+        }
+    }
+    buffer.write(&bytes[..n])?;
+    if at.is_none(){handle.position=position.checked_add(n as i64).ok_or_else(||error("multipart reader position overflow"))?;}
+    if let Some(cause)=failure{return Err(error(cause.to_string()));}
+    if n==0||at.is_some()&&n<wanted{return Err(error("EOF"));}
+    Ok(Value::Int(n as i64))
 }
 
 fn path_error(operation:&str,handle:&FileHandle,message:&str)->gotmpl::Value{

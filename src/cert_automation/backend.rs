@@ -4,6 +4,7 @@ pub(super) use super::attempt::{BackendId, InputBinding};
 
 pub(crate) enum PreparedBackend {
     Acme(AcmeIssuerConfig),
+    ZeroSsl {settings:Arc<crate::tls_app_config::zerossl_settings::Prepared>,prepare:Option<super::zerossl::HttpPreparation>},
     Internal { pki: crate::local_pki::LocalPki, ca: String,
         options: crate::local_pki::InternalIssuerOptions },
 }
@@ -12,8 +13,8 @@ pub(super) struct Backend {
     pub storage_key: String,
     pub kind: BackendKind,
 }
-fn identity_bytes(id:&BackendId)->Result<usize>{
-    let(a,b)=match id {BackendId::Acme{directory,config_identity}=>(directory,config_identity),BackendId::Internal{ca,options_identity}=>(ca,options_identity)};
+pub(super) fn identity_bytes(id:&BackendId)->Result<usize>{
+    let(a,b)=match id {BackendId::ZeroSsl{config_identity}=>("",config_identity.as_str()),BackendId::Acme{directory,config_identity}=>(directory.as_str(),config_identity.as_str()),BackendId::Internal{ca,options_identity}=>(ca.as_str(),options_identity.as_str())};
     a.len().checked_add(b.len()).and_then(|n|n.checked_add(std::mem::size_of::<BackendId>()+64)).ok_or_else(||crate::cert_transient::ResourceDenied.into())
 }
 pub(super) struct BackendIdentity {pub id:BackendId,_memory:crate::acme_wire::chain_memory::Scratch}
@@ -33,19 +34,20 @@ impl BackendSelection {
 }
 pub(super) enum BackendKind {
     Acme(usize),
+    ZeroSsl(super::zerossl::State),
     Internal { pki: crate::local_pki::LocalPki, ca: String,
         options: crate::local_pki::InternalIssuerOptions },
 }
 impl Backend {
     pub(super) fn issuer_class(&self) -> &str {
-        match &self.kind {BackendKind::Acme(_)=>"",BackendKind::Internal{ca,..}=>ca}
+        match &self.kind {BackendKind::Acme(_)|BackendKind::ZeroSsl(_)=>"",BackendKind::Internal{ca,..}=>ca}
     }
     pub(super) fn acme<'a>(&self, issuers: &'a [IssuerState]) -> Option<&'a IssuerState> {
         match self.kind {BackendKind::Acme(index)=>issuers.get(index),_=>None}
     }
     pub(super) fn renewal(&self, info:&MaterialInfo, ratio:f64, ari:Option<&AriWindow>, interval:Duration)->Result<i64> {
         let ordinary=renewal_time(info.not_before,info.not_after,ratio,ari,&info.leaf_sha256)?;
-        if matches!(self.kind,BackendKind::Acme(_)){return Ok(ordinary)}
+        if matches!(self.kind,BackendKind::Acme(_)|BackendKind::ZeroSsl(_)){return Ok(ordinary)}
         let interval=interval.checked_mul(5).unwrap_or(Duration::MAX);
         let seconds=interval.as_secs().saturating_add(u64::from(interval.subsec_nanos()>0));
         Ok(ordinary.min(info.not_after.saturating_sub(i64::try_from(seconds).unwrap_or(i64::MAX)))
@@ -69,6 +71,8 @@ fn unavailable_at(error:&anyhow::Error,cancel:&CancellationToken,depth:usize)->b
     if cancel.is_cancelled() || crate::cert_transient::is_resource(error)
         ||error.is::<crate::cert_transient::ResourceDenied>()
         ||error.is::<crate::acme_wire::chain_memory::MemoryDenied>()
+        ||error.is::<super::zerossl::IssuedCandidate>()||error.chain().any(|cause|cause.is::<super::zerossl::IssuedCandidate>())
+        ||error.is::<super::zerossl::CreateUncertain>()||error.chain().any(|cause|cause.is::<super::zerossl::CreateUncertain>())
         ||error.is::<LegDeadline>()||error.is::<ExpiredStoredCandidate>()||error.is::<FutureCertificate>()
         ||error.is::<crate::acme_wire::AcmeRequestCancelled>() {
         return false
@@ -93,6 +97,7 @@ fn unavailable_at(error:&anyhow::Error,cancel:&CancellationToken,depth:usize)->b
         ||error.chain().any(|cause|cause.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout)) {
         return false
     }
+    if error.is::<super::zerossl::ClosedLeg>(){return true}
     if error.is::<crate::local_pki::SignerUnavailable>()
         ||error.chain().any(|cause|cause.is::<crate::local_pki::SignerUnavailable>()) {return true}
     // Actual HTTP responses follow a completed handshake; local controls above
@@ -170,10 +175,10 @@ impl CertificateManager {
             if let Some(id)=id {
                 if let Some(index)=self.inner.backends.iter().position(|b|b.id==id){return Ok(BackendSelection::Configured(index))}
                 let (kind,class)=match &id {
-                    BackendId::Acme{..}=>(ManagedKind::Acme,""),BackendId::Internal{ca,..}=>(ManagedKind::Internal,ca.as_str()),
+                    BackendId::Acme{..}=>(ManagedKind::Acme,""),BackendId::ZeroSsl{..}=>(ManagedKind::ZeroSsl,""),BackendId::Internal{ca,..}=>(ManagedKind::Internal,ca.as_str()),
                 };
                 ensure!(self.inner.backends.iter().any(|b|b.issuer_class()==class
-                    &&matches!((&b.kind,kind),(BackendKind::Acme(_),ManagedKind::Acme)|(BackendKind::Internal{..},ManagedKind::Internal))),
+                    &&matches!((&b.kind,kind),(BackendKind::Acme(_),ManagedKind::Acme)|(BackendKind::ZeroSsl(_),ManagedKind::ZeroSsl)|(BackendKind::Internal{..},ManagedKind::Internal))),
                     "stored winner is outside current issuer policy");
                 return BackendSelection::historical(kind,class)
             }
@@ -191,12 +196,12 @@ impl CertificateManager {
     }}
     pub(crate) fn index_for_class(&self,class:&str,kind:ManagedKind)->Result<usize>{
         self.inner.backends.iter().enumerate().find(|(_,b)|b.issuer_class()==class
-            &&matches!((&b.kind,kind),(BackendKind::Acme(_),ManagedKind::Acme)|(BackendKind::Internal{..},ManagedKind::Internal)))
+            &&matches!((&b.kind,kind),(BackendKind::Acme(_),ManagedKind::Acme)|(BackendKind::ZeroSsl(_),ManagedKind::ZeroSsl)|(BackendKind::Internal{..},ManagedKind::Internal)))
             .map(|(i,_)|i).ok_or_else(||anyhow!("cached issuer is outside this policy"))
     }
     pub(crate) fn selected_kind(&self,index:usize)->Result<ManagedKind>{
         let backend=self.inner.backends.get(index).ok_or_else(||anyhow!("selected issuer not initialized"))?;
-        Ok(match backend.kind{BackendKind::Acme(_)=>ManagedKind::Acme,BackendKind::Internal{..}=>ManagedKind::Internal})
+        Ok(match backend.kind{BackendKind::Acme(_)=>ManagedKind::Acme,BackendKind::ZeroSsl(_)=>ManagedKind::ZeroSsl,BackendKind::Internal{..}=>ManagedKind::Internal})
     }
     pub(crate) fn selected_class(&self,index:usize)->Result<&str>{
         self.inner.backends.get(index).map(Backend::issuer_class).ok_or_else(||anyhow!("selected issuer not initialized"))
@@ -226,25 +231,29 @@ impl CertificateManager {
         }).await
     }
     pub(super) async fn ensure_unified(&self,names:Vec<String>,cancel:CancellationToken,round:retry_operation::AcmeRound<'_>,storage_check:&mut storage_check::CheckState)->Result<ManagedCertificate> {
-        let lease=self.inner.store.lock(&format!("issue_cert_{}",names[0]),cancel.clone()).await?;
+        let (lease,_lease_lifetime)=if self.inner.backends.iter().any(|b|matches!(b.kind,BackendKind::ZeroSsl(_))){
+            let(lease,lifetime)=crate::challenge::zerossl_cleanup_lease(&self.inner.store,&format!("issue_cert_{}",names[0]),cancel.clone()).await?;
+            (lease,Some(lifetime))
+        }else{(self.inner.store.lock(&format!("issue_cert_{}",names[0]),cancel.clone()).await?,None)};
         let initial=async {
             let (ready,previous)=self.load_state_for_round(&names,&lease,&cancel,round,storage_check).await?;
             if let Some(ready)=ready{return Ok((Some(ready),previous,None,None,None))}
             round.enter();
             let old=self.load_attempt(&names).await?;
             if let Some(old)=old.filter(|a|a.unified()&&!a.retired&&a.winner.is_none()) {
-                ensure!(old.configured_sequence.iter().eq(self.inner.backends.iter().map(|b|&b.id)),
-                    "active certificate issuer sequence changed; resume the original policy");
-                let id=old.input_id.as_deref().ok_or_else(||anyhow!("active attempt input missing"))?;
-                match self.load_input(id,&old.attempt_id,&cancel).await {
-                    Ok(input)=>{
-                        let lifecycle=crate::cert_events::Attempt::new(&names[0],previous.as_ref().map(|p|p.not_after));
-                        return Ok((None,previous,Some(old.attempt_id),Some(lifecycle),Some(input)))
-                    },
-                    Err(error)if error.is::<crate::key_compromise::KeyCompromised>()=>{
-                        self.archive_compromised_attempt(old,&lease,&cancel).await?;
-                    },
-                    Err(error)=>return Err(error),
+                if old.configured_sequence.iter().eq(self.inner.backends.iter().map(|b|&b.id)) {
+                    let id=old.input_id.as_deref().ok_or_else(||anyhow!("active attempt input missing"))?;
+                    match self.load_input(id,&old.attempt_id,&cancel).await {
+                        Ok(input)=>{
+                            let lifecycle=crate::cert_events::Attempt::new(&names[0],previous.as_ref().map(|p|p.not_after));
+                            return Ok((None,previous,Some(old.attempt_id),Some(lifecycle),Some(input)))
+                        },
+                        Err(error)if error.is::<crate::key_compromise::KeyCompromised>()=>self.archive_compromised_attempt(old,&lease,&cancel).await?,
+                        Err(error)=>return Err(error),
+                    }
+                }else{
+                    ensure!(self.closed_zero_configuration(&old).await?,"active certificate issuer sequence changed; resume the original policy");
+                    self.archive_closed_zero(old,&lease,&cancel).await?;
                 }
             }
             let lifecycle=self.emit_obtaining(&names,previous.as_ref(),&cancel).await?;
@@ -311,7 +320,10 @@ impl CertificateManager {
                     Err(error)=>return Err(error),}
                 }
             }
-            let lease=self.inner.store.lock(&format!("issue_cert_{}",names[0]),cancel.clone()).await?;
+            let(lease,_lease_lifetime)=if matches!(backend.kind,BackendKind::ZeroSsl(_)){
+                let(lease,lifetime)=crate::challenge::zerossl_cleanup_lease(&self.inner.store,&format!("issue_cert_{}",names[0]),cancel.clone()).await?;
+                (lease,Some(lifetime))
+            }else{(self.inner.store.lock(&format!("issue_cert_{}",names[0]),cancel.clone()).await?,None)};
             let work=cancel.child_token();let lost=lease.lost();
             let result={
             let operation=async {
@@ -322,6 +334,7 @@ impl CertificateManager {
                 ensure!(active.attempt_id==attempt_id&&active.winner.is_none(),"certificate attempt superseded");
                 self.inner.resolver.leaf_guard().key_deny().check_state(&input.key_state)?;
                 match &backend.kind {
+                    BackendKind::ZeroSsl(settings)=>self.issue_zerossl(&names,backend,settings,input.clone(),&attempt_id,&lease,&lifecycle,&work,true,Some(&produced)).await,
                     BackendKind::Internal{..}=>self.issue_internal(&names,backend,input.clone(),&attempt_id,&lease,&lifecycle,&work,true,Some(&produced)).await,
                     BackendKind::Acme(index)=>{
                         let issuer=&self.inner.issuers[*index];

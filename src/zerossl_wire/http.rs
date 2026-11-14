@@ -53,7 +53,7 @@ impl Reply {
   let mut dom_credit=pools.payload.reserve(footprint.owned.checked_add(256).ok_or(crate::cert_transient::ResourceDenied)?)?;
   let _temporary=chain_memory::try_scratch(footprint.temporary.checked_add(4096).ok_or(crate::cert_transient::ResourceDenied)?)?;
   let value:serde_json::Value=match serde_json::from_slice(&self.body.bytes){Ok(value)=>value,Err(_)=>{
-   if !(200..300).contains(&self.status){dom_credit.resize(size_of::<models::ApiError>()+128)?;return Err(models::ApiError{http_status:self.status,info:Default::default(),_memory:dom_credit}.into())}
+   if !(200..300).contains(&self.status){dom_credit.resize(size_of::<models::ApiError>()+128)?;return Err(models::ApiError{http_status:self.status,info:Default::default(),confirmed_rejection:false,_memory:dom_credit}.into())}
    return Err(InvalidResponse.into())
   }};
   let bytes=footprint.owned.checked_add(typed_extra(&value)?).and_then(|n|n.checked_add(size_of::<T>()+128)).ok_or(crate::cert_transient::ResourceDenied)?;
@@ -63,7 +63,7 @@ impl Reply {
   }};
   if rejected||!(200..300).contains(&self.status){
    let parsed:models::ApiReplyError=serde_json::from_value(value).map_err(|_|InvalidResponse)?;
-   drop(dom_credit);return Err(models::ApiError{http_status:self.status,info:parsed.error,_memory:resident}.into())
+   drop(dom_credit);return Err(models::ApiError{http_status:self.status,info:parsed.error,confirmed_rejection:rejected,_memory:resident}.into())
   }
   let parsed:T=serde_json::from_value(value).map_err(|_|InvalidResponse)?;drop(dom_credit);Ok(Owned{value:parsed,_memory:resident})
  }

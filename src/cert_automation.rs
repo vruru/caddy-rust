@@ -15,6 +15,11 @@ mod storage_check;
 pub(crate) mod retry_operation;
 pub(crate) mod test_ca;
 mod internal;
+pub(crate) mod zerossl;
+mod zerossl_record;
+mod revoke;
+pub(crate) use attempt::BackendId as IssuerBackendId;
+pub(crate) use revoke::IssuerReceipt;
 pub(crate) use backend::{PreparedBackend,BackendSelection};
 mod account_key;
 mod configured_account;
@@ -154,7 +159,7 @@ impl Default for AutomationOptions {
 }
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub(crate) enum ManagedKind {Acme,Internal}
+pub(crate) enum ManagedKind {Acme,Internal,ZeroSsl}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ManagedCertificate {
@@ -882,7 +887,7 @@ impl CertificateManager {
             });
         }
         let mut backends=Vec::new();let unified_key=ordered.as_ref().map(|(_,key)|*key);
-        if let Some((prepared,_))=ordered {
+        if let Some((prepared,key_type))=ordered {
             let mut index=0;
             for item in prepared {
                 let value=match item {
@@ -890,6 +895,10 @@ impl CertificateManager {
                         let issuer=&issuers[index];let value=backend::Backend{id:backend::acme_id(&issuer.config)?,
                             storage_key:issuer_key(&issuer.config.wire.directory)?,kind:backend::BackendKind::Acme(index)};
                         index+=1;value
+                    },
+                    backend::PreparedBackend::ZeroSsl{settings,prepare}=>backend::Backend {
+                        id:zerossl::backend_identity(&settings,key_type,false,false)?,storage_key:"zerossl".to_owned(),
+                        kind:backend::BackendKind::ZeroSsl(zerossl::State {settings,prepare,wire:OnceCell::new(),limiter:resources.ca("https://api.zerossl.com".to_owned())?}),
                     },
                     backend::PreparedBackend::Internal{pki,ca,options}=>backend::Backend {
                         id:backend::internal_id(&ca,&options),storage_key:ca.clone(),
@@ -984,7 +993,11 @@ impl CertificateManager {
     /// Generation-scoped leaf CSR behavior; account signing keys are unaffected.
     pub fn with_csr_options(mut self,must_staple:bool,reuse_private_keys:bool)->Result<Self> {
         let inner=Arc::get_mut(&mut self.inner).ok_or_else(||anyhow!("certificate manager already shared"))?;
-        inner.must_staple=must_staple;inner.reuse_private_keys=reuse_private_keys;Ok(self)
+        inner.must_staple=must_staple;inner.reuse_private_keys=reuse_private_keys;
+        for backend in &mut inner.backends{if let backend::BackendKind::ZeroSsl(state)=&backend.kind{
+            backend.id=zerossl::backend_identity(&state.settings,inner.unified_key.ok_or_else(||anyhow!("ZeroSSL shared key policy missing"))?,must_staple,reuse_private_keys)?;
+        }}
+        Ok(self)
     }
     async fn emit_obtaining(&self, names: &[String], previous: Option<&Replacement>,
         cancel: &CancellationToken) -> Result<crate::cert_events::Attempt> {
@@ -1947,9 +1960,11 @@ impl CertificateManager {
             if let Some(id)=historical_id {
                 ensure!(match id {
                     attempt::BackendId::Acme{..}=>matches!(backend.kind,backend::BackendKind::Acme(_)),
+                    attempt::BackendId::ZeroSsl{..}=>matches!(backend.kind,backend::BackendKind::ZeroSsl(_)),
                     attempt::BackendId::Internal{ca,..}=>matches!(&backend.kind,backend::BackendKind::Internal{ca:current,..} if current==ca),
                 },"historical issuer kind is outside current policy");
             }
+            self.check_revoke_intent(historical_id.unwrap_or(&backend.id),&info).await?;
             let historical=historical_id.is_some();
             // A healthy historical leaf remains eligible by actual kind/class.
             // No current credentials/transport may masquerade as its old CA leg.

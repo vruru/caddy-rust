@@ -2,29 +2,23 @@
 use super::{Control,Fields,RenderResult,arity,error,lock,string,text};
 use gotmpl::{Object,Value,ValueFunc};
 use std::{collections::BTreeMap,sync::{Arc,Mutex,OnceLock,Weak}};
-use tokio::sync::{mpsc,oneshot};
+#[path="request_body.rs"] pub(crate) mod request_body;
+pub(crate) use request_body::{BodyRead,Request as ReadRequest};
 pub(super) type Values=BTreeMap<gotmpl::GoKey,Value>;
 #[derive(Default)]struct State {form:Option<Arc<Values>>,post:Option<Arc<Values>>,multipart:Option<Arc<super::multipart::Parsed>>}
 pub(crate) struct Form {
     method:String,query:String,content_type:Vec<u8>,state:Mutex<State>,
-    sender:OnceLock<mpsc::UnboundedSender<ReadRequest>>,
+    reader:request_body::Reader,
     control:OnceLock<Weak<Control>>,
     query_source:OnceLock<Arc<dyn Fn()->RenderResult<Vec<u8>>+Send+Sync>>,
 }
-pub(crate) struct ReadRequest {pub reply:oneshot::Sender<RenderResult<BodyRead>>}
-pub(crate) enum BodyRead {Bytes(Vec<u8>),Io(String),TooLarge}
 impl Form {
-    pub(crate) fn new(method:&str,query:&str,content_type:&[u8])->Arc<Self>{Arc::new(Self{method:method.into(),query:query.into(),content_type:content_type.into(),state:Mutex::new(State::default()),sender:OnceLock::new(),control:OnceLock::new(),query_source:OnceLock::new()})}
+    pub(crate) fn new(method:&str,query:&str,content_type:&[u8])->Arc<Self>{Arc::new(Self{method:method.into(),query:query.into(),content_type:content_type.into(),state:Mutex::new(State::default()),reader:request_body::Reader::default(),control:OnceLock::new(),query_source:OnceLock::new()})}
     pub(super) fn set_query_source(&self,source:Arc<dyn Fn()->RenderResult<Vec<u8>>+Send+Sync>){let _=self.query_source.set(source);}
     pub(super) fn set_control(&self,control:Arc<Control>){let _=self.control.set(Arc::downgrade(&control));}
-    pub(crate) fn attach(&self)->RenderResult<mpsc::UnboundedReceiver<ReadRequest>>{
-        let(tx,rx)=mpsc::unbounded_channel();self.sender.set(tx).map_err(|_|error("template body owner was already attached"))?;Ok(rx)
-    }
-    fn read(&self)->RenderResult<BodyRead>{
-        let Some(sender)=self.sender.get()else{return Ok(BodyRead::Io("http: missing form body".into()));};
-        let(reply,receiver)=oneshot::channel();sender.send(ReadRequest{reply}).map_err(|_|error("template body owner retired"))?;
-        receiver.blocking_recv().map_err(|_|error("template body owner retired"))?
-    }
+    pub(crate) fn attach(&self,control:&Arc<Control>)->RenderResult<tokio::sync::mpsc::Receiver<ReadRequest>>{self.set_control(control.clone());self.reader.attach(control)}
+    fn read(&self)->RenderResult<BodyRead>{let control=self.control.get().and_then(Weak::upgrade).ok_or_else(||error("template form control retired"))?;self.reader.request(request_body::Operation::All,&control)}
+    pub(super) fn body_value(self:&Arc<Self>,control:&Arc<Control>)->RenderResult<Value>{request_body::value(self,control)}
     fn parse_form(&self,state:&mut State)->RenderResult<Option<String>>{
         // Go does not retain the first ParseForm error. Subsequent calls return nil.
         let mut failure=None;
@@ -36,7 +30,7 @@ impl Form {
                 failure=parsed.error;
                 if parsed.media_type=="application/x-www-form-urlencoded"{
                     match self.read()?{
-                        BodyRead::Bytes(bytes)=>{
+                        BodyRead::Bytes(bytes,_)=>{
                             let(values,query_error)=parse_query(&bytes,self.control.get().and_then(Weak::upgrade).as_ref())?;post=values;if failure.is_none(){failure=query_error;}
                         }
                         BodyRead::Io(reason)=>{if failure.is_none(){failure=Some(reason);}}
@@ -60,7 +54,7 @@ impl Form {
         if parsed.error.is_some()||parsed.media_type!="multipart/form-data"{return Ok(Some("request Content-Type isn't multipart/form-data".into()));}
         let boundary=parsed.params.as_ref().and_then(|params|params.get("boundary"));
         let Some(boundary)=boundary else{return Ok(Some("no multipart boundary param in Content-Type".into()));};
-        let bytes=match self.read()?{BodyRead::Bytes(bytes)=>bytes,BodyRead::Io(message)=>return Ok(Some(message)),BodyRead::TooLarge=>return Ok(Some("multipart: message too large".into()))};
+        let bytes=match self.read()?{BodyRead::Bytes(bytes,_)=>bytes,BodyRead::Io(message)=>return Ok(Some(message)),BodyRead::TooLarge=>return Ok(Some("multipart: message too large".into()))};
         let parsed=match super::multipart::read_form(&bytes,boundary,max_memory,self.control.get().and_then(Weak::upgrade).as_ref())?{Ok(parsed)=>parsed,Err(message)=>return Ok(Some(message))};
         let mut form=state.form.as_ref().map_or_else(Values::new,|form|form.as_ref().clone());append_values(&mut form,parsed.values.as_ref().clone())?;state.form=Some(Arc::new(form));
         let mut post=state.post.as_ref().map_or_else(Values::new,|post|post.as_ref().clone());append_values(&mut post,parsed.values.as_ref().clone())?;state.post=Some(Arc::new(post));

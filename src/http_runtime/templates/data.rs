@@ -157,7 +157,7 @@ impl RequestData {
             ("ProtoMajor".into(),Value::Int(major)),("ProtoMinor".into(),Value::Int(minor)),
             ("ContentLength".into(),Value::Int64(if original{0}else{self.content_length})),
             ("Close".into(),Value::Bool(!original&&matches!(self.version,Version::HTTP_10|Version::HTTP_11)&&(crate::http_runtime::proxy::header_has_token(&headers,header::CONNECTION,"close")||(self.version==Version::HTTP_10&&!crate::http_runtime::proxy::header_has_token(&headers,header::CONNECTION,"keep-alive"))))),
-            ("TransferEncoding".into(),Value::List(Vec::new().into())),("Body".into(),Value::Nil),
+            ("TransferEncoding".into(),Value::List(Vec::new().into())),("Body".into(),if original{Value::Nil}else{self.form.body_value(control)?}),
             ("MultipartForm".into(),if original{super::forms::Form::new("GET","",b"").multipart_value()}else{self.form.multipart_value()}),
         ]);
         fields.insert("Response".into(),nil_pointer("*http.Response",&["Status","StatusCode","Proto","ProtoMajor","ProtoMinor","Header","Body","ContentLength","TransferEncoding","Close","Uncompressed","Trailer","Request","TLS"]));

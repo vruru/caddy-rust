@@ -38,13 +38,8 @@ pub(super) fn parse(value: &Value, path: &str) -> Result<Issuer> {
                 options,
             })
         }
-        "zerossl" => {
-            Object::new(Some(value), ObjectKind::ZeroSsl, path)?;
-            Err(ConfigError::unsupported(
-                pointer(path, "module"),
-                "zerossl_api_issuer",
-            ))
-        }
+        "zerossl" => super::zerossl_settings::Input::decode(value,path,crate::acme_wire::chain_memory::shared().payload.clone())
+            .map(Issuer::ZeroSsl).map_err(|error|if error.is::<super::zerossl_settings::UnsupportedCnameProvider>(){ConfigError::unsupported(pointer(path,"cname_validation"),"zerossl_cname_provider")}else{ConfigError::invalid(path.to_owned())}),
         _ => Err(ConfigError::unsupported(
             pointer(path, "module"),
             "issuer_module",

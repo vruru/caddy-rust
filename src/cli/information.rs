@@ -129,6 +129,7 @@ static STANDARD_MODULES: &[&str] = &[
     "tls.handshake_match.sni_regexp",
     "tls.issuance.acme",
     "tls.issuance.internal",
+    "tls.issuance.zerossl",
     "tls.leaf_cert_loader.file",
     "tls.leaf_cert_loader.folder",
     "tls.leaf_cert_loader.pem",

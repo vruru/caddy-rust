@@ -10,6 +10,7 @@ use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 #[derive(Clone)]
 pub(super) enum Issuer {
     Acme(Box<AcmeSettings>),
+    ZeroSsl(std::sync::Arc<super::zerossl_settings::Input>),
     Internal {
         ca: String,
         options: InternalIssuerOptions,

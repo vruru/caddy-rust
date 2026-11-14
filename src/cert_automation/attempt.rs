@@ -73,7 +73,11 @@ fn is_hex64_ascii(s: &str) -> bool {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
-pub(super) enum BackendId {
+pub(crate) enum BackendId {
+    ZeroSsl {
+        #[serde(deserialize_with = "super::job_codec::text")]
+        config_identity: String,
+    },
     Acme {
         #[serde(deserialize_with = "super::job_codec::text")]
         directory: String,

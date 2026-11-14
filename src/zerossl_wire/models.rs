@@ -81,6 +81,7 @@ pub(crate) struct ApiErrorInfo {pub code:i64,#[serde(rename="type")]pub kind:Str
 /// Raw external strings are available to closed callers but never logged here.
 pub(crate) struct ApiError {
  pub http_status:u16,pub info:ApiErrorInfo,
+ pub confirmed_rejection:bool,
  pub(super) _memory:crate::acme_wire::chain_memory::Lease,
 }
 impl fmt::Debug for ApiError {fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.debug_struct("ZeroSslApiError").field("status",&self.http_status).field("code",&self.info.code).finish()}}

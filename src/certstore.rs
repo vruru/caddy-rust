@@ -772,6 +772,19 @@ impl FsStore {
         lease::acquire(self.core.clone(), name, cancel).await
     }
 
+    /// Local API receipts live only in the strict native sidecar, never the
+    /// public CertMagic data/import namespace. Prefix is closed to leaf hashes.
+    pub(crate) async fn issuer_receipt_paths(&self)->Result<Vec<String>>{
+        self.blocking(|c|c.state.list("issuer-receipts",true)).await
+    }
+    pub(crate) async fn issuer_receipt_read(&self,key:&str)->Result<Option<crate::cert_transient::Bytes>>{
+        issuer_receipt_path(key)?;let key=key.to_owned();
+        self.blocking(move|c|c.state.load_owned(&key,true,crate::cert_transient::Lifetime::Temporary)).await
+    }
+    pub(crate) async fn issuer_receipt_write<B:AsRef<[u8]>+Send+'static>(&self,key:&str,bytes:B,lease:&StorageLease)->Result<()>{
+        issuer_receipt_path(key)?;ensure!(lease.name()=="key_compromise","issuer receipt lease scope mismatch");
+        let key=key.to_owned();self.fenced(lease,move|c|c.state.store(&key,bytes.as_ref())).await
+    }
     pub async fn journal_load(&self, job_id: &str) -> Result<Option<Value>> {
         let key = job_key(job_id)?;
         self.blocking(move |c| {
@@ -2164,6 +2177,11 @@ impl FsStore {
     }
 }
 
+fn issuer_receipt_path(path:&str)->Result<()>{
+    ensure!(path.strip_prefix("issuer-receipts/").and_then(|p|p.strip_suffix(".json"))
+        .is_some_and(|p|p.len()==64&&p.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))),"invalid issuer receipt path");
+    Ok(())
+}
 fn job_key(id: &str) -> Result<String> {
     ensure!(
         !id.is_empty()

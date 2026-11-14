@@ -251,11 +251,26 @@ impl CertificateManager {
             return self.recover_test_ca_phase(names,state,lease,cancel).await;
         }
         if state.winner.is_some(){return Ok(())}
+        if !state.configured_sequence.iter().eq(self.inner.backends.iter().map(|b|&b.id))
+            &&self.closed_zero_configuration(state).await?{return Ok(())}
         let Some(id)=state.current_job_id.as_deref()else{return Ok(())};
         let Some(selected)=state.current_backend.as_ref()else{return Ok(())};
         let backend=self.inner.backends.iter().find(|b|&b.id==selected)
             .ok_or_else(||anyhow!("active certificate backend changed; resume original policy"))?;
         match &backend.kind {
+            backend::BackendKind::ZeroSsl(settings)=>{
+                let leg=self.load_zero(id).await?.ok_or_else(||anyhow!("active ZeroSSL leg missing"))?;
+                ensure!(leg.attempt_id==state.attempt_id&&leg.names==names&&&leg.backend==selected
+                    &&state.current_input.as_ref()==Some(&leg.input),"active ZeroSSL leg identity changed");
+                if matches!(leg.phase,super::zerossl_record::Phase::Prepared|super::zerossl_record::Phase::Cancelled|super::zerossl_record::Phase::CreateRejected){return Ok(())}
+                let input_id=state.input_id.as_deref().ok_or_else(||anyhow!("ZeroSSL attempt input missing"))?;
+                let input=self.load_input(input_id,&state.attempt_id,cancel).await?;
+                let lifecycle=crate::cert_events::Attempt::new(&names[0],None);
+                match self.issue_zerossl(names,backend,settings,input,&state.attempt_id,lease,&lifecycle,cancel,false,None).await{
+                    Err(error)if error.is::<super::zerossl::ClosedLeg>()=>{},
+                    result=>{result?;},
+                }
+            },
             backend::BackendKind::Internal{..}=>{
                 let leg=self.load_internal(id).await?.ok_or_else(||anyhow!("active internal leg missing"))?;
                 ensure!(leg.attempt_id==state.attempt_id&&leg.names==names&&&leg.backend==selected
@@ -362,7 +377,13 @@ impl CertificateManager {
         if state.retired {return self.retire_input(&state,lease).await}
         let id=state.current_job_id.as_deref().ok_or_else(||anyhow!("expired attempt job missing"))?;
         let internal=matches!(state.current_backend,Some(attempt::BackendId::Internal{..}));
-        let (expected_leaf,storage_key)=if internal {
+        let zero=matches!(state.current_backend,Some(attempt::BackendId::ZeroSsl{..}));
+        let (expected_leaf,storage_key)=if zero {
+            let leg=self.load_zero(id).await?.ok_or_else(||anyhow!("expired ZeroSSL leg missing"))?;
+            ensure!(leg.attempt_id==state.attempt_id&&leg.names==names&&Some(&leg.backend)==state.current_backend.as_ref()
+                &&Some(&leg.input)==state.current_input.as_ref(),"expired ZeroSSL binding changed");
+            (leg.stored_leaf_sha256,"zerossl".to_owned())
+        }else if internal {
             let leg=self.load_internal(id).await?.ok_or_else(||anyhow!("expired internal leg missing"))?;
             ensure!(leg.attempt_id==state.attempt_id&&leg.names==names
                 &&Some(&leg.backend)==state.current_backend.as_ref()
@@ -398,7 +419,7 @@ impl CertificateManager {
         let name=lease.name().to_owned();
         let encoded=self.cpu(cancel,move||job_codec::encode_record(&state,&name)).await?;
         self.inner.store.journal_store_encoded_fenced(&archive,encoded,lease).await?;
-        if !internal {self.abandon_leg(names,&expected.attempt_id,lease).await?;}
+        if !internal&&!zero {self.abandon_leg(names,&expected.attempt_id,lease).await?;}
         let mut state=self.load_attempt(names).await?.ok_or_else(||anyhow!("expired attempt disappeared"))?;
         ensure!(state.attempt_id==expected.attempt_id&&state.winner.is_none(),"expired attempt superseded");
         if let Some(leaf)=materialized {

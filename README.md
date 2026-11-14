@@ -9,7 +9,7 @@ The project currently covers a specific subset of functionalities:
 *   **Process Lifecycle**: Linux `Type=notify` readiness/reload/stop datagrams, bounded notification delivery, Unix signal handling and graceful drain.
 *   **HTTP/Admin**: Transactional endpoints, Host/origin/remote authorization, conditional configurations, and ETag support.
 *   **Transports**: H1, H2, and H3 streaming uploads and downloads, range-conditional responses, compression, reverse proxying (including FastCGI and WebSocket), and load balancing with dynamic upstream health checks.
-*   **TLS & Certificates**: TLS 1.2/1.3, managed and manual certificate support, on-demand ACME (HTTP-01, TLS-ALPN-01), local PKI, OCSP, session tickets, external certificate retrieval (HTTP, Tailscale), generation-scoped Must-Staple requests and private-key reuse.
+*   **TLS & Certificates**: TLS 1.2/1.3, managed and manual certificate support, native ZeroSSL REST issuance/recovery/revocation, on-demand ACME (HTTP-01, TLS-ALPN-01), local PKI, OCSP, session tickets, external certificate retrieval (HTTP, Tailscale), generation-scoped Must-Staple requests and private-key reuse.
 *   **ACME Server**: Native account/order lifecycle, HTTP-01/DNS-01/TLS-ALPN-01 validation, CSR signing, persistent revocation and key rollover with checked Bolt-format state interoperability.
 *   **Explicit CBC Policies**: Complete native SSL record/session processing for configured TLS 1.2 ECDHE AES-CBC suites, retaining the existing resolver, client-authentication and revocation policy.
 *   **Metrics**: Generation-scoped Prometheus/OpenMetrics scraping, HTTP/protobuf and gRPC OTLP, console export, real runtime facts, and bounded observation/export lifetimes, with Process-owned client handshake scheduling and tested macOS/Linux DNS retirement.
@@ -24,7 +24,7 @@ The project currently covers a specific subset of functionalities:
 *   **Compatibility**: Correct useful extensions remain supported even where the baseline rejects them. Resource bounds and repairs to upstream bugs are documented differences; accepting a configuration alone does not establish correct execution.
 
 **Known Gaps**:
-The complete ZeroSSL REST issuer remains an integration task. Remaining template receiver and Go PKIX edge cases, optional provider bindings, unverified platforms, and the final combined feature/performance/production gates are tracked in `docs/COMPATIBILITY-STATUS.md`. Targeted feature checks do not establish complete replacement readiness.
+The known finite standard capability gaps have native runtime consumers. Final combined feature/performance/production acceptance, remaining edge-case verification, optional provider bindings and unverified platforms are tracked in `docs/COMPATIBILITY-STATUS.md`. Targeted feature checks do not establish complete replacement readiness.
 
 ## Build
 

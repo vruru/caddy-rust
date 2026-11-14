@@ -96,15 +96,18 @@ const NEEDS_RENEW: u8 = 4;
 struct Metadata {
     latest: Option<Observation>,
     revoked: Option<Observation>,
+    issuer_revoked:Option<Observation>,
     good_since: Option<i64>,
     withdrawn_for: Option<RevocationVersion>,
 }
 impl Metadata {
     fn effective_revoked(&self) -> Option<Observation> {
+        if let Some(issuer)=self.issuer_revoked{return Some(issuer)}
         self.revoked
             .filter(|r| self.good_since.is_none_or(|good| r.this_update >= good))
     }
     fn withdrawn(&self) -> bool {
+        if self.issuer_revoked.is_some(){return true}
         self.withdrawn_for
             .is_some_and(|w| self.good_since.is_none_or(|good| w.this_update >= good))
     }
@@ -167,6 +170,17 @@ impl LeafState {
         }
         self.publish(&metadata);
         Ok(())
+    }
+    /// A direct authenticated issuer revocation is a permanent local fact for
+    /// this exact leaf. A later OCSP Good does not reverse an explicit revoke.
+    pub(crate) fn observe_issuer(&self,observation:Observation)->Result<()>{
+        ensure!(observation.status==Status::Revoked,"issuer observation is not a revocation");
+        let mut metadata=self.metadata()?;
+        if metadata.issuer_revoked.is_none_or(|old|old.reason!=Some(1)
+            &&(observation.reason==Some(1)||observation.this_update>=old.this_update)){
+            metadata.issuer_revoked=Some(observation);
+        }
+        self.publish(&metadata);Ok(())
     }
     /// Both flags come from the same publication; do not combine two separate
     /// reads when deciding which certificate/staple pair to return.
@@ -252,12 +266,14 @@ impl LeafGuard {
     /// `not_after` must come from the same authenticated certificate DER.
     pub fn intern(&self, leaf: LeafId, not_after: i64) -> Result<Arc<LeafState>> {
         ensure!(not_after > 0, "leaf validity outside bounds");
+        let issuer_observation=self.key_deny.issuer_observation(&leaf,not_after)?;
         let mut states = self.states()?;
         if let Some(state) = states.get(&leaf) {
             ensure!(
                 state.not_after == not_after,
                 "leaf validity differs from registered certificate"
             );
+            if let Some(observation)=issuer_observation{state.observe_issuer(observation)?;}
             return Ok(state.clone());
         }
         if states.len() >= self.capacity {
@@ -272,6 +288,7 @@ impl LeafGuard {
             "leaf status capacity exhausted"
         );
         let state = Arc::new(LeafState::new(not_after));
+        if let Some(observation)=issuer_observation{state.observe_issuer(observation)?;}
         states.insert(leaf, state.clone());
         Ok(state)
     }

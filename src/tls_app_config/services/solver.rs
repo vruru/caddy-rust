@@ -7,6 +7,7 @@ use crate::{
 
 pub(super) struct SolverBroker {
     settings: Vec<BindingSettings>,
+    acme_count:usize,
     staged: Vec<StagedAddress>,
     provider: Option<Arc<dyn ChallengeListenerProvider>>,
     leases: AsyncMutex<Vec<Box<dyn ChallengeListenerLease>>>,
@@ -25,10 +26,12 @@ struct BindingSettings {
 impl SolverBroker {
     pub(super) fn new(
         settings: Vec<AcmeSettings>,
+        zero_ssl:Vec<Arc<super::super::zerossl_settings::Prepared>>,
+        zero_default_port:u16,
         staged: Vec<StagedAddress>,
         provider: Option<Arc<dyn ChallengeListenerProvider>>,
     ) -> Result<Arc<Self>> {
-        ensure!(settings.len()<=16,"challenge issuer binding limit");
+        ensure!(settings.len()+zero_ssl.len()<=16,"challenge issuer binding limit");
         let bytes=settings.iter().try_fold(8192usize,|n,s|{
             let text=s.config.wire.directory.len().checked_mul(3).and_then(|a|s.bind_host.len().checked_mul(2).and_then(|b|a.checked_add(b))).ok_or(crate::cert_transient::ResourceDenied)?;
             let test=crate::cert_automation::test_ca::directory(&s.config.wire.directory,s.test_ca.as_deref()).map_or(0,str::len);
@@ -36,8 +39,10 @@ impl SolverBroker {
             n.checked_add(text).and_then(|n|n.checked_add(std::mem::size_of::<BindingSettings>()+2048)).ok_or(crate::cert_transient::ResourceDenied)
         })?.checked_add(staged.len().checked_mul(std::mem::size_of::<StagedAddress>()).ok_or(crate::cert_transient::ResourceDenied)?)
             .ok_or(crate::cert_transient::ResourceDenied)?;
+        let bytes=zero_ssl.iter().try_fold(bytes,|n,s|n.checked_add(s.settings.listen_host.len()*2+std::mem::size_of::<BindingSettings>()+2048).ok_or(crate::cert_transient::ResourceDenied))?;
         let memory=crate::cert_transient::reserve(bytes)?;
-        let settings = settings
+        let acme_count=settings.len();
+        let mut settings = settings
             .into_iter()
             .map(|settings| {
                 let directory = url::Url::parse(&settings.config.wire.directory)
@@ -55,8 +60,14 @@ impl SolverBroker {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        for zero in zero_ssl {
+            let bind_host=zero.settings.listen_host.clone();
+            let bind_address=if let Some(provider)=&provider{provider.resolve_bind_host(&bind_host)?}else{crate::http_runtime::listener_lease::numeric_bind_host(&bind_host)?};
+            settings.push(BindingSettings{directory:String::new(),test_directory:None,bind_host,bind_address,
+                http_port:if zero.settings.alternate_http_port>0{u16::try_from(zero.settings.alternate_http_port)?}else{zero_default_port},alpn_port:443});
+        }
         Ok(Arc::new(Self {
-            settings,
+            settings,acme_count,
             staged,
             provider,
             leases: AsyncMutex::new(Vec::new()),
@@ -71,10 +82,17 @@ impl SolverBroker {
     pub(super) fn callbacks(self:&Arc<Self>)->Result<Vec<SolverPreparation>>{
         // Constructor prepaid this bounded vector/callback metadata. Every
         // callback and invoked future keeps the concrete producer alive.
-        (0..self.settings.len()).map(|index|self.callback_for(index)).collect()
+        (0..self.acme_count).map(|index|self.callback_for(index)).collect()
+    }
+    pub(super) fn zerossl_callbacks(self:&Arc<Self>)->Vec<crate::cert_automation::zerossl::HttpPreparation>{
+        (self.acme_count..self.settings.len()).map(|index|{
+            let this=self.clone();let callback:crate::cert_automation::zerossl::HttpPreparation=Arc::new(move|cancel|{
+                let this=this.clone();Box::pin(async move{this.prepare_index(index,ChallengeType::Http01,cancel).await})
+            });callback
+        }).collect()
     }
     pub(super) fn test_callbacks(self:&Arc<Self>)->Result<Vec<Option<SolverPreparation>>>{
-        (0..self.settings.len()).map(|index|{
+        (0..self.acme_count).map(|index|{
             if self.settings[index].test_directory.is_none(){return Ok(None)}
             let this=self.clone();
             let callback:SolverPreparation=Arc::new(move|directory:String,kind,cancel|{

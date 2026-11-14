@@ -33,17 +33,16 @@ In particular, a later configuration compensation cannot undo an already
 started system trust installation. Validation and rejection before activation
 must not start that installation.
 
-## Explicit standard capability gaps
+## Capability and verification boundaries
 
-These are finite known gaps, not a claim that every existing configuration uses
-or is broken by these fields. Rejected fields must not be made superficially
-compatible by ignoring them. The adapter, typed plan and real runtime consumer
-must all implement their behavior.
+The enumerated standard feature gaps now have typed plans and actual native
+runtime consumers. The final combined candidate still needs the release gates
+below. Unsupported extension inputs remain explicit errors; accepting or
+ignoring a field is not evidence of compatibility.
 
 | Area | Missing fields or legal branches |
 | --- | --- |
-| Certificate issuers | Complete ZeroSSL REST issuer integration; REST primitives alone are not an issuer |
-| Template and certificate edge cases | Remaining receiver behavior and Go PKIX edges require the combined audit; private Go reflection/layout equivalence is not promised |
+| Edge-case verification | Template receivers and certificate paths require the combined regression; private Go reflection/layout equivalence is not promised |
 | Optional providers | DNS publication/validation and non-default filesystem backends require actual provider implementations; the inspected standard inventory contains none of those plugins |
 | Platforms | Windows CLI/service/native trust and other unverified OS branches; macOS/Linux verification does not establish all-platform readiness |
 
@@ -94,6 +93,32 @@ ECH publication without a provider is a no-op, and an explicit publisher without
 a usable provider is rejected. Listing a module name does not establish DNS
 record publication. Native treats `dns:null` as unconfigured, a deliberate
 no-op extension to the reference's rejection of that input.
+
+## ZeroSSL and shared cancellation boundaries
+
+The REST issuer owns its typed backend, prepared credential, fixed endpoint,
+shared CSR/key, persistent create intent, known-ID recovery, HTTP proof,
+validation/download and publication CAS. An uncertain create is not replayed.
+Only demonstrably uncreated or closed ZeroSSL attempts permit a corrected
+credential configuration to replace the old attempt. Shared proof readers select
+the first matching accepted policy and stop with their generation.
+
+Revocation binds to the stored backend and exact leaf rather than current issuer
+order. Authenticated API confirmations are stored only in instance-private state;
+they are not signed OCSP and cannot be introduced by public storage import.
+Already-revoked results confirm the leaf, not a newly requested reason. A local
+key-compromise veto in that case remains explicitly conservative. Accepted
+issuance tasks retain scoped storage/network ownership for bounded cleanup before
+the generation closes its outgoing TLS scope. A failed renewal preserves the
+previous working leaf.
+
+Template multipart Read/ReadAt mutate the existing typed-byte COW view. Request
+Body Read/Close and form parsing share the actual asynchronous body owner and
+consumption position; ordinary Read does not collect an entire slow upload. The
+bridge has capacity one and uses the existing template work/memory budget. Close
+retires the read half promptly instead of adding an extra compatibility drain of
+an unknown slow source. Memory, disk/section, EOF, alias and concurrent-upload
+checks belong to the same combined candidate gates.
 
 ## Server/listener layer
 

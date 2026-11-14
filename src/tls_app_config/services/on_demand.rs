@@ -2475,7 +2475,7 @@ impl RegistrationInput {
             let mut values=["";16];let mut n=0;
             if policy.issuers.is_empty(){n=1}else{
                 ensure!(policy.issuers.len()<=16,"issuer class count exceeds bounds");
-                for issuer in &policy.issuers {values[n]=match issuer{Issuer::Acme(_)=>"",Issuer::Internal{ca,..}=>ca};n+=1;}
+                for issuer in &policy.issuers {values[n]=match issuer{Issuer::Acme(_)|Issuer::ZeroSsl(_)=>"",Issuer::Internal{ca,..}=>ca};n+=1;}
             }
             sets.push(IssuerClasses::new(&values[..n])?);
         }

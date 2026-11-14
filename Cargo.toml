@@ -132,8 +132,9 @@ openssl-sys = { path = "vendor/openssl-sys-0.9.118" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["std", "general"] }
 
 [profile.release]
-debug = 1
-strip = "none"
+debug = 0
+strip = "symbols"
+panic = "unwind"
 
 [profile.release.package."*"]
 debug = 0
