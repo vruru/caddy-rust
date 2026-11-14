@@ -101,14 +101,28 @@ fn cancellation_children_bytes(children: usize) -> Result<usize> {
         .and_then(|bytes| bytes.checked_mul(3))
         .ok_or_else(|| crate::cert_transient::ResourceDenied.into())
 }
-fn scope_metadata_bytes() -> Result<usize> {
+fn scope_fixed_metadata_bytes() -> Result<usize> {
     metadata_sum(&[
         std::mem::size_of::<Scope>(),
         std::mem::size_of::<ScopeOwner>(),
         CHILD_PRIMITIVES,
         physical_tracker_bytes()?,
+    ])
+}
+// Only two scope roles exist: a generation may create issuer legs; a leg
+// cannot create another scope. Each leg's children are actual connection jobs.
+fn leg_metadata_bytes() -> Result<usize> {
+    metadata_sum(&[
+        scope_fixed_metadata_bytes()?,
         cancellation_children_bytes(maximum_children(minimum_connection_loan()?)?)?,
     ])
+}
+fn scope_metadata_bytes() -> Result<usize> {
+    let children=metadata_sum(&[
+        maximum_children(minimum_connection_loan()?)?,
+        maximum_children(leg_metadata_bytes()?)?,
+    ])?;
+    metadata_sum(&[scope_fixed_metadata_bytes()?, cancellation_children_bytes(children)?])
 }
 // Pinned tokio-util 0.7.20 TaskTrackerInner is AtomicUsize + Notify;
 // include its Arc control block and maximum field alignment padding. This
@@ -126,7 +140,7 @@ fn master_metadata_bytes() -> Result<usize> {
     // all live call nodes plus scopes, independently of every scope's own Vec.
     let nodes = metadata_sum(&[
         maximum_children(minimum_connection_loan()?)?,
-        maximum_children(scope_metadata_bytes()?)?,
+        maximum_children(leg_metadata_bytes()?)?,
     ])?;
     metadata_sum(&[
         std::mem::size_of::<Master>(),
@@ -145,6 +159,7 @@ struct Master {
     stop: CancellationToken,
     tasks: TaskTracker,
     executor: ClientTlsExecutor,
+    sign: SignSlot,
     total: Option<Arc<Semaphore>>,
     local: Arc<Semaphore>,
     _metadata: Loan,
@@ -180,6 +195,7 @@ impl Resources {
                 stop: CancellationToken::new(),
                 tasks: TaskTracker::new(),
                 executor: ClientTlsExecutor::new(),
+                sign: SignSlot::default(),
                 total,
                 local,
                 _metadata: Loan {
@@ -219,6 +235,7 @@ impl Master {
         let loan = self.loan(scope_metadata_bytes()?)?;
         let scope = Scope {
             master: self.clone(),
+            parent: None,
             closed: Mutex::new(false),
             stop: self.stop.child_token(),
             tasks: TaskTracker::new(),
@@ -248,6 +265,7 @@ impl Master {
         {
             *self.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
         }
+        self.sign_notify(true);
         self.stop.cancel();
         self.tasks.close();
         if force {
@@ -294,6 +312,9 @@ impl Drop for ScopeOwner {
 }
 pub(crate) struct Scope {
     master: Arc<Master>,
+    // Keep the generation's child-vector high-water loan until every actual
+    // descendant scope, retained error and connection has retired.
+    parent: Option<Arc<Scope>>,
     closed: Mutex<bool>,
     stop: CancellationToken,
     tasks: TaskTracker,
@@ -301,11 +322,33 @@ pub(crate) struct Scope {
     _metadata: Loan,
 }
 impl Scope {
+    /// Closed generation -> issuer-leg edge, never an arbitrary recursive tree.
+    /// Closing this external handle affects its leg only. Closing the accepted
+    /// generation still cancels every leg, including an in-flight DNS worker.
+    pub(crate) fn issuer_leg(self:&Arc<Self>) -> Result<ScopeOwner> {
+        if self.parent.is_some() { return Err(io::Error::other("issuer leg cannot create another scope").into()); }
+        let loan=self.master.loan(leg_metadata_bytes()?)?;
+        let scope={
+            let master=self.master.closed.lock().map_err(|_|io::Error::other("outgoing TLS admission failed"))?;
+            let generation=self.closed.lock().map_err(|_|io::Error::other("outgoing TLS admission failed"))?;
+            if *master || *generation || self.stop.is_cancelled() {return Err(ConnectionControl::Stopped.into());}
+            Scope {
+                master:self.master.clone(), parent:Some(self.clone()),
+                closed:Mutex::new(false), stop:self.stop.child_token(),
+                tasks:TaskTracker::new(), physical:TaskTracker::new(), _metadata:loan,
+            }
+        };
+        // Any concurrent parent close is represented by this real child token.
+        // Never destroy a scope/cancellation node under either admission lock.
+        if scope.stop.is_cancelled() {return Err(ConnectionControl::Stopped.into());}
+        Ok(ScopeOwner{inner:Arc::new(scope),cancel_on_drop:None})
+    }
     pub(crate) fn close(&self) {
         {
             *self.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
         }
         self.stop.cancel();
+        self.master.sign_notify(false);
         self.tasks.close();
         self.physical.close();
     }
@@ -342,20 +385,26 @@ impl Scope {
     fn admit(self: &Arc<Self>, bytes: usize,issuer_owner:crate::acme_wire::ClientOwner) -> Result<ConnectionLease> {
         // Both connector and DNS callers use this same preallocation fence.
         let loan = self.master.loan(metadata_sum(&[bytes, physical_work_bytes()?])?)?;
-        let (global, local, physical) = {
+        let (global, local, physical, parent, parent_physical) = {
             let master = self
                 .master
                 .closed
                 .lock()
                 .map_err(|_| io::Error::other("outgoing TLS admission failed"))?;
+            // Parent close and descendant admission share this fence: merely
+            // testing its cancellation token could race a closed+empty wait.
+            let parent=self.parent.as_ref().map(|parent|parent.closed.lock()
+                .map_err(|_|io::Error::other("outgoing TLS admission failed"))).transpose()?;
             let child = self
                 .closed
                 .lock()
                 .map_err(|_| io::Error::other("outgoing TLS admission failed"))?;
-            if *master || *child || self.stop.is_cancelled() {
+            if *master || *child || parent.as_deref().is_some_and(|closed|*closed) || self.stop.is_cancelled() {
                 return Err(ConnectionControl::Stopped.into());
             }
-            (self.master.tasks.token(), self.tasks.token(), self.physical.token())
+            (self.master.tasks.token(), self.tasks.token(), self.physical.token(),
+                self.parent.as_ref().map(|parent|parent.tasks.token()),
+                self.parent.as_ref().map(|parent|parent.physical.token()))
         };
         let life = Arc::new(Life {
             scope: self.clone(),
@@ -364,8 +413,9 @@ impl Scope {
             _issuer_owner:issuer_owner,
             _global: global,
             _local: local,
+            _parent: parent,
         });
-        let work = Arc::new(PhysicalWork { _life: life.clone(), _token: physical });
+        let work = Arc::new(PhysicalWork { _life: life.clone(), _token: physical, _parent:parent_physical });
         Ok(ConnectionLease { life, work })
     }
 }
@@ -377,6 +427,7 @@ struct Life {
     _issuer_owner:crate::acme_wire::ClientOwner,
     _global: TaskTrackerToken,
     _local: TaskTrackerToken,
+    _parent: Option<TaskTrackerToken>,
 }
 impl Life {
     fn grow(&self, bytes: usize) -> Result<()> {
@@ -407,6 +458,7 @@ impl Life {
 struct PhysicalWork {
     _life: Arc<Life>,
     _token: TaskTrackerToken,
+    _parent: Option<TaskTrackerToken>,
 }
 #[derive(Clone)]
 pub(crate) struct ConnectionLease {
@@ -703,4 +755,203 @@ impl hyper::rt::Write for ScopedIo {
         this.live(cx)?;
         Pin::new(&mut this.inner).poll_shutdown(cx)
     }
+}
+
+// Fixed native JWS CPU driver. This capability has no connection/IO methods.
+#[derive(Default)]
+struct SignSlot {
+    state: std::sync::Mutex<SignSlotState>,
+    changed: std::sync::Condvar,
+}
+#[derive(Default)]
+struct SignSlotState {
+    preparing: bool,
+    driver: Option<Arc<crate::cert_cpu::sign::Shared>>,
+}
+pub(crate) struct CpuMetadata {
+    _loan: Loan,
+}
+pub(crate) struct CpuLease {
+    scope: Arc<Scope>,
+    tokens: Option<CpuTokens>,
+    metadata: Arc<CpuMetadata>,
+}
+struct CpuTokens {
+    _global: TaskTrackerToken,
+    _local: TaskTrackerToken,
+    _physical: TaskTrackerToken,
+    _parent: Option<TaskTrackerToken>,
+    _parent_physical: Option<TaskTrackerToken>,
+}
+impl CpuLease {
+    pub(crate) fn stopped(&self) -> bool {
+        self.scope.stop.is_cancelled()
+    }
+    pub(crate) fn matches(&self, scope: &Arc<Scope>) -> bool {
+        Arc::ptr_eq(&self.scope, scope)
+    }
+    pub(crate) fn metadata(&self) -> Arc<CpuMetadata> {
+        self.metadata.clone()
+    }
+    // Only the closed resident controller calls this after actual data/permit /
+    // blocking join disposition. Metadata cannot recreate a work capability.
+    pub(crate) fn finish(mut self) {
+        drop(self.tokens.take());
+    }
+}
+impl Master {
+    fn sign_notify(&self, close: bool) {
+        let driver = self
+            .sign
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .driver
+            .clone();
+        if let Some(driver) = driver {
+            if close {
+                driver.close();
+            } else {
+                driver.notify();
+            }
+        }
+    }
+    fn prepare_sign(self: &Arc<Self>, slots: Arc<Semaphore>) -> Result<()> {
+        {
+            let mut state = self
+                .sign
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("certificate CPU state failed"))?;
+            while state.preparing {
+                state = self
+                    .sign
+                    .changed
+                    .wait(state)
+                    .map_err(|_| io::Error::other("certificate CPU state failed"))?;
+            }
+            if let Some(driver) = &state.driver {
+                return driver.check_slots(&slots);
+            }
+            if self.stop.is_cancelled() {
+                return Err(ConnectionControl::Stopped.into());
+            }
+            state.preparing = true;
+        }
+        struct Preparing<'a>(&'a SignSlot);
+        impl Drop for Preparing<'_> {
+            fn drop(&mut self) {
+                {
+                    lock_sign(&self.0.state).preparing = false;
+                }
+                self.0.changed.notify_all();
+            }
+        }
+        let preparing = Preparing(&self.sign);
+        // Runtime construction / startup ack, credit return and drop are never
+        // executed under the Master/SignSlot admission fences.
+        let result = (|| {
+            let bytes = crate::cert_cpu::sign::control_layout()?;
+            let metadata = Arc::new(CpuMetadata {
+                _loan: self.loan(bytes)?,
+            });
+            let driver = crate::cert_cpu::sign::Shared::new(slots, metadata);
+            let executor = self.executor.prepare()?;
+            executor.register_sign_driver(driver.clone())?;
+            Ok::<_, anyhow::Error>(driver)
+        })();
+        let closing =
+            *self.closed.lock().unwrap_or_else(|e| e.into_inner()) || self.stop.is_cancelled();
+        {
+            let mut state = self.sign.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.preparing = false;
+            if let Ok(driver) = &result {
+                state.driver = Some(driver.clone());
+            }
+        }
+        drop(preparing);
+        if closing {
+            if let Ok(driver) = &result {
+                driver.close();
+            }
+        }
+        result?;
+        if closing {
+            return Err(ConnectionControl::Stopped.into());
+        }
+        Ok(())
+    }
+}
+impl Scope {
+    pub(crate) fn prepare_sign_driver(self: &Arc<Self>, slots: Arc<Semaphore>) -> Result<()> {
+        if self.stop.is_cancelled() {
+            return Err(ConnectionControl::Stopped.into());
+        }
+        self.master.prepare_sign(slots)?;
+        if self.stop.is_cancelled() {
+            return Err(ConnectionControl::Stopped.into());
+        }
+        Ok(())
+    }
+    pub(crate) fn sign_ticket(
+        self: &Arc<Self>,
+        slots: &Arc<Semaphore>,
+    ) -> Result<crate::cert_cpu::sign::Ticket> {
+        let driver = self
+            .master
+            .sign
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("certificate CPU state failed"))?
+            .driver
+            .clone()
+            .ok_or_else(|| io::Error::other("certificate CPU driver not prepared"))?;
+        driver.check_slots(slots)?;
+        let bytes = crate::cert_cpu::sign::cell_layout()?;
+        let loan = self.master.loan(bytes)?;
+        let tokens = {
+            let master = self
+                .master
+                .closed
+                .lock()
+                .map_err(|_| io::Error::other("certificate CPU admission failed"))?;
+            let parent = self
+                .parent
+                .as_ref()
+                .map(|p| {
+                    p.closed
+                        .lock()
+                        .map_err(|_| io::Error::other("certificate CPU admission failed"))
+                })
+                .transpose()?;
+            let local = self
+                .closed
+                .lock()
+                .map_err(|_| io::Error::other("certificate CPU admission failed"))?;
+            if *master
+                || *local
+                || parent.as_deref().is_some_and(|v| *v)
+                || self.stop.is_cancelled()
+            {
+                return Err(ConnectionControl::Stopped.into());
+            }
+            CpuTokens {
+                _global: self.master.tasks.token(),
+                _local: self.tasks.token(),
+                _physical: self.physical.token(),
+                _parent: self.parent.as_ref().map(|p| p.tasks.token()),
+                _parent_physical: self.parent.as_ref().map(|p| p.physical.token()),
+            }
+        };
+        let lease = CpuLease {
+            scope: self.clone(),
+            tokens: Some(tokens),
+            metadata: Arc::new(CpuMetadata { _loan: loan }),
+        };
+        driver.register(lease)
+    }
+}
+
+fn lock_sign<T>(value: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    value.lock().unwrap_or_else(|e| e.into_inner())
 }

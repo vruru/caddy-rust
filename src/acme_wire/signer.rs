@@ -215,6 +215,14 @@ impl AccountSigner {
         URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()))
     }
 
+    pub(crate) fn max_signature_len(&self) -> usize {
+        match self {
+            Self::P256(_) => 64,
+            Self::P384(_) => 96,
+            Self::Ed25519(_) => 64,
+            Self::Rsa(key) => rsa::traits::PublicKeyParts::size(key.as_ref()),
+        }
+    }
     pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
         Ok(match self {
             Self::P256(key) => {

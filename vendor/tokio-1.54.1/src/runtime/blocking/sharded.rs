@@ -234,6 +234,37 @@ impl ShardedImpl {
         Ok(())
     }
 
+    pub(super) fn try_wake_blocking_queue<F>(
+        &self,
+        metrics: &SpawnerMetrics,
+        on_no_idle: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&mut ThreadManagementState) -> std::io::Result<()>,
+    {
+        let mut coord = self.coord.lock();
+        if coord.thread_mgmt_state.shutdown {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe, "blocking pool is shutting down",
+            ));
+        }
+        // Push/pop release their shard before taking coord. This is the same
+        // coord -> shard order used by the worker's pre-idle recheck.
+        let queued = self.shards.iter().any(|shard| !shard.lock().queue.is_empty());
+        if !queued {
+            return Ok(());
+        }
+        if metrics.num_idle_threads() == 0 {
+            on_no_idle(&mut coord.thread_mgmt_state)
+        } else {
+            metrics.dec_num_idle_threads();
+            coord.num_notify += 1;
+            drop(coord);
+            self.condvar.notify_one();
+            Ok(())
+        }
+    }
+
     /// Run a worker thread's main loop.
     pub(super) fn run_worker(
         &self,

@@ -13,12 +13,16 @@ pub(super) struct Input {
     options:WireOptions,
     #[cfg(feature="native-run")]
     scope:Option<Arc<crate::outgoing_tls::Scope>>,
+    cpu: Arc<Semaphore>,
     owner:ClientOwner,
 }
 pub(super) struct Built {pub client:reqwest::Client,pub owner:ClientOwner}
 impl Input {
-    pub fn new(options:WireOptions,#[cfg(feature="native-run")] scope:Option<Arc<crate::outgoing_tls::Scope>>,owner:ClientOwner)->Self {
-        Self{options,#[cfg(feature="native-run")] scope,owner}
+    pub fn new(options:WireOptions,#[cfg(feature="native-run")] scope:Option<Arc<crate::outgoing_tls::Scope>>,owner:ClientOwner,
+        cpu: Arc<Semaphore>,
+    )->Self {
+        Self{options,#[cfg(feature="native-run")] scope,
+            cpu,owner}
     }
     // A consuming method captures the complete input envelope, including its
     // last loan field, through queued/unstarted/started worker destruction.
@@ -37,6 +41,7 @@ impl Input {
         }
         #[cfg(feature="native-run")]
         if let Some(scope)=self.scope.take(){
+            scope.prepare_sign_driver(self.cpu.clone())?;
             #[cfg(unix)]
             {builder=builder.dns_resolver(crate::http_runtime::acme_client_dns::Resolver::new(scope.clone(),self.owner.clone())?);}
             builder=builder.connector_layer(scope.layer()?.with_issuer_owner(self.owner.clone()));

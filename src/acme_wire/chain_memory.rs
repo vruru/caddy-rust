@@ -179,6 +179,30 @@ impl Buffer {
 
 pub(crate) struct Scratch(OwnedSemaphorePermit);
 
+impl Scratch {
+    pub(crate) fn bytes(&self) -> usize { self.0.num_permits() }
+    pub(crate) fn grow_to(&mut self, bytes: usize) -> Result<()> {
+        let held = self.0.num_permits();
+        if bytes > held {
+            // Both permits originate at scratch_sem(); no new pool or wait.
+            self.0.merge(try_scratch(bytes - held)?.0);
+        }
+        Ok(())
+    }
+    // Only shrink after the corresponding input/temporary buffers died. The
+    // remaining loan accompanies the actual owned request body, data first.
+    pub(crate) fn shrink_to(&mut self, bytes: usize) -> Result<()> {
+        let held = self.0.num_permits();
+        if bytes > held {
+            bail!(MemoryDenied);
+        }
+        if let Some(excess) = self.0.split(held - bytes) {
+            drop(excess);
+        }
+        Ok(())
+    }
+}
+
 pub(crate) async fn scratch(bytes: usize, cancel: CancellationToken) -> Result<Scratch> {
     if bytes > SCRATCH_LIMIT {
         bail!(MemoryDenied);

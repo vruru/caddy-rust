@@ -521,6 +521,26 @@ impl Spawner {
             })
     }
 
+    pub(crate) fn try_wake_blocking_queue(&self, rt: &Handle) -> io::Result<()> {
+        self.inner.inner_impl.try_wake_blocking_queue(
+            &self.inner.metrics,
+            |state| {
+                if self.inner.metrics.num_threads() >= self.inner.thread_cap {
+                    return Ok(());
+                }
+                let shutdown_tx = state.shutdown_tx.clone().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "blocking pool is shutting down")
+                })?;
+                let id = state.worker_thread_index;
+                let handle = self.spawn_thread(shutdown_tx, rt, id)?;
+                self.inner.metrics.inc_num_threads();
+                state.worker_thread_index += 1;
+                state.worker_threads.insert(id, handle);
+                Ok(())
+            },
+        )
+    }
+
     fn spawn_thread(
         &self,
         shutdown_tx: shutdown::Sender,
@@ -574,6 +594,20 @@ impl InnerImpl {
         match self {
             InnerImpl::Locked(l) => l.spawn_task(task, metrics, on_no_idle),
             InnerImpl::Sharded(s) => s.spawn_task(task, metrics, on_no_idle),
+        }
+    }
+
+    fn try_wake_blocking_queue<F>(
+        &self,
+        metrics: &SpawnerMetrics,
+        on_no_idle: F,
+    ) -> io::Result<()>
+    where
+        F: FnOnce(&mut ThreadManagementState) -> io::Result<()>,
+    {
+        match self {
+            InnerImpl::Locked(l) => l.try_wake_blocking_queue(metrics, on_no_idle),
+            InnerImpl::Sharded(s) => s.try_wake_blocking_queue(metrics, on_no_idle),
         }
     }
 
@@ -654,6 +688,32 @@ impl LockedImpl {
         }
 
         Ok(())
+    }
+
+    fn try_wake_blocking_queue<F>(
+        &self,
+        metrics: &SpawnerMetrics,
+        on_no_idle: F,
+    ) -> io::Result<()>
+    where
+        F: FnOnce(&mut ThreadManagementState) -> io::Result<()>,
+    {
+        let mut locked = self.mutex.lock();
+        if locked.thread_mgmt_state.shutdown {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "blocking pool is shutting down"));
+        }
+        if locked.queue.is_empty() {
+            return Ok(());
+        }
+        if metrics.num_idle_threads() == 0 {
+            on_no_idle(&mut locked.thread_mgmt_state)
+        } else {
+            metrics.dec_num_idle_threads();
+            locked.num_notify += 1;
+            drop(locked);
+            self.condvar.notify_one();
+            Ok(())
+        }
     }
 
     /// Run a worker thread's main loop.

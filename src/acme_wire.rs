@@ -190,6 +190,8 @@ struct WireInner {
     cpu: Arc<Semaphore>,
     chain_memory:Arc<ChainMemoryPools>,
     client: reqwest::Client,
+    #[cfg(feature = "native-run")]
+    sign_scope: Option<Arc<crate::outgoing_tls::Scope>>,
     directory_url: Url,
     directory: Directory,
     trusted: HashSet<String>,
@@ -265,7 +267,11 @@ impl AcmeWire {
         validate_url(&directory_url, &trusted, options.allow_insecure_loopback, allowed_http_origin.as_deref())?;
         if let Some(proxy)=&options.network_proxy {proxy.validate()?;}
         let allow_loopback=options.allow_insecure_loopback;
-        let input=client_build::Input::new(options,#[cfg(feature="native-run")] scope,owner);
+        #[cfg(feature = "native-run")]
+        let sign_scope = scope.clone();
+        let input=client_build::Input::new(options,#[cfg(feature="native-run")] scope,owner,
+            cpu.clone(),
+        );
         let built=crate::cert_cpu::run(cpu.clone(),cancel.clone(),move||input.build()).await?;
         let response = send(&built.client, Method::GET, directory_url.clone(), None, cancel).await?;
         check_status(&response)?;
@@ -291,6 +297,8 @@ impl AcmeWire {
         Ok(Self {
             inner: Arc::new(WireInner {
                 client:built.client,
+                #[cfg(feature = "native-run")]
+                sign_scope,
                 cpu,
                 chain_memory,
                 directory_url,
@@ -508,27 +516,8 @@ impl AcmeWire {
         for attempt in 0..3 {
             let body_credit=match first_credit.take(){Some(credit)=>Some(credit),None=>memory.as_ref().map(|p|p.payload.reserve(MAX_BODY)).transpose()?};
             let nonce = self.nonce(cancel).await?;
-            let mut protected = json!({"alg":signer.algorithm(),"nonce":nonce,"url":url.as_str()});
-            if let Some(kid) = kid {
-                protected["kid"] = json!(kid);
-            } else {
-                protected["jwk"] = signer.jwk();
-            }
-            let protected = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&protected)?);
-            let payload = match payload {
-                Some(value) => URL_SAFE_NO_PAD.encode(serde_json::to_vec(value)?),
-                None => String::new(),
-            };
-            let signer = signer.clone();
-            let signed_bytes = format!("{protected}.{payload}");
-            let signature = match crate::cert_cpu::run(self.inner.cpu.clone(),cancel.clone(),move || signer.sign(signed_bytes.as_bytes())).await {
-                Err(error) if cancel.is_cancelled() => return Err(error.context(ProtocolError { status:0,kind:"cancelledBeforeSend".into(),uncertain:false,retry_after:None })),
-                result => result?,
-            };
-            let body = serde_json::to_vec(
-                &json!({"protected":protected,"payload":payload,"signature":URL_SAFE_NO_PAD.encode(signature)}),
-            )?;
-            let response = send_with_memory(
+            let body = self.jws_body(signer, nonce, &url, kid, payload, cancel).await?;
+            let response = send_body_with_memory(
                 &self.inner.client,
                 Method::POST,
                 url.clone(),
@@ -615,6 +604,41 @@ impl AcmeWire {
             certificate_id: certificate_id.to_owned(),
         }))
     }
+}
+
+impl AcmeWire {
+    async fn jws_body(&self, signer: &Arc<AccountSigner>, nonce: String, url: &Url,
+        kid: Option<&str>, payload: Option<&Value>, cancel: &CancellationToken) -> Result<RequestBody> {
+        #[cfg(feature = "native-run")]
+        if let Some(scope) = &self.inner.sign_scope {
+            let ticket = scope.sign_ticket(&self.inner.cpu)?;
+            let mut nonce = Some(nonce);
+            let future = ticket.submit_jws(signer.clone(), &mut nonce, url.as_str(), kid, payload, cancel.clone())?;
+            let ready = match future.await {
+                Err(error) if cancel.is_cancelled() => return Err(error.context(ProtocolError {
+                    status: 0, kind: "cancelledBeforeSend".into(), uncertain: false, retry_after: None,
+                })),
+                result => result?,
+            };
+            if cancel.is_cancelled() {
+                drop(ready);
+                return Err(cancelled_request(ProtocolError {
+                    status: 0, kind: "cancelledBeforeSend".into(), uncertain: false, retry_after: None,
+                }));
+            }
+            return Ok(RequestBody::Owned(ready.handoff_http(scope)?));
+        }
+        let mut protected = json!({"alg":signer.algorithm(),"nonce":nonce,"url":url.as_str()});
+        if let Some(kid) = kid { protected["kid"] = json!(kid); }
+        else { protected["jwk"] = signer.jwk(); }
+        let protected = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&protected)?);
+        let payload = match payload {
+            Some(value) => URL_SAFE_NO_PAD.encode(serde_json::to_vec(value)?),
+            None => String::new(),
+        };
+        Ok(RequestBody::Legacy(legacy_jws(self.inner.cpu.clone(), signer.clone(), protected, payload, cancel.clone()).await?))
+    }
+
 }
 
 impl AccountSession {
@@ -1024,6 +1048,30 @@ async fn send_with_type(
     send_with_memory(client,method,url,body,content_type,None,None,None,cancel).await
 }
 async fn send_with_memory(client:&reqwest::Client,method:Method,url:Url,body:Option<Vec<u8>>,content_type:&str,memory:Option<Arc<ChainMemoryPools>>,body_credit:Option<ChainMemoryLease>,http_slots:Option<Arc<Semaphore>>,cancel:&CancellationToken)->Result<WireResponse> {
+    send_body_with_memory(
+        client,
+        method,
+        url,
+        body.map(RequestBody::Legacy),
+        content_type,
+        memory,
+        body_credit,
+        http_slots,
+        cancel,
+    )
+    .await
+}
+async fn send_body_with_memory(
+    client: &reqwest::Client,
+    method: Method,
+    url: Url,
+    body: Option<RequestBody>,
+    content_type: &str,
+    memory: Option<Arc<ChainMemoryPools>>,
+    body_credit: Option<ChainMemoryLease>,
+    http_slots: Option<Arc<Semaphore>>,
+    cancel: &CancellationToken,
+)->Result<WireResponse> {
     let is_post = method == Method::POST;
     if cancel.is_cancelled() {
         return Err(cancelled_request(ProtocolError {
@@ -1045,7 +1093,7 @@ async fn send_with_memory(client:&reqwest::Client,method:Method,url:Url,body:Opt
     if let Some(body) = body {
         request = request
             .header(reqwest::header::CONTENT_TYPE, content_type)
-            .body(body);
+            .body(body.into_body());
     }
     let mut response = tokio::select! {
         biased;
@@ -1162,4 +1210,47 @@ pub(crate) fn append_trusted_root_pem(mut builder:reqwest::ClientBuilder,pem:&[u
     }
     ensure!(valid>0,"ACME trust root PEM contains no usable certificates");
     Ok(builder)
+}
+
+async fn legacy_jws(
+    cpu: Arc<Semaphore>,
+    signer: Arc<AccountSigner>,
+    protected: String,
+    payload: String,
+    cancel: CancellationToken,
+) -> Result<Vec<u8>> {
+    let signer = signer.clone();
+    let signed_bytes = format!("{protected}.{payload}");
+    let signature = match crate::cert_cpu::run(cpu, cancel.clone(), move || {
+        signer.sign(signed_bytes.as_bytes())
+    })
+    .await
+    {
+        Err(error) if cancel.is_cancelled() => {
+            return Err(error.context(ProtocolError {
+                status: 0,
+                kind: "cancelledBeforeSend".into(),
+                uncertain: false,
+                retry_after: None,
+            }));
+        }
+        result => result?,
+    };
+    Ok(serde_json::to_vec(
+        &json!({"protected":protected,"payload":payload,"signature":URL_SAFE_NO_PAD.encode(signature)}),
+    )?)
+}
+enum RequestBody {
+    Legacy(Vec<u8>),
+    #[cfg(feature = "native-run")]
+    Owned(bytes::Bytes),
+}
+impl RequestBody {
+    fn into_body(self) -> reqwest::Body {
+        match self {
+            Self::Legacy(v) => v.into(),
+            #[cfg(feature = "native-run")]
+            Self::Owned(v) => v.into(),
+        }
+    }
 }

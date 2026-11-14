@@ -1,7 +1,7 @@
 //! Allocation-free serde_json::Value footprint for the pinned BTreeMap graph.
-//! Rust 1.99.1 alloc/collections/btree/node.rs has B=6, 11 key/value slots,
+//! Rust 1.100.0 alloc/collections/btree/node.rs has B=6, 11 key/value slots,
 //! parent pointer + two u16 fields, and 12 child pointers in internal nodes.
-//! https://github.com/rust-lang/rust/blob/1.99.1/library/alloc/src/collections/btree/node.rs
+//! https://github.com/rust-lang/rust/blob/1.100.0/library/alloc/src/collections/btree/node.rs
 //! Update this derivation/allocator checks when changing the Rust toolchain.
 use crate::cert_transient::ResourceDenied;
 use anyhow::Result;

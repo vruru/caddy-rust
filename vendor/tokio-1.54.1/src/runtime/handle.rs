@@ -239,6 +239,16 @@ impl Handle {
         self.inner.blocking_spawner().spawn_blocking(self, func)
     }
 
+    /// Attempts to wake a worker for an already queued blocking task.
+    ///
+    /// This opt-in recovery hook never enqueues a task. It preserves the
+    /// existing blocking thread limit and returns an OS thread-creation error
+    /// to the caller. An empty queue or a pool already at its thread limit is
+    /// a successful no-op. A shutting-down pool returns `BrokenPipe`.
+    pub fn try_wake_blocking_queue(&self) -> std::io::Result<()> {
+        self.inner.blocking_spawner().try_wake_blocking_queue(self)
+    }
+
     /// Runs a future to completion on this `Handle`'s associated `Runtime`.
     ///
     /// This runs the given future on the current thread, blocking until it is

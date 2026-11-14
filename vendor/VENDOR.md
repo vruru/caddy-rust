@@ -259,3 +259,10 @@ dependency or package version is added for this operation.
 ## Tokio threaded-runtime startup rollback
 
 Tokio 1.54.1 is vendored under its original MIT license. Its crates.io archive SHA256 is b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3. The threaded builder now owns startup resources before worker launch and returns an OS thread-creation error only after closing the scheduler, returning unstarted cores and joining started workers. Zero-worker locked blocking pools also retire queued tasks outside the mutex. Public spawn_blocking contracts and automatic CPU selection are retained. See tokio-1.54.1/PATCH-NOTES.md and LICENSE. Independent upstream development targets and dependencies are omitted; this does not add a test runner or workflow.
+
+
+The vendored Tokio also exposes an explicit `try_wake_blocking_queue` recovery
+operation for an already queued task after a failed thread creation. Locked and
+sharded pools preserve cap, idle and shutdown behavior; no retry task is added
+and public `spawn_blocking` is unchanged. The certificate signing driver owns
+its bounded retry policy. See `tokio-1.54.1/PATCH-NOTES.md`.

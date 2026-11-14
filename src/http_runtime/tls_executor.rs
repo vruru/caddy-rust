@@ -209,6 +209,34 @@ impl Shared {
     }
 }
 impl TlsExecutor {
+    pub(crate) fn register_sign_driver(
+        &self,
+        driver: Arc<crate::cert_cpu::sign::Shared>,
+    ) -> Result<()> {
+        let token = {
+            let closed = self
+                .shared
+                .admission_closed
+                .lock()
+                .map_err(|_| anyhow!("TLS driver admission failed"))?;
+            if *closed {
+                return Err(anyhow!("TLS executor stopped"));
+            }
+            self.shared.tasks.token()
+        };
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let stop = self.shared.stop.clone();
+        self.handle.spawn(async move {
+            // Only this fixed driver is admitted here. Its own unwind catcher
+            // drains actual cells; the host token is not part of Master.tasks.
+            let _token = token;
+            driver.host(stop, send).await;
+        });
+        match receive.recv() {
+            Ok(true) => Ok(()),
+            _ => Err(anyhow!("certificate CPU driver startup failed")),
+        }
+    }
     pub fn diagnostics(&self) -> TlsHandshakeDiagnostics {
         let c = self.shared.capacities;
         TlsHandshakeDiagnostics {

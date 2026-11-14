@@ -1692,7 +1692,7 @@ behavior for byte values that cannot be represented as UTF-8.
 
 ### Root-managed default Rustls CA and ACME connection scheduling
 
-Root-managed HTTP CA loaders and ACME managers run default Rustls connection establishment on one lazily prepared client TLS executor per CertificateResources. Configuration CPU preparation creates the executor; workers follow the CPUs available to the process. The owned connector clone is polled for readiness and called on that executor, covering DNS/TCP, HTTPS-proxy TLS, CONNECT and origin TLS while retaining the original roots, verifier, proxy/environment policy, SNI, client identity, ALPN and timeouts. HTTP/JWS construction, application requests and response-body processing keep their existing execution paths. This layer adds no CBC retry and does not move default Rustls authenticated-record processing to a different runtime. Explicit native SSL connections retain their existing complete owned-engine path.
+Root-managed HTTP CA loaders and ACME managers run default Rustls connection establishment on one lazily prepared client TLS executor per CertificateResources. Configuration CPU preparation creates the executor; workers follow the CPUs available to the process. The owned connector clone is polled for readiness and called on that executor, covering DNS/TCP, HTTPS-proxy TLS, CONNECT and origin TLS while retaining the original roots, verifier, proxy/environment policy, SNI, client identity, ALPN and timeouts. Root-managed JWS construction and signing use the owned CPU residence described in `docs/ACME-SIGNING.md`; application requests and response-body processing retain their separate paths. This layer adds no CBC retry and does not move default Rustls authenticated-record processing to a different runtime. Explicit native SSL connections retain their existing complete owned-engine path.
 
 A generation has an independent external scope owner. Actual queued/running futures, completed but unconsumed results, errors and returned connection IO retain concrete scope and metadata owners; IO keeps no handshake running/queue permit. The optional reqwest IO mapping preserves proxy flags, Connection, ALPN/TlsInfo and vectored IO delegation. Idle connections remain cancellable even while they retain the runtime. Services close only their generation after accepted business work drains; final Root drain then joins the shared executor. The last external NativeBackend handle reuses the existing owned graceful stop, including configured delay/grace, with an explicit force fallback when no usable runtime can start that stop. Internal tasks and IO do not retain this external handle.
 
@@ -1864,3 +1864,15 @@ File-server content status overrides are described in
 and range responses, informational writer ordering and safe invalid-code errors.
 
 The optional business automatic-certificate read/write probe and `disable_storage_check` behavior are specified in [STORAGE-CHECK.md](STORAGE-CHECK.md). It does not bypass real persistence or enable certificate cleaning.
+
+
+Native ACME signing ownership
+----------------------------
+
+Root-managed JWS inputs and their intermediate storage are admitted before
+copying or encoding, retained through actual CPU work and cleanup, and handed
+to HTTP as owned bytes. Transient blocking-thread creation failure recovers the
+existing queue without permanently disabling future signing. Scope, cancellation,
+retained-result and standalone-constructor boundaries are documented in
+[`docs/ACME-SIGNING.md`](docs/ACME-SIGNING.md). These changes do not complete
+whole-operation issuer fallback, all trust loaders or final production acceptance.

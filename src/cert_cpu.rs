@@ -126,3 +126,5 @@ async fn dispatch<T: Send + 'static>(
         result = &mut worker => result.map_err(|_| anyhow!("certificate worker failed"))?,
     }
 }
+
+pub(crate) mod sign;
