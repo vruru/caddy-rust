@@ -1890,3 +1890,20 @@ offset. Reserved or out-of-range binary offsets fail explicitly. Monotonic state
 is omitted. Native macOS and Linux all-CPU/single-CPU results match the pinned
 Go oracle across valid outputs and error cases. Mutable decoding, append
 receivers and remaining location semantics are separate compatibility work.
+
+
+ACME setup failure provenance
+-----------------------------
+
+The standalone legacy manager now uses the existing conservative issuer
+classification during directory/client and account setup. Invalid local trust
+material, timing, origin or account input and local reservation errors stop
+that attempt; they no longer trigger a request to another configured issuer.
+Explicit invalid-credential sentinels retain their established fallback rule.
+Actual remote directory responses with invalid JSON or invalid advertised
+endpoints preserve their real HTTP status in a typed ProtocolError, so both
+manager paths can try a separately configured issuer without contacting the
+unauthorized endpoint. Existing remote account-response errors, HTTP failures
+and proven pre-TLS connection refusals retain their classifications. This does
+not extend fallback permission to generic request timeouts or establish the
+remaining per-issuer physical-retirement and late-commit acceptance gates.

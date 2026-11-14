@@ -275,9 +275,13 @@ impl AcmeWire {
         let built=crate::cert_cpu::run(cpu.clone(),cancel.clone(),move||input.build()).await?;
         let response = send(&built.client, Method::GET, directory_url.clone(), None, cancel).await?;
         check_status(&response)?;
+        let directory_status = response.status.as_u16();
         let body=response.body;
         let directory: Directory = crate::cert_cpu::run(cpu.clone(),cancel.clone(),move || serde_json::from_slice(&body)
-            .map_err(|_| anyhow!("invalid ACME directory response"))).await?;
+            .map_err(|_| anyhow::Error::new(ProtocolError {
+                status: directory_status, kind: "invalidDirectory".into(),
+                uncertain: false, retry_after: None,
+            }).context("invalid ACME directory response"))).await?;
         for endpoint in [
             &directory.new_nonce,
             &directory.new_account,
@@ -287,12 +291,15 @@ impl AcmeWire {
         .chain(directory.revoke_cert.iter())
         .chain(directory.renewal_info.iter())
         {
-            validate_url(
-                &Url::parse(endpoint).map_err(|_| anyhow!("invalid ACME directory endpoint"))?,
-                &trusted,
-                allow_loopback,
-                allowed_http_origin.as_deref(),
-            )?;
+            let remote_endpoint = || ProtocolError {
+                status: directory_status, kind: "invalidDirectoryEndpoint".into(),
+                uncertain: false, retry_after: None,
+            };
+            let endpoint = Url::parse(endpoint).map_err(|_| {
+                anyhow::Error::new(remote_endpoint()).context("invalid ACME directory endpoint")
+            })?;
+            validate_url(&endpoint, &trusted, allow_loopback, allowed_http_origin.as_deref())
+                .map_err(|error| anyhow::Error::new(remote_endpoint()).context(error.to_string()))?;
         }
         Ok(Self {
             inner: Arc::new(WireInner {

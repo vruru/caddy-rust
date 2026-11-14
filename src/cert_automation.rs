@@ -1408,15 +1408,16 @@ impl CertificateManager {
                 Ok(wire) => wire,
                 Err(error) => {
                     record_issuer_error(issuer, &error);
+                    let advance = backend::unavailable(&error, &cancel);
                     last_error = Some(error);
-                    continue;
+                    if advance { continue; } else { break; }
                 }
             };
             let reservation = match self.read_reservation(&names, issuer).await {
                 Ok(value) => value,
                 Err(error) => {
                     last_error = Some(error);
-                    continue;
+                    break;
                 }
             };
             let account = match self
@@ -1431,8 +1432,10 @@ impl CertificateManager {
                 Ok(account) => account,
                 Err(error) => {
                     record_issuer_error(issuer, &error);
+                    let advance = backend::unavailable(&error, &cancel)
+                        || error.is::<account_key::CredentialUnavailable>();
                     last_error = Some(error);
-                    continue;
+                    if advance { continue; } else { break; }
                 }
             };
             // Registration/network setup has finished; do not hold a CA
