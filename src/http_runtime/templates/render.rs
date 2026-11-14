@@ -7,7 +7,7 @@ mod sprig;
 #[path = "data.rs"]
 mod data;
 #[path="go_url.rs"]
-mod go_url;
+pub(crate) mod go_url;
 #[path="forms.rs"]
 pub(super) mod forms;
 #[path="media_type.rs"]

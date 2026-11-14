@@ -3,6 +3,7 @@
 //! use noninteractive sudo; CLI callers may preauthenticate sudo separately.
 #[path = "trust_java.rs"]
 mod java;
+#[path="trust_uninstall.rs"]mod uninstall;
 use super::{
     TrustInstaller, material,
     trust_command::{self, Output},
@@ -684,7 +685,9 @@ struct Root {
     temp: Temp,
 }
 impl Root {
-    fn parse(input: &[u8]) -> Result<Self> {
+    fn parse(input: &[u8]) -> Result<Self> {Self::parse_with_time(input,true)}
+    fn parse_for_removal(input:&[u8])->Result<Self>{Self::parse_with_time(input,false)}
+    fn parse_with_time(input:&[u8],validate_time:bool)->Result<Self>{
         let chain = material::chain(input)?;
         ensure!(
             chain.len() == 1,
@@ -700,7 +703,7 @@ impl Root {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs(),
         )?;
-        material::validate(&pair, None, now, false)?;
+        if validate_time{material::validate(&pair, None, now, false)?;}
         let der = &chain[0];
         let (_, cert) =
             x509_parser::parse_x509_certificate(der).map_err(|_| anyhow!("invalid trust root"))?;

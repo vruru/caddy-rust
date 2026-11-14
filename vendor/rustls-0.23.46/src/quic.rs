@@ -54,6 +54,13 @@ mod connection {
             match self { Self::Client(connection)=>connection.native_exporter(),
                 Self::Server(connection)=>connection.native_exporter() }
         }
+        /// Observe an exporter only when the current TLS state actually owns
+        /// exporter secrets. This does not establish peer authentication or
+        /// change `is_handshaking`; early HTTP consumers must retain that fact.
+        pub fn native_exporter_for_phase(&self) -> Result<alloc::sync::Arc<dyn crate::NativeExporter>, Error> {
+            match self { Self::Client(connection)=>connection.native_exporter(),
+                Self::Server(connection)=>connection.native_exporter_for_phase() }
+        }
         /// Peer-provided client status, visible only after completed server Finished.
         pub fn native_peer_ocsp_response(&self) -> Option<&[u8]> {
             match self { Self::Server(connection) => connection.native_peer_ocsp_response(), Self::Client(_) => None }
@@ -397,6 +404,11 @@ mod connection {
         /// A read-only exporter capability retaining no QUIC stream or packet keys.
         pub fn native_exporter(&self) -> Result<alloc::sync::Arc<dyn crate::NativeExporter>, Error> {
             if self.is_handshaking() { return Err(Error::HandshakeNotComplete); }
+            self.core.native_exporter()
+        }
+        /// Capture only already-derived exporter secrets from the real state.
+        /// Authentication and handshake completion remain separate observations.
+        pub fn native_exporter_for_phase(&self) -> Result<alloc::sync::Arc<dyn crate::NativeExporter>, Error> {
             self.core.native_exporter()
         }
         /// Return the TLS-encoded transport parameters for the session's peer.

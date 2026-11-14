@@ -5,7 +5,7 @@
 ## Current Status
 
 The project currently covers a specific subset of functionalities:
-*   **CLI**: `fmt`, `adapt`, `validate`, `run`, `start`, `reload`, `stop`, `hash-password` (bcrypt and Argon2id), and recovery with `run --resume`.
+*   **CLI**: `fmt`, `adapt`, `validate`, `run`, `start`, `reload`, `stop`, `hash-password` (bcrypt and Argon2id), recovery with `run --resume`, module/build/environment information, offline storage import/export, and explicit PKI `trust`/`untrust`.
 *   **Process Lifecycle**: Linux `Type=notify` readiness/reload/stop datagrams, bounded notification delivery, Unix signal handling and graceful drain.
 *   **HTTP/Admin**: Transactional endpoints, Host/origin/remote authorization, conditional configurations, and ETag support.
 *   **Transports**: H1, H2, and H3 streaming uploads and downloads, range-conditional responses, compression, reverse proxying (including FastCGI and WebSocket), and load balancing with dynamic upstream health checks.
@@ -16,6 +16,7 @@ The project currently covers a specific subset of functionalities:
 *   **Resource Push & Rewrites**: Native bounded HTTP/2 push, independent child stream lifetimes, and ordered byte-preserving URI/query and upstream rewrites.
 *   **Tracing & Timeouts**: Generation-scoped OpenTelemetry tracing and actual stream/tunnel lifetimes; native server hard deadlines and scoped route progress limits across H1/H2/H3.
 *   **Templates & Logic**: Native Go-template, Goldmark and CEL behavior has differential coverage; remaining host methods and edge cases are tracked explicitly.
+*   **Listener & ECH Controls**: Unix and inherited descriptors, per-listener protocols, socket keepalive, header limits, full duplex, and server ECH over TCP and HTTP/3. ECH keys use compatible storage, rotation and retained snapshots; DNS publication requires a separate provider plugin.
 
 **Runtime Characteristics**:
 *   CPU: Auto-detects and utilizes all available CPUs at startup.
@@ -23,7 +24,7 @@ The project currently covers a specific subset of functionalities:
 *   **Compatibility**: Correct useful extensions remain supported even where the baseline rejects them. Resource bounds and repairs to upstream bugs are documented differences; accepting a configuration alone does not establish correct execution.
 
 **Known Gaps**:
-Remaining standard modules/fields, remaining listener/address combinations, remaining replacer/provider scheduling, complete template mutability and remaining host methods, Go PKIX edge cases, and full issuer/CA-loader capabilities are not yet implemented.
+The complete ZeroSSL REST issuer remains an integration task. Remaining template receiver and Go PKIX edge cases, optional provider bindings, unverified platforms, and the final combined feature/performance/production gates are tracked in `docs/COMPATIBILITY-STATUS.md`. Targeted feature checks do not establish complete replacement readiness.
 
 ## Build
 

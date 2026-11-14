@@ -34,13 +34,14 @@ pub(in crate::http_runtime) struct View<'a> {
     values: &'a HashMap<String, String>,
     raw_regex_captures: &'a super::super::request_regex::RawCaptures,
     probe: bool,
-    authority: &'a str,
+    authority: &'a [u8],
     original_uri: &'a Uri,
     original_method: &'a Method,
     peer: &'a NetAddress,
     local: &'a NetAddress,
     tls: bool,
     client_ip: Option<IpAddr>,
+    trusted: bool,
     business: &'a Arc<BusinessGuard>,
     maps: &'a [LazyMap],
     resources: &'a super::super::resource_budget::Resources,
@@ -68,6 +69,7 @@ impl<'a> View<'a> {
             local: &ctx.local,
             tls: ctx.tls,
             client_ip: ctx.client_ip,
+            trusted: ctx.trusted,
             business: &ctx.business,
             maps: &ctx.maps,
             resources: &ctx.resources,
@@ -100,14 +102,41 @@ impl<'a> View<'a> {
         let snapshot = self.request.as_ref().and_then(|r| r.extensions().get::<Arc<ConnectionSnapshot>>());
         Some(super::super::placeholder_value::tls_scalar(scalar, self.tls, snapshot))
     }
+    fn authority_scalar(&self,name:&str)->Option<Vec<u8>>{
+        if self.probe||self.values.contains_key(name)||self.raw_regex_captures.get(name).is_some(){return None}
+        Some(match name{
+            "http.request.hostport"=>self.authority.to_vec(),
+            "http.request.host"=>super::super::request_host::hostname(self.authority).to_vec(),
+            "http.request.port"=>super::super::request_host::port(self.authority).to_vec(),
+            _=>return None,
+        })
+    }
+    fn tls_client(&self,name:&str)->Option<Result<Vec<u8>>>{
+        if self.probe||self.values.contains_key(name)||self.raw_regex_captures.get(name).is_some()
+            ||!super::super::client_cert_text::known(name){return None}
+        Some((||{
+            let cache=self.request.as_ref().and_then(|r|r.extensions().get::<Arc<super::super::client_cert_facts::Cache>>());
+            let bytes=super::super::client_cert_text::upper(self.tls,cache)?;
+            if self.retentions.get().is_none(){
+                let owner=super::super::map_runtime::TextRetentions::new(self.pool()).map_err(|_|failure(http::StatusCode::SERVICE_UNAVAILABLE))?;
+                let _=self.retentions.set(owner);
+            }
+            self.retentions.get().expect("prepared TLS text owner").reserve_copy(bytes).map_err(|_|failure(http::StatusCode::SERVICE_UNAVAILABLE))?;
+            super::super::client_cert_text::lookup(name,self.tls,cache).expect("known client TLS provider")
+        })())
+    }
     pub(in crate::http_runtime) fn lookup_bytes_checked(&self, name: &str) -> Result<Option<Vec<u8>>> {
         if let Some(value) = self.tls_scalar(name) { return value.map(|value| Some(value.into_bytes())); }
+        if let Some(value)=self.tls_client(name){return value.map(Some)}
+        if let Some(value)=self.authority_scalar(name){return Ok(Some(value))}
         Ok(self.lookup_bytes(name))
     }
     pub(in crate::http_runtime) fn lookup_checked(&self, name: &str) -> Result<Option<String>> {
         if let Some(value) = self.tls_scalar(name) {
             return Ok(Some(String::from_utf8(value?.into_bytes())?));
         }
+        if let Some(value)=self.tls_client(name){return Ok(Some(String::from_utf8(value?)?))}
+        if let Some(value)=self.authority_scalar(name){return Ok(Some(String::from_utf8(value)?))}
         Ok(self.lookup(name))
     }
     pub(in crate::http_runtime) fn expand_primitive_bytes(&self, text: &str, unknown_empty: bool) -> Result<Vec<u8>> {
@@ -136,6 +165,7 @@ impl<'a> View<'a> {
         if let Some(value) = self.raw_regex_captures.get(name) {
             return Some(value.to_vec());
         }
+        if let Some(value)=self.authority_scalar(name){return Some(value)}
         if !self.values.contains_key(name)
             && let Some(rewrite) = self.request.as_ref().and_then(|r| r.projection)
         {
@@ -218,6 +248,7 @@ impl<'a> View<'a> {
             }
         }
         if let Some(value) = self.tls_scalar(name) { return value.ok().map(|value| value.into_bytes()); }
+        if let Some(value)=self.tls_client(name){return value.ok()}
         self.lookup_depth(name,0,missing).map(String::into_bytes)
     }
     pub(super) fn replacer_query(&self) -> &[u8] {
@@ -254,6 +285,7 @@ impl<'a> View<'a> {
         if let Some(value) = self.tls_scalar(name) {
             return value.ok().and_then(|value| String::from_utf8(value.into_bytes()).ok());
         }
+        if let Some(value)=self.tls_client(name){return value.ok().and_then(|v|String::from_utf8(v).ok())}
         let req = self.request.as_ref();
         let source = req.and_then(|r| {
             r.extensions()
@@ -268,15 +300,7 @@ impl<'a> View<'a> {
                 .generation()
                 .time_until_shutdown()
                 .unwrap_or_default(),
-            "http.request.hostport" => self.authority.to_owned(),
-            "http.request.host" => hostname(&self.authority),
-            "http.request.port" => self
-                .authority
-                .parse::<http::uri::Authority>()
-                .ok()
-                .and_then(|a| a.port_u16())
-                .map(|p| p.to_string())
-                .unwrap_or_default(),
+            "http.request.hostport"|"http.request.host"|"http.request.port"=>String::from_utf8(self.authority_scalar(name)?).ok()?,
             "http.request.remote" => self.peer.to_string(),
             "http.request.remote.host" => self.peer.host(),
             "http.request.remote.port" => self.peer.port_text(),
@@ -284,7 +308,7 @@ impl<'a> View<'a> {
             "http.request.local.host" => self.local.host(),
             "http.request.local.port" => self.local.port_text(),
             "http.request.client_ip" | "http.vars.client_ip" => {
-                self.client_ip.map_or_else(String::new, |ip| ip.to_string())
+                self.client_ip.map_or_else(||if self.trusted&&self.peer.raw_text().as_ref()==b"@"{"@".into()}else{String::new()},|ip|ip.to_string())
             }
             "http.request.scheme" => {
                 if self.tls {
@@ -391,7 +415,7 @@ impl View<'_>{
             let (direct,missing)={
                 let _temporary=self.resources.map_bytes.reserve(8<<20).map_err(|_|failure(http::StatusCode::SERVICE_UNAVAILABLE))?;
                 let missing=std::cell::Cell::new(false);
-                let direct=if let Some(value)=self.tls_scalar(name){Some(value?.into_bytes())}else{self.lookup_bytes_inner(name,&missing)};
+                let direct=if let Some(value)=self.tls_scalar(name){Some(value?.into_bytes())}else if let Some(value)=self.tls_client(name){Some(value?)}else{self.lookup_bytes_inner(name,&missing)};
                 let direct=if let Some(bytes)=direct{
                     ensure!(bytes.len()<=super::super::map_runtime::CAP,"map placeholder value exceeds limit");
                     let credit=self.resources.map_bytes.reserve(bytes.len().saturating_mul(2)+1024).map_err(|_|failure(http::StatusCode::SERVICE_UNAVAILABLE))?;
@@ -439,6 +463,8 @@ impl View<'_>{
     pub(in crate::http_runtime) async fn lookup_text_resolved(&self,name:&str)->Result<Option<String>>{
         if self.maps.is_empty(){return self.lookup_checked(name)}
         if let Some(value)=self.tls_scalar(name){return Ok(Some(String::from_utf8(value?.into_bytes())?))}
+        if let Some(value)=self.tls_client(name){return Ok(Some(String::from_utf8(value?)?))}
+        if let Some(value)=self.authority_scalar(name){return Ok(Some(String::from_utf8(value)?))}
         let Some(bytes)=self.lookup_resolved(name).await?else{return Ok(None)};
         let Ok(text)=std::str::from_utf8(&bytes)else{return Ok(None)};
         self.retain_text(bytes.clone())?;Ok(Some(text.to_owned()))

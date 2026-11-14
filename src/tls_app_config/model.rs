@@ -85,6 +85,7 @@ pub(super) struct Identity {
 
 #[derive(Clone)]
 pub struct CertificatePlan {
+    pub(super)ech:Option<super::ech::Settings>,
     pub(super) tls_resolvers: std::sync::Arc<[String]>,
     pub(super) storage: Option<PathBuf>,
     pub(super) http_challenge_port: Option<u16>,
@@ -108,6 +109,7 @@ pub struct CertificatePlan {
 impl Default for CertificatePlan {
     fn default() -> Self {
         Self {
+            ech:None,
             storage: None,
             tls_resolvers: std::sync::Arc::from([]),
             http_challenge_port: None,

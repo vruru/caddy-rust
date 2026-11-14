@@ -29,6 +29,7 @@ use crate::{quic, record_layer};
 
 /// Connection state common to both client and server connections.
 pub struct CommonState {
+    pub(crate) native_ech_accepted: bool,
     pub(crate) negotiated_version: Option<ProtocolVersion>,
     pub(crate) handshake_kind: Option<HandshakeKind>,
     pub(crate) native_hrr: bool,
@@ -68,8 +69,13 @@ pub struct CommonState {
 }
 
 impl CommonState {
+    /// Whether this server actually decrypted and accepted RFC 9849 ECH.
+    /// This does not imply that the peer's Finished has been authenticated.
+    pub fn ech_accepted(&self) -> bool { self.native_ech_accepted }
+
     pub(crate) fn new(side: Side) -> Self {
         Self {
+            native_ech_accepted: false,
             negotiated_version: None,
             handshake_kind: None,
             native_hrr: false,

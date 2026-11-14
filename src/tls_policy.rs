@@ -6,6 +6,7 @@ pub(crate) mod prepared_auth;
 pub(crate) use client_auth::{source_certificates,source_inline,source_append_certificates};
 mod client_paths;
 mod provision;
+pub(crate) mod secrets_log;
 pub(crate) use provision::key_exchange_group;
 
 use std::collections::BTreeMap;
@@ -382,9 +383,6 @@ fn parse_one_policy(v: &Value) -> Result<ConnectionPolicy> {
 
     let insecure_secrets_log =
         parse_opt_string(obj.get("insecure_secrets_log"), "insecure_secrets_log")?;
-    if insecure_secrets_log.is_some() {
-        bail!("insecure_secrets_log is non-empty → unsupported in this module");
-    }
 
     let handshake_context = obj.get("handshake_context").cloned();
     if handshake_context.is_some() {

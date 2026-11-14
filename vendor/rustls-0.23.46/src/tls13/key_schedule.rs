@@ -479,6 +479,11 @@ pub(crate) struct KeyScheduleTrafficWithClientFinishedPending {
 }
 
 impl KeyScheduleTrafficWithClientFinishedPending {
+    /// TLS1.3 exporter secret already derived from the server Finished
+    /// transcript. This owned observation does not mark peer Finished verified.
+    pub(crate) fn native_exporter(&self)->alloc::sync::Arc<dyn crate::NativeExporter>{
+        alloc::sync::Arc::new(NativeTls13Exporter{ks:self.before_finished.ks.inner.suite.into(),secret:self.before_finished.current_exporter_secret.clone()})
+    }
     pub(crate) fn update_decrypter(&self, common: &mut CommonState) {
         debug_assert_eq!(common.side, Side::Server);
         self.before_finished
@@ -933,6 +938,18 @@ fn hkdf_expand_label_slice(
     hkdf_expand_label_inner(expander, label, context, output.len(), |e, info| {
         e.expand_slice(info, output)
     })
+}
+
+pub(crate) fn server_ech_confirmation_secret(
+    hkdf_provider: &'static dyn Hkdf,
+    client_hello_inner_random: &[u8],
+    hs_hash: hash::Output,
+) -> [u8; 8] {
+    hkdf_expand_label(
+        hkdf_provider.extract_from_secret(None, client_hello_inner_random).as_ref(),
+        SecretKind::ServerEchConfirmationSecret.to_bytes(),
+        hs_hash.as_ref(),
+    )
 }
 
 pub(crate) fn server_ech_hrr_confirmation_secret(

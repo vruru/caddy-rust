@@ -24,6 +24,8 @@ pub(super) struct ProxyClient {
     connector: PreparedTransport,
     http1_connector: PreparedTransport,
     http2_only: bool,
+    h3:Option<super::proxy_h3::Pool>,
+    idle_limit:Option<hyper_util::client::legacy::NativeIdlePool>,
     cache: Arc<std::sync::Mutex<ClientCache>>,
     pub(super) config: Arc<ProxyConfig>,
     dynamic: Option<Arc<super::proxy_dynamic::DynamicUpstreams>>,
@@ -45,6 +47,8 @@ impl PartialEq for ClientKey{fn eq(&self,other:&Self)->bool{self.text==other.tex
 impl std::hash::Hash for ClientKey{fn hash<H:std::hash::Hasher>(&self,state:&mut H){std::hash::Hash::hash(&self.text,state)}}
 const CLIENT_CACHE_BYTES:usize=4<<20;
 impl ProxyClient {
+    pub(super) fn forward_route(&self,target:&Uri,resolved:Option<&str>)->Result<Option<Arc<super::proxy_transport::ProxyRoute>>>{self.connector.proxy_route(target,resolved)}
+    pub(super) async fn h3_fetch(&self,dial:&Uri,family:super::http_dial::Family,sni:Option<ServerName<'static>>,request:Request<Body>,timeout:Option<i64>,resources:&super::resource_budget::Resources,mapped:bool)->Result<Response<Body>>{self.h3.as_ref().ok_or_else(||anyhow::anyhow!("upstream H3 is not prepared"))?.fetch(dial,family,sni,request,timeout,resources,mapped).await}
     pub(super) fn metric_probes(&self)->Vec<(Arc<str>,crate::metrics::upstream::Probe)>{self.selection.metric_probes()}
 
     pub(super) fn client_for(
@@ -57,11 +61,13 @@ impl ProxyClient {
         cache_pool:&native_write_policy::Pool,
         map_pool:Option<&native_write_policy::Pool>,
         dns:super::resource_budget::BlockingBudget,
+        source:Option<std::net::SocketAddr>,
+        forward:Option<Arc<super::proxy_transport::ProxyRoute>>,
     ) -> Result<HyperClient> {
-        let input=dial.len().checked_add(unix_path.map_or(0,str::len)).and_then(|n|n.checked_add(512)).ok_or_else(||anyhow::anyhow!("proxy dial metadata size overflow"))?;
+        let input=dial.len().checked_add(forward.as_ref().map_or(0,|p|p.endpoint.to_string().len()+p.auth.as_ref().map_or(0,|a|a.as_bytes().len())+512)).and_then(|n|n.checked_add(unix_path.map_or(0,str::len))).and_then(|n|n.checked_add(512)).ok_or_else(||anyhow::anyhow!("proxy dial metadata size overflow"))?;
         let cost=input.checked_mul(16).and_then(|n|n.checked_add(if map_pool.is_some(){65536}else{8192})).ok_or_else(||anyhow::anyhow!("proxy dial metadata size overflow"))?;
         let _workspace=map_pool.map(|pool|pool.reserve(input.saturating_mul(8).saturating_add(8192))).transpose().map_err(|_|super::request::failure(StatusCode::SERVICE_UNAVAILABLE))?;
-        let cache_key = format!("{family:?}|{dial}|{force_http1}|{server_name:?}|{unix_path:?}|mapped:{}",map_pool.is_some());
+        let cache_key = format!("{family:?}|{dial}|{force_http1}|{server_name:?}|{unix_path:?}|mapped:{}|source:{:?}|proxy:{:?}",map_pool.is_some(),if self.config.transport.proxy_protocol.is_some(){source}else{None},forward.as_ref().map(|p|p.identity));
         let mut cache = self
             .cache
             .lock()
@@ -96,15 +102,21 @@ impl ProxyClient {
         builder.http1_allow_obsolete_multiline_trailers(true);
         builder.http2_only(self.http2_only && !force_http1);
         // Pinned Caddy HTTPTransport defaults, not Hyper's unbounded idle pool.
-        builder.pool_max_idle_per_host(32);
-        builder.pool_idle_timeout(Duration::from_secs(120));
+        builder.pool_max_idle_per_host(if self.config.transport.keep_alive.enabled{self.config.transport.keep_alive.max_idle_per_host}else{0});
+        builder.pool_idle_timeout((self.config.transport.keep_alive.idle_ns>0).then(||Duration::from_nanos(self.config.transport.keep_alive.idle_ns as u64)));
         builder.pool_timer(TokioTimer::new());
+        if let Some(pool)=&self.idle_limit{builder.native_idle_pool(pool.clone());}
+        builder.http1_read_buffer_size(self.config.transport.read_buffer);
+        builder.http1_write_buffer_size(self.config.transport.write_buffer);
+        builder.http1_max_header_size(self.config.transport.max_header_bytes);
+        builder.http1_max_headers(self.config.transport.max_header_bytes/3+1);
+        builder.http2_max_header_list_size(u32::try_from(self.config.transport.max_header_bytes).unwrap_or(u32::MAX));
         let transport = if force_http1 {
             &self.http1_connector
         } else {
             &self.connector
         };
-        let mut connector=transport.connector(uri,family,server_name,unix_path);
+        let mut connector=transport.connector(uri,family,server_name,unix_path)?.with_proxy_source(source)?.with_forward_proxy(forward)?;
         if let Some(owner)=&owner{connector=connector.with_map_owner(owner.clone(),dns);}
         let client = builder.build(connector);
         if cache_credit.is_none(){return Ok(client)}
@@ -191,7 +203,7 @@ pub(super) fn prepare_clients(
                             "FastCGI capture_stderr requires generation logging"
                         );
                     }
-                    let connector = PreparedTransport::prepare(config,resources)?;
+                    let connector = PreparedTransport::prepare(config,resources,dns)?;
                     let http1_connector = connector.http1();
                     output.insert(
                         config as *const ProxyConfig as usize,
@@ -217,9 +229,11 @@ pub(super) fn prepare_clients(
                                         .map(Arc::new)
                                 })
                                 .transpose()?,
+                            h3:if config.transport.http3{Some(connector.h3_pool(dns)?)}else{None},
                             connector,
                             http1_connector,
                             http2_only: config.http2_only,
+                            idle_limit:(config.transport.keep_alive.max_idle>0).then(||hyper_util::client::legacy::NativeIdlePool::new(config.transport.keep_alive.max_idle)),
                             cache: Arc::new(std::sync::Mutex::new(ClientCache {
                                 clock: 0,
                                 clients: HashMap::new(),
@@ -260,6 +274,9 @@ pub(super) struct PreparedResponse {
     sniff: bool,
     flush_interval: i64,
     force_immediate: bool,
+    handler:Option<Arc<crate::http_config::proxy_handler::HandlerOptions>>,
+    verbose:Option<super::proxy_verbose::Verbose>,
+    response_method:http::Method,
     upgrade: Option<Upgrade>,
     lease: Option<Arc<super::proxy_policy::RequestLease>>,
 }
@@ -271,6 +288,8 @@ struct Upgrade {
     expected_accept: Option<[u8;28]>,
     client: HyperClient,
     close_delay: Option<Duration>,
+    timeout:Option<Duration>,
+    buffer_size:usize,
     extended: Option<Arc<websocket::Prepared>>,
 }
 
@@ -297,6 +316,7 @@ impl PreparedResponse {
             sniff,
             flush_interval,
             force_immediate,
+            handler:None,verbose:None,response_method:http::Method::GET,
             upgrade: None,
             lease: None,
         }
@@ -336,6 +356,9 @@ impl PreparedResponse {
                 for name in [http::header::UPGRADE,http::header::CONNECTION,http::header::SEC_WEBSOCKET_ACCEPT,
                 ] {self.response.headers_mut().remove(name);}
             }
+            let stream_bytes=setup.buffer_size.checked_mul(2).and_then(|n|n.checked_add(2048)).ok_or_else(||super::request::budget_failure(ctx,super::resource_budget::BudgetError::Overloaded))?;
+            let buffer_credit=ctx.resources.transfer_deadlines.reserve(stream_bytes).map_err(|_|super::request::budget_failure(ctx,super::resource_budget::BudgetError::Overloaded))?;
+            let buffers=Arc::new(websocket::StreamBuffers{size:setup.buffer_size,_credit:buffer_credit});
             if ctx.req().version()==Version::HTTP_2 {
                 if let Some(prepared)=&setup.extended {
                     self.response.extensions_mut().insert(websocket::write_allocation(prepared,&ctx.resources.transfer_deadlines,
@@ -345,7 +368,7 @@ impl PreparedResponse {
             if ctx.req().version()==Version::HTTP_3 {
                 let prepared=setup.extended.ok_or_else(||anyhow::anyhow!("HTTP/3 upgrade requires extended CONNECT"))?;
                 *self.response.body_mut()=websocket::h3_body(setup.upstream,prepared.clone(),ctx,inner,setup.client,
-                    self.lease.take().expect("HTTP upgrade lease"),setup.close_delay,
+                    self.lease.take().expect("HTTP upgrade lease"),setup.close_delay,setup.timeout,buffers,
                 ).await?;
                 self.response.extensions_mut().insert(websocket::write_allocation(&prepared,&ctx.resources.transfer_deadlines,
                     ));
@@ -363,6 +386,7 @@ impl PreparedResponse {
             let trace=ctx.trace_tunnel();
             let count_data=ctx.req().version()==Version::HTTP_2;
             inner.upgrades.spawn(async move {
+                let _buffers=buffers;
                 let _extended = setup.extended;
                 let _admission = admission;
                 let _hold_client = setup.client;
@@ -378,9 +402,10 @@ impl PreparedResponse {
                         observation:if count_data{trace.clone()}else{None},
                     };
                     let mut upstream=TokioIo::new(upstream);
-                    let copy=tokio::io::copy_bidirectional(&mut downstream,&mut upstream);
+                    let copy=tokio::io::copy_bidirectional_with_sizes(&mut downstream,&mut upstream,_buffers.size,_buffers.size);
                     tokio::pin!(copy);
-                    let result=if let Some(delay)=setup.close_delay{
+                    let copy_with_drain=async{
+                    if let Some(delay)=setup.close_delay{
                         tokio::select!{
                             result=&mut copy=>result,
                             _=drain.cancelled()=>match tokio::time::timeout(delay,copy).await{
@@ -388,7 +413,9 @@ impl PreparedResponse {
                                 Err(error)=>Err(std::io::Error::new(std::io::ErrorKind::TimedOut,error)),
                             },
                         }
-                    }else{copy.await};
+                    }else{copy.await}
+                    };
+                    let result=if let Some(timeout)=setup.timeout{match tokio::time::timeout(timeout,copy_with_drain).await{Ok(result)=>result,Err(error)=>Err(std::io::Error::new(std::io::ErrorKind::TimedOut,error))}}else{copy_with_drain.await};
                     result.map(|_|())
                 };
                 let result=tokio::select!{biased;
@@ -476,6 +503,16 @@ impl PreparedResponse {
             let status = self.response.status().as_u16();
             apply_response_headers(self.response.headers_mut(), status, &self.headers, ctx).await?;
         }
+        if !upgrade&&self.handler.as_ref().is_some_and(|h|h.response_buffers!=0)
+            && super::proxy_handler::response_has_content(&self.response_method,&self.response)
+            &&(self.force_immediate||super::incremental::is_enabled(self.response.headers())){
+            let name=&self.handler.as_ref().expect("handler policy").proxy_status_name;
+            return Err(super::proxy_handler::refuse(ctx,name,Some(self.response.headers())))
+        }
+        if let Some(log)=&self.verbose{
+            log.number("wrote header","status",self.response.status().as_u16()as u64);
+            if !upgrade{let body=std::mem::replace(self.response.body_mut(),full(Bytes::new()));*self.response.body_mut()=log.body(body);}
+        }
         *self.response.version_mut() = ctx.req().version();
         // A copied or intercepted response may move just its body. Keep
         // upstream admission with the stream rather than the header object.
@@ -503,12 +540,18 @@ pub(super) async fn serve(
     server: &Arc<ActiveServer>,
 ) -> Result<PreparedResponse> {
     let rewrite=if let Some(plan)=&config.rewrite{Some(super::rewrite_runtime::upstream(plan,ctx).await?)}else{None};
+    let method=rewrite.as_ref().map_or_else(||ctx.req().method().clone(),|r|r.method.clone());
+    let has_content=super::proxy_handler::request_has_content(ctx,&method,rewrite.as_ref().is_some_and(|r|r.omit_body));
+    let request_incremental=super::incremental::is_enabled(ctx.req().headers());
+    if request_incremental&&has_content&&(config.ext.request_buffers!=0||config.fastcgi.is_some()&&ctx.proxy_content_length()<0){
+        return Err(super::proxy_handler::refuse(ctx,&config.handler.proxy_status_name,None))
+    }
     let previous = ctx
         .req()
         .extensions()
         .get::<super::proxy_replay::ReplaySource>()
         .cloned();
-    let mut source = if rewrite.as_ref().is_some_and(|r|r.omit_body)&&!websocket::is_extended(ctx.req()){super::proxy_replay::ReplaySource::empty()}else if ctx.fastcgi_body_claimed {
+    let mut source = if request_incremental&&!has_content{super::proxy_replay::ReplaySource::empty()}else if rewrite.as_ref().is_some_and(|r|r.omit_body)&&!websocket::is_extended(ctx.req()){super::proxy_replay::ReplaySource::empty()}else if ctx.fastcgi_body_claimed {
         let source =
             previous.ok_or_else(|| anyhow::anyhow!("request body ownership unavailable"))?;
         ensure!(source.replayable(), "proxy request body already consumed");
@@ -535,7 +578,7 @@ pub(super) async fn serve(
         ctx.fastcgi_body_claimed = true;
         ctx.request = Some(Request::from_parts(parts, full(Bytes::new())));
         ctx.body_limit = None;
-        super::proxy_buffer::prepare(ctx, body, config.ext.request_buffers).await?
+        super::proxy_buffer::prepare(ctx, body, if request_incremental{0}else{config.ext.request_buffers}).await?
     };
     if source.complete_length().is_none()
         && let Some(transport) = &config.fastcgi
@@ -551,6 +594,14 @@ pub(super) async fn serve(
             .insert("http.reverse_proxy.retries".into(), retries.to_string());
         let mut progress = AttemptProgress::default();
         let result = serve_once(ctx, config, server, Some(&source), &mut progress,rewrite.as_ref()).await;
+        let result=match result{Ok(mut prepared)=>{
+            prepared.handler=Some(config.handler.clone());prepared.response_method=method.clone();
+            prepared.verbose=super::proxy_verbose::Verbose::capture(server.logging.as_ref(),config.handler.verbose_logs);
+            if config.handler.response_buffers!=0&&!super::incremental::is_enabled(prepared.response.headers())&&prepared.response.status()!=StatusCode::SWITCHING_PROTOCOLS{
+                let body=std::mem::replace(prepared.response.body_mut(),full(Bytes::new()));
+                match Box::pin(super::proxy_buffer::prepare_response(ctx,body,config.handler.response_buffers,prepared.response.headers().contains_key(http::header::TRAILER))).await{Ok(body)=>{*prepared.response.body_mut()=body;Ok(prepared)},Err(error)=>Err(error)}
+            }else{Ok(prepared)}
+        },Err(error)=>Err(error)};
         if result.is_ok() {
             if let Some(guard) = progress.guard.take() {
                 guard.disarm();
@@ -585,6 +636,7 @@ pub(super) async fn serve(
         if !matches!(allowed, Ok(true)) {
             return Err(error);
         }
+        if let Some(log)=super::proxy_verbose::Verbose::capture(server.logging.as_ref(),config.handler.verbose_logs){log.number("retrying","after_ns",config.ext.retry.try_interval.as_nanos().min(u64::MAX as u128)as u64);}
         retries = retries
             .checked_add(1)
             .ok_or_else(|| super::request::failure(StatusCode::SERVICE_UNAVAILABLE))?;
@@ -870,7 +922,14 @@ async fn serve_once(
     let unix_host = (unix_path.is_some() && config.tls.is_some())
         .then(|| super::http_dial::unix_tls_host(server_name.as_ref()));
     let map_scope=ctx.text_owner().is_some();
-    let client = state.client_for(&connection_uri,family,is_upgrade,server_name,unix_path,&ctx.resources.proxy_client_cache_bytes,if map_scope{Some(&ctx.resources.map_bytes)}else{None},ctx.resources.proxy_dial_dns.clone())?;
+    let resolved_proxy=match &config.transport.forward_proxy{
+        crate::http_config::proxy_transport::NetworkProxy::Url(raw)=>Some(ctx.expand_text_resolved(raw,true).await?),_=>None,
+    };
+    let forward=state.connector.proxy_route(&connection_uri.parse()?,resolved_proxy.as_deref())?;
+    let proxy_plain=forward.as_ref().is_some_and(|p|p.kind!=super::proxy_transport::ProxyKind::Socks)&&scheme=="http";
+    let proxy_auth=if proxy_plain{forward.as_ref().and_then(|p|p.auth.clone())}else{None};
+    let h3_name=server_name.clone();
+    let client = if config.transport.http3{anyhow::ensure!(!is_upgrade,"upstream H3 protocol upgrade is unsupported");None}else{Some(state.client_for(&connection_uri,family,is_upgrade,server_name,unix_path,&ctx.resources.proxy_client_cache_bytes,if map_scope{Some(&ctx.resources.map_bytes)}else{None},ctx.resources.proxy_dial_dns.clone(),ctx.peer.socket(),forward)?)};
     let mut outgoing = ctx.req().headers().clone();
     if extended.is_some() {
         use base64::Engine;
@@ -887,6 +946,11 @@ async fn serve_once(
     let mut headers = proxy_headers(ctx, config, outgoing, is_upgrade, false, unix_host.as_deref(),
     )
     .await?;
+    if super::incremental::is_enabled(&headers)&&!super::incremental::is_enabled(ctx.req().headers())
+        && super::proxy_handler::request_has_content(ctx,&outgoing_method,rewrite.is_some_and(|r|r.omit_body))
+        && config.ext.request_buffers!=0{
+        return Err(super::proxy_handler::refuse(ctx,&config.handler.proxy_status_name,None))
+    }
     trailer_metadata.write_upstream_declaration(&mut headers);
     if rewrite.is_some_and(|r|r.omit_body){headers.remove(http::header::CONTENT_LENGTH);headers.remove(http::header::TRANSFER_ENCODING);headers.remove(http::header::TRAILER);}
     let replacement = ctx
@@ -932,17 +996,11 @@ async fn serve_once(
             HeaderValue::from_static("gzip"),
         );
     }
-    let outgoing_host = headers
-        .get_all(http::header::HOST)
-        .iter()
-        .next_back()
-        .and_then(|v| v.to_str().ok())
-        .filter(|v| !v.is_empty())
-        .unwrap_or(dial_address);
-    let outgoing_host = outgoing_host.to_owned();
-    headers.insert(http::header::HOST, HeaderValue::from_str(&outgoing_host)?);
+    let outgoing_host=headers.get_all(http::header::HOST).iter().next_back().filter(|v|!v.is_empty()).cloned().unwrap_or(HeaderValue::from_str(dial_address)?);
+    headers.insert(http::header::HOST,outgoing_host.clone());
     let target=rewrite_uri.as_ref().unwrap_or_else(||ctx.req().uri()).path_and_query().map_or("/",|x|x.as_str());
-    let mut parts=http::uri::Parts::default();parts.scheme=Some(scheme.parse()?);parts.authority=Some(outgoing_host.parse()?);parts.path_and_query=Some(http::uri::PathAndQuery::from_native_rewrite_path_query(target.to_owned())?);
+    let mut parts=http::uri::Parts::default();parts.scheme=Some(scheme.parse()?);parts.authority=Some(http::uri::Authority::from_native_http_host(outgoing_host.as_bytes())?);parts.path_and_query=Some(http::uri::PathAndQuery::from_native_rewrite_path_query(target.to_owned())?);
+    if proxy_plain{parts.authority=Some(connection_uri.parse::<Uri>()?.authority().ok_or_else(||anyhow::anyhow!("upstream proxy target missing"))?.clone());}
     let uri=Uri::from_parts(parts).map_err(|_|anyhow::anyhow!("invalid expanded upstream authority"))?;
     // Header operations may replace the generated nonce. Bind this attempt to
     // exactly the one challenge that is actually serialized upstream.
@@ -976,6 +1034,7 @@ async fn serve_once(
         .extensions_mut()
         .remove::<hyper::upgrade::OnUpgrade>();
     *request.uri_mut() = uri;
+    if let Some(auth)=proxy_auth{headers.insert(http::header::PROXY_AUTHORIZATION,auth);}
     *request.headers_mut() = headers;
     *request.version_mut() = if config.http2_only && !is_upgrade {
         Version::HTTP_2
@@ -1002,13 +1061,9 @@ async fn serve_once(
     // future, which shares its allocation with non-proxy handlers.
     progress.fetch_started = true;
     let began = std::time::Instant::now();
-    let mut response = Box::pin(fetch_with_informational(
-        ctx,
-        &client,
-        request,
-        config.response_header_timeout,
-    ))
-    .await?;
+    let mut response=if config.transport.http3{
+        state.h3_fetch(&connection_uri.parse()?,family,h3_name,request,config.response_header_timeout,&ctx.resources,map_scope).await?
+    }else{Box::pin(fetch_with_informational(ctx,client.as_ref().expect("HTTP client"),request,config.response_header_timeout,config.transport.expect_continue_ns)).await?.map(|body|body.map_err(|e|->BoxError{e.into()}).boxed_unsync())};
     progress.response_received = true;
     if outgoing_method==http::Method::HEAD&&ctx.req().method()!=http::Method::HEAD&&!matches!(response.status(),StatusCode::NO_CONTENT|StatusCode::NOT_MODIFIED){
         // A rewritten HEAD has no representation bytes to forward to the
@@ -1044,8 +1099,9 @@ async fn serve_once(
         downstream: (is_upgrade && ctx.req().version()!=Version::HTTP_3).then(|| hyper::upgrade::on(ctx.req_mut())),
         expected: expected_upgrade,
         expected_accept,
-        client: client.clone(),
+        client: client.as_ref().expect("HTTP upgrade client").clone(),
         close_delay: config.stream_close_delay,
+        timeout:config.handler.stream_timeout,buffer_size:config.handler.stream_buffer_size,
         extended,
     });
     let has_body = !hyper::body::Body::is_end_stream(response.body())
@@ -1085,6 +1141,7 @@ async fn serve_once(
         sniff: false,
         flush_interval: config.flush_interval,
         force_immediate,
+        handler:None,verbose:None,response_method:outgoing_method,
         upgrade,
         lease: Some(lease),
     })
@@ -1094,20 +1151,22 @@ async fn fetch_with_informational(
     client: &HyperClient,
     mut request: Request<Body>,
     timeout: Option<i64>,
+    expect_continue_ns:i64,
 ) -> Result<Response<Incoming>> {
     use super::request::accepts_informational;
-    let interim = if accepts_informational(ctx) {
-        // Callbacks run on the transport's driver, not the current handler.
-        // Allocate the queue's storage only when there is an actual hint.
-        let receive = Arc::new(ProxyInterim::default());
-        let send = receive.clone();
-        hyper::ext::on_informational(&mut request, move |head| {
-            send.enqueue(head.status(), head.headers());
+    let mut continue_gate=None;
+    if expect_continue_ns>0&&request.headers().get_all(http::header::EXPECT).iter().any(|value|value.as_bytes().eq_ignore_ascii_case(b"100-continue"))&&!hyper::body::Body::is_end_stream(request.body()){
+        let (parts,body)=request.into_parts();let (body,gate,head)=super::proxy_continue::gate(body,Duration::from_nanos(expect_continue_ns as u64));
+        request=Request::from_parts(parts,body);request.extensions_mut().insert(hyper::ext::NativeRequestHead(head));continue_gate=Some(gate);
+    }
+    let interim=accepts_informational(ctx).then(||Arc::new(ProxyInterim::default()));
+    if interim.is_some()||continue_gate.is_some(){
+        let receive=interim.clone();
+        hyper::ext::on_informational(&mut request,move|head|{
+            if head.status()==StatusCode::CONTINUE{if let Some(gate)=&continue_gate{gate.allow();}}
+            if let Some(send)=&receive{send.enqueue(head.status(),head.headers());}
         });
-        Some(receive)
-    } else {
-        None
-    };
+    }
     request
         .extensions_mut()
         .remove::<hyper::ext::SendCompletion>();
@@ -1300,23 +1359,20 @@ pub(super) fn proxy_headers<'a>(
 ) -> Pin<Box<dyn std::future::Future<Output = Result<HeaderMap>> + Send + 'a>> {
     let prepared = (|| -> Result<_> {
     let original_host = ctx.authority.clone();
-    let old_xff = if ctx.trusted {
-        headers
-            .get_all("x-forwarded-for")
-            .iter()
-            .filter_map(|h| h.to_str().ok())
-            .collect::<Vec<_>>()
-            .join(", ")
-    } else {
-        String::new()
-    };
-    let forwarded_host = if ctx.trusted {
-        headers.get("x-forwarded-host").cloned()
+    let trusted=super::proxy_handler::trusted(ctx,config);
+    let mut old_xff=Vec::new();
+    if trusted{for(i,value)in headers.get_all("x-forwarded-for").iter().enumerate(){if i>0{old_xff.extend_from_slice(b", ");}old_xff.extend_from_slice(value.as_bytes());}}
+    let unix_trusted=ctx.trusted&&ctx.peer.raw_text().as_ref()==b"@";
+    let unix_xff=if unix_trusted && headers.contains_key("x-forwarded-for") {
+        Some(HeaderValue::from_bytes(&old_xff)?)
+    }else{None};
+    let forwarded_host = if trusted {
+        headers.get_all("x-forwarded-host").iter().next_back().filter(|v|!v.is_empty()).cloned()
     } else {
         None
     };
-    let forwarded_proto = if ctx.trusted {
-        headers.get("x-forwarded-proto").cloned()
+    let forwarded_proto = if trusted {
+        headers.get_all("x-forwarded-proto").iter().next_back().filter(|v|!v.is_empty()).cloned()
     } else {
         None
     };
@@ -1324,22 +1380,26 @@ pub(super) fn proxy_headers<'a>(
     if let Some((peer_host,_))=ctx.peer.host_port_bytes().filter(|(host,_)|!host.is_empty()) {
         let peer_host=peer_host.split(|b|*b==b'%').next().unwrap_or_default();
         let mut xff=Vec::with_capacity(old_xff.len()+peer_host.len()+2);
-        if !old_xff.is_empty(){xff.extend_from_slice(old_xff.as_bytes());xff.extend_from_slice(b", ");}
+        if !old_xff.is_empty(){xff.extend_from_slice(&old_xff);xff.extend_from_slice(b", ");}
         xff.extend_from_slice(peer_host);
         headers.insert("x-forwarded-for",HeaderValue::from_bytes(&xff)?);
-        headers.insert("x-forwarded-host",forwarded_host.unwrap_or(HeaderValue::from_str(&original_host)?),
+        headers.insert("x-forwarded-host",forwarded_host.unwrap_or(HeaderValue::from_bytes(&original_host)?),
             );
         headers.insert("x-forwarded-proto",forwarded_proto.unwrap_or(HeaderValue::from_static(if ctx.tls{"https"}else{"http"})),
             );
+    } else if unix_trusted {
+        // A genuinely trusted Unix peer has no IP to append. Preserve the
+        // incoming chain and origin fields, exactly as the Caddy Unix branch.
+        if let Some(value)=unix_xff{headers.insert("x-forwarded-for",value);}else{headers.remove("x-forwarded-for");}
+        headers.insert("x-forwarded-host",forwarded_host.unwrap_or(HeaderValue::from_bytes(&original_host)?));
+        headers.insert("x-forwarded-proto",forwarded_proto.unwrap_or(HeaderValue::from_static(if ctx.tls{"https"}else{"http"})));
     } else {
-        // An absent or unparseable peer host cannot authenticate supplied
-        // forwarding headers. Never substitute the physical proxy's IP.
         for name in ["x-forwarded-for","x-forwarded-host","x-forwarded-proto"]{headers.remove(name);}
     }
     // net/http stores the validated authority outside Header. An absolute or
     // authority-form target wins over a conflicting raw wire Host; explicit
     // header_up operations below may still replace that initial value.
-    headers.insert(http::header::HOST, HeaderValue::from_str(&original_host)?);
+    headers.insert(http::header::HOST, HeaderValue::from_bytes(&original_host)?);
     // Caddy HTTPTransport supplies this default before the handler's user ops.
     if !fastcgi
         && config.tls.is_some()
@@ -1364,6 +1424,7 @@ pub(super) fn proxy_headers<'a>(
         Ok(headers)
     })();
     let view=ctx.lookup_view();
+    let host_resources=ctx.resources.clone();
     let snapshot = super::headers_replace::prepare_owned(
         &config.request_headers,
         ctx,
@@ -1374,10 +1435,7 @@ pub(super) fn proxy_headers<'a>(
         super::request::apply_headers_view(&mut headers,&config.request_headers,view).await?;
         super::headers_replace::apply_owned(&mut headers, &config.request_headers, snapshot?, None)
             .await?;
-        if !fastcgi && let Some(host) = headers.get(http::header::HOST).and_then(|v| v.to_str().ok())
-        && let std::borrow::Cow::Owned(host) = super::http_dial::wire_host(host) {
-        headers.insert(http::header::HOST, HeaderValue::from_str(&host)?);
-    }
+        if !fastcgi{if let Some(host)=headers.get(http::header::HOST).cloned(){headers.insert(http::header::HOST,super::request_host::normalize_header(host,&host_resources).await?);}}
     Ok(headers)
     })
 }
@@ -1429,16 +1487,16 @@ pub(super) fn remove_hop_headers(headers: &mut HeaderMap, upgrade: bool, preserv
 }
 
 struct ProxyBody {
-    body: hyper::body::Incoming,
-    client: HyperClient,
+    body: Body,
+    client: Option<HyperClient>,
 }
 impl hyper::body::Body for ProxyBody {
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = BoxError;
     fn poll_frame(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<std::result::Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+    ) -> std::task::Poll<Option<std::result::Result<hyper::body::Frame<Bytes>, BoxError>>> {
         let _client = &self.client;
         std::pin::Pin::new(&mut self.body).poll_frame(cx)
     }

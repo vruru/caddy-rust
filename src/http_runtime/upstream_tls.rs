@@ -73,6 +73,8 @@ pub(super) fn native_roots() -> Result<&'static rustls::RootCertStore> {
 /// Prepared off the reactor before a candidate generation is published.
 #[derive(Clone)]
 pub(super) struct PreparedTransport {
+    settings:Option<Arc<super::proxy_transport::Settings>>,
+    proxy_tls:Option<Arc<PreparedTls>>,
     http: [HttpConnector<super::http_dial::FamilyResolver>; 3],
     tls: Option<Arc<ClientConfig>>,
     native: Option<Arc<native_ssl_tls::ClientConfig>>,
@@ -86,28 +88,29 @@ pub(super) struct PreparedTransport {
     connect_timeout: Duration,
 }
 impl PreparedTransport {
-    pub(super) fn prepare(config: &ProxyConfig,resources:&Arc<super::resource_budget::Resources>) -> Result<Self> {
+    pub(super) fn prepare(config: &ProxyConfig,resources:&Arc<super::resource_budget::Resources>,dns:&Arc<super::proxy_dynamic::DnsShared>) -> Result<Self> {
+        let settings=super::proxy_transport::Settings::new(config.transport.clone(),dns.clone())?;
         let http = [
             super::http_dial::Family::Any,
             super::http_dial::Family::V4,
             super::http_dial::Family::V6,
         ]
-        .map(|family| {
-            let mut http =
-                HttpConnector::new_with_resolver(super::http_dial::FamilyResolver::new(family));
-            http.enforce_http(false);
-            http.set_connect_timeout((!config.dial_timeout.is_zero()).then_some(config.dial_timeout));
-            http.set_nodelay(true);
-            http
-        });
+        .map(|family| settings.http(family,super::http_dial::FamilyResolver::new(family),config.dial_timeout));
         let tls = config
             .tls
             .as_ref()
             .map(|t| provision_inner(t, config.enable_http2,false,Some(&resources.ssl_verify),true))
             .transpose()?;
+        let proxy_may_tls=match &config.transport.forward_proxy{
+            crate::http_config::proxy_transport::NetworkProxy::Direct=>false,
+            crate::http_config::proxy_transport::NetworkProxy::Url(url)=>url.starts_with("https:")||url.contains('{'),
+            crate::http_config::proxy_transport::NetworkProxy::Environment=>["HTTP_PROXY","http_proxy","HTTPS_PROXY","https_proxy"].iter().any(|key|std::env::var(key).is_ok_and(|url|url.starts_with("https:"))),
+        };
+        let proxy_tls=match &tls{Some(t)=>Some(Arc::new(t.clone())),None if proxy_may_tls=>Some(Arc::new(proxy_default_tls(resources)?)),None=>None};
         let (tls,native,fallback,managed)=match tls{Some(t)=>(Some(Arc::new(t.rustls)),t.native,t.fallback,t.managed),None=>(None,None,None,None)};
-        let client_executor=if tls.is_some()&&native.is_none(){Some(resources.client_tls_executor()?)}else{None};
+        let client_executor=if (tls.is_some()&&native.is_none())||proxy_tls.as_ref().is_some_and(|t|t.native.is_none()){Some(resources.client_tls_executor()?)}else{None};
         Ok(Self {
+            settings:Some(settings),proxy_tls,
             client_executor,
             http,
             tls,
@@ -121,11 +124,17 @@ impl PreparedTransport {
             connect_timeout:config.dial_timeout,
         })
     }
+    pub(super) fn h3_pool(&self,dns:&Arc<super::proxy_dynamic::DnsShared>)->Result<super::proxy_h3::Pool>{
+        Ok(super::proxy_h3::Pool::new(self.settings.as_ref().ok_or_else(||anyhow::anyhow!("H3 settings unavailable"))?.clone(),self.tls.as_ref().ok_or_else(||anyhow::anyhow!("H3 requires TLS"))?.as_ref().clone(),self.managed.clone(),dns.clone(),self.handshake,self.connect_timeout))
+    }
+    pub(super) fn proxy_route(&self,target:&Uri,resolved:Option<&str>)->Result<Option<Arc<super::proxy_transport::ProxyRoute>>>{
+        self.settings.as_ref().map(|s|s.proxy(target,resolved)).transpose().map(Option::flatten)
+    }
     pub(super) fn metrics(dial:Uri,tls:Option<Arc<ClientConfig>>,timeout:Duration)->FixedDialConnector{
         let family=super::http_dial::Family::Any;
         let mut http=HttpConnector::new_with_resolver(super::http_dial::FamilyResolver::new(family));
         http.enforce_http(false);http.set_connect_timeout((!timeout.is_zero()).then_some(timeout));http.set_nodelay(true);
-        FixedDialConnector{http,family,tls,native:None,fallback:None,managed:None,client_executor:None,http1_native:false,read:Some(timeout),write:Some(timeout),handshake:Some(timeout),dial,server_name:None,unix_path:None,connect_timeout:timeout,map_owner:None}
+        FixedDialConnector{settings:None,proxy_tls:None,route:None,gate:None,connection_hold:None,dial_elapsed:None,proxy_header:None,http,family,tls,native:None,fallback:None,managed:None,client_executor:None,http1_native:false,read:Some(timeout),write:Some(timeout),handshake:Some(timeout),dial,server_name:None,unix_path:None,connect_timeout:timeout,map_owner:None}
     }
     pub(super) fn http1(&self) -> Self {
         let mut result = self.clone();
@@ -146,8 +155,9 @@ impl PreparedTransport {
         family: super::http_dial::Family,
         server_name: Option<ServerName<'static>>,
         unix_path:Option<&str>,
-    ) -> FixedDialConnector {
-        FixedDialConnector {
+    ) -> Result<FixedDialConnector> {
+        Ok(FixedDialConnector {
+            settings:self.settings.clone(),proxy_tls:self.proxy_tls.clone(),route:None,connection_hold:None,dial_elapsed:None,gate:self.settings.as_ref().map(|s|s.gate(dial.authority().map_or("",|a|a.as_str()))).transpose()?.flatten(),proxy_header:None,
             http: self.http[match family {
                 super::http_dial::Family::Any => 0,
                 super::http_dial::Family::V4 => 1,
@@ -173,7 +183,7 @@ impl PreparedTransport {
             unix_path:unix_path.map(Arc::from),
             connect_timeout:self.connect_timeout,
             map_owner:None,
-        }
+        })
     }
 }
 fn read_material(path: &str, budget: &mut u64) -> Result<Vec<u8>> {
@@ -330,6 +340,7 @@ fn provider_for(tls:&ProxyTls)->Result<Arc<rustls::crypto::CryptoProvider>>{
         Arc::new(provider)
     })
 }
+#[derive(Clone)]
 pub(crate) struct PreparedTls {pub(crate) rustls:ClientConfig,pub(crate) native:Option<Arc<native_ssl_tls::ClientConfig>>,fallback:Option<Arc<native_ssl_tls::ClientConfig>>,pub(crate) managed:Option<Arc<crate::tls_app_config::ManagedClientSource>>}
 fn provision_inner(tls: &ProxyTls, enable_http2: bool, allow_empty_default:bool,scope:Option<&Arc<native_ssl_tls::VerificationScope>>,cbc_compat:bool) -> Result<PreparedTls> {
     ensure!(
@@ -465,6 +476,10 @@ impl hyper::rt::Write for Output{
 
 #[derive(Clone)]
 pub(super) struct FixedDialConnector {
+    proxy_tls:Option<Arc<PreparedTls>>,route:Option<Arc<super::proxy_transport::ProxyRoute>>,
+    settings:Option<Arc<super::proxy_transport::Settings>>,
+    gate:Option<Arc<tokio::sync::Semaphore>>,connection_hold:Option<Arc<tokio::sync::OwnedSemaphorePermit>>,dial_elapsed:Option<Arc<std::sync::atomic::AtomicU64>>,
+    proxy_header:Option<Arc<[u8]>>,
     pub(super) http: HttpConnector<super::http_dial::FamilyResolver>,
     family: super::http_dial::Family,
     pub(super) tls: Option<Arc<ClientConfig>>,
@@ -512,13 +527,19 @@ async fn within_tls<T>(deadline:Option<Instant>,future:impl Future<Output=Result
 async fn dial_once(
     http:&mut HttpConnector<super::http_dial::FamilyResolver>,
     family:super::http_dial::Family,dial:&Uri,unix_path:Option<&str>,
-    allowance:Option<Duration>,
+    allowance:Option<Duration>,settings:Option<&super::proxy_transport::Settings>,
 )->Result<super::http_dial_io::DialIo,ConnectError>{
     use super::http_dial_io::DialIo;
     let future=async {
+        if let Some(local)=settings.and_then(|s|s.local.as_ref()){
+            let mismatch=matches!((local,unix_path),(super::proxy_transport::LocalAddress::Unix(_),None)|(super::proxy_transport::LocalAddress::Tcp(_),Some(_)));
+            if mismatch{return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,"local address network does not match upstream").into())}
+        }
         if let Some(path)=unix_path {
             #[cfg(unix)] {
-                let stream=super::http_dial::connect_unix(path).await?;
+                let stream=if let Some(super::proxy_transport::LocalAddress::Unix(local))=settings.and_then(|s|s.local.as_ref()){
+                    let socket=tokio::net::UnixSocket::new_stream()?;socket.bind(local.as_ref())?;socket.connect(path).await?
+                }else{super::http_dial::connect_unix(path).await?};
                 Ok(DialIo::Unix(TokioIo::new(stream)))
             }
             #[cfg(not(unix))] {
@@ -584,7 +605,7 @@ impl Service<Uri> for FixedDialConnector {
             let output=match owner.work_pool.reserve(std::mem::size_of::<Output>().saturating_add(2048)){Ok(credit)=>Arc::new(credit),Err(error)=>return Box::pin(async move{Err(Box::new(std::io::Error::other(error.to_string()))as Self::Error)})};
             (Some(Arc::new(workspace)),Some(output))
         }else{(None,None)};
-        let state=DialState{http:self.http.clone(),tls:self.tls.clone(),native:self.native.clone(),fallback:self.fallback.clone(),managed:self.managed.clone(),client_executor:self.client_executor.clone(),http1_native:self.http1_native,read:self.read,write:self.write,handshake:self.handshake,dial:self.dial.clone(),family:self.family,server_name:self.server_name.clone(),unix_path:self.unix_path.clone(),connect_timeout:self.connect_timeout,map_owner:self.map_owner.clone(),output_credit,_workspace:workspace};
+        let state=DialState{dial_elapsed:self.dial_elapsed.clone(),connection_hold:self.connection_hold.clone(),proxy_tls:self.proxy_tls.clone(),route:self.route.clone(),settings:self.settings.clone(),gate:self.gate.clone(),proxy_header:self.proxy_header.clone(),http:self.http.clone(),tls:self.tls.clone(),native:self.native.clone(),fallback:self.fallback.clone(),managed:self.managed.clone(),client_executor:self.client_executor.clone(),http1_native:self.http1_native,read:self.read,write:self.write,handshake:self.handshake,dial:self.dial.clone(),family:self.family,server_name:self.server_name.clone(),unix_path:self.unix_path.clone(),connect_timeout:self.connect_timeout,map_owner:self.map_owner.clone(),output_credit,_workspace:workspace};
         Box::pin(state.run())
     }
 }
@@ -598,6 +619,16 @@ pub(crate) fn ca_source_prepared_tls(ca:Option<serde_json::Value>,insecure:bool,
 }
 
 impl FixedDialConnector{
+    pub(super) fn with_forward_proxy(mut self,route:Option<Arc<super::proxy_transport::ProxyRoute>>)->Result<Self>{
+        if let Some(route)=&route{if self.dial.scheme_str()==Some("http"){self.gate=self.settings.as_ref().map(|s|s.gate(route.endpoint.authority().map_or("",|a|a.as_str()))).transpose()?.flatten();}}
+        self.route=route;Ok(self)
+    }
+    pub(super) fn with_proxy_source(mut self,source:Option<std::net::SocketAddr>)->Result<Self>{
+        if let Some(version)=self.settings.as_ref().and_then(|s|s.options.proxy_protocol){
+            let source=source.ok_or_else(||anyhow::anyhow!("outgoing PROXY protocol requires a socket peer identity"))?;
+            self.proxy_header=Some(super::proxy_transport::proxy_header(version,source).into());
+        }Ok(self)
+    }
     #[cfg(not(unix))]
     pub(super) fn with_metrics_dns(self, _lease:crate::outgoing_tls::ConnectionLease)->Self {
         // Preserve the existing platform Gai path. Owned raw-NSS retirement is
@@ -617,8 +648,9 @@ impl FixedDialConnector{
     pub(super) fn with_map_owner(mut self,owner:Arc<super::map_runtime::DialOwner>,budget:super::resource_budget::BlockingBudget)->Self{
         // PreparedTransport configures exactly these TCP options. Only the
         // resolver changes for a Map-derived dial; TLS state is untouched.
-        let mut http=HttpConnector::new_with_resolver(super::http_dial::FamilyResolver::with_map(self.family,budget,owner.clone()));
+        let mut http=HttpConnector::new_with_resolver(super::http_dial::FamilyResolver::with_map(self.family,budget.clone(),owner.clone()));
         http.enforce_http(false);http.set_connect_timeout((!self.connect_timeout.is_zero()).then_some(self.connect_timeout));http.set_nodelay(true);
+        if let Some(settings)=&self.settings {http=settings.http(self.family,super::http_dial::FamilyResolver::with_map(self.family,budget.clone(),owner.clone()),self.connect_timeout);}
         self.http=http;self.map_owner=Some(owner);self
     }
 }
@@ -641,6 +673,10 @@ impl hyper::rt::Write for MapOutput{
 // This single concrete input owns its real fields before all credits. Explicit
 // Drop keeps that order even when its async run future is never first-polled.
 struct DialState{
+ dial_elapsed:Option<Arc<std::sync::atomic::AtomicU64>>,
+ connection_hold:Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+ proxy_tls:Option<Arc<PreparedTls>>,route:Option<Arc<super::proxy_transport::ProxyRoute>>,
+ settings:Option<Arc<super::proxy_transport::Settings>>,gate:Option<Arc<tokio::sync::Semaphore>>,proxy_header:Option<Arc<[u8]>>,
  http:HttpConnector<super::http_dial::FamilyResolver>,tls:Option<Arc<ClientConfig>>,native:Option<Arc<native_ssl_tls::ClientConfig>>,fallback:Option<Arc<native_ssl_tls::ClientConfig>>,managed:Option<Arc<crate::tls_app_config::ManagedClientSource>>,client_executor:Option<Arc<super::tls_executor::TlsExecutor>>,http1_native:bool,
  read:Option<Duration>,write:Option<Duration>,handshake:Option<Duration>,dial:Uri,family:super::http_dial::Family,
  server_name:Option<ServerName<'static>>,unix_path:Option<Arc<str>>,connect_timeout:Duration,
@@ -649,12 +685,13 @@ struct DialState{
 impl Drop for DialState{fn drop(&mut self){}}
 impl DialState{
  async fn run(mut self)->Result<MapOutput,ConnectError>{
-  match self.connect().await{
+  let connection=match &self.gate{Some(gate)=>Some(Arc::new(gate.clone().acquire_owned().await.map_err(|_|std::io::Error::other("upstream connection admission closed"))?)),None=>self.connection_hold.clone()};
+  match self.connect(connection).await{
    Ok(inner)=>Ok(MapOutput{inner,_credit:self.output_credit.clone()}),
    Err(inner)=>match &self.output_credit{Some(credit)=>Err(Box::new(MapDialError{inner,_credit:credit.clone()})),None=>Err(inner)},
   }
  }
- async fn connect(&mut self)->Result<Output,ConnectError>{
+ async fn connect(&mut self,connection:Option<Arc<tokio::sync::OwnedSemaphorePermit>>)->Result<Output,ConnectError>{
         let mut http=self.http.clone();
         let tls=self.tls.clone();
         let native=self.native.clone();
@@ -670,6 +707,7 @@ impl DialState{
         let server_name=self.server_name.clone();
         let unix_path=self.unix_path.clone();
         let connect_timeout=self.connect_timeout;
+        let settings=self.settings.clone();let proxy_header=self.proxy_header.clone();let route=self.route.clone();let proxy_tls=self.proxy_tls.clone();let forward_owner=self.map_owner.clone();let measured_dial=self.dial_elapsed.clone();let proxy_server_name=self.server_name.clone();let proxy_executor=client_executor.clone();
         // Only mapped attempts opt into concrete shared credits. This capsule
         // follows detached TLS CPU jobs as well as their not-yet-consumed result.
         let credits=match (&self.map_owner,&self.output_credit,&self._workspace){
@@ -682,11 +720,18 @@ impl DialState{
         // this concrete owner; both dial attempts share its resolver and credit.
         async move {
             let dial_allowance=(!connect_timeout.is_zero()).then_some(connect_timeout);
+            let forward_dial=route.as_ref().map(|_|Arc::new(std::sync::atomic::AtomicU64::new(0)));
             let first_dial=Instant::now();
-            let tcp=dial_once(&mut http,family,&dial,unix_path.as_deref(),dial_allowance).await?;
+            let mut tcp=if let Some(route)=&route{
+                forward_socket(&http,family,route,&dial,tls.is_some(),proxy_tls.as_deref(),proxy_executor.clone(),connect_timeout,handshake,read,write,settings.clone(),proxy_header.clone(),forward_owner.clone(),proxy_server_name.clone(),connection.clone(),forward_dial.clone()).await?
+            }else{dial_once(&mut http,family,&dial,unix_path.as_deref(),dial_allowance,settings.as_deref()).await?};
+            let dial_spent=if let Some(elapsed)=&forward_dial{Duration::from_nanos(elapsed.load(std::sync::atomic::Ordering::Acquire))}else{first_dial.elapsed()};
+            if let Some(elapsed)=&measured_dial{let nanos=u64::try_from(dial_spent.as_nanos()).unwrap_or(u64::MAX);let _=elapsed.fetch_update(std::sync::atomic::Ordering::AcqRel,std::sync::atomic::Ordering::Acquire,|old|Some(old.saturating_add(nanos)));}
+            if let Some(hold)=&connection{tcp=super::http_dial_io::DialIo::Limited{inner:Box::new(tcp),_connection:hold.clone()};}
+            if route.is_none(){if let Some(header)=&proxy_header {use tokio::io::AsyncWriteExt;let mut io=TokioIo::new(&mut tcp);io.write_all(header).await?;io.flush().await?;}}
             // Only actual dial time is deducted from the aggregate dial allowance.
             // Both TLS attempts and the compatibility redial share one TLS deadline.
-            let dial_left=dial_allowance.map(|d|d.saturating_sub(first_dial.elapsed()));
+            let dial_left=dial_allowance.map(|d|d.saturating_sub(dial_spent));
             let io=TimeoutIo::new(tcp,read,write);
             let Some(cfg)=tls else{return Ok(Output::Http(io));};
             let server_name=match server_name{
@@ -744,7 +789,14 @@ impl DialState{
                     // A first fatal40 is a compatibility candidate, not proof of
                     // the peer's private failure reason. The second context is
                     // TLS1.2/CBC-only with the identical native trust verifier.
-                    let tcp=within_tls(deadline,dial_once(&mut http,family,&dial,unix_path.as_deref(),dial_left)).await?;
+                    if dial_left.is_some_and(|d|d.is_zero()){return Err(std::io::Error::new(std::io::ErrorKind::TimedOut,"upstream dial timeout").into())}
+                    let retry_began=Instant::now();
+                    let mut tcp=if let Some(route)=&route{
+                        within_tls(deadline,forward_socket(&http,family,route,&dial,true,proxy_tls.as_deref(),proxy_executor.clone(),dial_left.unwrap_or_default(),handshake,read,write,settings.clone(),proxy_header.clone(),forward_owner.clone(),proxy_server_name.clone(),connection.clone(),forward_dial.clone())).await?
+                    }else{within_tls(deadline,dial_once(&mut http,family,&dial,unix_path.as_deref(),dial_left,settings.as_deref())).await?};
+                    if let Some(elapsed)=&measured_dial{let nanos=u64::try_from(retry_began.elapsed().as_nanos()).unwrap_or(u64::MAX);let _=elapsed.fetch_update(std::sync::atomic::Ordering::AcqRel,std::sync::atomic::Ordering::Acquire,|old|Some(old.saturating_add(nanos)));}
+            if let Some(hold)=&connection{tcp=super::http_dial_io::DialIo::Limited{inner:Box::new(tcp),_connection:hold.clone()};}
+                    if route.is_none(){if let Some(header)=&proxy_header {use tokio::io::AsyncWriteExt;let mut io=TokioIo::new(&mut tcp);io.write_all(header).await?;io.flush().await?;}}
                     native_output(credited_native(fallback,credits.as_ref()),binding,server_name,TimeoutIo::new(tcp,read,write),http1_native,deadline).await
                 },
             };
@@ -754,4 +806,29 @@ impl DialState{
             output
         }.await
  }
+}
+
+fn proxy_default_tls(resources:&Arc<super::resource_budget::Resources>)->Result<PreparedTls>{
+    let options=ProxyTls{source_identity:[0;32],prepared_ca:None,prepared_trust:None,client_certificate_automate:None,managed_client:None,renegotiation:native_ssl_tls::Renegotiation::Never,curves:Vec::new(),ca:None,except_ports:Vec::new(),server_name:None,insecure_skip_verify:false,root_ca_pem_files:Vec::new(),root_ca_pool:Vec::new(),client_certificate_file:None,client_certificate_key_file:None,handshake_timeout:None};
+    provision_inner(&options,false,false,Some(&resources.ssl_verify),true)
+}
+/// The proxy is itself an authenticated endpoint. Reuse the same native TLS
+/// machinery, then CONNECT/SOCKS, then the existing origin TLS machinery.
+async fn forward_socket(http:&HttpConnector<super::http_dial::FamilyResolver>,family:super::http_dial::Family,route:&super::proxy_transport::ProxyRoute,target:&Uri,tunnel:bool,tls:Option<&PreparedTls>,executor:Option<Arc<super::tls_executor::TlsExecutor>>,connect_timeout:Duration,handshake:Option<Duration>,read:Option<Duration>,write:Option<Duration>,settings:Option<Arc<super::proxy_transport::Settings>>,prefix:Option<Arc<[u8]>>,map_owner:Option<Arc<super::map_runtime::DialOwner>>,server_name:Option<ServerName<'static>>,connection_hold:Option<Arc<tokio::sync::OwnedSemaphorePermit>>,dial_elapsed:Option<Arc<std::sync::atomic::AtomicU64>>)->Result<super::http_dial_io::DialIo,ConnectError>{
+    use super::{proxy_transport::ProxyKind,http_dial_io::{DialIo,AsyncIo}};
+    let encrypted=route.kind==ProxyKind::Https;
+    let config=if encrypted{Some(tls.ok_or("HTTPS proxy trust is not prepared")?)}else{None};
+    let mut rustls=config.map(|c|c.rustls.clone());if let Some(config)=rustls.as_mut(){config.alpn_protocols.clear();}
+    let mut connector=FixedDialConnector{http:http.clone(),family,tls:rustls.map(Arc::new),native:config.and_then(|c|c.native.clone()),fallback:config.and_then(|c|c.fallback.clone()),managed:config.and_then(|c|c.managed.clone()),client_executor:executor,http1_native:true,read,write,handshake,dial:route.endpoint.clone(),server_name,unix_path:None,connect_timeout,map_owner,settings,proxy_tls:None,route:None,gate:None,connection_hold,dial_elapsed,proxy_header:prefix};
+    let stream=Box::pin(connector.call(route.endpoint.clone())).await?;
+    let mut stream:Box<dyn AsyncIo>=Box::new(TokioIo::new(stream));
+    if route.kind==ProxyKind::Socks{
+        let auth=route.socks_auth.as_ref().map(|(a,b)|(a.as_slice(),b.as_slice()));
+        super::proxy_tunnel::socks5(&mut stream,target,auth).await?;
+        Ok(DialIo::Tunnel{io:TokioIo::new(stream),proxied:false})
+    }else if tunnel{
+        let limit=connector.settings.as_ref().map_or(10<<20,|s|s.options.max_header_bytes);
+        let stream=tokio::time::timeout(Duration::from_secs(60),super::proxy_tunnel::http_connect(stream,target,route.auth.as_ref(),limit)).await.map_err(|_|std::io::Error::new(std::io::ErrorKind::TimedOut,"proxy CONNECT timeout"))??;
+        Ok(DialIo::Tunnel{io:TokioIo::new(Box::new(stream)),proxied:false})
+    }else{Ok(DialIo::Tunnel{io:TokioIo::new(stream),proxied:true})}
 }

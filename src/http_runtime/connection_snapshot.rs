@@ -1,4 +1,4 @@
-//! Owned observations from a completed TLS handshake. Request consumers never
+//! Owned observations from the actual TLS handshake phase. Request consumers never
 //! borrow the TLS stream, and missing observations are not represented by zero.
 use std::{fmt, sync::Arc};
 
@@ -157,6 +157,7 @@ impl ConnectionSnapshot {
             metadata.signed_certificate_timestamps_observation = Ok(connection.native_peer_scts()
                 .ok_or(ConnectionSnapshotError::Unavailable("completed client certificate SCTs"))?
                 .iter().map(|sct|Arc::from(sct.as_slice())).collect::<Vec<_>>().into());
+            metadata.ech_accepted = connection.ech_accepted();
             metadata.tls_unique_observation = Ok(connection.native_tls_unique().map(Arc::from));
             metadata.hello_retry_request_observation = Ok(connection.native_hello_retry_request());
             metadata.curve_id_observation = connection.native_curve_id()
@@ -192,6 +193,29 @@ impl ConnectionSnapshot {
                     chain(&peer)
                 }
             };
+            if !data.handshake_complete {
+                // The only pre-Finished request path is QUIC early dispatch.
+                // Client authentication is never resumed/early in Native.
+                if client_auth.is_some_and(|auth|auth.is_active()){return Err(ConnectionSnapshotError::Unavailable("early client authentication"))}
+                use ConnectionSnapshotError::Unavailable;
+                let version=data.protocol_version.ok_or(Unavailable("early TLS version"))?;
+                if version!=0x0304{return Err(Unavailable("early TLS1.3"))}
+                let cipher_suite=data.cipher_suite.ok_or(Unavailable("early cipher suite"))?;
+                let kind=data.handshake_kind.ok_or(Unavailable("early handshake kind"))?;
+                let did_resume=kind==rustls::HandshakeKind::Resumed;
+                return Ok(ConnectionMetadata{
+                    version,handshake_complete:false,did_resume,cipher_suite,
+                    curve_id_observation:data.key_exchange_group.ok_or(Unavailable("early negotiated group")),
+                    alpn:data.protocol.as_deref().unwrap_or_default().into(),negotiated_protocol_is_mutual:true,
+                    server_name:offered_name.into(),peer_certificates:peer,
+                    ech_accepted:data.ech_accepted,verified_chains_observation:Ok(None),
+                    signed_certificate_timestamps_observation:Ok(data.peer_scts.as_ref().map_or_else(||Arc::from([]),|s|s.iter().map(|v|Arc::from(v.as_slice())).collect::<Vec<_>>().into())),
+                    ocsp_response_observation:Ok(data.peer_ocsp_response.as_deref().unwrap_or_default().into()),
+                    tls_unique_observation:Ok(None),hello_retry_request_observation:Ok(data.hello_retry_request),
+                    local_certificate_observation:Ok(Some(chain(local_chain))),
+                    exporter:data.owned_exporter.clone().map(|exporter|Arc::new(OwnedExporter(exporter))as Arc<dyn ConnectionExporter>),
+                });
+            }
             let mut metadata = capture(
                 Negotiated {
                     version: data.protocol_version,
@@ -213,6 +237,7 @@ impl ConnectionSnapshot {
             metadata.signed_certificate_timestamps_observation = Ok(data.peer_scts.as_ref()
                 .ok_or(ConnectionSnapshotError::Unavailable("QUIC completed client certificate SCTs"))?
                 .iter().map(|sct|Arc::from(sct.as_slice())).collect::<Vec<_>>().into());
+            metadata.ech_accepted = data.ech_accepted;
             metadata.hello_retry_request_observation = Ok(data.hello_retry_request);
             metadata.verified_chains_observation = verified_paths(data.client_chain_observation.as_ref(),
                 &metadata.peer_certificates);
@@ -361,8 +386,8 @@ fn capture(
         negotiated_protocol_is_mutual: true,
         server_name: observed.offered_name,
         peer_certificates: observed.peer,
-        // This server does not implement ECH acceptance. Peer extensions are
-        // replaced by authenticated completed TCP/QUIC observations above.
+        // The common builder carries no engine proof. TCP/QUIC capture above
+        // replaces this with the actual server HPKE acceptance observation.
         ech_accepted: false,
         verified_chains_observation,
         signed_certificate_timestamps_observation: Ok(Arc::from([])),

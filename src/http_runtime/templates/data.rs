@@ -10,12 +10,13 @@ pub(crate) struct RequestData {
     dynamic:crate::http_runtime::placeholder_value::Dynamic,
     tls_snapshot:Option<Arc<crate::http_runtime::ConnectionSnapshot>>,
     tls_values:tls_values::Cache,
+    client_cert_text:Option<Arc<crate::http_runtime::client_cert_facts::Cache>>,
     url_values:OnceLock<request_url::Cache>,
     url_origin:Option<Uri>,url_origin_form:bool,
     h2_protocol:Option<Arc<str>>,
     rewrite:Option<crate::http_runtime::rewrite_runtime::Projection>,
     pub uri:Uri,pub original_uri:Uri,pub request_uri:Vec<u8>,pub method:Method,pub original_method:Method,
-    pub form:Arc<super::forms::Form>,pub headers:HeaderMap,pub version:Version,pub host:String,pub remote:Vec<u8>,
+    pub form:Arc<super::forms::Form>,pub headers:HeaderMap,pub version:Version,pub host:bytes::Bytes,pub remote:Vec<u8>,
     pub remote_ip:Vec<u8>,pub client_ip:String,pub tls:bool,pub content_length:i64,pub placeholders:BTreeMap<String,(Vec<u8>,bool)>,
 }
 // Mechanical H2/H3 URIs contain pseudo-field scheme/authority even though
@@ -26,7 +27,13 @@ pub(crate) struct RequestData {
 impl RequestData {
     pub(crate) fn capture<'a>(ctx:&'a super::super::super::request::Context)->impl std::future::Future<Output=Result<Self,super::super::TemplateFailure>>+Send+'a{
         let prepared=Self::capture_primitives(ctx);let view=ctx.lookup_view();
-        async move{let mut value=prepared?;value.maps=crate::http_runtime::map_runtime::Provider::capture(view).await.map_err(|_|super::super::TemplateFailure(http::StatusCode::SERVICE_UNAVAILABLE))?;Ok(value)}
+        let cache=ctx.tls.then(||ctx.req().extensions().get::<Arc<crate::http_runtime::client_cert_facts::Cache>>().cloned()).flatten();
+        let resources=ctx.resources.clone();
+        async move{
+            if let Some(cache)=cache{
+                cache.get(&resources).await.map_err(|_|super::super::TemplateFailure(http::StatusCode::SERVICE_UNAVAILABLE))?;
+            }
+            let mut value=prepared?;value.maps=crate::http_runtime::map_runtime::Provider::capture(view).await.map_err(|_|super::super::TemplateFailure(http::StatusCode::SERVICE_UNAVAILABLE))?;Ok(value)}
     }
     fn capture_primitives(ctx:&super::super::super::request::Context)->Result<Self,super::super::TemplateFailure>{
         let req=ctx.req();let mut placeholders=BTreeMap::new();
@@ -43,8 +50,8 @@ impl RequestData {
         let url_origin_form=matches!(req.version(),Version::HTTP_2|Version::HTTP_3)
             &&(ctx.template_original_method()!=Method::CONNECT||ctx.original_uri.path_and_query().is_some());
         let rewrite=target.is_none().then(||crate::http_runtime::rewrite_runtime::projection(req).cloned()).flatten();
-        let request_uri=if let Some(rewrite)=&rewrite{rewrite.request_uri.to_vec()}else if target.is_some(){Vec::new()}else{ctx.original_uri.path_and_query().map_or("/",|v|v.as_str()).as_bytes().to_vec()};
-        let form=super::forms::Form::new(req.method().as_str(),uri.query().unwrap_or_default(),req.headers().get(header::CONTENT_TYPE).and_then(|v|v.to_str().ok()).unwrap_or_default());
+        let request_uri=if let Some(rewrite)=&rewrite{rewrite.request_uri.to_vec()}else if target.is_some(){Vec::new()}else{crate::http_runtime::request_host::request_target(req).to_vec()};
+        let form=super::forms::Form::new(req.method().as_str(),uri.query().unwrap_or_default(),req.headers().get(header::CONTENT_TYPE).map_or(&[][..],|v|v.as_bytes()));
         // Go's net/http parser promotes the wire Host header into Request.Host
         // and removes it from Request.Header; Hyper retains that wire field.
         let mut headers=req.headers().clone();headers.remove(header::HOST);
@@ -56,7 +63,7 @@ impl RequestData {
         }else{None};
         if h2_protocol.as_ref().is_some_and(|p|p.len()>128*1024){return Err(super::super::TemplateFailure(http::StatusCode::INTERNAL_SERVER_ERROR));}
 
-        Ok(Self{maps:None,tls_snapshot:req.extensions().get::<Arc<crate::http_runtime::ConnectionSnapshot>>().cloned(),tls_values:tls_values::cache(),url_values:OnceLock::new(),dynamic:crate::http_runtime::placeholder_value::Dynamic::capture(ctx),h2_protocol,rewrite,url_origin,url_origin_form,uri,original_uri,request_uri,form,method:req.method().clone(),original_method:ctx.lookup("http.request.orig_method").and_then(|s|s.parse().ok()).unwrap_or(Method::GET),headers,version:req.version(),host:ctx.authority.clone(),remote:ctx.peer.raw_text().into_owned(),remote_ip:ctx.peer.raw_host().into_owned(),client_ip:ctx.client_ip.map_or_else(String::new,|ip|ip.to_string()),tls:ctx.tls,content_length:if target.is_some(){0}else{ctx.template_content_length()},placeholders})
+        Ok(Self{client_cert_text:req.extensions().get::<Arc<crate::http_runtime::client_cert_facts::Cache>>().cloned(),maps:None,tls_snapshot:req.extensions().get::<Arc<crate::http_runtime::ConnectionSnapshot>>().cloned(),tls_values:tls_values::cache(),url_values:OnceLock::new(),dynamic:crate::http_runtime::placeholder_value::Dynamic::capture(ctx),h2_protocol,rewrite,url_origin,url_origin_form,uri,original_uri,request_uri,form,method:req.method().clone(),original_method:ctx.lookup("http.request.orig_method").and_then(|s|s.parse().ok()).unwrap_or(Method::GET),headers,version:req.version(),host:ctx.authority.clone(),remote:ctx.peer.raw_text().into_owned(),remote_ip:ctx.peer.raw_host().into_owned(),client_ip:ctx.client_ip_text(),tls:ctx.tls,content_length:if target.is_some(){0}else{ctx.template_content_length()},placeholders})
     }
     pub(super) fn placeholder(&self,name:&str,control:&Arc<super::Control>)->RenderResult<Value>{
         if let Some(value)=self.placeholder_primitive(name,control)?{return Ok(value)}
@@ -89,6 +96,12 @@ impl RequestData {
             control.reserve_host_bytes(length.saturating_mul(2).saturating_add(64))?;
             return Ok(Some(Value::from_go_bytes(value.into_bytes())));
         }
+        if crate::http_runtime::client_cert_text::known(name){
+            let upper=crate::http_runtime::client_cert_text::upper(self.tls,self.client_cert_text.as_ref()).map_err(|e|error(e.to_string()))?;
+            control.reserve_host_bytes(upper)?;
+            let value=crate::http_runtime::client_cert_text::lookup(name,self.tls,self.client_cert_text.as_ref()).expect("known client TLS provider").map_err(|e|error(e.to_string()))?;
+            return Ok(Some(Value::from_go_bytes(value)))
+        }
         if let Some(name)=name.strip_prefix("http.request.header."){
             let values=self.headers.get_all(name);let count=values.iter().count();
             let length=values.iter().try_fold(count.saturating_sub(1),|n,v|n.checked_add(v.as_bytes().len())).ok_or_else(||error("header placeholder size overflow"))?;
@@ -120,16 +133,13 @@ impl RequestData {
         }
         arity(args,0,0)?;
         if name=="RemoteIP"{return Ok(Value::from_go_bytes(self.remote_ip.clone()));}
-        Ok(string(match name{
-            "ClientIP"=>self.client_ip.clone(),
-            "Host"=>{
-                if self.host.starts_with('['){self.host.rsplit_once("]:").map_or_else(||self.host.clone(),|(host,_)|host.trim_start_matches('[').into())}
-                else if self.host.bytes().filter(|byte|*byte==b':').count()==1{self.host.split_once(':').map_or_else(||self.host.clone(),|(host,_)|host.into())}
-                else{self.host.clone()}
-            }
-            _=>return Err(error("unknown request template method")),
-        }))
+        match name{
+            "ClientIP"=>Ok(string(self.client_ip.clone())),
+            "Host"=>Ok(Value::from_go_bytes(crate::http_runtime::request_host::hostname(&self.host))),
+            _=>Err(error("unknown request template method")),
+        }
     }
+
     pub(super) fn value(&self,original:bool,control:&Arc<super::Control>)->RenderResult<Value>{
         let uri=if original{&self.original_uri}else{&self.uri};
         if self.url_values.get().is_none(){let prepared=request_url::cache(control)?;let _=self.url_values.set(prepared);}
@@ -142,13 +152,13 @@ impl RequestData {
             ("Method".into(),string(method.as_str())),("URL".into(),request_url::cached(uri,self.url_origin.as_ref(),self.url_origin_form,control,url_cache,original,if original{None}else{self.rewrite.as_ref()})?),
             ("Header".into(),header_clone::value(Arc::new(Mutex::new(headers.clone())),false,if original{None}else{self.h2_protocol.clone()},original,control)?),
             ("Trailer".into(),header_clone::value(Arc::new(Mutex::new(HeaderMap::new())),false,None,true,control)?),
-            ("Host".into(),string(if original{""}else{&self.host})),("RemoteAddr".into(),Value::from_go_bytes(self.remote.clone())),
+            ("Host".into(),Value::from_go_bytes(if original{b"".as_slice()}else{self.host.as_ref()})),("RemoteAddr".into(),Value::from_go_bytes(self.remote.clone())),
             ("RequestURI".into(),Value::from_go_bytes(request_uri.as_slice())),("Proto".into(),string(proto)),
             ("ProtoMajor".into(),Value::Int(major)),("ProtoMinor".into(),Value::Int(minor)),
             ("ContentLength".into(),Value::Int64(if original{0}else{self.content_length})),
             ("Close".into(),Value::Bool(!original&&matches!(self.version,Version::HTTP_10|Version::HTTP_11)&&(crate::http_runtime::proxy::header_has_token(&headers,header::CONNECTION,"close")||(self.version==Version::HTTP_10&&!crate::http_runtime::proxy::header_has_token(&headers,header::CONNECTION,"keep-alive"))))),
             ("TransferEncoding".into(),Value::List(Vec::new().into())),("Body".into(),Value::Nil),
-            ("MultipartForm".into(),if original{super::forms::Form::new("GET","","").multipart_value()}else{self.form.multipart_value()}),
+            ("MultipartForm".into(),if original{super::forms::Form::new("GET","",b"").multipart_value()}else{self.form.multipart_value()}),
         ]);
         fields.insert("Response".into(),nil_pointer("*http.Response",&["Status","StatusCode","Proto","ProtoMajor","ProtoMinor","Header","Body","ContentLength","TransferEncoding","Close","Uncompressed","Trailer","Request","TLS"]));
         fields.insert("Pattern".into(),string(""));
@@ -247,24 +257,25 @@ pub(super) fn metadata_info(path:&Path,metadata:std::fs::Metadata)->RenderResult
     Ok(Value::Object(Arc::new(Object{methods,go_type:Some("*os.fileStat"),..Object::default()})))
 }
 
-fn query_escape(input:&str)->String {
-    let mut output=String::new();for byte in input.bytes(){match byte{b' '=>output.push('+'),byte if byte.is_ascii_alphanumeric()||b"-_.~".contains(&byte)=>output.push(byte as char),byte=>output.push_str(&format!("%{byte:02X}"))}}output
-}
-
-pub(super) fn values_snapshot(snapshot:Arc<dyn Fn()->RenderResult<Arc<Fields>>+Send+Sync>)->Value{values_dynamic(snapshot,Arc::new(||false))}
-pub(super) fn values_dynamic(snapshot:Arc<dyn Fn()->RenderResult<Arc<Fields>>+Send+Sync>,is_nil:Arc<dyn Fn()->bool+Send+Sync>)->Value{
+pub(super) fn values_dynamic(snapshot:Arc<dyn Fn()->RenderResult<Arc<super::forms::Values>>+Send+Sync>,is_nil:Arc<dyn Fn()->bool+Send+Sync>)->Value{
     let mut methods=BTreeMap::<Arc<str>,ValueFunc>::new();
-    for name in ["Get","Has","Encode"] {let snapshot=snapshot.clone();methods.insert(name.into(),Arc::new(move|args|{
+    for name in ["Get","Has","Encode"]{let snapshot=snapshot.clone();methods.insert(name.into(),Arc::new(move|args|{
         arity(args,usize::from(name!="Encode"),usize::from(name!="Encode"))?;let entries=snapshot()?;
         if name=="Encode"{
-            let mut output=String::new();
-            for(key,values)in entries.iter(){if let Value::List(values)=values{for value in values.iter(){if !output.is_empty(){output.push('&');}output.push_str(&query_escape(key));output.push('=');output.push_str(&query_escape(value.as_str().unwrap_or_default()));if output.len()>1<<20{return Err(error("encoded query byte limit exceeded"));}}}}
-            return Ok(string(output));
+            let mut output=Vec::new();
+            for(key,values)in entries.iter(){if let Value::Slice(values)=values{for value in values.iter(){
+                if !output.is_empty(){output.push(b'&');}
+                query_escape_bytes(&mut output,key.as_bytes());output.push(b'=');
+                query_escape_bytes(&mut output,value.as_go_bytes().ok_or_else(||error("invalid form string value"))?);
+                if output.len()>1<<20{return Err(error("encoded query byte limit exceeded"));}
+            }}}
+            return Ok(Value::from_go_bytes(output));
         }
-        let key=text(args,0)?;if name=="Has"{return Ok(Value::Bool(entries.contains_key(key)));}
-        Ok(entries.get(key).and_then(|value|if let Value::List(values)=value{values.first()}else{None}).cloned().unwrap_or_else(||string("")))
+        let key=args[0].as_go_bytes().ok_or_else(||error("form map key requires string"))?;
+        if name=="Has"{return Ok(Value::Bool(entries.contains_key(key)));}
+        Ok(entries.get(key).and_then(|v|if let Value::Slice(v)=v{v.get(0)}else{None}).unwrap_or_else(||string("")))
     }));}
-    Value::Object(Arc::new(Object{methods,map_view:Some(MapView{is_nil,type_name:"url.Values",zero:Value::List(Vec::new().into()),snapshot:Arc::new(move||snapshot().map(gotmpl::GoMapSnapshot::Utf8))}),..Object::default()}))
+    Value::Object(Arc::new(Object{methods,map_view:Some(MapView{is_nil,type_name:"url.Values",zero:Value::Slice(gotmpl::TypedSlice::nil("[]string")),snapshot:Arc::new(move||snapshot().map(gotmpl::GoMapSnapshot::Keyed))}),..Object::default()}))
 }
 
 fn mode_string(value:i64)->String {
@@ -287,6 +298,9 @@ pub(super) fn mode_value(mode:u32)->Value{
 
 pub(super) fn typed_map(type_name:&'static str,entries:Arc<Fields>,zero:Value)->Value{
     Value::Object(Arc::new(Object{map_view:Some(MapView{is_nil:Arc::new(||false),type_name,zero,snapshot:Arc::new(move||Ok(gotmpl::GoMapSnapshot::Utf8(entries.clone())))}),..Object::default()}))
+}
+pub(super)fn typed_keyed_map(type_name:&'static str,entries:Arc<super::forms::Values>,zero:Value)->Value{
+    Value::Object(Arc::new(Object{map_view:Some(MapView{is_nil:Arc::new(||false),type_name,zero,snapshot:Arc::new(move||Ok(gotmpl::GoMapSnapshot::Keyed(entries.clone())))}),..Object::default()}))
 }
 
 fn nil_pointer(go_type:&'static str,names:&[&str])->Value{

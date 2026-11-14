@@ -5,6 +5,7 @@
 mod decode;
 #[path = "tls_app_config/error.rs"]
 mod error;
+#[path="tls_app_config/ech.rs"]pub(crate)mod ech;
 #[path = "tls_app_config/external.rs"]
 mod external;
 #[path = "tls_app_config/issuer_account_key.rs"]

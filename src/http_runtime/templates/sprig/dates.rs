@@ -1,6 +1,9 @@
 use super::*;
 use crate::logging::{Timestamp,time_components,time_layout::Layout};
 use chrono::{TimeZone,Offset};
+#[path="dates/mutable.rs"]mod mutable;
+#[path="dates/codecs.rs"]mod codecs;
+#[path="dates/display.rs"]mod display;
 #[derive(Clone)]
 enum Zone {Utc,Local,Named(Arc<str>),Fixed(Arc<(i32,String)>)}
 #[derive(Clone)]
@@ -19,15 +22,32 @@ fn fixed_zone(offset:i32,name:String)->Zone{
         Zone::Fixed(ZONES[(offset/3600+12)as usize].clone())
     }else{Zone::Fixed(Arc::new((offset,name)))}
 }
-fn location_name(zone:&Zone)->&str{match zone{Zone::Utc=>"UTC",Zone::Local=>"Local",Zone::Named(name)=>name,Zone::Fixed(value)=>&value.1}}
+fn location_name(zone:&Zone)->&str{match zone{Zone::Utc=>"UTC",Zone::Local=>crate::http_config::helpers::local_location_name(),Zone::Named(name)=>name,Zone::Fixed(value)=>&value.1}}
 fn format(time:&Time,layout:&str)->gotmpl::Result<String>{
     let(offset,zone)=zone_info(&time.zone,time.stamp.seconds);
     let components=time_components::at(time.stamp,offset,zone).map_err(|e|err(e.to_string()))?;
     Layout::compile(layout).and_then(|layout|layout.format(&components,MAX_BYTES)).map_err(|e|err(e.to_string()))
 }
+fn format_bytes(time:&Time,mut layout:&[u8])->gotmpl::Result<Vec<u8>>{
+    if layout.len()>MAX_BYTES{return Err(err("time layout exceeds byte limit"))}
+    let mut out=Vec::new();
+    loop{
+        let(valid,invalid)=match std::str::from_utf8(layout){Ok(valid)=>(valid,&[][..]),Err(error)=>{
+            let at=error.valid_up_to();let n=error.error_len().unwrap_or(layout.len()-at);
+            (std::str::from_utf8(&layout[..at]).map_err(|_|err("invalid time layout split"))?,&layout[at..at+n])
+        }};
+        let formatted=format(time,valid)?;checked_length(out.len(),formatted.len().checked_add(invalid.len()).ok_or_else(||err("time format size overflow"))?)?;
+        out.extend_from_slice(formatted.as_bytes());out.extend_from_slice(invalid);
+        let consumed=valid.len()+invalid.len();if consumed==layout.len(){return Ok(out)}layout=&layout[consumed..];
+    }
+}
 fn extract(value:&V)->gotmpl::Result<Time>{
     let V::Object(object)=value else{return Err(err("expected time.Time"));};
-    object.host_data::<Time>("time.Time").cloned().ok_or_else(||err("expected time.Time"))
+    current(object)
+}
+fn current(object:&gotmpl::Object)->gotmpl::Result<Time>{
+    if let Some(time)=object.host_data::<Time>("time.Time"){return Ok(time.clone())}
+    mutable::snapshot(object)
 }
 fn date_input(value:&V)->Time{match value{
     V::Int(seconds)|V::Int64(seconds)=>Time{stamp:Timestamp{seconds:*seconds,nanosecond:0},zone:Zone::Local,monotonic:None},
@@ -76,17 +96,17 @@ fn add_date(time: &Time, years: i64, months: i64, days: i64) -> gotmpl::Result<T
     })
 }
 fn time_equal(a:&gotmpl::Object,b:&gotmpl::Object)->bool {
-    let(Some(a),Some(b))=(a.host_data::<Time>("time.Time"),b.host_data::<Time>("time.Time"))else{return false;};
+    let(Ok(a),Ok(b))=(current(a),current(b))else{return false;};
     let location=match(&a.zone,&b.zone){(Zone::Utc,Zone::Utc)|(Zone::Local,Zone::Local)=>true,(Zone::Named(a),Zone::Named(b))=>Arc::ptr_eq(a,b),(Zone::Fixed(a),Zone::Fixed(b))=>Arc::ptr_eq(a,b),_=>false};
     location&&a.stamp.seconds==b.stamp.seconds&&a.stamp.nanosecond==b.stamp.nanosecond&&a.monotonic==b.monotonic
 }
 fn time_deep_equal(a:&gotmpl::Object,b:&gotmpl::Object)->bool{
-    let(Some(a),Some(b))=(a.host_data::<Time>("time.Time"),b.host_data::<Time>("time.Time"))else{return false;};
+    let(Ok(a),Ok(b))=(current(a),current(b))else{return false;};
     let location=match(&a.zone,&b.zone){(Zone::Utc,Zone::Utc)|(Zone::Local,Zone::Local)=>true,(Zone::Named(a),Zone::Named(b))=>a==b,(Zone::Fixed(a),Zone::Fixed(b))=>a==b,_=>false};
     location&&a.stamp.seconds==b.stamp.seconds&&a.stamp.nanosecond==b.stamp.nanosecond&&a.monotonic==b.monotonic
 }
 fn time_key_order(a:&gotmpl::Object,b:&gotmpl::Object)->gotmpl::Result<std::cmp::Ordering>{
-    let(a,b)=(a.host_data::<Time>("time.Time").ok_or_else(||err("invalid time key"))?,b.host_data::<Time>("time.Time").ok_or_else(||err("invalid time key"))?);
+    let(a,b)=(current(a)?,current(b)?);
     fn location(zone:&Zone)->(u8,usize){match zone{Zone::Utc=>(0,0),Zone::Local=>(1,0),Zone::Named(name)=>(2,name.as_ptr()as usize),Zone::Fixed(value)=>(3,Arc::as_ptr(value)as usize)}}
     Ok((a.stamp.nanosecond,a.stamp.seconds,location(&a.zone)).cmp(&(b.stamp.nanosecond,b.stamp.seconds,location(&b.zone))))
 }
@@ -135,11 +155,18 @@ static ADD_DATE_SIG: gotmpl::Signature = gotmpl::Signature::from_static(
     &[gotmpl::ArgKind::Int, gotmpl::ArgKind::Int, gotmpl::ArgKind::Int], None,
 );
 
+static APPEND_SIG:gotmpl::Signature=gotmpl::Signature::from_static(&[gotmpl::ArgKind::ByteSlice],None);
 static TIME_TYPE: gotmpl::HostType = gotmpl::HostType {
     methods: &[
         gotmpl::HostMethod { name: "String", invoke: |o, a| time_call("String", o, a), signature: None },
+        gotmpl::HostMethod { name: "GoString", invoke: |o, a| time_call("GoString", o, a), signature: None },
+        gotmpl::HostMethod {name:"In",invoke:|o,a|time_call("In",o,a),signature:Some(&gotmpl::Signature::from_static(&[gotmpl::ArgKind::GoPointer("*time.Location")],None))},
+        gotmpl::HostMethod {name:"IsDST",invoke:|o,a|time_call("IsDST",o,a),signature:None},
         gotmpl::HostMethod { name: "MarshalText", invoke: |o, a| time_call("MarshalText", o, a), signature: None },
         gotmpl::HostMethod { name: "MarshalJSON", invoke: |o, a| time_call("MarshalJSON", o, a), signature: None },
+        gotmpl::HostMethod {name:"AppendText",invoke:|o,a|time_call("AppendText",o,a),signature:Some(&APPEND_SIG)},
+        gotmpl::HostMethod {name:"AppendBinary",invoke:|o,a|time_call("AppendBinary",o,a),signature:Some(&APPEND_SIG)},
+        gotmpl::HostMethod {name:"AppendFormat",invoke:|o,a|time_call("AppendFormat",o,a),signature:Some(&gotmpl::Signature::from_static(&[gotmpl::ArgKind::ByteSlice,gotmpl::ArgKind::String],None))},
         gotmpl::HostMethod { name: "MarshalBinary", invoke: |o, a| time_call("MarshalBinary", o, a), signature: None },
         gotmpl::HostMethod { name: "GobEncode", invoke: |o, a| time_call("GobEncode", o, a), signature: None },
         gotmpl::HostMethod { name: "Unix", invoke: |o, a| time_call("Unix", o, a), signature: None },
@@ -173,12 +200,28 @@ static TIME_TYPE: gotmpl::HostType = gotmpl::HostType {
 };
 
 fn time_call(name: &str, object: &gotmpl::Object, a: &[V]) -> R {
-    let time = object.host_data::<Time>("time.Time").ok_or_else(|| err("invalid time.Time"))?;
-    let display = object.display.as_deref().ok_or_else(|| err("invalid display"))?;
+    let owned = current(object)?;
+    let time = &owned;
     match name {
+        "In"=>{arity(a,1,1)?;let V::Object(location)=&a[0]else{return Err(err("time: missing Location in call to Time.In"))};let zone=location.host_data::<Zone>("*time.Location").ok_or_else(||err("time: missing Location in call to Time.In"))?;time_value(Time{zone:zone.clone(),monotonic:None,..time.clone()})},
+        "AppendText"|"AppendBinary"|"AppendFormat"=>{
+            arity(a,if name=="AppendFormat"{2}else{1},if name=="AppendFormat"{2}else{1})?;
+            let prefix=match &a[0]{V::Nil=>gotmpl::TypedSlice::nil("[]uint8"),V::Slice(s)if s.go_type()=="[]uint8"=>s.clone(),_=>return Err(err("expected []uint8"))};
+            let method=if name=="AppendText"{"MarshalText"}else{"MarshalBinary"};
+            let formatted=if name=="AppendFormat"{V::Slice(gotmpl::TypedSlice::bytes(Some(format_bytes(time,a[1].as_go_bytes().ok_or_else(||err("expected string layout"))?)?.into())))}else{time_call(method,object,&[]).map_err(|error|err(error.to_string().replace(method,name)))?};
+            let suffix=match formatted{V::Slice(bytes)=>bytes.visible_bytes().ok_or_else(||err("time wire bytes missing"))?,_=>return Err(err("invalid time wire bytes"))};
+            let length=checked_length(prefix.len(),suffix.len())?;
+            if length<=prefix.cap(){let output=prefix.reslice(0,length)?;output.write_range(prefix.len(),&suffix)?;return Ok(V::Slice(output))}
+            let capacity=prefix.byte_append_capacity(suffix.len())?;
+            if capacity>MAX_BYTES{return Err(err("time append exceeds byte limit"));}
+            let mut bytes=Vec::new();bytes.try_reserve_exact(capacity).map_err(|_|err("time append allocation failed"))?;
+            if let Some(old)=prefix.visible_bytes(){bytes.extend_from_slice(&old);}
+            bytes.extend_from_slice(&suffix);bytes.resize(capacity,0);
+            Ok(V::Slice(gotmpl::TypedSlice::bytes(Some(bytes.into())).with_len(length)?))
+        },
         "Format" => {
             arity(a, 1, 1)?;
-            output(format(time, arg_text(a, 0)?)?)
+            Ok(V::from_go_bytes(format_bytes(time,a[0].as_go_bytes().ok_or_else(||err("expected string layout"))?)?))
         },
         "Add" => {
             arity(a, 1, 1)?;
@@ -255,7 +298,9 @@ fn time_call(name: &str, object: &gotmpl::Object, a: &[V]) -> R {
         _ => {
             arity(a, 0, 0)?;
             match name {
-                "String" => output(display.to_owned()),
+                "String" => output(display::string(time)?),
+                "GoString"=>output(display::go_string(time)?),
+                "IsDST"=>Ok(V::Bool(display::is_dst(time))),
                 "MarshalText" | "MarshalJSON" => {
                     let (offset, zone) = zone_info(&time.zone, time.stamp.seconds);
                     let components = time_components::at(time.stamp, offset, zone)
@@ -324,6 +369,7 @@ fn time_call(name: &str, object: &gotmpl::Object, a: &[V]) -> R {
                         display: Some(name.into()),
                         go_type: Some("*time.Location"),
                         pointer_identity:Some(match &time.zone{Zone::Utc=>1,Zone::Local=>2,Zone::Named(name)=>name.as_ptr()as usize,Zone::Fixed(value)=>Arc::as_ptr(value)as usize}),
+                        data:Some(Arc::new(time.zone.clone())),data_bytes:std::mem::size_of::<Zone>(),
                         methods: BTreeMap::from([(
                             "String".into(),
                             Arc::new(
@@ -372,18 +418,11 @@ fn time_value(time: Time) -> R {
             .into())
     })()
     .map_err(|e| Arc::from(e.to_string()));
-    let mut display = format(&time, "2006-01-02 15:04:05.999999999 -0700 MST")?;
-    if let Some(mono) = time.monotonic {
-        display.push_str(&format!(
-            " m={}{}.{:09}",
-            if mono < 0 { "-" } else { "+" },
-            mono.unsigned_abs() / 1_000_000_000,
-            mono.unsigned_abs() % 1_000_000_000
-        ));
-    }
+    let display = display::string(&time)?;
     Ok(V::Object(Arc::new(gotmpl::Object {
         json: Some(json),
         host_type: Some(&TIME_TYPE),
+        formatter:Some(display::formatter),
         display: Some(display.into()),
         go_type: Some("time.Time"),
         data: Some(Arc::new(time)),
@@ -395,11 +434,18 @@ fn time_value(time: Time) -> R {
     })))
 }
 
+/// Addressable certificate fields are a render-private copy; mutation never
+/// changes the signed DER, authentication facts or a later request's values.
+pub(crate)fn addressable_time(seconds:i64,nanosecond:u32,control:&Arc<crate::http_runtime::templates::render::Control>)->R{
+    mutable::value(Time{stamp:Timestamp{seconds,nanosecond},zone:Zone::Utc,monotonic:None},control)
+}
+pub(crate)fn utc_time(seconds:i64,nanosecond:u32)->R{time_value(Time{stamp:Timestamp{seconds,nanosecond},zone:Zone::Utc,monotonic:None})}
+
 pub(super) fn add_functions(m:&mut M){for name in ["now","date","dateInZone","date_in_zone","htmlDate","htmlDateInZone","dateModify","date_modify","mustDateModify","must_date_modify","toDate","mustToDate","unixEpoch","ago","duration","durationRound"]{put(m,name,move|a|call(name,a));}}
 fn call(name:&str,a:&[V])->R{
     match name{
         "now"=>{arity(a,0,0)?;time_value(now())},
-        "date"|"dateInZone"|"date_in_zone"=>{arity(a,if name=="date"{2}else{3},if name=="date"{2}else{3})?;let mut time=date_input(&a[1]);time.zone=if name=="date"{Zone::Local}else{zone(arg_text(a,2)?)};output(format(&time,arg_text(a,0)?)?)},
+        "date"|"dateInZone"|"date_in_zone"=>{arity(a,if name=="date"{2}else{3},if name=="date"{2}else{3})?;let mut time=date_input(&a[1]);time.zone=if name=="date"{Zone::Local}else{zone(arg_text(a,2)?)};Ok(V::from_go_bytes(format_bytes(&time,a[0].as_go_bytes().ok_or_else(||err("expected string layout"))?)?))},
         "htmlDate"|"htmlDateInZone"=>{arity(a,if name=="htmlDate"{1}else{2},if name=="htmlDate"{1}else{2})?;let mut time=date_input(&a[0]);time.zone=if name=="htmlDate"{Zone::Local}else{zone(arg_text(a,1)?)};output(format(&time,"2006-01-02")?)},
         "dateModify"|"date_modify"|"mustDateModify"|"must_date_modify"=>{
             arity(a,2,2)?;let time=extract(&a[1])?;match crate::duration::parse_go(arg_text(a,0)?){Ok(duration)=>time_value(add(&time,duration)?),Err(error)if name.starts_with("must")=>Err(err(error.to_string())),Err(_)=>Ok(a[1].clone())}

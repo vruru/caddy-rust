@@ -110,6 +110,7 @@ sha1={version="0.10",features=["oid"]}
 p224={version="0.13.2",features=["ecdsa"]}
 
 openssl = { version = "=0.10.82", features = ["vendored"] }
+tar = { version = "=0.4.46", default-features = false }
 
 [patch.crates-io]
 tokio = { path = "vendor/tokio-1.54.1" }

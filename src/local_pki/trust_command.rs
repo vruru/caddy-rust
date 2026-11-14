@@ -42,14 +42,17 @@ enum Pipe {
 async fn drain(mut pipe: impl AsyncRead + Unpin) -> Result<Vec<u8>> {
     let mut result = Vec::new();
     let mut bytes = [0; 8192];
+    let mut truncated = false;
     loop {
         let n = pipe.read(&mut bytes).await?;
         if n == 0 {
             break;
         }
         let keep = n.min((65536_usize).saturating_sub(result.len()));
+        truncated |= keep != n;
         result.extend_from_slice(&bytes[..keep]);
     }
+    ensure!(!truncated,"trust command output exceeds 64 KiB");
     Ok(result)
 }
 pub(super) async fn execute(

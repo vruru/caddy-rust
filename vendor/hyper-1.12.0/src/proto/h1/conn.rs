@@ -70,6 +70,7 @@ where
                 h1_parser_config: ParserConfig::default(),
                 h1_max_headers: None,
                 h1_max_header_size: None,
+                native_request_target:false,
                 #[cfg(feature = "server")]
                 h1_header_read_timeout: None,
                 #[cfg(feature = "server")]
@@ -132,6 +133,10 @@ where
     }
 
     #[cfg(feature = "client")]
+    #[cfg(feature="client")]
+    pub(crate) fn set_write_buffer_size(&mut self,bytes:usize){self.io.set_write_buffer_size(bytes);}
+    #[cfg(feature="client")]
+    pub(crate) fn set_native_read_buffer(&mut self,chunk:usize,max:usize){self.io.set_native_read_buffer(chunk,max);}
     pub(crate) fn set_read_buf_exact_size(&mut self, sz: usize) {
         self.io.set_read_buf_exact_size(sz);
     }
@@ -176,6 +181,9 @@ where
         self.state.h09_responses = true;
     }
 
+    #[cfg(feature="server")]
+    pub(crate) fn set_native_request_target(&mut self,enabled:bool){self.state.native_request_target=enabled;}
+
     pub(crate) fn set_http1_max_headers(&mut self, val: usize) {
         self.state.h1_max_headers = Some(val);
     }
@@ -212,6 +220,9 @@ where
     pub(crate) fn into_inner(self) -> (I, Bytes) {
         self.io.into_inner()
     }
+
+    #[cfg(feature="server")]
+    pub(super) fn application_upgrade_requested(&self)->bool{self.state.upgrade.as_ref().is_some_and(|p|p.was_requested())}
 
     pub(crate) fn pending_upgrade(&mut self) -> Option<crate::upgrade::Pending> {
         let pending = self.state.upgrade.take()?;
@@ -339,6 +350,7 @@ where
                 h1_parser_config: self.state.h1_parser_config.clone(),
                 h1_max_headers: self.state.h1_max_headers,
                 h1_max_header_size: self.state.h1_max_header_size,
+                native_request_target:self.state.native_request_target,
                 preserve_header_case: self.state.preserve_header_case,
                 #[cfg(feature = "ffi")]
                 preserve_header_order: self.state.preserve_header_order,
@@ -1174,6 +1186,7 @@ struct State {
     h1_parser_config: ParserConfig,
     h1_max_headers: Option<usize>,
     h1_max_header_size: Option<usize>,
+    native_request_target:bool,
     #[cfg(feature = "server")]
     h1_header_read_timeout: Option<Duration>,
     #[cfg(feature = "server")]

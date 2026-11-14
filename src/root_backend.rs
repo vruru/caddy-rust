@@ -906,7 +906,7 @@ fn prepare(raw: Value) -> Result<Prepared, AdminError> {
     if apps.is_some_and(|v| {
         v.as_object().is_none_or(|o| {
             o.keys()
-                .any(|key| !matches!(key.as_str(), "http" | "tls" | "pki" | "events"))
+                .any(|key| !matches!(key.as_str(), "http" | "tls" | "pki" | "events" | "caddy.filesystems"))
         })
     }) {
         return Err(failed("unsupported_application_module"));
@@ -930,6 +930,9 @@ fn prepare(raw: Value) -> Result<Prepared, AdminError> {
     // the original integer-negative-zero provenance needed by typed fields.
     let mut applications = serde_json::Map::new();
     applications.insert("http".to_owned(), http);
+    if let Some(fs)=apps.and_then(|a|a.get("caddy.filesystems")).filter(|v|!v.is_null()){
+        applications.insert("caddy.filesystems".into(),fs.clone());
+    }
     let mut document = serde_json::Map::new();
     document.insert("apps".to_owned(), Value::Object(applications));
     let mut http = http_config::validate_json(&Value::Object(document))

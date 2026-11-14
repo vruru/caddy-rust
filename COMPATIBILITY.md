@@ -875,8 +875,9 @@ Rust library callers gain `AcmeIssuerConfig::account_key` with type
 field. This is a Rust source interface extension, not a cross-language plugin
 ABI. Signing-key/control input residency is distinct from certificate-chain
 payload pools; this feature does not claim a whole-process heap or RSS bound.
-The independent ZeroSSL API issuer and DNS solver/resolver/ECH options remain
-explicitly unfinished. Test-CA phase/recovery and warm retry behavior are described in
+The independent ZeroSSL API issuer and DNS solver/resolver options remain
+explicitly unfinished in this historical inventory. Current server ECH protocol
+behavior and its publication boundary are documented below. Test-CA phase/recovery and warm retry behavior are described in
 [TEST-CA.md](TEST-CA.md); physical Name0 forced-renewal retry integration remains pending.
 HTTP CA sources are described below.
 
@@ -1332,8 +1333,8 @@ the existing staged socket ownership, reload and failed-candidate rollback
 path. Bare numeric IPs and omitted ports retain the reference's ephemeral-port
 semantics. IPv4, IPv6, wildcard addresses and the optional TCP network prefix
 are supported. The existing per-server limit applies to expanded endpoints:
-at most 1024, checked before allocating the expanded range. Unknown listener
-networks and Unix HTTP listeners remain explicit gaps;
+at most 1024, checked before allocating the expanded range. Unknown listener networks remain explicit gaps; Unix and inherited descriptor
+HTTP listeners are implemented by the later server/listener layer below.
 this does not claim every NetworkAddress or Caddyfile site-address combination.
 
 
@@ -1448,7 +1449,7 @@ socket mode; failed candidates leave the existing generation intact. An IPv6-onl
 capability. A default dual-family challenge lease reuses the actual IPv6
 listener and acquires a separate IPv4 listener, retaining/releasing each real
 descriptor independently, including listeners initially bound with port zero.
-Hostname TCP listeners are described below; Unix and file-descriptor HTTP listeners remain separate gaps.
+Hostname TCP listeners and the later Unix/file-descriptor layer are described below.
 
 Template HTTP header accessors
 ------------------------------
@@ -1631,8 +1632,9 @@ work. `listener_resolution_diagnostics()` exposes only read-only lane, tracked
 job and retained-credit observations. Plan/result graphs keep their allowances
 until their actual final owner retires, not merely until an await completes.
 
-This layer does not implement Unix, unixpacket, inherited-fd or large-range HTTP
-listeners, and does not add a configuration-level custom resolver plugin API. The existing
+The hostname-resolution layer does not add a configuration-level custom resolver
+plugin API. Unix, unixpacket and inherited-fd listeners are covered by the later
+server/listener layer below; large-range limits remain unchanged. The existing
 1024-entry per-server range capacity remains explicit. Current native hostname
 runtime validation covers macOS and Linux ARM64; unsupported system resolver
 platforms return an explicit error. Private acceptance includes strict H1/H2/H3
@@ -2006,3 +2008,112 @@ fresh upstream mTLS; explicit roots across delayed on-demand groups; HTTP,
 storage and PKI CA consumers; normal CLI trust-installer dispatch; and existing
 chain, Map, session and multi-protocol transfer regressions. The feature inventory
 and remaining release boundaries are in docs/COMPATIBILITY-STATUS.md.
+
+
+### Server options and concrete HTTP listener networks
+
+Server `keepalive_interval`, `keepalive_idle` and `keepalive_count` are consumed
+on each actual TCP accept, including accepts from reused listeners. Defaults
+are 15 seconds, 15 seconds and 9 probes. Negative interval disables keepalive;
+negative idle/count preserve the kernel value. Positive fractional seconds are
+rounded up for kernel options. Operating-system option errors retain the
+reference's nonfatal behavior. Existing accepted sockets retain their policy.
+
+`max_header_bytes` defaults to 16 KiB for absent, null or nonpositive values.
+HTTP/1 uses the reference's additional 4096-byte read allowance; HTTP/2 adds the
+reference's 320-byte field overhead; HTTP/3 advertises and enforces its field
+section limit. Ordinary H2 overflow receives 431 without preventing a later
+stream; the existing decoder abuse limit can terminate the connection.
+HTTP/1 header slots grow with actual input instead of imposing a hidden
+100-field limit or preallocating an arbitrarily large configured count.
+
+`enable_full_duplex` controls HTTP/1 response dispatch while an application is
+still reading the request body. False waits for that reader; true permits an
+early streaming response. HTTP/2 and HTTP/3 keep their independent streams.
+Ignored or dropped bodies retain Native's bounded immediate-drain-or-close
+behavior; this switch does not introduce a new unbounded post-handler drain.
+
+`listen_protocols` follows the original listen-string positions, and each
+expanded port-range entry inherits its corresponding set. Null/empty entries
+inherit global protocols, and an empty string includes that global set. The
+actual listener's ALPN, cleartext H2 and H3 acceptance use this set. TLS material
+is prepared once and restricted by protocol group, without reopening sources.
+The original Hyper-util upgrade API is unchanged; Native uses an additive
+selected-protocol upgrade entry so an H1-only listener cannot sniff into H2.
+
+HTTP listeners support TCP/TCP4/TCP6, UDP/UDP4/UDP6 for H3, Unix streams,
+Unix sequenced packets, inherited stream `fd` and inherited UDP `fdgram`.
+These retain actual kernel addresses, including raw Unix names, rather than
+fabricating IP endpoints. Unix permissions default to 0200, require owner-write
+when explicit, and use an inode-checked no-follow update. Reused Unix sockets
+retain their inode; failed preparation before activation retains the old route.
+Permission preparation can precede final publication, as with the reference's
+listener side effects; this is not an atomic filesystem transaction. Last-owner
+cleanup only unlinks the socket inode this runtime actually bound. Inherited
+descriptors are duplicated with CLOEXEC and never consume the caller's original
+or unlink its path. Linux abstract sockets are supported. Unix packet sockets
+retain their operating system's record semantics. Unsupported families fail
+explicitly. Existing IP-only inspection APIs remain, with an additive
+`bound_endpoints` API for concrete Unix/IP endpoints.
+
+`trusted_proxies_unix` only trusts the actual anonymous Unix peer name `@`.
+A named Unix peer is not trusted by this flag or by an IP CIDR. Trusted anonymous
+peers preserve incoming X-Forwarded-For/Host/Proto without appending a fabricated
+IP; the client-IP fallback is `@`. False strips those untrusted forwarded fields.
+
+`allow_0rtt` defaults to true and permits actual early HTTP/3 dispatch in the
+runtime-default stateful ticket mode. A request received before client Finished
+has `HandshakeComplete=false`; later requests capture the real completed phase.
+Version, resume, ALPN, peer identity and exporter observations come from the
+actual engine state. An already-derived exporter is observable through a narrow
+phase capability without marking authentication complete. IP-based matchers
+return 425 before Finished. Existing leaf/SNI/policy/session ownership checks,
+handshake admission and cancellation remain active. TLS client authentication
+retains its completed-handshake boundary.
+
+Rotating/distributed stateless STEK tickets preserve their existing resumption
+semantics. Rustls rejects early data with stateless tickets, so allowing 0-RTT
+does not promise acceptance in that mode. No replay cache or stateful replacement
+of distributed tickets is introduced. Early data remains replayable; applications
+must use it only where replay is acceptable. The listener layer is validated on
+macOS and Linux ARM64, not an all-platform socket-support claim.
+
+
+Server Encrypted ClientHello (RFC 9849)
+-------------------------------------
+
+Native's opt-in server ECH decrypts ClientHelloInner before TCP or HTTP/3 SNI,
+policy and certificate selection. Accepted inner messages require TLS 1.3;
+enabling ECH does not disable ordinary non-ECH TLS 1.2. ServerHello and HRR
+confirmation use the inner transcript. HRR's second ClientHello uses the
+same retained HPKE context. Malformed inner padding, session ID, compressed
+extension references, markers or pre-TLS-1.3 offers fail the handshake. A
+matching ID alone never establishes acceptance. Rejected keys/unknown IDs
+retain outer authentication and may return configured retry information.
+
+`.Req.TLS.ECHAccepted` and its scalar projection reflect actual TLS state,
+not extension presence. Accepted HTTP/3 early requests can have ECHAccepted
+true while HandshakeComplete is false; client identity and verified chains
+are not invented before Finished. Stateful ECH resumption and early dispatch
+preserve inner SNI, policy, leaf-veto and ticket gates. The existing stateless
+ticket boundary still rejects early data while allowing 1-RTT resumption; ECH
+adds no anti-replay framework and does not change distributed STEK behavior.
+
+The application prepares immutable key snapshots; accepted handshakes retain
+their key generation through rotation. ECH snapshot access performs no network or storage I/O.
+TCP preflight and QUIC preflight/initial acceptance use the existing bounded
+CPU lane. Later QUIC HRR crypto remains in Quinn's existing driver; this is
+not a claim that all QUIC crypto is scheduled outside its reactor. The HPKE
+provider offers its existing traditional KEM/symmetric suites; the standard
+application generates X25519 keys. This does not claim every KEM exposed by
+Go's broader TLS library.
+
+A plaintext forwarded `inner` marker follows Go's ordinary negotiated-version
+and certificate-authentication rules. The marker alone neither sets Native
+HPKE acceptance nor creates an ECH confirmation value. Full split-mode
+front-to-backend forwarding is outside this server protocol implementation;
+the tested deployment is shared mode.
+
+This server protocol layer does not itself publish ECH DNS records or add DNS
+provider plugins. App key lifecycle/storage and publication availability are
+separate consumers. These source capabilities imply no production acceptance.

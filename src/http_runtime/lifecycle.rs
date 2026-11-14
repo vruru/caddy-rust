@@ -34,8 +34,9 @@ struct Pending {
 struct ListenerControl {
     admission: Arc<connection_budget::ListenerBudget>,
     cancel: CancellationToken,
-    actual: SocketAddr,
+    actual: crate::http_config::ListenerAddress,
     actual_only_v6: bool,
+    unix_inode:Option<(u64,u64)>,
     proof: Arc<ArcSwap<ProofListener>>,
 }
 impl Drop for ListenerControl {
@@ -46,7 +47,7 @@ impl Drop for ListenerControl {
 }
 struct PoolSlot {
     owner: Weak<ListenerControl>,
-    actual: SocketAddr,
+    actual: crate::http_config::ListenerAddress,
     only_v6: bool,
     actual_only_v6: bool,
     cancel: CancellationToken,
@@ -60,17 +61,19 @@ struct LeaseRecord {
 /// including an unpolled or unwinding accept task.
 pub(super) struct ListenerSocket {
     pub(super) admission: Arc<connection_budget::ListenerBudget>,
-    socket: Option<TcpListener>,
+    socket: Option<listener_io::Listener>,
+    cleanup:Option<listener_io::PathCleanup>,
     finished: CancellationToken,
 }
 impl ListenerSocket {
-    pub(super) fn socket(&self) -> &TcpListener {
+    pub(super) fn socket(&self) -> &listener_io::Listener {
         self.socket.as_ref().expect("live listener socket")
     }
 }
 impl Drop for ListenerSocket {
     fn drop(&mut self) {
         drop(self.socket.take());
+        drop(self.cleanup.take());
         self.finished.cancel();
     }
 }
@@ -268,6 +271,12 @@ async fn retire_generation(
 
 /// Candidate listener capabilities. `declared` remains the configuration key;
 /// `actual` records the OS-selected port when the declared port was zero.
+/// Actual kernel endpoint. Unix names are retained as original OS bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BoundEndpoint {
+    Ip(SocketAddr),
+    Unix { path: Arc<[u8]>, packet: bool },
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StagedAddress {
     pub declared: SocketAddr,
@@ -670,7 +679,7 @@ impl HttpRuntime {
                                 .bindings
                                 .iter()
                                 .all(|(key, owned)| {
-                                    let overlap=control.pool.get(key).is_some_and(|slot|overlaps(slot.actual,slot.actual_only_v6,address));
+                                    let overlap=control.pool.get(key).is_some_and(|slot|overlaps(&slot.actual,slot.actual_only_v6,address));
                                     !overlap || owned==kind
                                 })),
                             "HTTP candidate conflicts with a challenge listener lease"
@@ -699,6 +708,7 @@ impl HttpRuntime {
                             address.clone(),
                             *kind,
                             Some(servers[address].only_v6(address)),
+                            servers[address].unix_mode(address),
                             &proof_tls,
                             false,
                             &mut launches,
@@ -711,14 +721,11 @@ impl HttpRuntime {
                             .get(address)
                             .map(|server| ListenerKind::of(server))
                             .unwrap_or(*kind);
-                        addresses.push(StagedAddress {
-                            declared: address.address,
-                            actual: listener.actual,
-                            only_v6: listener.actual_only_v6,
-                            reused,
-                            http01: capability == ListenerKind::Http,
-                            tls_alpn01: capability == ListenerKind::Tls,
-                        });
+                        if let Some(actual)=listener.actual.socket(){addresses.push(StagedAddress {
+                            declared:address.socket().unwrap_or(actual),actual,
+                            only_v6:listener.actual_only_v6,reused,
+                            http01:capability==ListenerKind::Http,tls_alpn01:capability==ListenerKind::Tls,
+                        });}
                         listeners.insert(address.clone(), listener);
                     }
                     control
@@ -738,7 +745,7 @@ impl HttpRuntime {
                 }
             }
         };
-        let tcp_bindings=listeners.iter().map(|(key,owner)|(key.clone(),owner.actual)).collect::<HashMap<_,_>>();
+        let tcp_bindings=listeners.iter().filter_map(|(key,owner)|owner.actual.socket().map(|actual|(key.clone(),actual))).collect::<HashMap<_,_>>();
         let quic = {
             let mut state = self.control.lock();
             ensure!(!guard.cancel.is_cancelled(), "HTTP candidate was stopped");
@@ -747,7 +754,7 @@ impl HttpRuntime {
         for (declared, listener) in &quic {
             if !bindings.contains_key(declared) {
                 addresses.push(StagedAddress {
-                    declared: declared.address,
+                    declared: declared.socket().unwrap_or(listener.binding.actual),
                     actual: listener.binding.actual,
                     only_v6: listener.binding.actual_only_v6,
                     reused: self
@@ -853,9 +860,7 @@ impl HttpRuntime {
             .pool
             .iter()
             .filter_map(|(key, slot)| {
-                slot.owner
-                    .upgrade()
-                    .map(|owner| (key.address, slot.actual, owner.admission.snapshot()))
+                slot.owner.upgrade().and_then(|owner|Some((key.socket()?,slot.actual.socket()?,owner.admission.snapshot())))
             })
             .collect::<Vec<_>>();
         rows.sort_by_key(|row| row.0);
@@ -866,8 +871,17 @@ impl HttpRuntime {
             .lock()
             .listeners
             .values()
-            .map(|listener| listener.actual)
+            .filter_map(|listener| listener.actual.socket())
             .collect()
+    }
+    /// Actual bound endpoints, including Unix paths and inherited socket families.
+    /// The original `bound_addresses` API continues to return only IP endpoints.
+    pub async fn bound_endpoints(&self) -> Vec<BoundEndpoint> {
+        self.control.lock().listeners.values().filter_map(|listener|match &listener.actual {
+            crate::http_config::ListenerAddress::Inet(address)=>Some(BoundEndpoint::Ip(*address)),
+            crate::http_config::ListenerAddress::Unix{path,packet}=>Some(BoundEndpoint::Unix{path:path.clone(),packet:*packet}),
+            crate::http_config::ListenerAddress::Fd{..}=>None,
+        }).collect()
     }
     /// Normal stop never upgrades itself to force. Pending stage ownership must
     /// resolve first; a deadline leaves StopRequested and old listeners intact.
@@ -1108,9 +1122,9 @@ fn covers(bound: SocketAddr, requested: SocketAddr, only_v6: bool) -> bool {
             && (bound.is_ipv6() && (!only_v6 || requested.is_ipv6())
                 || bound.is_ipv4() && requested.is_ipv4())
 }
-fn overlaps(bound:SocketAddr,bound_only_v6:bool,requested:&ListenerKey)->bool {
-    requested.port()!=0 && (covers(bound,requested.address,bound_only_v6)
-        || covers(requested.address,bound,requested.requested_v6()))
+fn overlaps(bound:&crate::http_config::ListenerAddress,bound_only_v6:bool,requested:&ListenerKey)->bool {
+    let(Some(bound),Some(requested_address))=(bound.socket(),requested.socket())else{return false};
+    requested.port()!=0 &&(covers(bound,requested_address,bound_only_v6)||covers(requested_address,bound,requested.requested_v6()))
 }
 fn pool_key(control: &Control, address: &ListenerKey, coverage: bool) -> Option<ListenerKey> {
     if control.pool.contains_key(address) {
@@ -1120,7 +1134,7 @@ fn pool_key(control: &Control, address: &ListenerKey, coverage: bool) -> Option<
         control
             .pool
             .iter()
-            .find_map(|(key, slot)| covers(slot.actual, address.address, slot.actual_only_v6).then(||key.clone()))
+            .find_map(|(key, slot)| slot.actual.socket().zip(address.socket()).is_some_and(|(actual,wanted)|covers(actual,wanted,slot.actual_only_v6)).then(||key.clone()))
     } else {
         None
     }
@@ -1161,6 +1175,7 @@ fn own_socket(
     address: ListenerKey,
     kind: ListenerKind,
     only_v6: Option<bool>,
+    unix_mode:Option<u32>,
     tls: &Arc<rustls::ServerConfig>,
     coverage: bool,
     launches: &mut Vec<Launch>,
@@ -1177,25 +1192,22 @@ fn own_socket(
             .owner
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("listener closing after admission"))?;
+        if let Some(mode)=unix_mode {listener_io::set_mode(&owner.actual,mode,owner.unix_inode)?;}
         return Ok((owner, true));
     }
     let only_v6=only_v6.unwrap_or_else(||address.requested_v6());
     // Different declarations are real distinct SO_REUSEPORT owners. Proof
     // acquisition uses coverage above and never invents a routing alias.
 
-    let (socket,actual_only_v6) =
-        bind_listener(address.address,only_v6).map_err(|_| anyhow::anyhow!("HTTP listener bind failed"))?;
-    let finished = CancellationToken::new();
-    let admission = connections.listener();
-    let socket = ListenerSocket {
-        admission: admission.clone(),
-        socket: Some(socket),
-        finished: finished.clone(),
-    };
-    let actual = socket
-        .socket()
-        .local_addr()
-        .map_err(|_| anyhow::anyhow!("HTTP listener address unavailable"))?;
+    let bound=listener_io::bind(&address.address,only_v6,unix_mode)
+        .map_err(|error|anyhow::anyhow!("HTTP listener bind failed: {error}"))?;
+    let actual_only_v6=bound.only_v6;let actual=bound.actual;
+    #[cfg(unix)]
+    let unix_inode=bound.cleanup.as_ref().map(listener_io::PathCleanup::identity);
+    #[cfg(not(unix))]
+    let unix_inode=None;
+    let finished=CancellationToken::new();let admission=connections.listener();
+    let socket=ListenerSocket{admission:admission.clone(),socket:Some(bound.listener),cleanup:bound.cleanup,finished:finished.clone()};
     let cancel = CancellationToken::new();
     let proof = Arc::new(ArcSwap::from_pointee(ProofListener {
         listener_stack:Arc::default(),
@@ -1205,8 +1217,9 @@ fn own_socket(
     let owner = Arc::new(ListenerControl {
         admission,
         cancel: cancel.clone(),
-        actual,
+        actual:actual.clone(),
         actual_only_v6,
+        unix_inode,
         proof: proof.clone(),
     });
     control.pool.insert(
@@ -1310,7 +1323,7 @@ fn requested_bindings(
             if let Some(port) = port {
                 ensure!(port != 0, "challenge port must be explicit");
                 let mut address=selected;address.set_port(port);
-                if let Some((_, other)) = bindings.iter().find(|(bound, _)| bound.address == address) {
+                if let Some((_, other)) = bindings.iter().find(|(bound, _)| bound.socket()==Some(address)) {
                     ensure!(
                         *other == kind,
                         "challenge protocols conflict on one address"
@@ -1341,17 +1354,17 @@ fn proof_bindings(control:&Control,requests:&[(ListenerKey,ListenerKind)])->Resu
     };
     for (address,kind) in requests {
         let kind=*kind;
-        if address.is_ipv6() && address.ip().is_unspecified() {
+        if address.is_ipv6() && address.ip().is_some_and(|ip|ip.is_unspecified()) {
             let ipv4=SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(),address.port());
-            let has4=control.pool.values().any(|slot|covers(slot.actual,ipv4,slot.actual_only_v6));
-            let has6=control.pool.values().any(|slot|covers(slot.actual,address.address,slot.actual_only_v6));
+            let has4=control.pool.values().any(|slot|slot.actual.socket().is_some_and(|actual|covers(actual,ipv4,slot.actual_only_v6)));
+            let has6=control.pool.values().any(|slot|slot.actual.socket().zip(address.socket()).is_some_and(|(actual,wanted)|covers(actual,wanted,slot.actual_only_v6)));
             if has4 || has6 {
                 add(ListenerKey::numeric(ipv4),kind)?;
                 let mut ipv6=address.clone();
                 if has4 && !has6 {
                     // Keep the real IPv4 owner; the missing family gets its own
                     // IPv6-only socket, never a mode change on the old socket.
-                    ipv6.identity=Arc::new(crate::http_config::ListenIdentity{host:ipv6.identity.host.clone(),family:crate::http_config::ListenerFamily::V6,port:ipv6.port()});
+                    ipv6.identity=Arc::new(crate::http_config::ListenIdentity{host:ipv6.identity.host.clone(),family:crate::http_config::ListenerFamily::V6,port:ipv6.port(),network:crate::http_config::ListenerNetwork::Tcp});
                 }
                 add(ipv6,kind)?;
                 continue;
@@ -1415,7 +1428,7 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
                             // Every overlapping reuseport owner can receive proof
                             // traffic. Inspect them all before changing any mode.
                             for (key,slot) in &state.pool {
-                                if !overlaps(slot.actual,slot.actual_only_v6,address){continue;}
+                                if !overlaps(&slot.actual,slot.actual_only_v6,address){continue;}
                                 if let Some((server,_))=current.business(key) {
                                     ensure!(ListenerKind::of(&server)==*kind,"challenge protocol conflicts with published listener");
                                 }
@@ -1423,7 +1436,7 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
                             }
                             if let Some(pending)=&state.pending {
                                 for (key,prepared) in &pending.bindings {
-                                    if overlaps(key.address,key.requested_v6(),address){ensure!(prepared==kind,"challenge protocol conflicts with pending listener");}
+                                    if overlaps(&key.address,key.requested_v6(),address){ensure!(prepared==kind,"challenge protocol conflicts with pending listener");}
                                 }
                             }
                         }
@@ -1437,6 +1450,7 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
                                 &mut state,
                                 address.clone(),
                                 *kind,
+                                None,
                                 None,
                                 &tls,
                                 true,
@@ -1458,8 +1472,8 @@ impl ChallengeListenerProvider for RuntimeChallengeProvider {
                             }
                             configure_proof(&owner, *kind, &tls,None);
                             addresses.push(StagedAddress {
-                                declared: address.address,
-                                actual: owner.actual,
+                                declared: address.socket().ok_or_else(||anyhow::anyhow!("non-IP proof declaration"))?,
+                                actual: owner.actual.socket().ok_or_else(||anyhow::anyhow!("non-IP proof listener"))?,
                                 only_v6: owner.actual_only_v6,
                                 reused,
                                 http01: *kind == ListenerKind::Http,

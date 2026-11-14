@@ -141,6 +141,8 @@ pub struct Builder {
     h1_preserve_header_order: bool,
     h1_read_buf_exact_size: Option<usize>,
     h1_max_buf_size: Option<usize>,
+    native_write_buffer_size:Option<usize>,
+    native_read_buffer_size:Option<usize>,
 }
 
 /// Returns a handshake future over some IO.
@@ -355,6 +357,8 @@ impl Builder {
             h1_writev: None,
             encoding_budget:None,
             h1_read_buf_exact_size: None,
+            native_write_buffer_size:None,
+            native_read_buffer_size:None,
             h1_parser_config: ParserConfig::default(),
             h1_obsolete_trailer_folding: false,
             h1_max_trailer_size: None,
@@ -576,6 +580,13 @@ impl Builder {
     /// Note that setting this option unsets the `max_buf_size` option.
     ///
     /// Default is an adaptive read buffer.
+    /// Configure the buffered write threshold independently of response reading.
+    pub fn native_write_buffer_size(&mut self,bytes:usize)->&mut Self{self.native_write_buffer_size=Some(bytes.max(1));self}
+
+    /// Set the read chunk size independently from the full header limit.
+    pub fn native_read_buffer_size(&mut self,bytes:usize)->&mut Self{self.native_read_buffer_size=Some(bytes.max(1));self}
+
+    /// Set the exact HTTP/1 read buffer size.
     pub fn read_buf_exact_size(&mut self, sz: Option<usize>) -> &mut Builder {
         self.h1_read_buf_exact_size = sz;
         self.h1_max_buf_size = None;
@@ -668,6 +679,8 @@ impl Builder {
             if let Some(max) = opts.h1_max_buf_size {
                 conn.set_max_buf_size(max);
             }
+            if let Some(bytes)=opts.native_read_buffer_size{conn.set_native_read_buffer(bytes,opts.h1_max_header_size.unwrap_or(417792));}
+            if let Some(bytes)=opts.native_write_buffer_size{conn.set_write_buffer_size(bytes);}
             let cd = proto::h1::dispatch::Client::new(rx);
             let proto = proto::h1::Dispatcher::new(cd, conn);
 

@@ -13,6 +13,12 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use zeroize::{Zeroize, Zeroizing};
 const STORE_LIMIT: u64 = 16 * 1024 * 1024;
+fn missing_alias(output:&super::Output)->bool{
+    [&output.stdout,&output.stderr].into_iter().any(|bytes|{
+        let text=String::from_utf8_lossy(bytes);
+        text.contains("java.lang.Exception: Alias <") && text.contains("> does not exist")
+    })
+}
 struct Candidate(PathBuf, Option<Arc<Root>>);
 impl Drop for Candidate {
     fn drop(&mut self) {
@@ -103,7 +109,21 @@ impl SystemTrustInstaller {
         store: &Path,
         root: Arc<Root>,
         cancel: CancellationToken,
-    ) -> Result<()> {
+    ) -> Result<()> { let alias=root.name.clone();self.edit_java(tool,store,root,cancel,false,&alias).await }
+    pub(super) async fn uninstall_java(&self,tool:&Path,store:&Path,root:Arc<Root>,cancel:CancellationToken)->Result<()>{
+        self.edit_java(tool,store,root.clone(),cancel.clone(),true,&root.name).await?;
+        #[cfg(target_os="linux")]
+        if store==Path::new("/etc/ssl/certs/java/cacerts") && self.targets.iter().any(|target|matches!(target,super::Target::System{directory,updater,..}if directory==Path::new("/usr/local/share/ca-certificates")&&updater.file_name().is_some_and(|name|name=="update-ca-certificates"))){
+            // Debian mirrors this exact local anchor under its own alias. Its
+            // system updater does not notify that hook about deleted local
+            // files, even with --fresh on affected releases. Remove only the
+            // derived alias after checking the actual exported fingerprint.
+            let alias=format!("debian:{}.pem",root.name.replace(' ',"_").replace(['(',')'],"=").replace(',',"_"));
+            self.edit_java(tool,store,root,cancel,true,&alias).await?;
+        }
+        Ok(())
+    }
+    async fn edit_java(&self,tool:&Path,store:&Path,root:Arc<Root>,cancel:CancellationToken,remove:bool,alias:&str)->Result<()>{
         // A trusted keytool must validate any candidate later published with
         // privilege. Never turn JAVA_HOME -> user tool -> sudo mv into an
         // arbitrary privileged-file replacement capability.
@@ -133,11 +153,17 @@ impl SystemTrustInstaller {
         let text = String::from_utf8_lossy(&text)
             .replace(':', "")
             .to_uppercase();
-        if text.contains(&root.sha1) || text.contains(&root.sha256) {
-            return Ok(());
+        let present=text.contains(&root.sha1)||text.contains(&root.sha256);
+        if !remove&&present||remove&&!present{return Ok(())}
+        if remove{
+            let exported=self.command(tool,vec!["-exportcert".into(),"-rfc".into(),"-keystore".into(),store.as_os_str().to_owned(),"-storepass".into(),"changeit".into(),"-alias".into(),alias.into()],None,false,cancel.clone(),false).await?;
+            if !exported.status.success() && missing_alias(&exported){return Ok(())}
+            ensure!(exported.status.success(),"Java root alias export failed");
+            let chain=super::material::chain(&exported.stdout)?;
+            ensure!(chain.len()==1&&super::hex(&Sha256::digest(&chain[0]))==root.sha256,"Java alias refers to a different certificate");
         }
         let path = store.to_path_buf();
-        let candidate_path = root.temp.directory.join("java-cacerts");
+        let candidate_path = root.temp.directory.join(format!("java-cacerts-{}",super::hex(&Sha256::digest(store.as_os_str().as_encoded_bytes()))));
         let path_for_copy = candidate_path.clone();
         let holder = root.clone();
         let (old, candidate) =
@@ -155,7 +181,10 @@ impl SystemTrustInstaller {
                 Ok((old, candidate))
             })
             .await??;
-        let args = vec![
+        let args=if remove{
+            vec!["-delete".into(),"-noprompt".into(),"-keystore".into(),candidate.0.as_os_str().to_owned(),"-storepass".into(),"changeit".into(),"-alias".into(),alias.into()]
+        }else{
+vec![
             "-importcert".into(),
             "-noprompt".into(),
             "-keystore".into(),
@@ -165,23 +194,16 @@ impl SystemTrustInstaller {
             "-file".into(),
             root.temp.file.as_os_str().to_owned(),
             "-alias".into(),
-            root.name.clone().into(),
-        ];
+            alias.into(),
+        ]
+        };
         success(
             self.command(tool, args, None, true, cancel.clone(), false)
                 .await?,
             "import Java candidate",
         )?;
-        let args = vec![
-            "-list".into(),
-            "-v".into(),
-            "-alias".into(),
-            root.name.clone().into(),
-            "-keystore".into(),
-            candidate.0.as_os_str().to_owned(),
-            "-storepass".into(),
-            "changeit".into(),
-        ];
+        let mut args=vec!["-list".into(),"-keystore".into(),candidate.0.as_os_str().to_owned(),"-storepass".into(),"changeit".into()];
+        if !remove{args.extend(["-v".into(),"-alias".into(),alias.into()]);}
         let checked = self
             .command(tool, args, None, false, cancel.clone(), false)
             .await?;
@@ -191,13 +213,20 @@ impl SystemTrustInstaller {
         );
         let mut checked_text = checked.stdout;
         checked_text.extend(checked.stderr);
-        ensure!(
+        if !remove {ensure!(
             String::from_utf8_lossy(&checked_text)
                 .replace(':', "")
                 .to_uppercase()
                 .contains(&root.sha256),
             "Java candidate fingerprint mismatch"
-        );
+        );}else{
+            // Validate the complete candidate above, then inspect only our
+            // alias. A different owner's alias may legitimately hold the same
+            // certificate; neither verbose-output truncation nor that alias
+            // grants permission to delete it.
+            let missing=self.command(tool,vec!["-list".into(),"-keystore".into(),candidate.0.as_os_str().to_owned(),"-storepass".into(),"changeit".into(),"-alias".into(),alias.into()],None,false,cancel.clone(),false).await?;
+            ensure!(!missing.status.success()&&missing_alias(&missing),"Java candidate alias remains or cannot be verified");
+        }
         ensure!(
             !cancel.is_cancelled(),
             "Java installation cancelled before publication"

@@ -27,13 +27,14 @@ pub(super) fn parse(views: CertificateViews<'_>) -> Result<CertificatePlan> {
     plan.disable_storage_check = tls.boolean("disable_storage_check")?.unwrap_or(false);
     plan.disable_storage_clean = tls.boolean("disable_storage_clean")?.unwrap_or(false);
     for (field, feature) in [
-        ("encrypted_client_hello", "encrypted_client_hello"),
         ("dns", "tls_dns_provider"),
     ] {
         if tls.value(field).is_some() {
             return Err(ConfigError::unsupported(tls.at(field), feature));
         }
     }
+    plan.ech=tls.value("encrypted_client_hello").filter(|value|!value.is_null())
+        .map(|value|super::ech::Settings::parse(value,&tls.at("encrypted_client_hello"))).transpose()?;
     // The TLS app stores defaults without eagerly interpreting them. An unused
     // resolver (or one shadowed by a handler-local setting) is not dialed.
     plan.tls_resolvers = tls.strings("resolvers")?.into_iter().map(str::to_owned).collect::<Vec<_>>().into();

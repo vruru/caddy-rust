@@ -159,7 +159,8 @@ impl Plan {
             path.len() + raw_query.map_or(0, str::len) <= 64 << 10,
             "URLPattern request exceeds its byte limit"
         );
-        let Ok(mut url) = Url::parse(&format!("{scheme}://{}", ctx.authority)) else {
+        let Ok(authority)=std::str::from_utf8(&ctx.authority)else{return Ok(false)};
+        let Ok(mut url) = Url::parse(&format!("{scheme}://{authority}")) else {
             return Ok(false);
         };
         if !url.username().is_empty() || url.password().is_some() {

@@ -19,3 +19,8 @@ pub(crate) fn open(bytes:&[u8],cwd:&Path)->Result<std::fs::File>{
     let path=super::manual_values::path(bytes,cwd)?;
     Ok(crate::http_config::helpers::open_regular_file(path.path.as_path())?)
 }
+
+/// Native paths retain non-UTF-8 bytes until the filesystem boundary.
+pub(crate) fn absolute(bytes:&[u8],cwd:&Path)->Result<std::path::PathBuf>{
+    let path=super::manual_values::path(bytes,cwd)?;Ok(path.path.clone())
+}

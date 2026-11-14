@@ -28,6 +28,7 @@ mod connection_identity;
 mod connection_snapshot;
 pub(crate) mod pkix_name;
 pub(crate) mod client_cert_facts;
+#[path="http_runtime/client_cert_text.rs"]pub(crate) mod client_cert_text;
 #[path = "http_runtime/cel_native_cert.rs"]
 mod cel_native_cert;
 mod cel_native_string;
@@ -72,6 +73,8 @@ mod listener_resolve;
 #[path="http_runtime/listener_key.rs"]
 mod listener_key;
 use listener_key::ListenerKey;
+mod socket_options;
+mod listener_io;
 pub(crate) use listener_resolve::Plan as ListenerPlan;
 pub use listener_resolve::ListenerResolutionDiagnostics;
 #[path = "http_runtime/manual_certificates.rs"]
@@ -82,7 +85,7 @@ mod tls_policies;
 #[path="http_runtime/tls_cbc.rs"]
 mod tls_cbc;
 mod certificate_choice;
-pub use lifecycle::{CommitOutcome, HttpStage, StagedAddress};
+pub use lifecycle::{BoundEndpoint, CommitOutcome, HttpStage, StagedAddress};
 #[path = "http_runtime/listener_lease.rs"]
 pub(crate) mod listener_lease;
 pub use listener_lease::{
@@ -97,6 +100,10 @@ pub(crate) use path_glob::go_path_glob;
 mod proxy;
 #[path = "http_runtime/proxy_buffer.rs"]
 mod proxy_buffer;
+#[path="http_runtime/proxy_handler.rs"]
+mod proxy_handler;
+#[path="http_runtime/proxy_verbose.rs"]
+mod proxy_verbose;
 #[path = "http_runtime/proxy_cleanup.rs"]
 mod proxy_cleanup;
 mod proxy_dns_addrselect;
@@ -140,6 +147,7 @@ pub(crate) mod encode_body;
 mod query_match;
 #[path = "http_runtime/request.rs"]
 mod request;
+mod request_host;
 #[path = "http_runtime/read_deadline.rs"]
 mod read_deadline;
 #[path = "http_runtime/route_timeouts.rs"]
@@ -165,6 +173,10 @@ mod incremental;
 mod zstd_codec;
 
 pub(crate) mod listener_stack;
+mod proxy_transport;
+mod proxy_continue;
+mod proxy_h3;
+mod proxy_tunnel;
 mod http_dial;
 mod http_dial_io;
 #[path = "http_runtime/rewrite_uri.rs"]
@@ -299,6 +311,8 @@ impl Generation {
 #[derive(Clone)]
 struct ActiveServer {
     resolved_listener: Option<Arc<listener_resolve::ResolvedServer>>,
+    protocols: crate::http_config::server_options::ProtocolSet,
+    network:crate::http_config::ListenerNetwork,
     tracing: Option<Arc<crate::metrics::distributed_trace::provider::Provider>>,
     acme_servers:Arc<HashMap<usize,Arc<crate::acme_server::Controller>>>,
     metrics: Arc<crate::metrics::Registry>,
@@ -664,8 +678,8 @@ async fn prepare_servers(
     for (server_index,server) in config.servers.iter().enumerate() {
         let resolved_listener=listener_plan.map(|plan|plan.servers[server_index].clone());
         let validation_keys;
-        let addresses=if let Some(resolved)=&resolved_listener {resolved.addresses.as_slice()}else{validation_keys=server.listen_specs.iter().filter_map(|spec|spec.numeric().map(|(address,_)|ListenerKey{address,identity:spec.identity().clone()})).collect::<Vec<_>>();validation_keys.as_slice()};
-        let only_v6=|key:&ListenerKey|resolved_listener.as_ref().map_or_else(||server.listen_v6_only.contains(&key.address),|plan|plan.v6_only.contains(key));
+        let addresses=if let Some(resolved)=&resolved_listener {resolved.addresses.as_slice()}else{validation_keys=server.listen_specs.iter().filter_map(|spec|spec.numeric().map(|(address,_)|ListenerKey{address:address.into(),identity:spec.identity().clone()})).collect::<Vec<_>>();validation_keys.as_slice()};
+        let only_v6=|key:&ListenerKey|resolved_listener.as_ref().map_or_else(||key.socket().is_some_and(|address|server.listen_v6_only.contains(&address)),|plan|plan.v6_only.contains(key));
         // One generation owns one manual resolver. Tags are per-server
         // identity filters, not separate key/OCSP snapshots.
         let loaded_names = manual
@@ -760,6 +774,8 @@ async fn prepare_servers(
         for client in clients.values(){metrics.upstreams(client.metric_probes());}
         let active = ActiveServer {
             resolved_listener: resolved_listener.clone(),
+            protocols: crate::http_config::server_options::ProtocolSet::default_global(),
+            network:crate::http_config::ListenerNetwork::Tcp,
             tracing: tracing.clone(),
             acme_servers:prepare_acme_handlers(server,provider,validate_only,resources).await?,
             metrics: metrics.clone(),
@@ -773,12 +789,22 @@ async fn prepare_servers(
             tickets: tickets.cloned().unwrap_or_default(),
             clients: Arc::new(clients),
         };
+        let mut protocol_policies=HashMap::new();
         for addr in addresses {
             if let Some(previous)=output.get(addr) {
                 ensure!(previous.only_v6(addr)==only_v6(addr),
                     "HTTP listener address has conflicting IPv6-only modes");
             }
-            output.insert(addr.clone(), Arc::new(active.clone()));
+            let protocols=server.listen_specs.iter().position(|spec|spec.identity()==&addr.identity)
+                .and_then(|index|server.listen_protocols.get(index)).copied()
+                .ok_or_else(||anyhow::anyhow!("listener protocol declaration missing"))?;
+            let mut active=active.clone();active.protocols=protocols;active.network=addr.identity.network;
+            ensure!(active.network.stream()||!(protocols.h1||protocols.h2c||(protocols.h2&&server.tls)),"packet listener cannot serve HTTP/1 or HTTP/2");
+            ensure!(active.network!=crate::http_config::ListenerNetwork::Fd||!server.tls||!protocols.h3,"fd stream cannot serve HTTP/3; use fdgram");
+            active.tls_policies=protocol_policies.entry(protocols).or_insert_with(||tls_policies::for_protocols(&active.tls_policies,protocols)).clone();
+            active.tls=active.tls_policies.first().map(|p|p.tls.clone());
+            active.policy_identity=tls_policies::set_identity(&active.tls_policies);
+            output.insert(addr.clone(), Arc::new(active));
         }
     }
     for ((address,only_v6), mut routes) in redirect_domains.routes(config.http_port, config.https_port) {
@@ -839,6 +865,8 @@ async fn prepare_servers(
             output.insert(
                 address,
                 Arc::new(ActiveServer {
+                    protocols:existing.protocols,
+                    network:existing.network,
                     tracing: tracing.clone(),
                     acme_servers:existing.acme_servers.clone(),
                     resolved_listener: existing.resolved_listener.clone(),
@@ -857,13 +885,14 @@ async fn prepare_servers(
         } else {
             routes.push(automatic_redirects::fallback(config.http_port, config.https_port));
             let plan = ServerConfig {
+                client_text_facts:false,
                 name: Arc::from("remaining_auto_https_redirects"),
                 access_logs: None,
                 named_routes: Default::default(),
                 header_aliases: Default::default(),
-                listen_specs: vec![crate::http_config::ListenSpec::Numeric{address:address.address,only_v6,identity:address.identity.clone()}],
-                listen: vec![address.address],
-                listen_v6_only: if only_v6 {std::collections::HashSet::from([address.address])}else{Default::default()},
+                listen_specs: vec![crate::http_config::ListenSpec::Numeric{address:address.socket().ok_or_else(||anyhow::anyhow!("redirect requires IP listener"))?,only_v6,identity:address.identity.clone()}],
+                listen: vec![address.socket().ok_or_else(||anyhow::anyhow!("redirect requires IP listener"))?],
+                listen_v6_only: if only_v6 {std::collections::HashSet::from([address.socket().ok_or_else(||anyhow::anyhow!("redirect requires IP listener"))?])}else{Default::default()},
                 routes,
                 errors: Vec::new(),
                 tls: false,
@@ -880,6 +909,8 @@ async fn prepare_servers(
                 transfers: crate::http_config::server_transfers::ServerTransfers::default(),
                 idle_timeout: Some(Duration::from_secs(300)),
                 protocols: vec!["h1".into(), "h2".into()],
+                listen_protocols:vec![crate::http_config::server_options::ProtocolSet{h1:true,..Default::default()}],
+                options:Default::default(),
                 redirect_http: false,
                 manage_certificates: false,
                 skip_manage: vec![],
@@ -896,6 +927,8 @@ async fn prepare_servers(
                     plan: Arc::new(plan),
                     acme_servers:Arc::new(HashMap::new()),
                     resolved_listener: None,
+                protocols:crate::http_config::server_options::ProtocolSet{h1:true,..Default::default()},
+                network:crate::http_config::ListenerNetwork::Tcp,
                     tls: None,
                     resolver: None,
                     tls_policies: Vec::new(),
@@ -914,8 +947,9 @@ async fn prepare_servers(
     ))
 }
 impl ActiveServer {
+    fn unix_mode(&self,key:&ListenerKey)->Option<u32>{self.plan.listen_specs.iter().find_map(|spec|match spec{crate::http_config::ListenSpec::Unix{identity,mode,..}if identity==&key.identity=>Some(*mode),_=>None})}
     fn only_v6(&self,address:&ListenerKey)->bool {
-        self.resolved_listener.as_ref().map_or_else(||self.plan.listen_v6_only.contains(&address.address),|plan|plan.v6_only.contains(address))
+        self.resolved_listener.as_ref().map_or_else(||address.socket().is_some_and(|value|self.plan.listen_v6_only.contains(&value)),|plan|plan.v6_only.contains(address))
     }
 }
 fn plain_transport_compatible(old: &ServerConfig, next: &ServerConfig) -> bool {
@@ -965,7 +999,7 @@ fn dns_covers(pattern: &str, name: &str) -> bool {
             .is_some_and(|(_, rest)| rest.eq_ignore_ascii_case(suffix))
     })
 }
-fn bind_listener(address: SocketAddr, only_v6: bool) -> Result<(TcpListener,bool)> {
+fn bind_listener(address: SocketAddr, only_v6: bool) -> std::io::Result<(TcpListener,bool)> {
     let domain = if address.is_ipv6() {
         socket2::Domain::IPV6
     } else {
@@ -1051,7 +1085,7 @@ async fn accept_loop(
             _ = inner.stopped.cancelled() => break,
             result = socket.socket().accept() => result,
         };
-        let Ok((stream, peer)) = accepted else {
+        let Ok((stream, peer, local)) = accepted else {
             if cancel.is_cancelled() {
                 break;
             }
@@ -1071,10 +1105,7 @@ async fn accept_loop(
             .business(&key)
             .map(|(server, _)| server)
             .filter(|server| h3::tcp_enabled(server));
-        let canonical = crate::net_address::canonical_socket;
-        let peer = canonical(peer);
-        let local = canonical(stream.local_addr().unwrap_or(key.address));
-        let _ = stream.set_nodelay(true);
+        if let Some(tcp)=stream.tcp(){let _=tcp.set_nodelay(true);if let Some(server)=&server{let _=socket_options::apply(tcp,server.plan.options.keepalive);}}
         let task_inner = inner.clone();
         let class = if server.is_some() {
             connection_budget::ConnectionClass::Classifying
@@ -1092,7 +1123,7 @@ async fn accept_loop(
         if let Some(server) = server {
             let key=key.clone();
             spawn_admitted(&inner, eviction, Some((cancel.clone(), admission.clone())), async move {
-                let (mut peer,mut local)=(crate::net_address::NetAddress::from(peer),crate::net_address::NetAddress::from(local));
+                let(mut peer,mut local)=(peer,local);
                 let accepted_listener_stack=server.plan.listener_stack.clone();
                 let deadline = match server.plan.request_head_limit() {
                     Some(timeout) => match tokio::time::Instant::now().checked_add(timeout) {
@@ -1205,7 +1236,7 @@ async fn accept_loop(
                 if proof.cancel.is_cancelled() {
                     return;
                 }
-                let (mut peer,mut local)=(crate::net_address::NetAddress::from(peer),crate::net_address::NetAddress::from(local));
+                let(mut peer,mut local)=(peer,local);
                 let deadline=tokio::time::Instant::now()+Duration::from_secs(10);
                 let stream=match listener_stack::prepare(stream,&proof.listener_stack.before,&mut peer,&mut local,Some(deadline),proof.cancel.child_token()).await{
                     Ok(stream)=>stream,Err(_)=>return,
@@ -1274,6 +1305,7 @@ where
     let mut builder = Builder::new(TokioExecutor::new()).http1_only();
     builder
         .http1()
+        .native_request_target(true)
         .keep_alive(false)
         .timer(TokioTimer::new())
         .header_read_timeout(None);
@@ -1316,6 +1348,9 @@ async fn serve_connection<I>(
         identity,
         admission,
     } = view;
+    // Go's h2-only TLS policy can complete its special h1/no-ALPN
+    // compatibility handshake, then closes before parsing HTTP/1 at all.
+    if negotiated_tls_h2==Some(false)&&!server.protocols.h1{return;}
     let client_cert_cache = tls_snapshot.as_ref().map(|snapshot| client_cert_facts::Cache::new(snapshot.clone()));
     let tls = negotiated_tls_h2.is_some();
     let svc_inner = inner.clone();
@@ -1376,7 +1411,7 @@ async fn serve_connection<I>(
                     identity.verdict(current, negotiated_tls_h2 == Some(true))
                 }
                 (None, Some(current))
-                    if plain_transport_compatible(&accepted_server.plan, &current.plan) =>
+                    if accepted_server.protocols==current.protocols && plain_transport_compatible(&accepted_server.plan, &current.plan) =>
                 {
                     TlsVerdict::Serve
                 }
@@ -1515,6 +1550,8 @@ async fn serve_connection<I>(
         }
     });
     let mut builder = Builder::new(TokioExecutor::new());
+    let header_limit=server.plan.options.max_header_bytes;
+    builder.http2().max_header_list_size(header_limit.saturating_add(320).min(u32::MAX as usize)as u32);
     // A negotiated H2 connection has the protocol's 10s preface window;
     // ReadHeaderTimeout is an HTTP/1 head deadline, not an H2 idle deadline.
     let protocol_timeout = if negotiated_tls_h2 == Some(true) {
@@ -1532,21 +1569,22 @@ async fn serve_connection<I>(
     );
     builder
         .http1()
+        .native_request_target(true)
         .informational_responses(
             request::MAX_INFORMATIONAL_HEADS,
             request::MAX_INFORMATIONAL_BYTES,
         )
+        .full_duplex(server.plan.options.enable_full_duplex)
+        .max_header_size(header_limit.saturating_add(4096))
+        .max_buf_size(header_limit.saturating_add(4096).max(8192))
+        .max_headers(header_limit.saturating_add(4096)/3+1)
         .allow_undeclared_trailers(true)
         .max_trailer_size(4096)
         .allow_obsolete_multiline_trailers(true)
         .timer(TokioTimer::new())
         .header_read_timeout(server.plan.request_head_limit())
         .idle_timeout(server.plan.idle_timeout);
-    let allow_h2 = server
-        .plan
-        .protocols
-        .iter()
-        .any(|p| p == if tls { "h2" } else { "h2c" });
+    let allow_h2 = server.protocols.contains(if tls {"h2"}else{"h2c"});
     if let Some(negotiated_h2) = negotiated_tls_h2 {
         builder = if negotiated_h2 {
             builder.http2_only()
@@ -1555,8 +1593,10 @@ async fn serve_connection<I>(
         };
     } else if !allow_h2 {
         builder = builder.http1_only();
+    } else if !server.protocols.h1 {
+        builder=builder.http2_only();
     }
-    let connection = builder.serve_connection_with_upgrades(io, service);
+    let connection = builder.serve_connection_with_upgrades_selected(io, service);
     tokio::pin!(connection);
     tokio::select! {
         _ = &mut connection => {},

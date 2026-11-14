@@ -8,7 +8,7 @@ const CREDIT: usize = 256 << 10;
 const LIMIT: usize = 64 << 20;
 static POOL: OnceLock<native_write_policy::Pool> = OnceLock::new();
 static PAYLOAD_POOL: OnceLock<native_write_policy::Pool> = OnceLock::new();
-const CHUNK_CREDIT:usize=(16<<10)+256;
+pub(super) struct StreamBuffers{pub(super) size:usize,pub(super) _credit:native_write_policy::Lease}
 pub(super) struct Prepared {
     upload: Mutex<Option<Body>>,
     _credit: native_write_policy::Lease,
@@ -33,6 +33,7 @@ impl Prepared {
 }
 struct Hold {
     trace: Option<Arc<super::super::tracing::Tunnel>>,
+    _buffers:Arc<StreamBuffers>,
     _prepared: Arc<Prepared>,
     _client: HyperClient,
     _admission: Arc<super::super::proxy_policy::RequestLease>,
@@ -49,10 +50,12 @@ struct UploadIo{
 impl UploadIo{
     fn trace(&self)->Option<Arc<super::super::tracing::Tunnel>>{self.hold.trace.clone()}
     async fn copy(&mut self)->std::io::Result<()>{
-        while let Some(frame)=self.body.frame().await{
-            let frame=frame.map_err(std::io::Error::other)?;
-            if let Ok(data)=frame.into_data(){self.writer.write_all(&data).await?;}
-        }
+        use futures_util::TryStreamExt;
+        let body=std::mem::replace(&mut self.body,full(Bytes::new()));
+        let stream=body.into_data_stream().map_err(std::io::Error::other);
+        let reader=tokio_util::io::StreamReader::new(stream);
+        let mut reader=tokio::io::BufReader::with_capacity(self.hold._buffers.size,reader);
+        tokio::io::copy_buf(&mut reader,&mut self.writer).await?;
         self.writer.shutdown().await
     }
 }
@@ -67,6 +70,7 @@ struct Download {
     cancelled: Pin<Box<dyn Future<Output=()>+Send>>,
     done: bool,
     payload_credit: Option<native_write_policy::Lease>,
+    chunk_credit:usize,
     pressure_timer: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 impl Drop for Download { fn drop(&mut self){self.cancel.cancel();} }
@@ -81,7 +85,7 @@ impl hyper::body::Body for Download {
         }
         if self.payload_credit.is_none() {
             loop {
-                match PAYLOAD_POOL.get_or_init(||native_write_policy::Pool::new(64<<20)).reserve(CHUNK_CREDIT) {
+                match PAYLOAD_POOL.get_or_init(||native_write_policy::Pool::new(64<<20)).reserve(self.chunk_credit) {
                     Ok(credit)=>{self.payload_credit=Some(credit);self.pressure_timer=None;break},
                     Err(_)=>{
                         // The final codec owner releases only pure atomic state.
@@ -114,11 +118,15 @@ pub(super) async fn h3_body(
     client: HyperClient,
     admission: Arc<super::super::proxy_policy::RequestLease>,
     close_delay: Option<Duration>,
+    timeout:Option<Duration>,
+    buffers:Arc<StreamBuffers>,
 ) -> Result<Body> {
     let upstream = upstream.await?;
     let upload = prepared.take_upload().ok_or_else(||anyhow::anyhow!("WebSocket upload already claimed"))?;
     let (reader,writer) = tokio::io::split(TokioIo::new(upstream));
+    let size=buffers.size;
     let hold = Arc::new(Hold{
+        _buffers:buffers,
         trace:ctx.trace_tunnel(),
         _prepared:prepared,_client:client,_admission:admission,_business:ctx.business.clone(),
         _metrics:ctx.metrics.as_ref().map(|g|(g.clone(),g.retain_tunnel())),
@@ -138,16 +146,19 @@ pub(super) async fn h3_body(
                 None=>std::future::pending().await,
             }
         };
+        let timer=async{match timeout{Some(delay)=>tokio::time::sleep(delay).await,None=>std::future::pending().await}};
+        let stop=async{tokio::select!{biased;
+            _=hard_stop.cancelled()=>{},_=upload_cancel.cancelled()=>{},_=deadline=>{},_=timer=>{},
+        }};
+        tokio::pin!(stop);
         tokio::select!{biased;
-            _=hard_stop.cancelled()=>upload_cancel.cancel(),
-            _=upload_cancel.cancelled()=>{},
-            _=deadline=>upload_cancel.cancel(),
-            result=&mut copy=>if result.is_err(){upload_cancel.cancel()}else{trace_actor.success()},
+            _=&mut stop=>upload_cancel.cancel(),
+            result=&mut copy=>{if result.is_ok(){trace_actor.success();stop.await;}upload_cancel.cancel();},
         }
     });
     Ok(Download{
-        reader:tokio_util::io::ReaderStream::with_capacity(reader,16<<10),_hold:hold,
-        cancelled:Box::pin(cancel.clone().cancelled_owned()),cancel,done:false,payload_credit:None,pressure_timer:None,
+        reader:tokio_util::io::ReaderStream::with_capacity(reader,size),_hold:hold,
+        cancelled:Box::pin(cancel.clone().cancelled_owned()),cancel,done:false,payload_credit:None,chunk_credit:size.saturating_add(256),pressure_timer:None,
     }.boxed_unsync())
 }
 

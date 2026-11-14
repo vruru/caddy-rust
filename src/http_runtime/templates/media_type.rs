@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 pub(crate) struct Parsed {
     pub media_type: String,
-    pub params: Option<BTreeMap<String, String>>,
+    pub params: Option<BTreeMap<String, Vec<u8>>>,
     pub error: Option<String>,
 }
 
@@ -28,81 +28,96 @@ fn unhex(c: u8) -> u8 {
     }
 }
 
-fn trim_left_unicode(s:&str)->&str{s.trim_start_matches(char::is_whitespace)}
-fn trim_unicode(s:&str)->&str{s.trim_matches(char::is_whitespace)}
+fn whitespace_prefix(s:&[u8])->usize {
+    match s.first().copied() {
+        Some(9..=13)|Some(32)=>1,
+        Some(0xc2)if matches!(s.get(1),Some(0x85|0xa0))=>2,
+        Some(0xe1)if s.get(1..3)==Some(&[0x9a,0x80])=>3,
+        Some(0xe2)if s.get(1)==Some(&0x80)&&s.get(2).is_some_and(|b|matches!(*b,0x80..=0x8a|0xa8|0xa9|0xaf))=>3,
+        Some(0xe2)if s.get(1..3)==Some(&[0x81,0x9f])=>3,
+        Some(0xe3)if s.get(1..3)==Some(&[0x80,0x80])=>3,
+        _=>0,
+    }
+}
+fn trim_left_unicode(mut s:&[u8])->&[u8] {
+    loop { let n=whitespace_prefix(s);if n==0{return s}s=&s[n..]; }
+}
+fn trim_unicode(s:&[u8])->&[u8] {
+    let mut s=trim_left_unicode(s);
+    loop {let n=(1..=3).find(|n|s.len()>=*n&&whitespace_prefix(&s[s.len()-n..])==*n);
+        let Some(n)=n else{return s};s=&s[..s.len()-n];}
+}
 
-fn consume_token(s: &str) -> (&str, &str) {
-    let bytes = s.as_bytes();
-    for i in 0..bytes.len() {
-        if !is_token_char(bytes[i]) {
+fn consume_token(s: &[u8]) -> (&[u8], &[u8]) {
+    for i in 0..s.len() {
+        if !is_token_char(s[i]) {
             return (&s[..i], &s[i..]);
         }
     }
-    (s, "")
+    (s, b"")
 }
 
-fn consume_value(s: &str) -> (String, &str) {
-    let bytes = s.as_bytes();
-    if bytes.is_empty() {
-        return (String::new(), s);
+fn consume_value(s: &[u8]) -> (Vec<u8>, &[u8]) {
+    if s.is_empty() {
+        return (Vec::new(), s);
     }
 
-    if bytes[0] != b'"' {
+    if s[0] != b'"' {
         let (tok, rest) = consume_token(s);
-        return (tok.to_string(), rest);
+        return (tok.to_vec(), rest);
     }
 
     let mut buffer = Vec::new();
-
     let mut i = 1;
-    while i < bytes.len() {
-        let r = bytes[i];
+    while i < s.len() {
+        let r = s[i];
         if r == b'"' {
-            match String::from_utf8(buffer) {
-                Ok(value) => return (value, &s[i+1..]),
-                Err(_) => return (String::new(), s),
-            }
+            return (buffer, &s[i+1..]);
         }
 
         if r == b'\\' {
-            if i + 1 < bytes.len() && is_t_special(bytes[i + 1]) {
-                buffer.push(bytes[i + 1]);
+            if i + 1 < s.len() && is_t_special(s[i + 1]) {
+                buffer.push(s[i + 1]);
                 i += 2;
                 continue;
             }
         }
 
         if r == b'\r' || r == b'\n' {
-            return (String::new(), s);
+            return (Vec::new(), s);
         }
 
         buffer.push(r);
         i += 1;
     }
 
-    (String::new(), s)
+    (Vec::new(), s)
 }
 
-fn consume_media_param(v: &str) -> (String, String, &str) {
+fn consume_media_param(v: &[u8]) -> (String, Vec<u8>, &[u8]) {
     let mut rest = trim_left_unicode(v);
 
-    if !rest.starts_with(';') {
-        return (String::new(), String::new(), v);
+    if !rest.starts_with(b";") {
+        return (String::new(), Vec::new(), v);
     }
     rest = &rest[1..];
 
     rest = trim_left_unicode(rest);
-    let (param, rest2) = consume_token(rest);
+    let (param_bytes, rest2) = consume_token(rest);
     rest = rest2;
 
-    let param_lower = param.to_lowercase();
-    if param_lower.is_empty() {
-        return (String::new(), String::new(), v);
+    let param_str = match std::str::from_utf8(param_bytes) {
+        Ok(st) => st.to_lowercase(),
+        Err(_) => String::new(),
+    };
+
+    if param_str.is_empty() {
+        return (String::new(), Vec::new(), v);
     }
 
     rest = trim_left_unicode(rest);
-    if !rest.starts_with('=') {
-        return (String::new(), String::new(), v);
+    if !rest.starts_with(b"=") {
+        return (String::new(), Vec::new(), v);
     }
     rest = &rest[1..];
 
@@ -110,39 +125,38 @@ fn consume_media_param(v: &str) -> (String, String, &str) {
     let (value, rest3) = consume_value(rest);
 
     if value.is_empty() && rest3.len() == rest.len() {
-        return (String::new(), String::new(), v);
+        return (String::new(), Vec::new(), v);
     }
 
-    (param_lower, value, rest3)
+    (param_str, value, rest3)
 }
 
-fn percent_hex_unescape(s: &str) -> Result<Vec<u8>, ()> {
-    let bytes = s.as_bytes();
+fn percent_hex_unescape(s: &[u8]) -> Result<Vec<u8>, ()> {
     let mut percents = 0;
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'%' {
+    while i < s.len() {
+        if s[i] != b'%' {
             i += 1;
             continue;
         }
         percents += 1;
-        if i + 2 >= bytes.len() || !is_hex(bytes[i + 1]) || !is_hex(bytes[i + 2]) {
+        if i + 2 >= s.len() || !is_hex(s[i + 1]) || !is_hex(s[i + 2]) {
             return Err(());
         }
         i += 3;
     }
 
     if percents == 0 {
-        return Ok(s.as_bytes().to_vec());
+        return Ok(s.to_vec());
     }
 
-    let mut t = Vec::with_capacity(bytes.len() - 2 * percents);
+    let mut t = Vec::with_capacity(s.len() - 2 * percents);
     i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
+    while i < s.len() {
+        match s[i] {
             b'%' => {
-                let hi = unhex(bytes[i + 1]);
-                let lo = unhex(bytes[i + 2]);
+                let hi = unhex(s[i + 1]);
+                let lo = unhex(s[i + 2]);
                 t.push((hi << 4) | lo);
                 i += 3;
             }
@@ -156,23 +170,28 @@ fn percent_hex_unescape(s: &str) -> Result<Vec<u8>, ()> {
     Ok(t)
 }
 
-fn decode_2231_enc(v: &str) -> Option<Vec<u8>> {
-    let mut parts = v.splitn(2, '\'');
-    let charset = parts.next()?.to_lowercase();
-    let v = parts.next()?;
+fn decode_2231_enc(v: &[u8]) -> Option<Vec<u8>> {
+    let mut parts = v.splitn(2, |&b| b == b'\'');
+    let charset_bytes = parts.next()?;
+    let rest_of_v = parts.next()?;
 
-    let mut parts2 = v.splitn(2, '\'');
+    let charset_str = match std::str::from_utf8(charset_bytes) {
+        Ok(st) => st.to_lowercase(),
+        Err(_) => return None,
+    };
+
+    let mut parts2 = rest_of_v.splitn(2, |&b| b == b'\'');
     parts2.next()?; // lang
     let ext_other_vals = parts2.next()?;
 
-    if charset != "us-ascii" && charset != "utf-8" {
+    if charset_str != "us-ascii" && charset_str != "utf-8" {
         return None;
     }
 
     percent_hex_unescape(ext_other_vals).ok()
 }
 
-fn check_media_type_disposition(s: &str) -> Result<(), String> {
+fn check_media_type_disposition(s: &[u8]) -> Result<(), String> {
     let (typ, rest) = consume_token(s);
     if typ.is_empty() {
         return Err("mime: no media type".to_string());
@@ -180,7 +199,7 @@ fn check_media_type_disposition(s: &str) -> Result<(), String> {
     if rest.is_empty() {
         return Ok(());
     }
-    if !rest.starts_with('/') {
+    if !rest.starts_with(b"/") {
         return Err("mime: expected slash after first token".to_string());
     }
     let rest = &rest[1..];
@@ -194,17 +213,29 @@ fn check_media_type_disposition(s: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn parse(v: &str) -> Parsed {
-    if v.len()>1<<20{return Parsed{media_type:String::new(),params:None,error:Some("template MIME source exceeds byte limit".into())};}
-    let mut entries=0usize;
-    let base = match v.find(';') {
+pub(crate) fn parse(v: &[u8]) -> Parsed {
+    if v.len() > 1<<20 {
+        return Parsed{media_type:String::new(),params:None,error:Some("template MIME source exceeds byte limit".into())};
+    }
+
+    let mut entries = 0usize;
+    let base = match v.iter().position(|b|*b==b';') {
         Some(i) => &v[..i],
         None => v,
     };
 
-    let mediatype = trim_unicode(base).to_lowercase();
+    let mediatype_bytes = trim_unicode(base);
 
-    if let Err(e) = check_media_type_disposition(&mediatype) {
+    let mediatype_str = match std::str::from_utf8(mediatype_bytes) {
+        Ok(st) => st.to_lowercase(),
+        Err(_) => return Parsed {
+            media_type: String::new(),
+            params: None,
+            error: Some("mime: no media type".to_string()), // Fallback, invalid encoding implies no valid ASCII token stream essentially
+        },
+    };
+
+    if let Err(e) = check_media_type_disposition(mediatype_bytes) {
         return Parsed {
             media_type: String::new(),
             params: None,
@@ -212,8 +243,8 @@ pub(crate) fn parse(v: &str) -> Parsed {
         };
     }
 
-    let mut params = BTreeMap::new();
-    let mut continuation: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut params: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut continuation: BTreeMap<String, BTreeMap<String, Vec<u8>>> = BTreeMap::new();
 
     let mut v_rest = &v[base.len()..];
 
@@ -225,11 +256,11 @@ pub(crate) fn parse(v: &str) -> Parsed {
 
         let (key, value, rest) = consume_media_param(v_rest);
         if key.is_empty() {
-            if trim_unicode(rest) == ";" {
+            if trim_unicode(rest) == b";" {
                 break;
             }
             return Parsed {
-                media_type: mediatype,
+                media_type: mediatype_str,
                 params: None,
                 error: Some("mime: invalid media parameter".to_string()),
             };
@@ -271,15 +302,16 @@ pub(crate) fn parse(v: &str) -> Parsed {
             params.insert(key, value);
         }
 
-        if entries>16_384{return Parsed{media_type:mediatype,params:None,error:Some("template MIME parameter count limit exceeded".into())};}
+        if entries > 16_384 {
+            return Parsed{media_type:mediatype_str,params:None,error:Some("template MIME parameter count limit exceeded".into())};
+        }
         v_rest = rest;
     }
 
     for (key, piece_map) in continuation {
         let single_part_key = format!("{}*", key);
-        if let Some(v) = piece_map.get(&single_part_key) {
-            if let Some(decv) = decode_2231_enc(v) {
-                let Ok(decv)=String::from_utf8(decv)else{return Parsed{media_type:mediatype,params:None,error:Some("template MIME parameter contains unrepresentable byte string".into())};};
+        if let Some(v_bytes) = piece_map.get(&single_part_key) {
+            if let Some(decv) = decode_2231_enc(v_bytes) {
                 params.insert(key.clone(), decv);
             }
             continue;
@@ -290,22 +322,22 @@ pub(crate) fn parse(v: &str) -> Parsed {
         let mut n = 0;
         loop {
             let simple_part = format!("{}*{}", key, n);
-            if let Some(v) = piece_map.get(&simple_part) {
+            if let Some(v_bytes) = piece_map.get(&simple_part) {
                 valid = true;
-                buf.extend_from_slice(v.as_bytes());
+                buf.extend_from_slice(v_bytes);
                 n += 1;
                 continue;
             }
 
             let encoded_part = format!("{}*", simple_part);
-            if let Some(v) = piece_map.get(&encoded_part) {
+            if let Some(v_bytes) = piece_map.get(&encoded_part) {
                 valid = true;
                 if n == 0 {
-                    if let Some(decv) = decode_2231_enc(v) {
+                    if let Some(decv) = decode_2231_enc(v_bytes) {
                         buf.extend_from_slice(&decv);
                     }
                 } else {
-                    if let Ok(decv) = percent_hex_unescape(v) {
+                    if let Ok(decv) = percent_hex_unescape(v_bytes) {
                         buf.extend_from_slice(&decv);
                     }
                 }
@@ -316,13 +348,12 @@ pub(crate) fn parse(v: &str) -> Parsed {
         }
 
         if valid {
-            let Ok(buf)=String::from_utf8(buf)else{return Parsed{media_type:mediatype,params:None,error:Some("template MIME parameter contains unrepresentable byte string".into())};};
             params.insert(key, buf);
         }
     }
 
     Parsed {
-        media_type: mediatype,
+        media_type: mediatype_str,
         params: Some(params),
         error: None,
     }

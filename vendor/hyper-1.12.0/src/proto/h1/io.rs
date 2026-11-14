@@ -116,6 +116,10 @@ where
     }
 
     #[cfg(feature = "client")]
+    pub(crate) fn set_native_read_buffer(&mut self,chunk:usize,max:usize){self.read_buf_strategy=ReadStrategy::Fixed{chunk:chunk.max(1),max:max.max(1)};}
+    #[cfg(feature="client")]
+    pub(crate) fn set_write_buffer_size(&mut self,bytes:usize){self.write_buf.max_buf_size=bytes.max(1);}
+    #[cfg(feature = "client")]
     pub(crate) fn set_read_buf_exact_size(&mut self, sz: usize) {
         self.read_buf_strategy = ReadStrategy::Exact(sz);
     }
@@ -215,6 +219,7 @@ where
                     h1_parser_config: parse_ctx.h1_parser_config.clone(),
                     h1_max_headers: parse_ctx.h1_max_headers,
                     h1_max_header_size: parse_ctx.h1_max_header_size,
+                    native_request_target:parse_ctx.native_request_target,
                     preserve_header_case: parse_ctx.preserve_header_case,
                     #[cfg(feature = "ffi")]
                     preserve_header_order: parse_ctx.preserve_header_order,
@@ -270,7 +275,9 @@ where
 
         // SAFETY: ReadBuf and poll_read promise not to set any uninitialized
         // bytes onto `dst`.
+        let fixed=matches!(self.read_buf_strategy,ReadStrategy::Fixed{..});
         let dst = unsafe { self.read_buf.chunk_mut().as_uninit_slice_mut() };
+        let dst=if fixed{let count=next.min(dst.len());&mut dst[..count]}else{dst};
         let mut buf = ReadBuf::uninit(dst);
         match Pin::new(&mut self.io).poll_read(cx, buf.unfilled()) {
             Poll::Ready(Ok(())) => {
@@ -435,6 +442,7 @@ enum ReadStrategy {
     },
     #[cfg(feature = "client")]
     Exact(usize),
+    Fixed{chunk:usize,max:usize},
 }
 
 impl ReadStrategy {
@@ -451,6 +459,7 @@ impl ReadStrategy {
             ReadStrategy::Adaptive { next, .. } => next,
             #[cfg(feature = "client")]
             ReadStrategy::Exact(exact) => exact,
+            ReadStrategy::Fixed{chunk,..}=>chunk,
         }
     }
 
@@ -459,6 +468,7 @@ impl ReadStrategy {
             ReadStrategy::Adaptive { max, .. } => max,
             #[cfg(feature = "client")]
             ReadStrategy::Exact(exact) => exact,
+            ReadStrategy::Fixed{max,..}=>max,
         }
     }
 
@@ -492,7 +502,7 @@ impl ReadStrategy {
                 }
             }
             #[cfg(feature = "client")]
-            ReadStrategy::Exact(_) => (),
+            ReadStrategy::Exact(_)|ReadStrategy::Fixed{..} => (),
         }
     }
 }

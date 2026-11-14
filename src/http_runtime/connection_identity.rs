@@ -1,5 +1,7 @@
 //! Handshake identity remains attached to its TLS connection; each new HTTP
 //! operation is admitted against the currently published route/TLS policy.
+#[path="connection_identity/ech_accept.rs"]
+pub(super) mod ech_accept;
 use crate::net_address::NetAddress;
 
 // CertMagic selects the local host when SNI is absent. Unlike ACL parsing,
@@ -67,11 +69,7 @@ impl TlsIdentity {
     pub(super) fn verdict(&self, current: &ActiveServer, h2: bool) -> TlsVerdict {
         if !self.leaf.admission().allow_certificate
             || !current.plan.tls
-            || !current
-                .plan
-                .protocols
-                .iter()
-                .any(|p| p == if h2 { "h2" } else { "h1" })
+            || !current.protocols.contains(if h2 {"h2"}else{"h1"})
         {
             return TlsVerdict::Reject;
         }
@@ -620,12 +618,15 @@ where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (peer, local) = peer_local;
+    let ech = inner.current.load_full().business(&address)
+        .and_then(|(server, _)| ech_accept::snapshot(&server));
     let mut start = tls_io_deadline(deadline, async move {
         let stream = super::ssl_capture::CaptureIo::new(tls_first_record::prepare(stream, reply_http).await?);
-        Ok(
-            tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream)
-                .await?,
-        )
+        if let Some(provider) = ech {
+            ech_accept::accept(inner, stream, provider.keys()).await
+        } else {
+            Ok(tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream).await?)
+        }
     })
     .await?;
     let hello = start.client_hello();

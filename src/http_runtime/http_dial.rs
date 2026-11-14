@@ -131,6 +131,7 @@ pub(super) struct FamilyResolver {
     inner: hyper_util::client::legacy::connect::dns::GaiResolver,
     family: Family,
     metrics: Option<crate::outgoing_tls::ConnectionLease>,
+    custom:Option<(std::sync::Arc<super::proxy_dynamic::DnsShared>,std::sync::Arc<[String]>,i64,i64)>,
     retained:Option<(super::resource_budget::BlockingBudget,std::sync::Arc<super::map_runtime::DialOwner>)>,
 }
 
@@ -140,15 +141,17 @@ impl FamilyResolver {
             inner: hyper_util::client::legacy::connect::dns::GaiResolver::new(),
             family,
             metrics: None,
-            retained:None,
+            retained:None,custom:None,
         }
     }
     pub(super) fn with_metrics(family:Family, lease:crate::outgoing_tls::ConnectionLease)->Self {
-        Self { inner:hyper_util::client::legacy::connect::dns::GaiResolver::new(), family, metrics:Some(lease), retained:None }
+        Self { inner:hyper_util::client::legacy::connect::dns::GaiResolver::new(), family, metrics:Some(lease), custom:None,retained:None }
     }
     pub(super) fn with_map(family:Family,budget:super::resource_budget::BlockingBudget,owner:std::sync::Arc<super::map_runtime::DialOwner>)->Self{
-        Self{inner:hyper_util::client::legacy::connect::dns::GaiResolver::new(),family,metrics:None,retained:Some((budget,owner))}
+        Self{inner:hyper_util::client::legacy::connect::dns::GaiResolver::new(),family,metrics:None,custom:None,retained:Some((budget,owner))}
     }
+    pub(super) fn with_custom(mut self,dns:std::sync::Arc<super::proxy_dynamic::DnsShared>,addresses:std::sync::Arc<[String]>,timeout:std::time::Duration,fallback:i64)->Self{self.custom=Some((dns,addresses,timeout.as_nanos().min(i64::MAX as u128)as i64,fallback));self}
+
 }
 
 pub(super) struct FamilyAddrs{values:vec::IntoIter<SocketAddr>,_metrics:Option<super::metrics_dns::Resident>,_retained:Option<super::resource_budget::RetainedBlockingOutput<io::Result<Vec<SocketAddr>>>>}
@@ -172,7 +175,7 @@ impl std::fmt::Display for LocalDnsFailure {
 impl std::error::Error for LocalDnsFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(self.0.as_ref()) }
 }
-fn local_dns_error(error: anyhow::Error) -> io::Error { io::Error::other(LocalDnsFailure(error)) }
+pub(super) fn local_dns_error(error: anyhow::Error) -> io::Error { io::Error::other(LocalDnsFailure(error)) }
 struct LookupFailure {
     output: super::resource_budget::RetainedBlockingOutput<io::Result<Vec<SocketAddr>>>,
 }
@@ -208,6 +211,15 @@ impl Service<Name> for FamilyResolver {
 
     fn call(&mut self, name: Name) -> Self::Future {
         let family=self.family;
+        if let Some((dns,addresses,timeout,fallback))=self.custom.clone(){
+            let retained=self.retained.as_ref().map(|(_,owner)|owner.clone());
+            return Box::pin(async move{
+                let _retained=retained;
+                let values=dns.lookup_host(name.as_str(),addresses,family,timeout,fallback).await.map_err(|error|std::io::Error::other(error.reallocate_into_boxed_dyn_error_without_backtrace()))?;
+                if values.is_empty(){return Err(std::io::Error::new(std::io::ErrorKind::AddrNotAvailable,"no addresses admitted"))}
+                Ok(FamilyAddrs{values:values.into_iter(),_retained:None,_metrics:None})
+            })
+        }
         if let Some(lease) = self.metrics.clone() {
             return Box::pin(super::metrics_dns::lookup(name, family, lease));
         }

@@ -30,11 +30,17 @@ pub(super) enum ObjectKind {
     ZeroSsl,
     StekStandard,
     StekDistributed,
+    Ech,
+    EchConfig,
+    EchPublication,
 }
 
 impl ObjectKind {
     pub(super) fn fields(self) -> &'static [&'static str] {
         match self {
+            Self::Ech=>&["configs","publication"],
+            Self::EchConfig=>&["public_name"],
+            Self::EchPublication=>&["configs","domains","publishers"],
             Self::Tls => &[
                 "certificates",
                 "automation",

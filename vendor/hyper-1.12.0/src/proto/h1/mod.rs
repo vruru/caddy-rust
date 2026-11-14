@@ -76,6 +76,7 @@ pub(crate) struct ParseContext<'ctx> {
     h1_parser_config: ParserConfig,
     h1_max_headers: Option<usize>,
     h1_max_header_size: Option<usize>,
+    native_request_target:bool,
     preserve_header_case: bool,
     #[cfg(feature = "ffi")]
     preserve_header_order: bool,

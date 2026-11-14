@@ -244,7 +244,7 @@ impl DnsShared {
     /// reuses the exact custom/system resolver, network and search semantics.
     pub(crate) async fn lookup_txt(self:&Arc<Self>,name:&str,resolvers:Arc<[String]>)->Result<Vec<Vec<u8>>> {
         let _queued=self.queue_slots.clone().try_acquire_owned().map_err(|_|anyhow!("ACME DNS queue capacity exceeded"))?;
-        let _lookup=self.lookup_slots.acquire().await.map_err(|_|anyhow!(STOPPED))?;
+        let _lookup=tokio::select!{biased;_=self.stop.cancelled()=>return Err(super::http_dial::local_dns_error(anyhow!(STOPPED)).into()),permit=self.lookup_slots.acquire()=>permit.map_err(|error|super::http_dial::local_dns_error(error.into()))?};
         let spec=DnsSpec{addrs:(!resolvers.is_empty()).then_some(resolvers),dial_ns:30_000_000_000,fallback_ns:300_000_000};
         let (resolver,sys)=self.resolver_for(&spec,IpVer::Any).await?;
         let lookup=lookup_record(&resolver,&sys,name,RecordType::TXT).await?;
@@ -268,6 +268,19 @@ impl DnsShared {
         }}Ok(values)
     }
 
+    pub(super) async fn lookup_host(self:&Arc<Self>,name:&str,addresses:Arc<[String]>,family:super::http_dial::Family,dial_ns:i64,fallback_ns:i64)->Result<Vec<SocketAddr>>{
+        let _queued=self.queue_slots.clone().try_acquire_owned().map_err(|error|super::http_dial::local_dns_error(error.into()))?;
+        let _lookup=tokio::select!{biased;_=self.stop.cancelled()=>return Err(super::http_dial::local_dns_error(anyhow!(STOPPED)).into()),permit=self.lookup_slots.acquire()=>permit.map_err(|error|super::http_dial::local_dns_error(error.into()))?};
+        let spec=DnsSpec{addrs:Some(addresses),dial_ns,fallback_ns};
+        let version=match family{super::http_dial::Family::Any=>IpVer::Any,super::http_dial::Family::V4=>IpVer::V4,super::http_dial::Family::V6=>IpVer::V6};
+        let (resolver,sys)=self.resolver_for(&spec,version).await.map_err(super::http_dial::local_dns_error)?;
+        let ips=lookup_ips(&resolver,&sys,name).await?;
+        if ips.len()>4096{return Err(super::http_dial::local_dns_error(anyhow!("proxy DNS result limit exceeded")).into())}
+        Ok(ips.into_iter().map(|ip|ip.socket(0)).collect())
+    }
+
+    pub(super) fn transport_tasks(&self)->TaskTracker{self.tasks.clone()}
+    pub(super) fn transport_stop(&self)->CancellationToken{self.stop.clone()}
     pub(super) fn close(&self) {
         self.stop.cancel();
         self.tasks.close();

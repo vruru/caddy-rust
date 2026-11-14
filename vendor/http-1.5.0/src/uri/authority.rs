@@ -41,6 +41,17 @@ impl Authority {
         create_authority(s, |s| s)
     }
 
+    /// Construct a Native HTTP message authority from an already normalized
+    /// ASCII Host. Literal percent is a logical Host byte here, not a wire URL
+    /// escape. This must not be used to parse incoming URLs. Ordinary Authority
+    /// parsing remains unchanged; invalid UTF-8 is never put into ByteStr.
+    pub fn from_native_http_host(raw:&[u8])->Result<Self,InvalidUri>{
+        if raw.is_empty()||!raw.is_ascii()||raw.contains(&b'@'){return Err(ErrorKind::InvalidAuthority.into())}
+        let end=Self::parse_mode(raw,2)?;if end!=raw.len(){return Err(ErrorKind::InvalidAuthority.into())}
+        let data=ByteStr::from_utf8(Bytes::copy_from_slice(raw)).map_err(|_|InvalidUri::from(ErrorKind::InvalidUriChar))?;
+        Ok(Self{data})
+    }
+
     /// Attempt to convert an `Authority` from a static string.
     ///
     /// This function will not perform any copying, and the string will be
@@ -87,7 +98,12 @@ impl Authority {
     // Postcondition: for all Ok() returns, s[..ret.unwrap()] is valid UTF-8 where
     // ret is the return value.
     pub(super) fn parse(s: &[u8]) -> Result<usize, InvalidUri> {
-        validate_authority_bytes(s).map_err(|e| {
+        Self::parse_mode(s,0)
+    }
+
+    pub(super) fn parse_native_http_target(s:&[u8])->Result<usize,InvalidUri>{Self::parse_mode(s,1)}
+    fn parse_mode(s:&[u8],mode:u8)->Result<usize,InvalidUri>{
+        validate_authority_bytes_mode(s,mode).map_err(|e| {
             match e {
                 AuthorityError::Empty => ErrorKind::Empty,
                 AuthorityError::InvalidUriChar => ErrorKind::InvalidUriChar,
@@ -470,9 +486,12 @@ where
     })
 }
 
+const fn hex_value(b:u8)->u8{match b{b'0'..=b'9'=>b-b'0',b'a'..=b'f'=>b-b'a'+10,b'A'..=b'F'=>b-b'A'+10,_=>255}}
+
 /// Shared validation logic for authority bytes.
 /// Returns the end position of valid authority bytes, or an error.
-const fn validate_authority_bytes(s: &[u8]) -> Result<usize, AuthorityError> {
+const fn validate_authority_bytes(s: &[u8]) -> Result<usize, AuthorityError> { validate_authority_bytes_mode(s,0) }
+const fn validate_authority_bytes_mode(s:&[u8],mode:u8)->Result<usize,AuthorityError>{
     if s.is_empty() {
         return Err(AuthorityError::Empty);
     }
@@ -562,8 +581,20 @@ const fn validate_authority_bytes(s: &[u8]) -> Result<usize, AuthorityError> {
     }
 
     if has_percent {
-        // Something after the userinfo has a `%`, so reject it.
-        return Err(AuthorityError::InvalidPercent);
+        if mode==0{return Err(AuthorityError::InvalidPercent)}
+        if mode==1{
+            let mut p=if at_sign_pos<end{at_sign_pos+1}else{0};
+            while p<end{
+                if s[p]==b'%' {
+                    if p+2>=end{return Err(AuthorityError::InvalidPercent)}
+                    let hi=hex_value(s[p+1]);let lo=hex_value(s[p+2]);
+                    if hi>15||lo>15{return Err(AuthorityError::InvalidPercent)}
+                    let decoded=hi*16+lo;
+                    if decoded!=b'%'&&decoded<128{return Err(AuthorityError::InvalidPercent)}
+                    p+=3;
+                }else{p+=1}
+            }
+        }
     }
 
     Ok(end)

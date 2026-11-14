@@ -3,6 +3,7 @@ use futures_util::FutureExt;
 
 impl CertificateServices {
     pub(super) async fn maintenance(self: Arc<Self>) {
+        if self.ech_runtime().is_some(){let this=self.clone();self.tasks.spawn(async move{this.maintain_ech().await;});}
         let eviction = self.clone();
         self.tasks.spawn(async move {
             eviction.run_cache_evictions().await;

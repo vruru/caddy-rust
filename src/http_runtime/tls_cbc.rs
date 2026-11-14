@@ -298,6 +298,8 @@ pub(super) fn engine_with_key(
     staple_gate: Arc<dyn Fn() -> bool + Send + Sync>,
 ) -> io::Result<ServerEngine> {
     let mut ctx = SslContextBuilder::new(SslMethod::tls_server()).map_err(io::Error::other)?;
+    let key_log=config.key_log.clone();
+    ctx.set_keylog_callback(move|_,line|crate::tls_policy::secrets_log::openssl_line(&*key_log,line));
     ctx.set_min_proto_version(Some(SslVersion::TLS1_2))
         .map_err(io::Error::other)?;
     ctx.set_max_proto_version(Some(SslVersion::TLS1_2))

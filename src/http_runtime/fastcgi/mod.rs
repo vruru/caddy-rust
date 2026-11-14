@@ -461,7 +461,7 @@ pub(super) async fn prepare_source(
         .map(|v| v.length);
     let known = replacement.or_else(|| body.size_hint().exact());
     let incremental = super::incremental::is_enabled(ctx.req().headers());
-    let mut source = prefix(ctx, body, known, transport, incremental).await?;
+    let mut source = prefix(ctx, body, known, transport, incremental,&config.handler.proxy_status_name).await?;
     let length = PreparedLength {
         config: config as *const ProxyConfig as usize,
         length: source.length,
@@ -498,6 +498,7 @@ async fn prefix(
     mut length: Option<u64>,
     transport: &FastCgiConfig,
     incremental: bool,
+    proxy_status_name:&str,
 ) -> Result<BodyPrefix> {
     let method = ctx.req().method().clone();
     let mut buffered = Vec::new();
@@ -507,7 +508,7 @@ async fn prefix(
     if incremental {
         if has_content(&method, length) {
             if length.is_none() || transport.explicit_request_buffer {
-                return Err(failure(StatusCode::NOT_IMPLEMENTED));
+                return Err(super::proxy_handler::refuse(ctx,proxy_status_name,None));
             }
         } else {
             length = Some(0);
@@ -666,7 +667,7 @@ pub(super) async fn serve(
             && transport.explicit_request_buffer
             && has_content(ctx.req().method(), Some(length))
         {
-            return Err(failure(StatusCode::NOT_IMPLEMENTED));
+            return Err(super::proxy_handler::refuse(ctx,&config.handler.proxy_status_name,None));
         }
         BodyPrefix {
             body,
@@ -681,7 +682,7 @@ pub(super) async fn serve(
             content_length_override: Some(length),
         }
     } else {
-        prefix(ctx, body, known_length, transport, is_incremental).await?
+        prefix(ctx, body, known_length, transport, is_incremental,&config.handler.proxy_status_name).await?
     };
     let mut headers = incoming_headers;
     if !probe && let Some(size) = source.content_length_override.or(replacement_length) {
@@ -704,7 +705,7 @@ pub(super) async fn serve(
         && super::incremental::is_enabled(&headers)
         && has_content(method, known_length)
     {
-        return Err(failure(StatusCode::NOT_IMPLEMENTED));
+        return Err(super::proxy_handler::refuse(ctx,&config.handler.proxy_status_name,None));
     }
     let protocol = match ctx.req().version() {
         Version::HTTP_10 => "HTTP/1.0",
@@ -715,11 +716,11 @@ pub(super) async fn serve(
     let tls = ctx.req().extensions().get::<TlsDetails>().copied();
     let cipher = tls.map(TlsDetails::cipher_name);
     let host = if probe {
-        ctx.authority.as_bytes()
+        ctx.authority.as_ref()
     } else {
         headers
             .get(header::HOST)
-            .map_or(ctx.authority.as_bytes(), HeaderValue::as_bytes)
+            .map_or(ctx.authority.as_ref(), HeaderValue::as_bytes)
     };
     let request = env::Request {
         method: method.as_str(),

@@ -305,6 +305,38 @@ impl<E> Builder<E> {
             },
         }
     }
+
+    /// Serve upgrades while honoring an explicitly selected HTTP/1 or HTTP/2
+    /// builder mode. An automatic builder retains protocol sniffing.
+    /// The original upgrade API keeps its upstream automatic behavior.
+    pub fn serve_connection_with_upgrades_selected<I, S, B>(
+        &self, io: I, service: S,
+    ) -> UpgradeableConnection<'_, I, S, E>
+    where
+        S: Service<Request<Incoming>, Response = Response<B>>,
+        S::Future: 'static,
+        S::Error: Into<Box<dyn StdError + Send + Sync>>,
+        B: Body + 'static,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+        I: Read + Write + Unpin + Send + 'static,
+        E: HttpServerConnExec<S::Future, B>,
+    {
+        let state=match self.version {
+            #[cfg(feature="http1")]
+            Some(Version::H1)=>UpgradeableConnState::H1 {
+                conn:self.http1.serve_connection(Rewind::new_buffered(io,Bytes::new()),service).with_upgrades(),
+            },
+            #[cfg(feature="http2")]
+            Some(Version::H2)=>UpgradeableConnState::H2 {
+                conn:self.http2.serve_connection(Rewind::new_buffered(io,Bytes::new()),service),
+            },
+            _=>UpgradeableConnState::ReadVersion {
+                read_version:read_version(io).with_timeout(self.protocol_timeout.as_ref()),
+                builder:Cow::Borrowed(self),service:Some(service),
+            },
+        };
+        UpgradeableConnection{state}
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -762,6 +794,9 @@ pub struct Http1Builder<'a, E> {
 
 #[cfg(feature = "http1")]
 impl<E> Http1Builder<'_, E> {
+    /// Opt in to Native HTTP/1 request-target provenance and encoded hosts.
+    pub fn native_request_target(&mut self,enabled:bool)->&mut Self{self.inner.http1.native_request_target(enabled);self}
+
     /// Enable informational responses with aggregate per-request count and
     /// header-byte limits. A zero limit disables them.
     pub fn informational_responses(
@@ -790,6 +825,9 @@ impl<E> Http1Builder<'_, E> {
         self.inner.http1.auto_date_header(enabled);
         self
     }
+
+    /// Control HTTP/1 request/response concurrency without affecting H2.
+    pub fn full_duplex(&mut self,value:bool)->&mut Self{self.inner.http1.full_duplex(value);self}
 
     /// Set whether HTTP/1 connections should support half-closures.
     ///
@@ -894,6 +932,12 @@ impl<E> Http1Builder<'_, E> {
         self.inner.http1.max_headers(val);
         self
     }
+
+    /// Maximum HTTP/1 request head bytes, including its start line.
+    pub fn max_header_size(&mut self, val:usize)->&mut Self {
+        self.inner.http1.max_header_size(val);self
+    }
+
 
     /// Set a timeout for reading client request headers. If a client does not
     /// transmit the entire header within this time, the connection is closed.

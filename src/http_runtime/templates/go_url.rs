@@ -1,7 +1,7 @@
 //! Go net/url Parse and URL.String for helper values, reusing listener URL primitives.
 use crate::http_runtime::http_redirect::url as primitive;
 #[derive(Clone,Default)]
-pub(super) struct Url {
+pub(crate) struct Url {
     pub scheme:String,pub opaque:String,pub host:String,pub user:Option<String>,pub path:String,pub raw_path:String,
     pub raw_query:String,pub force_query:bool,pub omit_host:bool,pub fragment:String,
 }

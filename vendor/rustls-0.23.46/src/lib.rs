@@ -633,6 +633,7 @@ pub use client::ClientConnection;
 pub mod server {
     pub(crate) mod builder;
     mod common;
+    mod ech;
     pub(crate) mod handy;
     mod hs;
     mod server_conn;
@@ -643,6 +644,7 @@ pub mod server {
     mod tls13;
 
     pub use builder::WantsServerCert;
+    pub use ech::{EchConfigProvider, EchServerKey};
     #[cfg(any(feature = "std", feature = "hashbrown"))]
     pub use handy::ResolvesServerCertUsingSni;
     #[cfg(any(feature = "std", feature = "hashbrown"))]

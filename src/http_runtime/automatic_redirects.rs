@@ -8,6 +8,7 @@ impl Domains {
     pub(super) fn record(&mut self,names:&[String],addresses:&[ListenerKey],v6_only:&impl Fn(&ListenerKey)->bool,https_port:u16){
         for name in names.iter().map(String::as_str).chain(names.is_empty().then_some("")) {
             for address in addresses {
+                if address.socket().is_none(){continue;}
                 let selected=self.0.entry(name.to_owned()).or_default();
                 if let Some(first)=selected.first() {
                     if first.0.port()!=address.port() {

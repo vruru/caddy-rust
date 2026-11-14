@@ -32,7 +32,7 @@ fn run() -> Result<()> {
     let report = match args.as_slice() {
         [flag] if flag == "--help" => {
             println!(
-                "caddy-compat-native fmt [FLAGS] [FILE] | adapt [FLAGS] | validate [FLAGS] | hash-password [FLAGS] | inspect-config FILE | inspect-storage CERTMAGIC_ROOT"
+                "caddy-compat-native list-modules [FLAGS] | build-info | environ [FLAGS] | storage import/export [FLAGS] | trust/untrust [FLAGS] | fmt [FLAGS] [FILE] | adapt [FLAGS] | validate [FLAGS] | hash-password [FLAGS] | inspect-config FILE | inspect-storage CERTMAGIC_ROOT"
             );
             if cfg!(feature = "native-run") {
                 println!(

@@ -181,6 +181,16 @@ const URI_CHARS: [u8; 256] = [
 ];
 
 impl Uri {
+    /// Parse a Native HTTP/1 request target. Only HTTP(S) absolute targets
+    /// receive the Go-compatible encoded-host rule. Generic URI parsing and
+    /// UTF-8 storage invariants are unchanged.
+    pub fn from_native_http1_target(raw:Bytes)->Result<Self,InvalidUri>{
+        if raw.len()>=7&&raw[..7].eq_ignore_ascii_case(b"http://")||raw.len()>=8&&raw[..8].eq_ignore_ascii_case(b"https://"){
+            parse_full_mode(raw,true)
+        }else{Self::from_maybe_shared(raw)}
+    }
+
+
     /// Creates a new builder-style object to manufacture a `Uri`.
     ///
     /// This method returns an instance of `Builder` which can be usd to
@@ -819,7 +829,8 @@ impl From<Uri> for Parts {
     }
 }
 
-fn parse_full(mut s: Bytes) -> Result<Uri, InvalidUri> {
+fn parse_full(s:Bytes)->Result<Uri,InvalidUri>{parse_full_mode(s,false)}
+fn parse_full_mode(mut s: Bytes,native_http:bool) -> Result<Uri, InvalidUri> {
     // Parse the scheme
     let scheme = match Scheme2::parse(&s[..])? {
         Scheme2::None => Scheme2::None,
@@ -844,7 +855,7 @@ fn parse_full(mut s: Bytes) -> Result<Uri, InvalidUri> {
 
     // Find the end of the authority. The scheme will already have been
     // extracted.
-    let authority_end = Authority::parse(&s[..])?;
+    let authority_end = if native_http{Authority::parse_native_http_target(&s[..])?}else{Authority::parse(&s[..])?};
 
     if scheme.is_none() {
         if authority_end != s.len() {

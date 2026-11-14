@@ -22,7 +22,7 @@ pub(super) fn make(inner:Arc<Inner>,server:Arc<ActiveServer>,business:Arc<Busine
         let path=uri.path_and_query().map_or("/",|p|p.as_str()).parse::<Uri>().map_err(|_|error("invalid virtual request target"))?;
         let mut request=Request::builder().method("GET").uri(path).body(full(bytes::Bytes::new())).map_err(|_|error("virtual request construction failed"))?;
         *request.headers_mut()=parent.headers.clone();
-        request.headers_mut().insert(header::HOST,header::HeaderValue::from_str(&parent.host).map_err(|_|error("invalid virtual request Host"))?);
+        request.headers_mut().insert(header::HOST,header::HeaderValue::from_bytes(&parent.host).map_err(|_|error("invalid virtual request Host"))?);
         request.headers_mut().insert(header::ACCEPT_ENCODING,header::HeaderValue::from_static("identity"));
         request.headers_mut().insert("caddy-templates-include",header::HeaderValue::from_str(&count.to_string()).map_err(|_|error("invalid virtual recursion count"))?);
         request.extensions_mut().insert(Inherited{tree:tree.clone(),depth:depth+1});

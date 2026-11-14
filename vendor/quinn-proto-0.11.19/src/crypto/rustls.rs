@@ -68,11 +68,12 @@ impl crypto::Session for TlsSession {
             key_exchange_group: self.inner.negotiated_key_exchange_group().map(|group| u16::from(group.name())),
             handshake_kind: self.inner.handshake_kind(),
             handshake_complete: !self.inner.is_handshaking(),
+            ech_accepted: self.inner.ech_accepted(),
             hello_retry_request: self.inner.native_hello_retry_request(),
             client_chain_observation: self.inner.native_client_chains().cloned(),
             peer_ocsp_response: self.inner.native_peer_ocsp_response().map(ToOwned::to_owned),
             peer_scts: self.inner.native_peer_scts().map(ToOwned::to_owned),
-            owned_exporter: self.inner.native_exporter().ok(),
+            owned_exporter: self.inner.native_exporter_for_phase().ok(),
             server_name: match self.inner {
                 Connection::Client(_) => None,
                 Connection::Server(ref session) => session.server_name().map(|x| x.into()),
@@ -273,6 +274,8 @@ pub struct HandshakeData {
     pub key_exchange_group: Option<u16>,
     pub handshake_kind: Option<rustls::HandshakeKind>,
     pub handshake_complete: bool,
+    /// True only when the actual server HPKE state accepted ECH.
+    pub ech_accepted: bool,
     pub hello_retry_request: bool,
     /// Owned observation from the actual completed server-side TLS verifier.
     pub client_chain_observation: Option<rustls::ClientChainObservation>,

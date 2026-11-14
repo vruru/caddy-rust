@@ -61,6 +61,9 @@ pub struct CertificateRequest {
 /// Certificate validity, actual protocol/signature selection and shared leaf
 /// admission are still checked by the final certificate resolver.
 pub trait ScopedCertificateProvider: Send + Sync {
+    /// Resident ECH keys for this accepted generation. Handshakes retain the
+    /// returned provider/snapshot; this accessor performs no I/O or parsing.
+    fn ech_provider(&self)->Option<Arc<dyn rustls::server::EchConfigProvider>>{None}
     /// Pure ACME configuration/reference checks, without opening a database or
     /// creating CA material. A generic name-only provider cannot validate one.
     fn validate_acme_server(&self,_config:&crate::acme_server::Config)->Result<()> {

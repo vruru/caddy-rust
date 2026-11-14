@@ -676,7 +676,7 @@ impl Prioritize {
         let _e = span.enter();
 
         // No queued frame can complete the observation after this discard.
-        stream.send_completion.take();
+        stream.send_completion.take();stream.send_head_completion.take();
 
         // TODO: make this more efficient?
         while let Some(frame) = stream.pending_send.pop_front(buffer) {
@@ -944,6 +944,11 @@ impl Prioritize {
             } else {
                 None
             };
+            let completion=if matches!(&frame,Frame::Headers(_)){
+                match(completion,stream.send_head_completion.take()){
+                    (Some(a),Some(b))=>Some(a.combine(b)),(a,b)=>a.or(b),
+                }
+            }else{completion};
             counts.transition_after(stream, is_pending_reset);
 
             return Some((frame, completion, data_receipt));

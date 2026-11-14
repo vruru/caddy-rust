@@ -47,6 +47,7 @@ pub(super) async fn prepare(
         tags.sort_unstable();
         tags.dedup();
     }
+    let enabled=server.listen_protocols.iter().copied().fold(crate::http_config::server_options::ProtocolSet::default(),|a,b|a.union(b));
     let mut result = Vec::new();
     for definition in &server.tls_policies {
         let selection = definition.certificate_selection.clone();
@@ -77,10 +78,10 @@ pub(super) async fn prepare(
         let definition = definition.clone();
         let prepared_definition = definition.clone();
         let mut alpn = Vec::new();
-        if server.protocols.iter().any(|protocol| protocol == "h2") {
+        if enabled.h2 {
             alpn.push(b"h2".to_vec());
         }
-        if server.protocols.iter().any(|protocol| protocol == "h1") {
+        if enabled.h1 {
             alpn.push(b"http/1.1".to_vec());
         }
         let (mut tls, identity, charge,native_verifier,native_suites) = resources
@@ -90,8 +91,8 @@ pub(super) async fn prepare(
             .map_err(|_| anyhow::anyhow!("TLS policy provisioning worker unavailable"))??;
         tls.alpn_protocols
             .retain(|protocol| match protocol.as_slice() {
-                b"h2" => server.protocols.iter().any(|value| value == "h2"),
-                b"http/1.1" => server.protocols.iter().any(|value| value == "h1"),
+                b"h2" => enabled.h2,
+                b"http/1.1" => enabled.h1,
                 _ => true,
             });
         *retained_bytes = retained_bytes
@@ -142,4 +143,15 @@ impl ActiveServer {
         }
         None
     }
+}
+
+/// Restrict a previously prepared verifier/resolver to one actual listener.
+/// No source is reopened and no trust/identity object is reconstructed.
+pub(super) fn for_protocols(policies:&[Arc<PreparedPolicy>], protocols:crate::http_config::server_options::ProtocolSet)->Vec<Arc<PreparedPolicy>> {
+ policies.iter().map(|p|{
+  let mut tls=(*p.tls).clone();
+  tls.alpn_protocols.retain(|v|match v.as_slice(){b"h2"=>protocols.h2,b"http/1.1"=>protocols.h1,_=>true});
+  let mut digest=Sha256::new();digest.update(b"caddy/listener-protocols/v1");digest.update(p.identity);digest.update([protocols.bits()]);
+  Arc::new(PreparedPolicy{definition:p.definition.clone(),native_suites:p.native_suites.clone(),native_verifier:p.native_verifier.clone(),tls:Arc::new(tls),resolver:p.resolver.clone(),sessions:Arc::new(connection_sessions::SharedSessions::new()),identity:digest.finalize().into()})
+ }).collect()
 }

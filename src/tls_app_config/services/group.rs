@@ -96,6 +96,7 @@ impl ManagerBuildInput {
             self.options,self.resources,None,self.prepared,self.key_type)?
             .with_construction_owner(self.owner.clone())?
             .with_issuer_values_credit(issuer_values_credit)?
+            .with_caddy_system_roots()?
             .with_issuer_custom_roots(self.custom_roots)?
             .with_prepared_test_cas(self.test_directories,&resources)?
             .with_test_ca_solvers(self.test_solvers)?

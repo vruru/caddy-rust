@@ -42,21 +42,9 @@ must all implement their behavior.
 
 | Area | Missing fields or legal branches |
 | --- | --- |
-| HTTP transport | `resolver`, `keep_alive`, `max_conns_per_host`, outgoing `proxy_protocol` |
-| Forward proxy | `network_proxy`, legacy `forward_proxy_url`, including normal reverse-proxy environment consumption |
-| Dialing | `dial_fallback_delay`, `local_address` |
-| HTTP transport buffering | `expect_continue_timeout`, `max_response_header_size`, `write_buffer_size`, `read_buffer_size` |
-| Upstream protocols | HTTP/3 upstream transport; existing frontend HTTP/3 is a separate implementation |
-| Reverse proxy | Handler-level legacy `trusted_proxies`, `response_buffers`, `proxy_status_name`, `stream_timeout`, `stream_buffer_size`, `verbose_logs` |
-| Server sockets | `keepalive_interval`, `keepalive_idle`, `keepalive_count` |
-| Server HTTP | `max_header_bytes`, `enable_full_duplex`, `trusted_proxies_unix`, `listen_protocols`, `allow_0rtt` |
-| Listener addresses | Remaining non-TCP HTTP listener network/address forms, including Unix sockets |
-| Certificate issuers | Complete ZeroSSL REST issuer lifecycle; REST primitives alone are not an issuer. Default ACME OS-root parity is also incomplete: the current reqwest build uses built-in WebPKI roots |
-| Leaf verification | Folder and storage leaf loaders |
-| Other standard capabilities | Standard ECH lifecycle, filesystem app and file-server `fs` selection, explicit `insecure_secrets_log` |
-| Providers and byte strings | Non-scalar TLS providers in ordinary text consumers; raw non-UTF-8 form/query values; percent-bearing non-IPv6 absolute HTTP target hosts |
-| Template methods | Remaining time/location mutable decode/append and private-reflection behavior documented in COMPATIBILITY.md |
-| CLI | `list-modules`, `build-info`, standalone `environ`, storage import/export, explicit PKI trust/untrust commands |
+| Certificate issuers | Complete ZeroSSL REST issuer integration; REST primitives alone are not an issuer |
+| Template and certificate edge cases | Remaining receiver behavior and Go PKIX edges require the combined audit; private Go reflection/layout equivalence is not promised |
+| Optional providers | DNS publication/validation and non-default filesystem backends require actual provider implementations; the inspected standard inventory contains none of those plugins |
 | Platforms | Windows CLI/service/native trust and other unverified OS branches; macOS/Linux verification does not establish all-platform readiness |
 
 Existing similarly named features do not satisfy a missing consumer. Incoming
@@ -69,6 +57,54 @@ Standard module behavior and the actual required third-party plugin behavior
 must be inventoried separately. This project does not promise a Go plugin
 binary ABI. Correct useful native extensions may remain supported even where
 the baseline rejects them.
+
+## Integrated capability groups
+
+The reverse-proxy handler now consumes its legacy trust, response buffering,
+Proxy-Status, stream timeout/buffer and verbose-log settings. HTTP transport
+controls include actual outgoing HTTP/3. These are separate from incoming
+protocol support and server-level proxy trust; their contracts are described
+in `PROXY-HANDLER.md` and COMPATIBILITY.md.
+
+Ordinary request replacers, headers, Map and file templates expose the supported
+client-certificate fingerprint, public key/hash, issuer, serial, subject,
+PEM/DER and SAN values through the existing TLS authentication boundary.
+Query, form and multipart names, filenames, content and MIME parameters retain
+their byte sequences. Time append/format methods return typed bytes;
+addressable X509 time fields support mutating decoders without adding pointer
+methods to ordinary returned Time values.
+
+Folder and storage leaf loaders prepare accepted certificate snapshots before
+handshakes. Configured ACME clients use system trust by default;
+`trusted_roots_pem_files` remains custom-only, and the public wire SDK retains
+its additive-extra-root contract. `insecure_secrets_log` is explicit, uses a
+private regular file, and supports the ordinary and CBC TLS engines.
+`SSLKEYLOGFILE` alone does not enable it.
+
+The filesystem app and `file_server.fs` select the real default OS filesystem;
+unknown backends are not mapped to it. Information commands, offline tar storage
+import/export, and explicit PKI trust/removal have actual CLI consumers. Linux
+system, Java and NSS trust installation/removal have real-backend coverage;
+this does not establish macOS Keychain or Windows trust acceptance.
+
+Server ECH includes key generation, compatible storage, restart, rotation and
+retention of cached configurations. Both implementations can read the stored
+key format. The original standard module set has no `dns.providers.*`; default
+ECH publication without a provider is a no-op, and an explicit publisher without
+a usable provider is rejected. Listing a module name does not establish DNS
+record publication. Native treats `dns:null` as unconfigured, a deliberate
+no-op extension to the reference's rejection of that input.
+
+## Server/listener layer
+
+Server socket keepalive, header limits, H1 full duplex, Unix proxy trust and
+per-listener protocol sets have real runtime consumers. Unix/unixpacket/fd and
+UDP/fdgram listeners retain concrete kernel identities and existing reload
+ownership. Stateful HTTP/3 early dispatch observes unfinished versus completed
+TLS honestly and returns 425 for IP matchers before Finished. Stateless STEK
+continues resumption while Rustls rejects early data. See COMPATIBILITY.md for
+platform limits, body-drain behavior and listener filesystem side effects.
+These targeted contracts do not replace the combined release gates below.
 
 ## Integrated release gates
 
@@ -98,3 +134,67 @@ Verification scripts, fixtures and operational evidence remain outside this
 source repository. No GitHub Actions are introduced by this process. Passing
 an isolated subset does not grant a general production release or change the
 separately authorized deployment scope.
+
+## Reverse-proxy HTTP transport
+
+The HTTP transport consumes resolver addresses, TCP keepalive probes, HTTP idle
+pool limits, total connections per host, local TCP/Unix binding, dial fallback,
+outgoing PROXY v1/v2, explicit HTTP/HTTPS/SOCKS5 proxies and the legacy proxy URL.
+When no proxy source is configured, HTTP_PROXY/HTTPS_PROXY/NO_PROXY are consumed;
+`network_proxy` with `from: none` disables that environment path. Proxy routing,
+authentication, and TLS are performed by the native connector. Origin and proxy
+handshakes retain the existing trust, client-identity and compatibility policies.
+The connection limit covers dialing, active and idle sockets rather than HTTP/2
+streams or TLS CPU slots. Outgoing PROXY pooling includes the actual source
+identity; Unix peers cannot supply a fabricated IP prefix.
+
+HTTP/1 read chunks and write-buffer batching are configurable independently of
+the total response-header limit. HTTP/2 applies its decoded header-list limit.
+The 100-continue interval starts at actual request-head flush; a 100 response
+releases the upload immediately and a final response can finish without reading
+or replaying the held body. Existing response-header and socket read/write
+limits remain separate controls. Buffer controls do not establish a bound on
+all ingress, HeaderMap, HPACK or process allocations.
+
+Exclusive `versions: ["3"]` with an explicit TLS configuration uses native QUIC
+and HTTP/3, including concurrent request streams, streaming uploads/responses,
+trailers, cancellation and pooled connections. It reuses the prepared verifier
+and managed-client certificate binding. TCP socket probes, TCP read/write buffer
+controls, outgoing PROXY and HTTP/SOCKS forward proxies are TCP-transport controls;
+they are not CONNECT-UDP/MASQUE support. Upstream HTTP/3 does not support the
+HTTP/1 Upgrade bridge. Its configured response-header timer starts after the
+upload's FIN is accepted by QUIC, and is not a claim of peer acknowledgment or
+physical UDP flush. The existing frontend HTTP/3 implementation is independent.
+
+The upstream QUIC cache and DNS/upload/driver ownership use the existing runtime
+resources and task tracker. Request-derived dial metadata retains its existing
+Map/optional-client-cache ownership. No new process-wide resource pool or CPU
+limit is introduced by these transport settings.
+
+## Absolute HTTP/1 target host bytes
+
+The Native HTTP/1 receiver accepts the Go URL host escape set in absolute HTTP(S)
+request targets: percent itself and escaped bytes at or above 0x80. Other escaped
+ASCII, controls and malformed escapes remain rejected. The ordinary http/Hyper
+URI parsers retain their strict default behavior; this is an explicit Native H1
+server opt-in, not a global relaxation of Authority or its UTF-8 representation.
+The literal on-wire Host header retains the ASCII HTTP host-character gate.
+
+The logical request authority is byte-valued and decoded exactly once. Template
+Request.Host/URL.Host, byte replacers, Map inputs, header matching, HostHash and
+CGI preserve those bytes. The raw request target is retained separately from
+URL.String, so an absolute target's scheme spelling and percent-escape case are
+not replaced by a normalized path/query. Access logs use the existing Go-style
+byte-string JSON serialization. Unrepresentable optional UTF-8-only metrics or
+trace host observations are omitted; that representation boundary does not alter
+the authority used for matching, authorization or forwarding.
+
+The outgoing Host is normalized independently: valid Unicode becomes IDNA,
+IPv6 routing zones are removed, and invalid UTF-8 produces a typed local 502
+before sending an upstream application request. X-Forwarded-Host retains the
+logical incoming byte fact. New Unicode conversion uses the existing bounded
+metadata lane and header pool, with the input/work/output loan following the
+actual worker and the final owned HeaderValue bytes. This does not claim that
+all HPACK/QUIC or process heap allocation is charged by that loan. ASCII keeps
+the existing path. Certificate URI SAN validation, TLS identity and trust rules
+are unchanged.

@@ -3,10 +3,10 @@ use super::{Control,Fields,RenderResult,arity,error,lock,string,text};
 use gotmpl::{Object,Value,ValueFunc};
 use std::{collections::BTreeMap,sync::{Arc,Mutex,OnceLock,Weak}};
 use tokio::sync::{mpsc,oneshot};
-type Values=Fields;
+pub(super) type Values=BTreeMap<gotmpl::GoKey,Value>;
 #[derive(Default)]struct State {form:Option<Arc<Values>>,post:Option<Arc<Values>>,multipart:Option<Arc<super::multipart::Parsed>>}
 pub(crate) struct Form {
-    method:String,query:String,content_type:String,state:Mutex<State>,
+    method:String,query:String,content_type:Vec<u8>,state:Mutex<State>,
     sender:OnceLock<mpsc::UnboundedSender<ReadRequest>>,
     control:OnceLock<Weak<Control>>,
     query_source:OnceLock<Arc<dyn Fn()->RenderResult<Vec<u8>>+Send+Sync>>,
@@ -14,7 +14,7 @@ pub(crate) struct Form {
 pub(crate) struct ReadRequest {pub reply:oneshot::Sender<RenderResult<BodyRead>>}
 pub(crate) enum BodyRead {Bytes(Vec<u8>),Io(String),TooLarge}
 impl Form {
-    pub(crate) fn new(method:&str,query:&str,content_type:&str)->Arc<Self>{Arc::new(Self{method:method.into(),query:query.into(),content_type:content_type.into(),state:Mutex::new(State::default()),sender:OnceLock::new(),control:OnceLock::new(),query_source:OnceLock::new()})}
+    pub(crate) fn new(method:&str,query:&str,content_type:&[u8])->Arc<Self>{Arc::new(Self{method:method.into(),query:query.into(),content_type:content_type.into(),state:Mutex::new(State::default()),sender:OnceLock::new(),control:OnceLock::new(),query_source:OnceLock::new()})}
     pub(super) fn set_query_source(&self,source:Arc<dyn Fn()->RenderResult<Vec<u8>>+Send+Sync>){let _=self.query_source.set(source);}
     pub(super) fn set_control(&self,control:Arc<Control>){let _=self.control.set(Arc::downgrade(&control));}
     pub(crate) fn attach(&self)->RenderResult<mpsc::UnboundedReceiver<ReadRequest>>{
@@ -31,14 +31,13 @@ impl Form {
         if state.post.is_none(){
             let mut post=Values::new();
             if matches!(self.method.as_str(),"POST"|"PUT"|"PATCH"){
-                let parsed=super::media_type::parse(if self.content_type.is_empty(){"application/octet-stream"}else{&self.content_type});
+                let parsed=super::media_type::parse(if self.content_type.is_empty(){b"application/octet-stream"}else{&self.content_type});
                 if parsed.error.as_deref().is_some_and(|e|e.starts_with("template ")){return Err(error(parsed.error.unwrap_or_default()));}
                 failure=parsed.error;
                 if parsed.media_type=="application/x-www-form-urlencoded"{
                     match self.read()?{
                         BodyRead::Bytes(bytes)=>{
-                            let raw=std::str::from_utf8(&bytes).map_err(|_|error("form contains unrepresentable byte string"))?;
-                            let(values,query_error)=parse_query(raw,self.control.get().and_then(Weak::upgrade).as_ref())?;post=values;if failure.is_none(){failure=query_error;}
+                            let(values,query_error)=parse_query(&bytes,self.control.get().and_then(Weak::upgrade).as_ref())?;post=values;if failure.is_none(){failure=query_error;}
                         }
                         BodyRead::Io(reason)=>{if failure.is_none(){failure=Some(reason);}}
                         BodyRead::TooLarge=>failure=Some("http: POST too large".into()),
@@ -49,7 +48,7 @@ impl Form {
         }
         if state.form.is_none(){
             if let Some(control)=self.control.get().and_then(Weak::upgrade).as_ref(){control.reserve_host_bytes(state.post.as_ref().map_or(0,|values|values.len().saturating_mul(96)))?;}
-            let mut form=state.post.as_ref().map(|values|values.as_ref().clone()).unwrap_or_default();let current=self.query_source.get().map(|source|source()).transpose()?;let raw=match &current{Some(raw)=>std::str::from_utf8(raw).map_err(|_|error("form query contains unrepresentable byte string"))?,None=>self.query.as_str()};let(query,query_error)=parse_query(raw,self.control.get().and_then(Weak::upgrade).as_ref())?;
+            let mut form=state.post.as_ref().map(|values|values.as_ref().clone()).unwrap_or_default();let current=self.query_source.get().map(|source|source()).transpose()?;let raw=current.as_deref().unwrap_or_else(||self.query.as_bytes());let(query,query_error)=parse_query(raw,self.control.get().and_then(Weak::upgrade).as_ref())?;
             if failure.is_none(){failure=query_error;}append_values(&mut form,query)?;state.form=Some(Arc::new(form));
         }
         Ok(failure)
@@ -63,8 +62,8 @@ impl Form {
         let Some(boundary)=boundary else{return Ok(Some("no multipart boundary param in Content-Type".into()));};
         let bytes=match self.read()?{BodyRead::Bytes(bytes)=>bytes,BodyRead::Io(message)=>return Ok(Some(message)),BodyRead::TooLarge=>return Ok(Some("multipart: message too large".into()))};
         let parsed=match super::multipart::read_form(&bytes,boundary,max_memory,self.control.get().and_then(Weak::upgrade).as_ref())?{Ok(parsed)=>parsed,Err(message)=>return Ok(Some(message))};
-        let mut form=state.form.as_ref().map_or_else(Fields::new,|form|form.as_ref().clone());append_values(&mut form,parsed.values.as_ref().clone())?;state.form=Some(Arc::new(form));
-        let mut post=state.post.as_ref().map_or_else(Fields::new,|post|post.as_ref().clone());append_values(&mut post,parsed.values.as_ref().clone())?;state.post=Some(Arc::new(post));
+        let mut form=state.form.as_ref().map_or_else(Values::new,|form|form.as_ref().clone());append_values(&mut form,parsed.values.as_ref().clone())?;state.form=Some(Arc::new(form));
+        let mut post=state.post.as_ref().map_or_else(Values::new,|post|post.as_ref().clone());append_values(&mut post,parsed.values.as_ref().clone())?;state.post=Some(Arc::new(post));
         state.multipart=Some(parsed);Ok(failure)
     }
     pub(super) fn signatures()->BTreeMap<Arc<str>,gotmpl::Signature>{BTreeMap::from([("ParseMultipartForm".into(),gotmpl::Signature::new(vec![gotmpl::ArgKind::Int64],None))])}
@@ -72,7 +71,7 @@ impl Form {
         let form=self.clone();let fields_form=self.clone();let remove_form=self.clone();
         Value::Object(Arc::new(Object{go_type:Some("*multipart.Form"),field_order:Some([Arc::from("Value"),Arc::from("File")].into()),fields:Fields::from([("Value".into(),Value::Nil),("File".into(),Value::Nil)]),nil_pointer:Some(Arc::new(move||lock(&form.state).is_ok_and(|state|state.multipart.is_none()))),dynamic_fields:Some(Arc::new(move|name|{
             let parsed=lock(&fields_form.state)?.multipart.clone().ok_or_else(||error("nil multipart form"))?;
-            Ok(Some(match name{"Value"=>super::data::typed_map("map[string][]string",parsed.values.clone(),Value::List(Vec::new().into())),"File"=>super::multipart::files_value(&parsed)?,_=>return Ok(None)}))
+            Ok(Some(match name{"Value"=>super::data::typed_keyed_map("map[string][]string",parsed.values.clone(),Value::Slice(gotmpl::TypedSlice::nil("[]string"))),"File"=>super::multipart::files_value(&parsed)?,_=>return Ok(None)}))
         })),methods:BTreeMap::from([("RemoveAll".into(),Arc::new(move|args:&[Value]|{arity(args,0,0)?;let parsed=lock(&remove_form.state)?.multipart.clone().ok_or_else(||error("runtime error: invalid memory address or nil pointer dereference"))?;Ok(match parsed.disk.as_ref().map(|disk|disk.remove()).transpose(){Ok(_)=>Value::NilError,Err(reason)=>error_value(reason.to_string())})})as ValueFunc)]),..Object::default()}))
     }
     pub(super) fn methods(self:&Arc<Self>)->BTreeMap<Arc<str>,ValueFunc>{
@@ -83,45 +82,51 @@ impl Form {
                     arity(args,0,0)?;let post=name=="PostForm";let form=form.clone();
                     let nil_form=form.clone();
                     return Ok(super::data::values_dynamic(Arc::new(move||{
-                        let state=lock(&form.state)?;let values=if post{&state.post}else{&state.form};Ok(values.clone().unwrap_or_else(||Arc::new(Fields::new())))
+                        let state=lock(&form.state)?;let values=if post{&state.post}else{&state.form};Ok(values.clone().unwrap_or_else(||Arc::new(Values::new())))
                     }),Arc::new(move||lock(&nil_form.state).is_ok_and(|state|if post{state.post.is_none()}else{state.form.is_none()}))));
                 }
                 if name=="FormFile"{return Err(error("invalid function signature for FormFile: expected one or two return values"));}
                 if name=="ParseMultipartForm"{arity(args,1,1)?;let memory=args[0].as_go_signed().ok_or_else(||error("expected int64"))?;let mut state=lock(&form.state)?;return Ok(match form.parse_multipart(&mut state,memory)?{Some(message)=>error_value(message),None=>Value::NilError});}
                 if name=="ParseForm"{arity(args,0,0)?;let mut state=lock(&form.state)?;return Ok(match form.parse_form(&mut state)?{Some(message)=>error_value(message),None=>Value::NilError});}
-                arity(args,1,1)?;let key=text(args,0)?;let mut state=lock(&form.state)?;
+                arity(args,1,1)?;let key=args[0].as_go_bytes().ok_or_else(||error("form value key requires string"))?;let mut state=lock(&form.state)?;
                 if if name=="FormValue"{state.form.is_none()}else{state.post.is_none()}{let _=form.parse_multipart(&mut state,32<<20)?;}
                 let values=if name=="FormValue"{&state.form}else{&state.post};
-                Ok(string(values.as_ref().and_then(|values|values.get(key)).and_then(|value|if let Value::List(values)=value{values.first()}else{None}).and_then(Value::as_str).unwrap_or_default()))
+                Ok(values.as_ref().and_then(|values|values.get(key)).and_then(|v|if let Value::Slice(v)=v{v.get(0)}else{None}).unwrap_or_else(||string("")))
             })as ValueFunc);
         }
         methods
     }
 }
-pub(super) fn append_values(to:&mut Values,from:Values)->RenderResult<()>{
-    for(key,values)in from{let current=to.entry(key).or_insert_with(||Value::List(Vec::new().into()));
-        let(Value::List(old),Value::List(new))=(current,values)else{return Err(error("invalid form map state"));};
-        if old.len()+new.len()>16_384{return Err(error("too many form values"));}let mut values=old.to_vec();values.extend(new.iter().cloned());*old=values.into();
+pub(super) fn append_values<K:Ord>(to:&mut BTreeMap<K,Value>,from:BTreeMap<K,Value>)->RenderResult<()>{
+    for(key,new)in from{
+        let current=to.entry(key).or_insert_with(||Value::Slice(gotmpl::TypedSlice::nil("[]string")));
+        let list=|v:&Value|->RenderResult<Vec<Value>>{match v{Value::Slice(s)=>Ok(s.iter().collect()),Value::List(v)=>Ok(v.to_vec()),_=>Err(error("invalid form map state"))}};
+        let mut values=list(current)?;let new=list(&new)?;
+        if values.len()+new.len()>16_384{return Err(error("too many form values"));}
+        values.extend(new);*current=Value::Slice(gotmpl::TypedSlice::values("[]string",Some(values.into()))?);
     }
     if to.len()>16_384{return Err(error("too many form keys"));}Ok(())
 }
-fn escape_error(input:&str)->Option<String>{
-    let bytes=input.as_bytes();for(i,byte)in bytes.iter().enumerate(){if *byte==b'%'&&(i+2>=bytes.len()||!bytes[i+1].is_ascii_hexdigit()||!bytes[i+2].is_ascii_hexdigit()){
-        let end=(i+3).min(bytes.len());let bad=String::from_utf8_lossy(&bytes[i..end]);return Some(format!("invalid URL escape {}",serde_json::to_string(&bad).unwrap_or_default()));
-    }}None
+fn escape_error(bytes:&[u8])->RenderResult<Option<String>>{
+    for(i,byte)in bytes.iter().enumerate(){if *byte==b'%'&&(i+2>=bytes.len()||!bytes[i+1].is_ascii_hexdigit()||!bytes[i+2].is_ascii_hexdigit()){
+        return Ok(Some(format!("invalid URL escape {}",gotmpl::quote_go_string(&bytes[i..(i+3).min(bytes.len())],false)?)))
+    }}Ok(None)
 }
-pub(super) fn parse_query(raw:&str,control:Option<&Arc<Control>>)->RenderResult<(Values,Option<String>)>{
-    if raw.bytes().filter(|b|*b==b'&').count()+1>10_000{return Ok((Values::new(),Some("number of URL query parameters exceeded limit".into())));}
-    let mut values=Values::new();let mut failure=None;
-    for segment in raw.as_bytes().split(|b|*b==b'&').filter(|part|!part.is_empty()){
+pub(super) fn parse_query(raw:&[u8],control:Option<&Arc<Control>>)->RenderResult<(Values,Option<String>)>{
+    if raw.iter().filter(|b|**b==b'&').count()+1>10_000{return Ok((Values::new(),Some("number of URL query parameters exceeded limit".into())));}
+    let mut pending=BTreeMap::<gotmpl::GoKey,Vec<Value>>::new();let mut failure=None;
+    for segment in raw.split(|b|*b==b'&').filter(|part|!part.is_empty()){
         if segment.contains(&b';'){failure=Some("invalid semicolon separator in query".into());continue;}
-        let segment_text=std::str::from_utf8(segment).map_err(|_|error("form contains unrepresentable byte string"))?;
-        let Some((key,value))=crate::http_runtime::query_match::query_pair(segment)else{if failure.is_none(){failure=escape_error(segment_text.split_once('=').map_or(segment_text,|(key,_)|key)).or_else(||escape_error(segment_text.split_once('=').map_or("",|(_,value)|value)));}continue;};
-        let key=std::str::from_utf8(&key).map_err(|_|error("form key contains unrepresentable byte string"))?;let value=std::str::from_utf8(&value).map_err(|_|error("form value contains unrepresentable byte string"))?;
-        if let Some(control)=control{control.charge(1)?;control.reserve_host_bytes(key.len()+value.len()+128)?;}
-        let entry=values.entry(Arc::from(key)).or_insert_with(||Value::List(Vec::new().into()));
-        if let Value::List(values)=entry{let mut next=values.to_vec();next.push(string(value));*values=next.into();}
+        let Some((key,value))=crate::http_runtime::query_match::query_pair(segment)else{
+            if failure.is_none(){let at=segment.iter().position(|b|*b==b'=');let(key,value)=at.map_or((segment,&[][..]),|i|(&segment[..i],&segment[i+1..]));failure=escape_error(key)?.or(escape_error(value)?);}
+            continue;
+        };
+        if let Some(control)=control{control.charge(1)?;control.reserve_host_bytes(key.len()+value.len()+256)?;}
+        let key=gotmpl::GoKey::from_bytes(key.into_owned());let value=Value::from_go_bytes(value.into_owned());
+        let entries=pending.entry(key).or_default();entries.try_reserve(1).map_err(|_|error("form value allocation failed"))?;entries.push(value);
     }
+    let mut values=Values::new();
+    for(key,entries)in pending{values.insert(key,Value::Slice(gotmpl::TypedSlice::values("[]string",Some(entries.into()))?));}
     Ok((values,failure))
 }
 pub(super) fn error_value(message:String)->Value{

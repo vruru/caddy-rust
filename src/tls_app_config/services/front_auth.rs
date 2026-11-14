@@ -3,6 +3,23 @@ use super::*;
 use crate::tls_policy::prepared_auth::{AuthBudget,AuthInputs,RetainedAuth,ResolvedFrontCa,AuthSources};
 impl CertificateServices{
     #[cfg(feature="native-run")]
+    async fn leaf_storage_inputs(&self,raw:&crate::tls_policy::ClientAuth,cancel:CancellationToken)->Result<crate::tls_policy::leaf_sources::StorageInputs>{
+        let mut out=Vec::new();
+        for(gi,verifier)in raw.verifiers.iter().enumerate(){
+            if let Some(loaders)=verifier.get("leaf_certs_loaders").and_then(serde_json::Value::as_array){
+                for(li,loader)in loaders.iter().enumerate(){
+                    if loader.get("loader").and_then(serde_json::Value::as_str)!=Some("storage"){continue}
+                    let root=super::super::pki_parse::parse_storage(loader.get("storage"),"leaf certificate storage")?
+                        .or_else(||self.plan.storage.clone()).unwrap_or_else(||self.context.paths.default_storage.clone());
+                    let store=self.context.resources.store(root,&self.context.paths,cancel.clone()).await?;
+                    out.try_reserve(1).map_err(|_|crate::cert_transient::ResourceDenied)?;
+                    out.push((gi,li,store.fs.clone()));
+                }
+            }
+        }
+        Ok(out)
+    }
+    #[cfg(feature="native-run")]
     pub(super) async fn begin_front_auth(self:&Arc<Self>,config:crate::http_config::PreparedConfig,cancel:CancellationToken)->Result<crate::http_config::PreparedConfig>{
         let this=self.clone();crate::cert_cpu::run(self.context.resources.cpu.clone(),cancel,move||{
             let mut config=config;
@@ -26,7 +43,8 @@ impl CertificateServices{
             let services=self.clone();let source_budget=budget.clone();
             entry.prepare_from(budget.clone(),self.context.resources.cpu.clone(),cancel.clone(),move|entry,token|async move{
                 let ca=ca.map(|source|entry.binding().map(|binding|ResolvedFrontCa::new(entry.key(),binding,source))).transpose()?;
-                let leaf=crate::tls_policy::leaf_sources::prepare(entry,services.context.paths.cwd.clone(),services.context.resources.io.clone(),services.context.resources.cpu.clone(),source_budget,token).await?;
+                let storage=services.leaf_storage_inputs(entry.raw(),token.clone()).await?;
+                let leaf=crate::tls_policy::leaf_sources::prepare(entry,services.context.paths.cwd.clone(),services.context.resources.io.clone(),services.context.resources.cpu.clone(),source_budget,token,storage).await?;
                 Ok(AuthSources{ca,leaf})
             }).await?;
         }}

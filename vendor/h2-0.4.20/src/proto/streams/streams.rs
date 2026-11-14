@@ -279,6 +279,7 @@ where
         use http::Method;
 
         let protocol = request.extensions_mut().remove::<Protocol>();
+        let head_completion=request.extensions_mut().remove::<crate::ext::NativeRequestHead>().map(|value|value.0.into_owner());
         let send_completion = request
             .extensions_mut()
             .remove::<crate::ext::SendCompletion>()
@@ -329,6 +330,7 @@ where
         // CONNECT leaves the data stream open for tunnel bytes after its
         // request headers; those future tunnel bytes are not the HTTP request
         // body and must not delay the response-header clock.
+        stream.send_head_completion=head_completion;
         stream.send_completion = send_completion.map(|completion| {
             let boundary = if *request.method() == Method::CONNECT {
                 super::stream::SendBoundary::ConnectRequestHeaders

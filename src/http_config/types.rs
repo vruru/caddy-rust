@@ -130,6 +130,7 @@ pub(crate) enum Handler {
         cache: Option<std::sync::Arc<crate::http_runtime::auth_cache::AuthCache>>,
     },
     FileServer {
+        fs: String,
         status: String,
         root: Option<String>,
         hide: Vec<String>,
@@ -182,6 +183,8 @@ pub(crate) struct Account {
 
 #[derive(Clone)]
 pub(crate) struct ProxyConfig {
+    pub(crate) transport:std::sync::Arc<super::proxy_transport::TransportOptions>,
+    pub(crate) handler:std::sync::Arc<super::proxy_handler::HandlerOptions>,
     pub(crate) rewrite: Option<std::sync::Arc<RewritePlan>>,
     pub(crate) ext: std::sync::Arc<super::proxy_ext::ProxyExt>,
     pub(crate) upstreams: Vec<crate::http_runtime::proxy_policy::Upstream>,

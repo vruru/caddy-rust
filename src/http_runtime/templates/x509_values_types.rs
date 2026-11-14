@@ -581,11 +581,10 @@ fn format_net(object: &Object, verb: char, format: &gotmpl::HostFormat) -> Rende
 
 pub(super) fn time_value(factory: &Arc<Factory>, seconds: i64, nanos: u32) -> RenderResult<Value> {
     factory.reserve(16384)?;
-    let stamp = chrono::DateTime::from_timestamp(seconds, nanos)
-        .ok_or_else(|| error("X.509 time outside supported range"))?;
-    let text = stamp.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string();
-    super::super::super::super::sprig::dates::yaml_timestamp(&text)?
-        .ok_or_else(|| error("X.509 time conversion failed"))
+    super::super::super::super::sprig::dates::utc_time(seconds,nanos)
+}
+pub(super)fn addressable_time(factory:&Arc<Factory>,seconds:i64,nanos:u32)->RenderResult<Value>{
+    super::super::super::super::sprig::dates::addressable_time(seconds,nanos,&factory.owner()?)
 }
 pub(super) fn name(factory: &Arc<Factory>, name: &Name) -> RenderResult<Value> {
     factory.reserve(name.names.len() * 2048 + name.string().len() * 4 + 8192)?;

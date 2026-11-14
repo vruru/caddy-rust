@@ -73,6 +73,7 @@ struct Plan {
     user_agent: Option<HeaderValue>,
     body: Bytes,
     sni: Option<String>,
+    proxy:Option<String>,
 }
 
 struct Verdict {
@@ -405,6 +406,7 @@ impl HttpProbe {
             user_agent,
             body,
             sni,
+            proxy:match &self.config.transport.forward_proxy{crate::http_config::proxy_transport::NetworkProxy::Url(raw)=>Some(expand(raw,true,lookup)?),_=>None},
         })
     }
 
@@ -608,11 +610,15 @@ impl HttpProbe {
         }
         let unix_path=super::http_dial::unix_path(&p.dial).map_err(|e|e.to_string())?;
         let (family,address)=if unix_path.is_some(){(super::http_dial::Family::Any,"localhost:0")}else{super::http_dial::Family::parse(&p.dial).map_err(|e|e.to_string())?};
-        let client = self
-            .client
-            .client_for(&format!("{}://{}", url.scheme, address),family,false,sni,unix_path,&self.resources.proxy_client_cache_bytes,None,self.resources.proxy_dial_dns.clone())
-            .map_err(|e| format!("upstream client: {e}"))?;
-        let resp = client.request(req).await.map_err(|e| error_chain(&e))?;
+        let dial:Uri=format!("{}://{}",url.scheme,address).parse().map_err(|e: http::uri::InvalidUri|e.to_string())?;
+        if self.config.transport.http3{return self.client.h3_fetch(&dial,family,sni,req,None,&self.resources,false).await.map(|r|{let gzip=gzip_req&&r.headers().get(header::CONTENT_ENCODING).is_some_and(|v|v.as_bytes().eq_ignore_ascii_case(b"gzip"));(r,gzip)}).map_err(|e|e.to_string())}
+        let forward=self.client.forward_route(&dial,p.proxy.as_deref()).map_err(|e|e.to_string())?;
+        if forward.as_ref().is_some_and(|r|r.kind!=super::proxy_transport::ProxyKind::Socks)&&url.scheme=="http"{
+            let mut parts=req.uri().clone().into_parts();parts.authority=dial.authority().cloned();*req.uri_mut()=Uri::from_parts(parts).map_err(|e|e.to_string())?;
+            if let Some(auth)=forward.as_ref().and_then(|r|r.auth.clone()){req.headers_mut().insert(header::PROXY_AUTHORIZATION,auth);}
+        }
+        let client=self.client.client_for(&dial.to_string(),family,false,sni,unix_path,&self.resources.proxy_client_cache_bytes,None,self.resources.proxy_dial_dns.clone(),None,forward).map_err(|e|format!("upstream client: {e}"))?;
+        let resp=client.request(req).await.map_err(|e|error_chain(&e))?;
         let gzip = gzip_req
             && resp
                 .headers()

@@ -65,6 +65,7 @@ use physical_ocsp::physical_ocsp_key;
 mod on_demand;
 #[path = "services/solver.rs"]
 mod solver;
+#[path="services/ech.rs"]mod ech;
 
 pub struct PrepareContext {
     pub events: Option<Arc<crate::events::EventsApp>>,
@@ -83,6 +84,7 @@ pub struct PrepareContext {
 /// Opaque, in-memory rollback capability; never constructible from JSON.
 #[derive(Clone)]
 pub struct RetainedCertificates {
+    ech:Option<Arc<super::ech::Snapshot>>,
     outgoing_trust:Option<Arc<outgoing_trust::Retained>>,
     client_auth:Option<Arc<crate::tls_policy::prepared_auth::RetainedAuth>>,
     issuer_values:Option<Arc<super::issuer_values::Retained>>,
@@ -252,6 +254,7 @@ struct State {
 }
 
 pub struct CertificateServices {
+    ech:OnceCell<Option<Arc<super::ech::Runtime>>>,
     #[cfg(feature="native-run")]
     outgoing_tls:Option<Arc<crate::outgoing_tls::Scope>>,
     ssl_verify:Arc<native_ssl_tls::VerificationScope>,
@@ -350,6 +353,7 @@ impl CertificateServices {
         let plan_memory=crate::cert_transient::reserve(std::mem::size_of::<CertificatePlan>()+64)?;
         let plan=Arc::new(plan);
         let this = Arc::new(Self {
+            ech:OnceCell::new(),
             #[cfg(feature="native-run")]
             outgoing_tls,
             ssl_verify:native_ssl_tls::VerificationScope::new(),
@@ -630,6 +634,7 @@ impl CertificateServices {
         );
         let state = self.state.lock().await;
         Ok(RetainedCertificates {
+            ech:self.ech.get().and_then(|e|e.as_ref()).map(|e|e.current()),
             outgoing_trust:self.outgoing_accepted.get().cloned().flatten(),
             client_auth:self.client_auth_accepted.get().cloned().flatten(),
             issuer_roots:super::issuer_roots::retain(&self.plan,&crate::tls_policy::prepared_auth::AuthBudget::Root(self.context.resources.external_bytes.clone()))?,
@@ -745,6 +750,7 @@ impl CertificateServices {
             Ok::<_,anyhow::Error>(explicit)
         }).await?;
         if let Some(retained)=&self.restore{super::issuer_roots::restore(&self.plan,&retained.issuer_roots)?;}else{super::issuer_roots::prepare_all(&self.plan,&self.context,cancel.clone()).await?;}
+        self.prepare_ech(cancel.clone()).await?;
         self.prepare_permission(cancel.clone()).await?;
         if let Some(retained) = &self.restore {
             self.context.leaf_guard.key_deny().require_loaded()?;

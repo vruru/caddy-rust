@@ -56,7 +56,7 @@ mod send_completion;
 #[cfg(all(feature = "http1", feature = "client"))]
 pub(crate) use send_completion::SendCompletionOwner;
 #[cfg(any(feature = "http2", all(feature = "http1", feature = "client")))]
-pub use send_completion::{SendCompletion, SendOutcome};
+pub use send_completion::{SendCompletion, SendOutcome,NativeRequestHead};
 
 #[cfg(all(feature = "server", any(feature = "http1", feature = "http2")))]
 mod server_informational;
@@ -335,3 +335,8 @@ mod encoding_budget;
 pub use encoding_budget::NativeEncodingBudget;
 #[cfg(feature="http1")]
 pub(crate) use encoding_budget::BufferBudget;
+
+#[cfg(all(feature="server",feature="http1"))]
+mod native_request_target;
+#[cfg(all(feature="server",feature="http1"))]
+pub use native_request_target::NativeRequestTarget;

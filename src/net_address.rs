@@ -29,6 +29,7 @@ fn socket_host(address: SocketAddr) -> String {
 pub enum NetAddress {
     Socket { address: SocketAddr, datagram: bool },
     Unix { path: Arc<[u8]>, datagram: bool },
+    UnixPacket { path:Arc<[u8]> },
 }
 impl From<SocketAddr> for NetAddress {
     fn from(address: SocketAddr) -> Self {
@@ -55,6 +56,7 @@ impl NetAddress {
                 datagram: false, ..
             } => "unix",
             Self::Unix { datagram: true, .. } => "unixgram",
+            Self::UnixPacket {..}=>"unixpacket",
         }
     }
     pub fn text(&self) -> Cow<'_, str> {
@@ -62,12 +64,12 @@ impl NetAddress {
             Self::Socket { address, .. } => {
                 Cow::Owned(canonical_socket(*address).to_string())
             }
-            Self::Unix { path, .. } => String::from_utf8_lossy(path),
+            Self::Unix { path, .. } | Self::UnixPacket{path} => String::from_utf8_lossy(path),
         }
     }
     pub fn raw_text(&self) -> Cow<'_, [u8]> {
         match self {
-            Self::Unix { path, .. } => Cow::Borrowed(path),
+            Self::Unix { path, .. } | Self::UnixPacket{path} => Cow::Borrowed(path),
             _ => Cow::Owned(self.text().into_owned().into_bytes()),
         }
     }
@@ -77,7 +79,7 @@ impl NetAddress {
                 Cow::Owned(socket_host(*address).into_bytes()),
                 Cow::Owned(address.port().to_string().into_bytes()),
             )),
-            Self::Unix { path, .. } => {
+            Self::Unix { path, .. } | Self::UnixPacket{path} => {
                 let (host, port) = split_host_port_bytes(path)?;
                 Some((Cow::Borrowed(host), Cow::Borrowed(port)))
             }
@@ -108,7 +110,7 @@ impl NetAddress {
     pub fn ip(&self) -> Option<IpAddr> {
         match self {
             Self::Socket { address, .. } => Some(address.ip().to_canonical()),
-            Self::Unix { path, .. } => {
+            Self::Unix { path, .. } | Self::UnixPacket{path} => {
                 let (host, _) = split_host_port_bytes(path)?;
                 let host = std::str::from_utf8(host).ok()?;
                 host.split('%').next()?.parse::<IpAddr>().ok()

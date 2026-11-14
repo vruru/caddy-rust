@@ -45,7 +45,23 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// Upper bound for buffered trailer metadata; exceeding it is an error, never a truncation.
 const MAX_TRAILERS: usize = 64 * 1024;
 
-pub(super) async fn prepare(ctx: &mut Context, mut body: Body, limit: i64) -> Result<ReplaySource> {
+pub(super) async fn prepare(ctx:&mut Context,body:Body,limit:i64)->Result<ReplaySource>{prepare_inner(ctx,body,limit,false).await}
+/// Same actual prefix/spool owner, without turning an upstream read failure
+/// into a client-upload error. Responses are never replayed by this entry.
+pub(super) async fn prepare_response(ctx:&mut Context,body:Body,limit:i64,trailers:bool)->Result<Body>{
+    let body=prepare_inner(ctx,body,limit,true).await?.take_unconsumed().map_err(|_|failure(StatusCode::BAD_GATEWAY))?;
+    // A complete prefix must not advertise exact DATA length when trailing
+    // frames remain. H1 would otherwise select Content-Length and lose them.
+    Ok(if trailers{ResponseTrailers(body).boxed_unsync()}else{body})
+}
+struct ResponseTrailers(Body);
+impl HttpBody for ResponseTrailers{
+    type Data=Bytes;type Error=BoxError;
+    fn poll_frame(mut self:Pin<&mut Self>,cx:&mut task::Context<'_>)->Poll<Option<Result<Frame<Bytes>,BoxError>>>{Pin::new(&mut self.0).poll_frame(cx)}
+    fn is_end_stream(&self)->bool{self.0.is_end_stream()}
+    fn size_hint(&self)->SizeHint{SizeHint::new()}
+}
+async fn prepare_inner(ctx: &mut Context, mut body: Body, limit: i64,response:bool) -> Result<ReplaySource> {
     // Only a confirmed end of stream means "no body"; a zero size hint does not.
     if body.is_end_stream() {
         return Ok(ReplaySource::empty());
@@ -70,7 +86,15 @@ pub(super) async fn prepare(ctx: &mut Context, mut body: Body, limit: i64) -> Re
         let frame = match body.frame().await {
             None => return Ok(acc.full()),
             Some(Ok(frame)) => frame,
-            Some(Err(error)) => return Err(read_failure(&error)),
+            Some(Err(error)) => {
+                if !response{return Err(read_failure(&error))}
+                // Preserve a failed upstream read even with a negative cap.
+                // Go Copy discards it (upstream TODO); treating a truncated
+                // prefix as a complete success can silently shorten framing.
+                let failed=http_body_util::StreamBody::new(futures_util::stream::once(async move{Err::<Frame<Bytes>,BoxError>(error)})).boxed_unsync();
+                let rest=Seq::boxed([Part::Body(failed,None),Part::Body(body,None)].into(),None);
+                return Ok(acc.partial(Bytes::new(),rest))
+            },
         };
         let mut data = match frame.into_data() {
             Ok(data) => data,

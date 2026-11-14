@@ -47,8 +47,9 @@ impl LinkPlan{
         Ok(Some(Arc::new(plan)))
     })
  }
- pub(super) fn dispatch_bytes<'a>(&'a self,target:&'a [u8],method:&'a str,authority:&'a str)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<()>>+Send+'a>>{
+ pub(super) fn dispatch_bytes<'a>(&'a self,target:&'a [u8],method:&'a str,authority:&'a [u8])->std::pin::Pin<Box<dyn std::future::Future<Output=Result<()>>+Send+'a>>{
     Box::pin(async move{
+    let authority=std::str::from_utf8(authority)?;
     // Go rejects framing and authority fields supplied in PushOptions.Header.
     anyhow::ensure!(!["content-length","content-encoding","trailer","te","expect","host"].iter().any(|key|self.headers.contains_key(*key)),"invalid push request header");
     let method=if method.is_empty(){Method::GET}else{Method::from_bytes(method.as_bytes())?};
@@ -96,7 +97,7 @@ impl LinkPlan{
     Ok(())
     })
  }
- pub(super) async fn links(&self,fields:&HeaderMap,authority:&str){
+ pub(super) async fn links(&self,fields:&HeaderMap,authority:&[u8]){
     for field in fields.get_all(http::header::LINK){
         for target in link_targets(field.as_bytes()){if self.dispatch_bytes(target,"",authority).await.is_err(){return}}
     }

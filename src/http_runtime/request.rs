@@ -38,7 +38,7 @@ pub(super) struct Context {
     pub(super) push_sni:Option<String>,
     access_names: Option<Vec<String>>,
     skip_access: bool,
-    pub authority: String,
+    pub authority: Bytes,
     pub client_ip: Option<IpAddr>,
     pub trusted: bool,
     pub drain: CancellationToken,
@@ -84,6 +84,11 @@ enum DeferredResponse {
     Trace(Arc<super::tracing::Observation>),
 }
 impl Context {
+    pub(super) fn proxy_content_length(&self)->i64{self.request_content_length}
+
+    pub(super) fn client_ip_text(&self)->String{
+        self.client_ip.map_or_else(||if self.trusted&&self.peer.raw_text().as_ref()==b"@"{"@".into()}else{String::new()},|ip|ip.to_string())
+    }
     pub(super) fn trace_tunnel(&self)->Option<Arc<super::tracing::Tunnel>>{
         super::tracing::Tunnel::capture(self.deferred.iter().filter_map(|entry|match entry{
             DeferredResponse::Trace(observation)=>Some(observation.clone()),_=>None,
@@ -109,7 +114,7 @@ impl Context {
         let authority = parts
             .uri
             .authority()
-            .map(|a| a.as_str().to_owned())
+            .map(|a|Bytes::copy_from_slice(a.as_str().as_bytes()))
             .unwrap_or_default();
         let origin: Uri = parts
             .uri
@@ -243,46 +248,16 @@ impl Context {
 }
 // Match Caddy's SplitHostPort fallback: an absent or malformed port leaves
 // the original authority intact, and valid bracketed hosts lose the brackets.
-fn strict_host_matches(authority: &str, sni: &str) -> bool {
-    let host = if let Some((host_port, port)) = authority.rsplit_once(':') {
-        let host = if let Some(bracketed) = host_port.strip_prefix('[') {
-            bracketed.strip_suffix(']')
-        } else if !host_port.contains(':') {
-            Some(host_port)
-        } else {
-            None
-        };
-        host.filter(|host| !host.contains(['[', ']']) && !port.contains(['[', ']']))
-            .unwrap_or(authority)
-    } else {
-        authority
-    };
-    host.eq_ignore_ascii_case(sni)
+fn strict_host_matches(authority:&[u8],sni:&str)->bool{
+    let host=if let Some(at)=authority.iter().rposition(|b|*b==b':'){
+        let hp=&authority[..at];let port=&authority[at+1..];
+        let candidate=if hp.first()==Some(&b'['){hp.strip_prefix(b"[").and_then(|h|h.strip_suffix(b"]"))}else if !hp.contains(&b':'){Some(hp)}else{None};
+        candidate.filter(|h|!h.contains(&b'[')&&!h.contains(&b']')&&!port.contains(&b'[')&&!port.contains(&b']')).unwrap_or(authority)
+    }else{authority};host.eq_ignore_ascii_case(sni.as_bytes())
 }
 
-fn request_authority<B>(request: &Request<B>) -> Result<String, ()> {
-    let authority = request
-        .uri()
-        .authority()
-        .map(|a| a.as_str())
-        .or_else(|| {
-            request
-                .headers()
-                .get(http::header::HOST)
-                .and_then(|v| v.to_str().ok())
-        })
-        .unwrap_or_default()
-        .to_owned();
-    if (request.version() != Version::HTTP_10 && authority.is_empty())
-        || authority.contains(['@', '/', '\r', '\n', ' ', '\t'])
-    {
-        return Err(());
-    }
-    if request.headers().get_all(http::header::HOST).iter().count() > 1 {
-        return Err(());
-    }
-    Ok(authority)
-}
+fn request_authority<B>(request:&Request<B>)->Result<Bytes,()>{super::request_host::authority(request)}
+
 pub(super) fn proof_response<B>(
     registry: &ChallengeRegistry,
     request: &Request<B>,
@@ -293,12 +268,13 @@ pub(super) fn proof_response<B>(
 fn proof_for_authority<B>(
     registry: &ChallengeRegistry,
     request: &Request<B>,
-    authority: &str,
+    authority: &[u8],
 ) -> Option<Response<Body>> {
     if let Some(token) = request
         .uri()
         .path()
         .strip_prefix("/.well-known/acme-challenge/")
+        && let Ok(authority)=std::str::from_utf8(authority)
         && let Some(proof) = registry.lookup_http(authority, token)
     {
         let mut response = simple(StatusCode::OK, proof);
@@ -362,12 +338,9 @@ where
         }
         return response;
     }
-    let trusted = server
-        .plan
-        .trusted_proxies
-        .iter()
-        .any(|range| peer.ip().is_some_and(|ip|range.contains(&ip)));
-    let client_ip = peer.ip().map(|ip|client_ip(request.headers(), ip, trusted, &server.plan));
+    let trusted = (server.plan.options.trusted_proxies_unix&&peer.raw_text().as_ref()==b"@")
+        ||server.plan.trusted_proxies.iter().any(|range|peer.ip().is_some_and(|ip|range.contains(&ip)));
+    let client_ip=client_ip(request.headers(),peer.ip(),trusted,&server.plan);
     let access = server
         .plan
         .access_logs
@@ -381,6 +354,7 @@ where
                 &authority,
                 &peer,
                 client_ip,
+                (trusted&&peer.raw_text().as_ref()==b"@").then_some("@"),
                 &inner.resources.access_capture,
             )
         })
@@ -464,8 +438,13 @@ where
             _map_registration_credit:None,
             _rewrite_view_credit:None,
     };
+    let client_facts_setup=if tls&&server.plan.client_text_facts{
+        if let Some(cache)=ctx.req().extensions().get::<Arc<super::client_cert_facts::Cache>>(){
+            cache.get(&ctx.resources).await.map(|_|()).map_err(anyhow::Error::msg)
+        }else{Err(anyhow::anyhow!("TLS client certificate cache missing"))}
+    }else{Ok(())};
     let timeout_setup=if push_seed.is_some(){if let Some(control)=ctx.timeouts.as_deref().and_then(|state|state.control()){ctx.bind_timeout_control(control)}else{Err(anyhow::anyhow!("pushed timeout seed already consumed"))}}else{super::route_timeouts::install_server(&mut ctx,&server.plan)};
-    let result = if timeout_setup.is_err(){
+    let result = if client_facts_setup.is_err()||timeout_setup.is_err(){
         ctx.close_after_response=true;
         Err(budget_failure(&mut ctx,super::resource_budget::BudgetError::Overloaded))
     } else if tls
@@ -876,7 +855,7 @@ fn chained_routes<'a>(
             } else {
                 Next::Routes(&list[index + 1..], next)
             };
-            let observed=if route.metrics {ctx.metrics.as_ref().and_then(|group|group.begin(server.plan.name.clone(),route.trace_modules.first().map_or_else(||Arc::from(""),|m|m.metric_name()),&ctx.authority,ctx.tls,ctx.req().method().as_str()))}else{None};
+            let observed=if route.metrics {ctx.metrics.as_ref().and_then(|group|group.begin_bytes(server.plan.name.clone(),route.trace_modules.first().map_or_else(||Arc::from(""),|m|m.metric_name()),&ctx.authority,ctx.tls,ctx.req().method().as_str()))}else{None};
             if let Some((_,observation))=&observed{ctx.deferred.push(DeferredResponse::Metrics(observation.clone()));}
             let result=handlers(&route.handlers, &route.trace_modules, ctx, inner, server, &after).await;
             if let Err(error)=&result && let Some(group)=&ctx.metrics {
@@ -944,7 +923,7 @@ fn handlers<'a>(
                     // proof/signing request may continue until its real grace
                     // deadline or explicit force closes this business owner.
                     let cancel=ctx.business.generation().hard_stop.child_token();
-                    let response=controller.handle(ctx.request.as_mut().expect("request owned"),&ctx.authority,cancel).await?;
+                    let response=controller.handle(ctx.request.as_mut().expect("request owned"),std::str::from_utf8(&ctx.authority).map_err(|e|failure_with_cause(StatusCode::BAD_REQUEST,e.into()))?,cancel).await?;
                     return Ok(Flow::Response(response));
                 }
                 Handler::Metrics{disable_openmetrics}=>{
@@ -1115,15 +1094,14 @@ fn handlers<'a>(
                     // append the authority, run ordinary operations, retain
                     // the final Host value as the request authority.
                     headers.remove(http::header::HOST);
-                    headers.append(http::header::HOST, HeaderValue::from_str(&ctx.authority)?);
+                    headers.append(http::header::HOST, HeaderValue::from_bytes(&ctx.authority)?);
                     apply_request_headers(&mut headers, request, ctx).await?;
                     super::headers_replace::apply(&mut headers,request,ctx,super::headers_replace::Scope::Request,None).await?;
                     ctx.authority = headers
                         .get_all(http::header::HOST)
                         .iter()
                         .next_back()
-                        .map(|value| value.to_str().map(str::to_owned))
-                        .transpose()?
+                        .map(|value|Bytes::copy_from_slice(value.as_bytes()))
                         .unwrap_or_default();
                     headers.remove(http::header::HOST);
                     *ctx.req_mut().headers_mut() = headers;
@@ -1305,6 +1283,7 @@ fn handlers<'a>(
                     }
                 }
                 Handler::FileServer {
+                    fs,
                     status,
                     root,
                     hide,
@@ -1317,6 +1296,7 @@ fn handlers<'a>(
                     ctx,
                     inner,
                     server,
+                    fs,
                     status,
                     root.as_deref(),
                     hide,
@@ -1434,6 +1414,10 @@ async fn var_match_value(ctx: &mut Context, key: &str) -> Result<String> {
 
 fn rewritten_path(ctx:&Context)->Result<String>{if let Some(p)=super::rewrite_runtime::projection(ctx.req()){Ok(String::from_utf8(p.state.path.clone())?)}else{decoded_path(ctx.req().uri().path_and_query().map_or("",|p|p.raw_path()))}}
 
+fn tls_handshake_complete(ctx:&Context)->bool{
+    ctx.req().extensions().get::<Arc<super::ConnectionSnapshot>>()
+        .and_then(|snapshot|snapshot.metadata().ok()).map_or(ctx.tls,|metadata|metadata.handshake_complete)
+}
 pub(super) fn matches<'a>(
     matcher: &'a Matcher,
     ctx: &'a mut Context,
@@ -1443,7 +1427,7 @@ pub(super) fn matches<'a>(
             Matcher::Expression(plan) => plan.matches(ctx).await?,
             Matcher::Host(hosts) => {
                 let mut found=false;
-                for host in hosts{let host=ctx.expand_text_resolved(host,true).await?;if host_match(&host,&hostname(&ctx.authority)){found=true;break;}}
+                for host in hosts{let host=ctx.expand_text_resolved(host,true).await?;if host_match_bytes(host.as_bytes(),super::request_host::hostname(&ctx.authority)){found=true;break;}}
                 found
             },
             Matcher::Path(patterns) => {
@@ -1469,8 +1453,12 @@ pub(super) fn matches<'a>(
             Matcher::HeaderRegex(rules) => {
                 let mut all = true;
                 for (header, plan) in rules {
+                    if header==http::header::HOST&&std::str::from_utf8(&ctx.authority).is_err(){
+                        let input=ctx.resources.rewrite_bytes.reserve(ctx.authority.len().saturating_mul(2).saturating_add(4096)).map_err(|e|failure_with_cause(StatusCode::SERVICE_UNAVAILABLE,e.into()))?;
+                        if !super::request_regex::matches_bytes(plan,ctx.authority.to_vec(),input,ctx).await?{all=false;break}continue
+                    }
                     let values = if header == http::header::HOST {
-                        vec![ctx.authority.clone()]
+                        vec![String::from_utf8(ctx.authority.to_vec()).expect("valid Host checked above")]
                     } else {
                         let values = ctx
                             .req()
@@ -1511,7 +1499,7 @@ pub(super) fn matches<'a>(
                 let mut all = true;
                 for (name, patterns) in headers {
                     let values = if name.eq_ignore_ascii_case("host") {
-                        vec![ctx.authority.as_bytes()]
+                        vec![ctx.authority.as_ref()]
                     } else {
                         ctx.req()
                             .headers()
@@ -1557,12 +1545,11 @@ pub(super) fn matches<'a>(
                 }
                 matched
             }
-            // All currently admitted TLS requests have completed a handshake.
-            Matcher::Tls(complete) => ctx.tls && *complete != Some(false),
+            Matcher::Tls(complete) => ctx.tls && complete.is_none_or(|expected|expected==tls_handshake_complete(ctx)),
             Matcher::UrlPattern(plan) => plan.matches(ctx).await?,
             Matcher::Not(sets) => !match_sets(sets, ctx).await?,
-            Matcher::RemoteIp(ranges) => ctx.peer.matcher_ip().is_some_and(|ip|ranges.iter().any(|r|r.contains(&ip))),
-            Matcher::ClientIp(ranges) => ctx.client_ip.is_some_and(|ip|ranges.iter().any(|r|r.contains(&ip))),
+            Matcher::RemoteIp(ranges) => {if ctx.tls&&!tls_handshake_complete(ctx){return Err(failure(StatusCode::TOO_EARLY))}ctx.peer.matcher_ip().is_some_and(|ip|ranges.iter().any(|r|r.contains(&ip)))},
+            Matcher::ClientIp(ranges) => {if ctx.tls&&!tls_handshake_complete(ctx){return Err(failure(StatusCode::TOO_EARLY))}ctx.client_ip.is_some_and(|ip|ranges.iter().any(|r|r.contains(&ip)))},
             Matcher::Protocol(protocol) => match protocol.as_str() {
                 "http" => !ctx.tls,
                 "https" => ctx.tls,
@@ -1930,6 +1917,11 @@ pub(super) fn hostname(authority: &str) -> String {
         .map(|v| v.host().trim_end_matches('.').to_ascii_lowercase())
         .unwrap_or_else(|_| authority.trim_end_matches('.').to_ascii_lowercase())
 }
+fn host_match_bytes(pattern:&[u8],host:&[u8])->bool{
+    let host=host.strip_prefix(b"[").unwrap_or(host);let host=host.strip_suffix(b"]").unwrap_or(host);
+    let pattern=pattern.strip_suffix(b".").unwrap_or(pattern);let host=host.strip_suffix(b".").unwrap_or(host);
+    let p=pattern.split(|b|*b==b'.').collect::<Vec<_>>();let h=host.split(|b|*b==b'.').collect::<Vec<_>>();p.len()==h.len()&&p.iter().zip(h).all(|(p,h)|*p==b"*"||p.eq_ignore_ascii_case(h))
+}
 fn host_match(pattern: &str, host: &str) -> bool {
     // Authority::host() retains IPv6 brackets. Caddy's Host matcher removes
     // them after splitting the request authority; matcher patterns stay literal.
@@ -1994,7 +1986,7 @@ pub(super) fn header_value_bytes_pattern(pattern: &[u8], value: &[u8]) -> bool {
         pattern == value
     }
 }
-fn client_ip(headers: &HeaderMap, peer: IpAddr, trusted: bool, server: &ServerConfig) -> IpAddr {
+fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>, trusted: bool, server: &ServerConfig) -> Option<IpAddr> {
     if !trusted {
         return peer;
     }
@@ -2010,7 +2002,7 @@ fn client_ip(headers: &HeaderMap, peer: IpAddr, trusted: bool, server: &ServerCo
                 if let Some(ip) = parse_forwarded_ip(part)
                     && !server.trusted_proxies.iter().any(|r| r.contains(&ip))
                 {
-                    return ip;
+                    return Some(ip);
                 }
             }
         }
@@ -2019,7 +2011,7 @@ fn client_ip(headers: &HeaderMap, peer: IpAddr, trusted: bool, server: &ServerCo
             for value in headers.get_all(name).iter().filter_map(|v| v.to_str().ok()) {
                 for part in value.split(',') {
                     if let Some(ip) = parse_forwarded_ip(part) {
-                        return ip;
+                        return Some(ip);
                     }
                 }
             }

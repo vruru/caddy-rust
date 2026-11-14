@@ -70,7 +70,7 @@ impl SendCompletion {
     /// Transfers a signal clone to the unique transport writer.
     #[doc(hidden)]
     pub fn into_owner(self) -> SendCompletionOwner {
-        SendCompletionOwner(Some(self))
+        SendCompletionOwner(Some(self), None)
     }
 
     /// Reports the HTTP protocol that flushed the observed bytes.
@@ -108,13 +108,21 @@ impl SendCompletion {
 /// The unique producer held by the stream or codec, independent of receivers.
 #[doc(hidden)]
 #[derive(Debug)]
-pub struct SendCompletionOwner(Option<SendCompletion>);
+pub struct SendCompletionOwner(Option<SendCompletion>, Option<SendCompletion>);
 
 impl SendCompletionOwner {
+        /// Join two observations of exactly the same physical write boundary.
+        #[doc(hidden)]
+        pub fn combine(mut self,mut other:Self)->Self{
+            debug_assert!(self.1.is_none()&&other.1.is_none());
+            self.1=other.0.take();self
+        }
+
     /// Resolves the signal after a successful write flush.
     pub fn mark_flushed(mut self, now: Instant, version: http::Version) {
         let completion = self.0.take().expect("live write observation");
         completion.finish(SendOutcome::Flushed(now), Some(version));
+        if let Some(other)=self.1.take(){other.finish(SendOutcome::Flushed(now),Some(version));}
     }
 }
 
@@ -122,6 +130,7 @@ impl Drop for SendCompletionOwner {
     fn drop(&mut self) {
         if let Some(completion) = self.0.take() {
             completion.finish(SendOutcome::Abandoned, None);
+            if let Some(other)=self.1.take(){other.finish(SendOutcome::Abandoned,None);}
         }
     }
 }

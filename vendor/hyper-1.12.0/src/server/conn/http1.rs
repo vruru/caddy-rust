@@ -73,6 +73,7 @@ pub struct Builder {
     h1_parser_config: ParserConfig,
     timer: Time,
     h1_half_close: bool,
+    h1_full_duplex:bool,
     h1_keep_alive: bool,
     h1_obsolete_trailer_folding: bool,
     h1_max_trailer_size: Option<usize>,
@@ -81,6 +82,7 @@ pub struct Builder {
     h1_preserve_header_case: bool,
     h1_max_headers: Option<usize>,
     h1_max_header_size: Option<usize>,
+    native_request_target:bool,
     h1_header_read_timeout: Dur,
     h1_idle_timeout: Dur,
     h1_initial_header_deadline: Option<Instant>,
@@ -245,12 +247,17 @@ where
 // ===== impl Builder =====
 
 impl Builder {
+    /// Opt in to Native HTTP/1 encoded-host and raw request-target facts.
+    /// Default builders keep the ordinary URI parser.
+    pub fn native_request_target(&mut self,enabled:bool)->&mut Self{self.native_request_target=enabled;self}
+
     /// Create a new connection builder.
     pub fn new() -> Self {
         Self {
             h1_parser_config: ParserConfig::default(),
             timer: Time::Empty,
             h1_half_close: false,
+            h1_full_duplex:true,
             h1_keep_alive: true,
             h1_obsolete_trailer_folding: false,
             h1_max_trailer_size: None,
@@ -259,6 +266,7 @@ impl Builder {
             h1_preserve_header_case: false,
             h1_max_headers: None,
             h1_max_header_size: None,
+            native_request_target:false,
             h1_header_read_timeout: Dur::Default(Some(Duration::from_secs(30))),
             h1_idle_timeout: Dur::Default(None),
             h1_initial_header_deadline: None,
@@ -269,6 +277,11 @@ impl Builder {
             informational: None,
         }
     }
+    /// Allow responses while an HTTP/1 request body is still being read.
+    /// False uses a bounded post-handler drain; defaults to the original Hyper
+    /// full-duplex behavior for callers that do not select the Caddy contract.
+    pub fn full_duplex(&mut self,value:bool)->&mut Self{self.h1_full_duplex=value;self}
+
     /// Set whether HTTP/1 connections should support half-closures.
     ///
     /// Clients can chose to shutdown their write-side while waiting
@@ -565,6 +578,7 @@ impl Builder {
         if let Some(max_headers) = self.h1_max_headers {
             conn.set_http1_max_headers(max_headers);
         }
+        conn.set_native_request_target(self.native_request_target);
         if let Some(max_header_size) = self.h1_max_header_size {
             conn.set_http1_max_header_size(max_header_size);
         }
@@ -596,7 +610,8 @@ impl Builder {
             conn.disable_date_header();
         }
         let sd = proto::h1::dispatch::Server::new(service, self.informational);
-        let proto = proto::h1::Dispatcher::new(sd, conn);
+        let mut proto = proto::h1::Dispatcher::new(sd, conn);
+        proto.set_full_duplex(self.h1_full_duplex);
         Connection { conn: proto }
     }
 }

@@ -115,6 +115,7 @@ impl Address{
                 Self::Socket{ip:address.ip().to_canonical().to_string(),port:address.port(),zone:if scope==0{String::new()}else{zone_name(scope)},transport:if datagram{Transport::Quic}else{transport}}
             },
             crate::net_address::NetAddress::Unix{path,datagram}=>Self::Unix{name:path.to_vec(),net:if datagram{"unixgram"}else{"unix"}.into()},
+            crate::net_address::NetAddress::UnixPacket{path}=>Self::Unix{name:path.to_vec(),net:"unixpacket".into()},
         }
     }
     pub fn network(&self)->&str{match self{Self::Socket{transport:Transport::Tcp,..}=>"tcp",Self::Socket{transport:Transport::Quic,..}=>"udp",Self::Unix{net,..}=>net}}

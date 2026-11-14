@@ -255,6 +255,7 @@ struct ManagerInner {
     must_staple: bool,
     reuse_private_keys: bool,
     disable_storage_check: bool,
+    caddy_system_roots: bool,
     lifecycle_events: Option<Arc<crate::events::EventsApp>>,
     store: FsStore,
     registry: ChallengeRegistry,
@@ -914,6 +915,7 @@ impl CertificateManager {
                 must_staple:false,
                 reuse_private_keys:false,
                 disable_storage_check:false,
+                caddy_system_roots:false,
                 lifecycle_events: None,
                 #[cfg(feature="native-run")]
                 outgoing_tls:None,
@@ -939,9 +941,13 @@ impl CertificateManager {
         })
     }
     fn wire_client_owner(&self)->crate::acme_wire::ClientOwner {
-        crate::acme_wire::ClientOwner::new(self.inner.issuer_values_credit.clone(),self.inner.construction_owner.clone())
+        crate::acme_wire::ClientOwner::new(self.inner.issuer_values_credit.clone(),self.inner.construction_owner.clone()).with_system_roots(self.inner.caddy_system_roots)
     }
     fn wire_client_owner_for(&self,issuer:&IssuerState)->crate::acme_wire::ClientOwner{self.wire_client_owner().with_custom_roots(issuer.custom_roots.clone())}
+    pub(crate) fn with_caddy_system_roots(mut self)->Result<Self>{
+        Arc::get_mut(&mut self.inner).ok_or_else(||anyhow!("certificate manager already shared"))?.caddy_system_roots=true;
+        Ok(self)
+    }
     pub(crate) fn with_issuer_custom_roots(mut self,roots:Vec<Option<Arc<crate::tls_app_config::issuer_roots::CustomRoots>>>)->Result<Self>{
         let inner=Arc::get_mut(&mut self.inner).ok_or_else(||anyhow!("certificate manager already shared"))?;
         ensure!(roots.len()==inner.issuers.len(),"ACME root issuer count differs");

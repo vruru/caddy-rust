@@ -104,6 +104,9 @@ impl ConnectionPolicy {
             builder.with_no_client_auth()
         };
         let mut config = builder.with_cert_resolver(resolver);
+        if let Some(path)=self.insecure_secrets_log.as_deref().filter(|p|!p.is_empty()){
+            config.key_log=super::secrets_log::prepare(path)?;
+        }
         config.alpn_protocols = self
             .alpn
             .as_ref()
@@ -146,6 +149,7 @@ impl ConnectionPolicy {
             || self.curves.is_some()
             || self.alpn.is_some()
             || self.drop
+            || self.insecure_secrets_log.as_ref().is_some_and(|p|!p.is_empty())
             || self.client_auth.is_some()
             || self.default_sni.as_ref().is_some_and(|s| !s.is_empty())
             || self.fallback_sni.as_ref().is_some_and(|s| !s.is_empty())

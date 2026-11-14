@@ -247,6 +247,7 @@ pub(super) fn configure(
     cache: &Arc<Shared>,
     slot: Arc<SelectionSlot>,
     policy: &super::PolicyScope,
+    allow_0rtt:bool,
 ) {
     config.max_early_data_size = 0;
     config.max_tls13_tickets = 0;
@@ -264,6 +265,7 @@ pub(super) fn configure(
                 slot,
                 attempts: AtomicU8::new(0),
             });
+            if allow_0rtt{config.max_early_data_size=u32::MAX;}
         }
         #[cfg(feature = "native-run")]
         TicketRuntime::Disabled => {}

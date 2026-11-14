@@ -11,9 +11,15 @@ impl Disk{
     }
 }
 pub(super) enum Backing {Memory(Arc<[u8]>),Disk{disk:Arc<Disk>,offset:u64,shared:bool}}
-pub(super) struct FileHeader {pub filename:String,pub header:HeaderMap,pub size:i64,pub backing:Backing,cached:Mutex<std::sync::Weak<gotmpl::Object>>}
-pub(super) struct Parsed {pub values:Arc<Fields>,pub files:BTreeMap<Arc<str>,Vec<Arc<FileHeader>>>,pub disk:Option<Arc<Disk>>}
-struct Part {headers:HeaderMap,name:String,filename:String,bytes:Vec<u8>}
+pub(super) struct FileHeader {pub filename:Vec<u8>,pub header:HeaderMap,pub size:i64,pub backing:Backing,cached:Mutex<std::sync::Weak<gotmpl::Object>>}
+pub(super) struct Parsed {pub values:Arc<super::forms::Values>,pub files:BTreeMap<gotmpl::GoKey,Vec<Arc<FileHeader>>>,pub disk:Option<Arc<Disk>>}
+struct Part {headers:HeaderMap,name:Vec<u8>,filename:Vec<u8>,bytes:Vec<u8>}
+fn basename(mut raw:&[u8])->Vec<u8>{
+    if raw.is_empty(){return Vec::new()}
+    while raw.ends_with(b"/"){raw=&raw[..raw.len()-1];}
+    if raw.is_empty(){return b"/".to_vec()}
+    raw.rsplit(|b|*b==b'/').next().unwrap_or(raw).to_vec()
+}
 fn line<'a>(body:&'a[u8],cursor:&mut usize)->&'a[u8]{let start=*cursor;let end=body[start..].iter().position(|b|*b==b'\n').map_or(body.len(),|n|start+n+1);*cursor=end;&body[start..end]}
 fn lws(bytes:&[u8])->&[u8]{let start=bytes.iter().position(|b|!matches!(b,b' '|b'\t')).unwrap_or(bytes.len());&bytes[start..]}
 fn boundary_line(line:&[u8],boundary:&[u8],newline:&[u8])->Option<bool>{
@@ -32,9 +38,9 @@ fn qp(bytes:&[u8])->Result<Vec<u8>,String>{
         else{return Err("unexpected EOF".into());}
     }Ok(out)
 }
-fn parts(body:&[u8],boundary:&str,control:Option<&Arc<Control>>)->RenderResult<Result<Vec<Part>,String>>{
+fn parts(body:&[u8],boundary:&[u8],control:Option<&Arc<Control>>)->RenderResult<Result<Vec<Part>,String>>{
     if boundary.is_empty(){return Ok(Err("multipart: boundary is empty".into()));}
-    let delimiter=[b"--".as_slice(),boundary.as_bytes()].concat();let mut cursor=0;let mut newline=b"\r\n".as_slice();let mut found=false;
+    let delimiter=[b"--".as_slice(),boundary].concat();let mut cursor=0;let mut newline=b"\r\n".as_slice();let mut found=false;
     while cursor<body.len(){let next=line(body,&mut cursor);if boundary_line(next,&delimiter,newline)==Some(true){return Ok(Ok(Vec::new()));}
         if boundary_line(next,&delimiter,newline)==Some(false){found=true;break;}
         if boundary_line(next,&delimiter,b"\n")==Some(false){newline=b"\n";found=true;break;}
@@ -59,27 +65,26 @@ fn parts(body:&[u8],boundary:&str,control:Option<&Arc<Control>>)->RenderResult<R
         if headers.get("Content-Transfer-Encoding").is_some_and(|value|value.as_bytes().eq_ignore_ascii_case(b"quoted-printable")){
             headers.remove("Content-Transfer-Encoding");bytes=match qp(&bytes){Ok(bytes)=>bytes,Err(message)=>return Ok(Err(message))};
         }
-        let disposition=super::media_type::parse(headers.get(header::CONTENT_DISPOSITION).and_then(|value|value.to_str().ok()).unwrap_or_default());
-        let mut name=String::new();let mut filename=String::new();
-        if disposition.error.is_none()&&disposition.media_type=="form-data"{if let Some(params)=disposition.params{name=params.get("name").cloned().unwrap_or_default();filename=params.get("filename").map(|name|std::path::Path::new(name).file_name().map_or_else(||name.clone(),|name|name.to_string_lossy().into_owned())).unwrap_or_default();}}
+        let disposition=super::media_type::parse(headers.get(header::CONTENT_DISPOSITION).map_or(&[][..],|value|value.as_bytes()));
+        let mut name=Vec::new();let mut filename=Vec::new();
+        if disposition.error.is_none()&&disposition.media_type=="form-data"{if let Some(params)=disposition.params{name=params.get("name").cloned().unwrap_or_default();filename=params.get("filename").map(|name|basename(name)).unwrap_or_default();}}
         if let Some(control)=control{control.reserve_host_bytes(bytes.len()+name.len()+filename.len()+headers.iter().map(|(key,value)|key.as_str().len()+value.as_bytes().len()+96).sum::<usize>()+192)?;}
         output.push(Part{headers,name,filename,bytes});if final_boundary{break;}
     }Ok(Ok(output))
 }
-pub(super) fn read_form(body:&[u8],boundary:&str,max_memory:i64,control:Option<&Arc<Control>>)->RenderResult<Result<Arc<Parsed>,String>>{
+pub(super) fn read_form(body:&[u8],boundary:&[u8],max_memory:i64,control:Option<&Arc<Control>>)->RenderResult<Result<Arc<Parsed>,String>>{
     if let Some(control)=control{control.reserve_host_bytes(body.len().saturating_mul(16))?;}
     let parts=match parts(body,boundary,control)?{Ok(parts)=>parts,Err(message)=>return Ok(Err(message))};
     let mut max_file=max_memory.max(0);if max_file==i64::MAX{max_file-=1;}
     let mut memory=max_memory.max(0).checked_add(10<<20).unwrap_or(i64::MAX);
-    let mut headers_remaining=10_000usize;let mut values=Fields::new();let mut files:BTreeMap<Arc<str>,Vec<(String,HeaderMap,i64,Option<Arc<[u8]>>,u64)>>=BTreeMap::new();
+    let mut headers_remaining=10_000usize;let mut values=super::forms::Values::new();let mut files:BTreeMap<gotmpl::GoKey,Vec<(Vec<u8>,HeaderMap,i64,Option<Arc<[u8]>>,u64)>>=BTreeMap::new();
     let mut disk_file:Option<tempfile::NamedTempFile>=None;let mut disk_count=0;let mut disk_offset=0u64;
     for part in parts{
         if part.name.is_empty(){continue;}
         memory=memory.saturating_sub(part.name.len()as i64+200);
         if part.filename.is_empty(){
             memory=memory.saturating_sub(part.bytes.len()as i64);if memory<0{return Ok(Err("multipart: message too large".into()));}
-            let text=std::str::from_utf8(&part.bytes).map_err(|_|error("multipart value contains unrepresentable byte string"))?;
-            super::forms::append_values(&mut values,Fields::from([(part.name.into(),gotmpl::Value::List(vec![string(text)].into()))]))?;continue;
+            super::forms::append_values(&mut values,super::forms::Values::from([(gotmpl::GoKey::from_bytes(part.name),gotmpl::Value::Slice(gotmpl::TypedSlice::values("[]string",Some(vec![gotmpl::Value::from_go_bytes(part.bytes)].into()))?))]))?;continue;
         }
         let header_size=400+part.headers.keys().map(|key|key.as_str().len()+200+part.headers.get_all(key).iter().map(|value|value.as_bytes().len()).sum::<usize>()).sum::<usize>();
         memory=memory.saturating_sub((header_size+200+100)as i64);if memory<0||part.headers.len()>headers_remaining{return Ok(Err("multipart: message too large".into()));}headers_remaining-=part.headers.len();
@@ -88,7 +93,7 @@ pub(super) fn read_form(body:&[u8],boundary:&str,max_memory:i64,control:Option<&
             if let Some(file)=disk_file.as_mut(){file.write_all(&part.bytes).map_err(|_|error("writing multipart temporary file failed"))?;}
             disk_count+=1;let offset=disk_offset;disk_offset=disk_offset.saturating_add(size as u64);(offset,None)
         }else{max_file-=size;memory-=size;if memory<0{return Ok(Err("multipart: message too large".into()));}(0,Some(Arc::from(part.bytes)))};
-        files.entry(part.name.into()).or_default().push((part.filename,part.headers,size,content,offset));
+        files.entry(gotmpl::GoKey::from_bytes(part.name)).or_default().push((part.filename,part.headers,size,content,offset));
     }
     let disk=disk_file.map(|file|{let path=file.path().to_owned();Arc::new(Disk{path,temporary:Mutex::new(Some(file.into_temp_path()))})});
     let mut parsed=BTreeMap::new();
@@ -100,16 +105,16 @@ pub(super) fn read_form(body:&[u8],boundary:&str,max_memory:i64,control:Option<&
 }
 
 pub(super) fn files_value(parsed:&Parsed)->RenderResult<gotmpl::Value>{
-    let mut files=Fields::new();
-    for(key,entries)in &parsed.files{let values=entries.iter().map(file_header_value).collect::<RenderResult<Vec<_>>>()?;files.insert(key.clone(),gotmpl::Value::List(values.into()));}
-    Ok(super::data::typed_map("map[string][]*multipart.FileHeader",Arc::new(files),gotmpl::Value::List(Vec::new().into())))
+    let mut files=super::forms::Values::new();
+    for(key,entries)in &parsed.files{let values=entries.iter().map(file_header_value).collect::<RenderResult<Vec<_>>>()?;files.insert(key.clone(),gotmpl::Value::Slice(gotmpl::TypedSlice::values("[]*multipart.FileHeader",Some(values.into()))?));}
+    Ok(super::data::typed_keyed_map("map[string][]*multipart.FileHeader",Arc::new(files),gotmpl::Value::Slice(gotmpl::TypedSlice::nil("[]*multipart.FileHeader"))))
 }
 fn file_header_value(header:&Arc<FileHeader>)->RenderResult<gotmpl::Value>{
     use gotmpl::{Object,Value,ValueFunc};
     let mut cached=lock(&header.cached)?;if let Some(value)=cached.upgrade(){return Ok(Value::Object(value));}
     let captured=header.clone();let mut headers=super::data::header_value(Arc::new(Mutex::new(header.header.clone())),false);
     if let Value::Object(object)=&mut headers{if let Some(object)=Arc::get_mut(object){if let Some(map)=object.map_view.as_mut(){map.type_name="textproto.MIMEHeader";}}}
-    let object=Arc::new(Object{go_type:Some("*multipart.FileHeader"),field_order:Some(["Filename","Header","Size"].map(Arc::from).into()),fields:Fields::from([("Filename".into(),string(header.filename.clone())),("Header".into(),headers),("Size".into(),Value::Int64(header.size))]),methods:BTreeMap::from([("Open".into(),Arc::new(move|args:&[Value]|{super::arity(args,0,0)?;open_value(&captured)})as ValueFunc)]),..Object::default()});
+    let object=Arc::new(Object{go_type:Some("*multipart.FileHeader"),field_order:Some(["Filename","Header","Size"].map(Arc::from).into()),fields:Fields::from([("Filename".into(),Value::from_go_bytes(header.filename.clone())),("Header".into(),headers),("Size".into(),Value::Int64(header.size))]),methods:BTreeMap::from([("Open".into(),Arc::new(move|args:&[Value]|{super::arity(args,0,0)?;open_value(&captured)})as ValueFunc)]),..Object::default()});
     *cached=Arc::downgrade(&object);Ok(Value::Object(object))
 }
 struct FileHandle {position:i64,size:i64,closed:bool,file:Option<std::fs::File>,path:Option<std::path::PathBuf>,_memory:Option<Arc<[u8]>>,_offset:u64,is_disk:bool}

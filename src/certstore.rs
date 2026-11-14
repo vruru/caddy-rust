@@ -728,6 +728,16 @@ impl FsStore {
             Ok(pinned)
         }).await
     }
+    /// Explicit offline archive import. Call only with exclusive offline
+    /// ownership of the storage root; this does not make a multi-key archive
+    /// an atomic certificate transaction. Runtime writers must use the scoped
+    /// transaction APIs. Imported material is revalidated before runtime use.
+    pub async fn import_offline_value(&self,key:&str,bytes:&[u8])->Result<()>{
+        ensure!(self.scope.is_none(),"offline import cannot use a runtime transaction scope");
+        ensure!(key!="locks"&&!key.starts_with("locks/"),"archive cannot import live storage locks");
+        let key=key.to_owned();let bytes=Zeroizing::new(bytes.to_vec());
+        self.blocking(move|core|core.data.store(&key,&bytes)).await
+    }
     pub async fn store(&self, key: &str, bytes: &[u8]) -> Result<()> {
         ensure!(
             key != "locks" && !key.starts_with("locks/"),

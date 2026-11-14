@@ -629,8 +629,9 @@ impl Connection {
     /// This server-side API is intended for HTTP request cancellation while
     /// the application is not writing. It never finishes or resets a stream.
     /// Like `SendStream::stopped`, completion means peer STOP_SENDING, an
-    /// acknowledged local FIN, or a lost connection. Only established server
-    /// connections are accepted: this observer does not authorize early data.
+    /// acknowledged local FIN, or a lost connection. Only server peer-bidi streams on an established or actual early-key
+    /// connection are accepted. The application must independently authorize
+    /// early dispatch; this observer never completes a TLS handshake.
     #[cfg(feature = "native-stream-observer")]
     pub fn observe_send_stopped(
         &self,
@@ -641,11 +642,11 @@ impl Connection {
     > {
         {
             let state = self.0.state.lock("observe_send_stopped::validate");
-            if !state.connected || state.inner.side() != Side::Server
+            if (!state.connected && !state.inner.has_0rtt()) || state.inner.side() != Side::Server
                 || stream.dir() != Dir::Bi || stream.initiator() != Side::Client
             {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
-                    "stream observation requires an established server peer-bidi stream"));
+                    "stream observation requires an established or early-key server peer-bidi stream"));
             }
         }
         let conn = self.0.clone();
@@ -688,8 +689,8 @@ impl Connection {
     #[cfg(feature="native-stream-observer")]
     fn observe_stream_transmit_owned(&self,stream:StreamId,pool:Option<&native_write_policy::Pool>)->Result<StreamTransmitObservation,io::Error>{
         let mut connection=self.0.state.lock("observe_stream_transmit");
-        if !connection.connected||connection.inner.side()!=Side::Server||stream.dir()!=Dir::Bi||stream.initiator()!=Side::Client {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,"transmit observation requires an established server peer-bidi stream"));
+        if (!connection.connected&&!connection.inner.has_0rtt())||connection.inner.side()!=Side::Server||stream.dir()!=Dir::Bi||stream.initiator()!=Side::Client {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,"transmit observation requires an established or early-key server peer-bidi stream"));
         }
         let table=&mut connection.transmit_observers;
         table.prune();
@@ -721,7 +722,7 @@ impl Connection {
     pub fn reset_observed_stream(&self,stream:StreamId,code:VarInt)->Result<(),io::Error> {
         let (wake,result)={
             let mut state=self.0.state.lock("reset_observed_stream");
-            if !state.connected || state.inner.side()!=Side::Server || stream.dir()!=Dir::Bi || stream.initiator()!=Side::Client {
+            if (!state.connected && !state.inner.has_0rtt()) || state.inner.side()!=Side::Server || stream.dir()!=Dir::Bi || stream.initiator()!=Side::Client {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput,"not a server response stream"));
             }
             let result=state.inner.send_stream(stream).reset(code)
@@ -742,7 +743,7 @@ impl Connection {
     pub fn stop_receive_stream(&self, stream: StreamId, code: VarInt) -> Result<(), io::Error> {
         let (status, reader, driver) = {
             let mut state = self.0.state.lock("stop_receive_stream");
-            if !state.connected || state.inner.side() != Side::Server
+            if (!state.connected && !state.inner.has_0rtt()) || state.inner.side() != Side::Server
                 || stream.dir() != Dir::Bi || stream.initiator() != Side::Client
             {
                 (0u8, None, None)
@@ -759,7 +760,7 @@ impl Connection {
             1 => Ok(()),
             2 => Err(io::Error::new(io::ErrorKind::NotFound, "receive stream already closed or stopped")),
             _ => Err(io::Error::new(io::ErrorKind::InvalidInput,
-                "receive stop requires an established server peer-bidi stream")),
+                "receive stop requires an established or early-key server peer-bidi stream")),
         }
     }
 
@@ -881,6 +882,13 @@ impl Connection {
             .inner
             .datagrams()
             .send_buffer_space()
+    }
+
+    /// Whether the real connection currently has early-data packet keys.
+    /// This does not imply a completed or authenticated TLS handshake.
+    #[cfg(feature="native-stream-observer")]
+    pub fn has_early_data_keys(&self) -> bool {
+        self.0.state.lock("has_early_data_keys").inner.has_0rtt()
     }
 
     /// The side of the connection (client or server)

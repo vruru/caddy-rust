@@ -128,6 +128,11 @@ impl Group {
             _lease: lease,
         }))
     }
+    /// Byte-valued HTTP Host facts cannot be put into UTF-8-only metric labels.
+    /// Drop that observation rather than altering the business request.
+    pub fn begin_bytes(&self,server:Arc<str>,handler:Arc<str>,host:&[u8],tls:bool,method:&str)->Option<(usize,Arc<Observation>)>{
+        match std::str::from_utf8(host){Ok(host)=>self.begin(server,handler,host,tls,method),Err(_)=>{self.registry.process.dropped.fetch_add(1,Ordering::Relaxed);None}}
+    }
     pub fn begin(
         &self,
         server: Arc<str>,

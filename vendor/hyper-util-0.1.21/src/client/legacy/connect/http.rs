@@ -69,6 +69,7 @@ struct Config {
     enforce_http: bool,
     happy_eyeballs_timeout: Option<Duration>,
     tcp_keepalive_config: TcpKeepaliveConfig,
+    native_local_address: Option<SocketAddr>,
     local_address_ipv4: Option<Ipv4Addr>,
     local_address_ipv6: Option<Ipv6Addr>,
     nodelay: bool,
@@ -227,6 +228,7 @@ impl<R> HttpConnector<R> {
                 enforce_http: true,
                 happy_eyeballs_timeout: Some(Duration::from_millis(300)),
                 tcp_keepalive_config: TcpKeepaliveConfig::default(),
+                native_local_address:None,
                 local_address_ipv4: None,
                 local_address_ipv6: None,
                 nodelay: false,
@@ -313,6 +315,13 @@ impl<R> HttpConnector<R> {
     ///
     /// Default is `None`.
     #[inline]
+    /// Bind the concrete local TCP endpoint, preserving port and IPv6 scope.
+    pub fn set_native_local_address(&mut self,address:Option<SocketAddr>){
+        self.set_local_address(address.map(|a|a.ip()));
+        self.config_mut().native_local_address=address;
+    }
+
+    /// Set the local interface IP used by new TCP connections.
     pub fn set_local_address(&mut self, addr: Option<IpAddr>) {
         let (v4, v6) = match addr {
             Some(IpAddr::V4(a)) => (Some(a), None),
@@ -932,13 +941,11 @@ fn connect(
         }
     }
 
-    bind_local_address(
-        &socket,
-        addr,
-        &config.local_address_ipv4,
-        &config.local_address_ipv6,
-    )
-    .map_err(ConnectError::m("tcp bind local error"))?;
+    if let Some(mut local)=config.native_local_address{
+        if local.ip().is_unspecified()&&local.is_ipv4()!=addr.is_ipv4(){local=SocketAddr::new(if addr.is_ipv4(){std::net::Ipv4Addr::UNSPECIFIED.into()}else{std::net::Ipv6Addr::UNSPECIFIED.into()},local.port());}
+        socket.bind(&local.into()).map_err(ConnectError::m("tcp bind local error"))?;
+    }else{bind_local_address(&socket,addr,&config.local_address_ipv4,&config.local_address_ipv6)
+        .map_err(ConnectError::m("tcp bind local error"))?;}
 
     // Convert the `Socket` to a Tokio `TcpSocket`.
     let socket = TcpSocket::from_std_stream(socket.into());

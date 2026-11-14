@@ -331,6 +331,8 @@ impl<'a> ClientHello<'a> {
 /// [`ServerSessionMemoryCache`]: crate::server::handy::ServerSessionMemoryCache
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
+    /// Optional RFC 9849 server ECH key source. Each handshake retains its snapshot.
+    pub ech_provider: Option<Arc<dyn super::ech::EchConfigProvider>>,
     /// Source of randomness and other crypto.
     pub(super) provider: Arc<CryptoProvider>,
 
@@ -924,6 +926,16 @@ mod connection {
         /// application should call `alert.write()` to send the alert to the client. It should
         /// not call `accept()` again.
         pub fn accept(&mut self) -> Result<Option<Accepted>, (Error, AcceptedAlert)> {
+            self.accept_with_ech(None)
+        }
+
+        /// Accept using a connection-retained ECH snapshot before exposing SNI.
+        /// HPKE and parsing are synchronous; asynchronous callers should use a
+        /// bounded CPU lane, as they do for the following handshake processing.
+        pub fn accept_with_ech(
+            &mut self,
+            keys: Option<Arc<[Arc<super::super::ech::EchServerKey>]>>,
+        ) -> Result<Option<Accepted>, (Error, AcceptedAlert)> {
             let Some(mut connection) = self.inner.take() else {
                 return Err((
                     Error::General("Acceptor polled after completion".into()),
@@ -941,6 +953,17 @@ mod connection {
             };
 
             let mut cx = Context::from(&mut connection);
+            let message = match super::super::ech::ServerEch::first(message, keys.unwrap_or_else(|| Arc::from([]))) {
+                Ok((message, ech)) => {
+                    cx.common.native_ech_accepted = ech.inner_random.is_some();
+                    cx.data.ech = Some(ech);
+                    message
+                }
+                Err(error) => {
+                    let error = cx.common.send_fatal_alert(crate::AlertDescription::IllegalParameter, error);
+                    return Err((error, AcceptedAlert::from(connection)));
+                }
+            };
             let sig_schemes = match hs::process_client_hello(&message, false, &mut cx) {
                 Ok((_, sig_schemes)) => sig_schemes,
                 Err(err) => {
@@ -1314,6 +1337,7 @@ impl ConnectionCore<ServerConnectionData> {
 /// State associated with a server connection.
 #[derive(Default, Debug)]
 pub struct ServerConnectionData {
+    pub(super) ech: Option<super::ech::ServerEch>,
     pub(crate) native_client_chains: crate::ClientChainObservation,
     pub(crate) native_peer_extras: crate::native_peer_extras::NativePeerExtras,
     pub(super) sni: Option<DnsName<'static>>,

@@ -116,50 +116,17 @@ impl Tls {
     }
 }
 
-fn host_patterns(host: &str, mut check: impl FnMut(&str) -> bool) -> bool {
-    if check(host) {
-        return true;
-    }
-    if host.len() > 253 {
-        return false;
-    }
-    let mut candidate = String::with_capacity(host.len().max(1));
-    let mut labels = host.split('.').collect::<Vec<_>>();
-    for index in 0..labels.len() {
-        if labels[index].is_empty() {
-            continue;
-        }
-        labels[index] = "*";
-        candidate.clear();
-        for (index, label) in labels.iter().enumerate() {
-            if index != 0 {
-                candidate.push('.');
-            }
-            candidate.push_str(label);
-        }
-        if check(&candidate) {
-            return true;
-        }
-    }
+fn host_patterns(host:&[u8],mut check:impl FnMut(&[u8])->bool)->bool{
+    if check(host){return true}if host.len()>253{return false}
+    let mut labels=host.split(|b|*b==b'.').collect::<Vec<_>>();let mut candidate=Vec::with_capacity(host.len().max(1));
+    for index in 0..labels.len(){if labels[index].is_empty(){continue}labels[index]=b"*";candidate.clear();for(index,label)in labels.iter().enumerate(){if index!=0{candidate.push(b'.')}candidate.extend_from_slice(label);}if check(&candidate){return true}}
     false
 }
-fn names(config: &AccessLogConfig, host: &str) -> Option<Vec<String>> {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    let mut mapped = None;
-    host_patterns(&host, |pattern| {
-        mapped = config.names.get(pattern);
-        mapped.is_some()
-    });
-    if let Some(values) = mapped {
-        return Some(values.clone());
-    }
-    if config.skip_unmapped
-        || host_patterns(&host, |pattern| {
-            config.skip_hosts.iter().any(|name| name == pattern)
-        })
-    {
-        return None;
-    }
+fn names(config:&AccessLogConfig,host:&[u8])->Option<Vec<String>>{
+    let host=host.strip_suffix(b".").unwrap_or(host).to_ascii_lowercase();let mut mapped=None;
+    host_patterns(&host,|pattern|{mapped=std::str::from_utf8(pattern).ok().and_then(|key|config.names.get(key));mapped.is_some()});
+    if let Some(values)=mapped{return Some(values.clone())}
+    if config.skip_unmapped||host_patterns(&host,|pattern|config.skip_hosts.iter().any(|key|key.as_bytes()==pattern)){return None}
     Some(vec![config.default_name.clone()])
 }
 fn prefix(value: &str, bytes: usize) -> String {
@@ -234,13 +201,13 @@ impl Access {
         logging: Arc<Logging>,
         config: &AccessLogConfig,
         request: &Request<T>,
-        authority: &str,
+        authority: &[u8],
         peer: &crate::net_address::NetAddress,
         client: Option<IpAddr>,
+        client_fallback:Option<&str>,
         budget: &Arc<CaptureBudget>,
     ) -> Option<Self> {
-        let host = authority.parse::<http::uri::Authority>().ok();
-        let names = names(config, host.as_ref().map_or(authority, |host| host.host()))?;
+        let names=names(config,super::request_host::hostname(authority))?;
         let protocol = match request.version() {
             Version::HTTP_10 => "HTTP/1.0",
             Version::HTTP_2 => "HTTP/2.0",
@@ -251,10 +218,7 @@ impl Access {
         let estimate = header_capture_cost(request.headers(), credentials)
             .saturating_add(authority.len().saturating_mul(2))
             .saturating_add(
-                request
-                    .uri()
-                    .path_and_query()
-                    .map_or(0, |value| value.as_str().len())
+                super::request_host::request_target(request).len()
                     .saturating_mul(2),
             )
             .saturating_add(names.iter().map(|name| name.len() + 32).sum::<usize>())
@@ -268,11 +232,11 @@ impl Access {
             budget.dropped.fetch_add(1, Ordering::Relaxed);
             return None;
         };
-        let request_uri = request.uri().path_and_query().map_or("/", |v| v.as_str());
+        let request_uri=super::request_host::request_target(request);
         let mut fields = vec![
             Field::new("remote_ip", V::RawString(peer.raw_host().into_owned())),
             Field::new("remote_port", V::RawString(peer.raw_port().into_owned())),
-            Field::new("client_ip", V::String(client.map_or_else(String::new,|ip|ip.to_string()))),
+            Field::new("client_ip", V::String(client.map_or_else(||client_fallback.unwrap_or_default().to_owned(),|ip|ip.to_string()))),
             Field::new("proto", V::String(protocol.into())),
             Field::new(
                 "method",
@@ -283,11 +247,11 @@ impl Access {
             ),
             Field::new(
                 "host",
-                V::String(prefix(authority, if reduced { 256 } else { usize::MAX })),
+                V::RawString(authority[..authority.len().min(if reduced{256}else{usize::MAX})].to_vec()),
             ),
             Field::new(
                 "uri",
-                V::String(prefix(request_uri, if reduced { 512 } else { usize::MAX })),
+                V::RawString(request_uri[..request_uri.len().min(if reduced{512}else{usize::MAX})].to_vec()),
             ),
         ];
         if reduced {

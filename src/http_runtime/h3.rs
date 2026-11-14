@@ -75,15 +75,11 @@ pub(super) struct Listener {
 }
 
 pub(super) fn enabled(server: &ActiveServer) -> bool {
-    server.plan.tls && server.plan.protocols.iter().any(|p| p == "h3")
+    server.plan.tls && server.protocols.h3 && !server.network.unix() && server.network!=crate::http_config::ListenerNetwork::Fd
 }
 
 pub(super) fn tcp_enabled(server: &ActiveServer) -> bool {
-    server
-        .plan
-        .protocols
-        .iter()
-        .any(|p| matches!(p.as_str(), "h1" | "h2" | "h2c"))
+    server.network.stream() && (server.protocols.h1 || (server.protocols.h2 && server.plan.tls) || server.protocols.h2c)
 }
 
 fn initial_config(
@@ -131,17 +127,17 @@ pub(super) fn stage(
             .send_window(2u64 * 1024 * 1024);
         let transport = Arc::new(transport);
         let scope = IpScope::of(server);
-        let wanted = tcp.get(key).copied().unwrap_or(key.address);
+        let wanted=tcp.get(key).copied().or_else(||key.socket());
         let only_v6=server.only_v6(key);
         let binding = if let Some(binding) = pool.get(key).and_then(Weak::upgrade) {
             ensure!(binding.only_v6==only_v6,"HTTP/3 listener IPv6-only mode changed across reload");
             ensure!(
-                wanted.port() == 0 || wanted == binding.actual,
+                wanted.is_none_or(|wanted|wanted.port()==0||wanted==binding.actual),
                 "HTTP/3 listener address changed across reload"
             );
             binding
         } else {
-            let (socket,actual_only_v6) = udp_socket(wanted,only_v6)?;
+            let(socket,actual_only_v6)=if let Some(wanted)=wanted{udp_socket(wanted,only_v6)?}else{inherited_udp_socket(&key.address)?};
             let endpoint = Endpoint::new(
                 quinn::EndpointConfig::default(),
                 Some(initial_config(crypto.clone(), &transport, scope)?),
@@ -203,6 +199,27 @@ fn udp_socket(address: SocketAddr, only_v6: bool) -> std::io::Result<(UdpSocket,
     socket.bind(&address.into())?;
     let actual_only_v6=if address.is_ipv6(){socket.only_v6()?}else{false};
     Ok((socket.into(),actual_only_v6))
+}
+
+/// Duplicate a caller-owned datagram listener without consuming its original
+/// descriptor. Quinn's builtin UDP path requires a real Internet UDP socket.
+fn inherited_udp_socket(address:&crate::http_config::ListenerAddress)->std::io::Result<(UdpSocket,bool)> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::FromRawFd;
+        let crate::http_config::ListenerAddress::Fd{number,datagram:true}=address else{return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,"HTTP/3 requires UDP or fdgram"))};
+        let fd=unsafe{libc::fcntl(*number as i32,libc::F_DUPFD_CLOEXEC,3)};
+        if fd<0{return Err(std::io::Error::last_os_error())}
+        // SAFETY: fcntl returned a fresh owned descriptor. Conversion below is
+        // performed only after checking SOCK_DGRAM and its Internet family.
+        let socket=unsafe{socket2::Socket::from_raw_fd(fd)};
+        if socket.r#type()?!=socket2::Type::DGRAM{return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,"fdgram is not a datagram socket"))}
+        let local=socket.local_addr()?.as_socket().ok_or_else(||std::io::Error::new(std::io::ErrorKind::Unsupported,"HTTP/3 fdgram requires an Internet UDP socket"))?;
+        let only_v6=local.is_ipv6()&&socket.only_v6()?;socket.set_nonblocking(true)?;
+        Ok((socket.into(),only_v6))
+    }
+    #[cfg(not(unix))]
+    {let _=address;Err(std::io::Error::new(std::io::ErrorKind::Unsupported,"fdgram HTTP/3 listener unsupported on this platform"))}
 }
 struct Preselected {
     certificate: crate::tls_resolver::CertificateSelection,
@@ -339,23 +356,27 @@ enum FlightState {
     Ready(hello::Hello),
 }
 
-fn inspect_client_hello(
+async fn inspect_client_hello(
     incoming: &quinn::Incoming,
     tls: &rustls::ServerConfig,
     previous: Option<usize>,
+    cpu: &resource_budget::BlockingBudget,
 ) -> Option<FlightState> {
     let Some((revision, flight)) = incoming.initial_flight(previous).ok()? else {
         return Some(FlightState::Unchanged);
     };
-    let version = flight.version();
-    let mut crypto = hello::Crypto::new();
-    for (offset, bytes) in flight.crypto_fragments().ok()? {
-        crypto.add(offset, &bytes).ok()?;
-    }
-    Some(match crypto.parse(tls, version).ok()? {
-        Some(hello) => FlightState::Ready(hello),
-        None => FlightState::Incomplete(revision),
-    })
+    let tls = tls.clone();
+    cpu.run(move || {
+        let version = flight.version();
+        let mut crypto = hello::Crypto::new();
+        for (offset, bytes) in flight.crypto_fragments().ok()? {
+            crypto.add(offset, &bytes).ok()?;
+        }
+        Some(match crypto.parse(&tls, version).ok()? {
+            Some(hello) => FlightState::Ready(hello),
+            None => FlightState::Incomplete(revision),
+        })
+    }).await.ok()?
 }
 
 enum Preflight {
@@ -388,9 +409,10 @@ async fn inspect_hello(
     header_timeout: Duration,
     listener: &PreflightLanes,
     process: &PreflightLanes,
+    cpu: &resource_budget::BlockingBudget,
 ) -> Option<Preflight> {
     let validated = incoming.remote_address_validated();
-    let hello = match inspect_client_hello(incoming, tls, None)? {
+    let hello = match inspect_client_hello(incoming, tls, None, cpu).await? {
         FlightState::Ready(hello) => hello,
         FlightState::Unchanged => return None,
         // Don't keep an unverified source in the fragment-wait lane. Retry is
@@ -405,7 +427,7 @@ async fn inspect_hello(
                 let mut previous = Some(revision);
                 loop {
                     tokio::time::sleep(Duration::from_millis(8)).await;
-                    match inspect_client_hello(incoming, tls, previous)? {
+                    match inspect_client_hello(incoming, tls, previous, cpu).await? {
                         FlightState::Ready(hello) => return Some(hello),
                         FlightState::Incomplete(revision) => previous = Some(revision),
                         FlightState::Unchanged => {}
@@ -574,9 +596,14 @@ async fn accept_loop(
             let budget = server.plan.read_header_timeout.unwrap_or(Duration::from_secs(15)).min(Duration::from_secs(15));
             let deadline = Instant::now() + budget;
             let Some(first) = server.tls_policies.first() else { return; };
+            // One immutable key view serves both unauthenticated preflight and
+            // the actual TLS state machine. Preflight never authenticates a peer.
+            let ech = connection_identity::ech_accept::snapshot(&server);
+            let mut hello_crypto = (*config.crypto).clone();
+            hello_crypto.ech_provider = ech.clone();
             let certificate_ip = if local.ip().is_unspecified() { String::new() }
                 else { crate::tls_resolver::canonical_certificate_ip(local.ip()) };
-            let preflight = server.tls_policies.len() != 1
+            let preflight = ech.is_some() || server.tls_policies.len() != 1
                 || server.events.as_ref().is_some_and(|events|events.should_emit("tls_get_certificate"))
                 || first.definition.has_custom_settings()
                 || first.resolver.certificate_selection.is_some()
@@ -587,7 +614,7 @@ async fn accept_loop(
                     _=activity.superseded.cancelled()=>return,
                     _=activity.admission_closed.cancelled()=>return,
                     _=activity.hard_stop.cancelled()=>return,
-                    value=tokio::time::timeout_at(deadline, inspect_hello(&incoming, &config.crypto, budget.min(Duration::from_secs(3)), &binding.preflight, &runtime.quic_limits.preflight))=>value.ok().flatten(),
+                    value=tokio::time::timeout_at(deadline, inspect_hello(&incoming, &hello_crypto, budget.min(Duration::from_secs(3)), &binding.preflight, &runtime.quic_limits.preflight, &runtime.resources.metadata))=>value.ok().flatten(),
                 };
                 let hello = match prepared {
                     Some(Preflight::Ready(hello)) => hello,
@@ -755,23 +782,51 @@ async fn accept_loop(
                 policy: PolicyScope::new(&server, index, &policy),
             });
             let mut crypto = (*policy.tls).clone();
+            crypto.ech_provider = ech;
             crypto.alpn_protocols = vec![b"h3".to_vec()];
             crypto.cert_resolver = seen.clone();
-            sessions::configure(&mut crypto, &server.tickets, &config.sessions, seen.selection.clone(), &seen.policy);
+            sessions::configure(&mut crypto, &server.tickets, &config.sessions, seen.selection.clone(), &seen.policy,server.plan.options.allow_0rtt);
             let Ok(crypto) = initial_config(crypto, &config.transport, config.scope) else {
                 return;
             };
-            let Ok(connecting) = incoming.accept_with(Arc::new(crypto)) else {
-                return;
+            // Initial TLS processing includes real HPKE, certificate selection,
+            // transcript and key exchange. HRR's later bounded crypto remains
+            // in Quinn's existing driver; it is not preflight authentication.
+            let Ok(Ok(mut connecting)) = runtime.resources.metadata.run(move ||
+                incoming.accept_with(Arc::new(crypto))).await else { return; };
+            let allow_early=server.plan.options.allow_0rtt&&!seen.policy.client_auth;
+            let (connection,handshake)=if allow_early {
+                let ready=tokio::select!{biased;
+                    _=activity.superseded.cancelled()=>return,
+                    _=activity.admission_closed.cancelled()=>return,
+                    _=activity.hard_stop.cancelled()=>return,
+                    value=tokio::time::timeout_at(deadline,connecting.handshake_data())=>matches!(value,Ok(Ok(_))),
+                };
+                if !ready{return;}
+                let Ok((connection,finished))=connecting.into_0rtt()else{return};
+                if connection.has_early_data_keys(){(connection,Some(finished))}else{
+                    // A 0.5-RTT server handle alone does not mean a client has
+                    // an accepted early-data session. Normal/stateless sessions
+                    // retain the completed-handshake request boundary.
+                    let complete=tokio::select!{biased;
+                        _=activity.superseded.cancelled()=>false,
+                        _=activity.drain.cancelled()=>false,
+                        _=activity.hard_stop.cancelled()=>false,
+                        result=tokio::time::timeout_at(deadline,finished)=>result.is_ok()
+                            &&connection.handshake_data().and_then(|data|data.downcast::<quinn::crypto::rustls::HandshakeData>().ok()).is_some_and(|data|data.handshake_complete),
+                    };
+                    if !complete{return;}(connection,None)
+                }
+            }else{
+                let connection=tokio::select!{biased;
+                    _=activity.superseded.cancelled()=>return,
+                    _=activity.drain.cancelled()=>return,
+                    _=activity.hard_stop.cancelled()=>return,
+                    value=tokio::time::timeout_at(deadline,connecting)=>match value{Ok(Ok(value))=>value,_=>return},
+                };
+                (connection,None)
             };
-            let connection=tokio::select! {
-                biased;
-                _=activity.superseded.cancelled()=>return,
-                _=activity.drain.cancelled()=>return,
-                _=activity.hard_stop.cancelled()=>return,
-                value=tokio::time::timeout_at(deadline,connecting)=>match value {Ok(Ok(value))=>value,_=>return},
-            };
-            drop((handshake_slot,process_handshake));
+
             let Some(selected) = seen.selection.current() else { return; };
             let snapshot = Arc::new(ConnectionSnapshot::capture_quic(
                 &connection, &selected.raw_sni, &selected.certificate.key.cert,
@@ -780,7 +835,23 @@ async fn accept_loop(
             let identity = QuicIdentity { leaf: selected.leaf().clone(), sni: selected.raw_sni.clone(), snapshot };
             let peer = Peer {key,peer,local,scope:config.scope};
             if !peer.permits(&connection) { return; }
-            serve_connection(runtime,connection,peer,server,activity,identity).await;
+            let serving=serve_connection(runtime,connection.clone(),peer,server,activity.clone(),identity,policy.clone(),selected.certificate.key.clone());
+            if let Some(finished)=handshake {
+                tokio::pin!(serving);
+                let finish=async {
+                    let accepted=tokio::select!{biased;
+                        _=activity.hard_stop.cancelled()=>false,
+                        result=tokio::time::timeout_at(deadline,finished)=>result.is_ok()
+                            &&connection.handshake_data().and_then(|data|data.downcast::<quinn::crypto::rustls::HandshakeData>().ok()).is_some_and(|data|data.handshake_complete),
+                    };
+                    drop((handshake_slot,process_handshake));accepted
+                };
+                tokio::pin!(finish);
+                tokio::select!{biased;
+                    complete=&mut finish=>{if complete{serving.await}else{connection.close(::h3::error::Code::H3_GENERAL_PROTOCOL_ERROR.value().try_into().expect("H3 code"),b"handshake failed");serving.await;}},
+                    _=&mut serving=>{connection.close(::h3::error::Code::H3_NO_ERROR.value().try_into().expect("H3 code"),b"");let _=finish.await;},
+                }
+            }else{drop((handshake_slot,process_handshake));serving.await;}
             drop(binding);
         });
     }
@@ -835,6 +906,23 @@ struct QuicIdentity {
     sni: Arc<str>,
 }
 
+struct RequestSnapshots {
+    initial:Arc<ConnectionSnapshot>,
+    complete:std::sync::OnceLock<Arc<ConnectionSnapshot>>,
+    policy:Arc<tls_policies::PreparedPolicy>,
+    local_key:Arc<CertifiedKey>,
+}
+impl RequestSnapshots {
+    fn for_request(&self,connection:&quinn::Connection)->Option<Arc<ConnectionSnapshot>>{
+        if self.initial.metadata().ok()?.handshake_complete{return Some(self.initial.clone())}
+        if let Some(complete)=self.complete.get(){return Some(complete.clone())}
+        let data=connection.handshake_data()?.downcast::<quinn::crypto::rustls::HandshakeData>().ok()?;
+        if !data.handshake_complete{return Some(self.initial.clone())}
+        let snapshot=self.complete.get_or_init(||Arc::new(ConnectionSnapshot::capture_quic(connection,&self.initial.metadata().map(|m|m.server_name.clone()).unwrap_or_else(|_|Arc::from("")),&self.local_key.cert,self.policy.definition.client_auth.as_ref())));
+        snapshot.metadata().ok()?;Some(snapshot.clone())
+    }
+}
+
 async fn serve_connection(
     inner: Arc<Inner>,
     quic: quinn::Connection,
@@ -842,18 +930,15 @@ async fn serve_connection(
     server: Arc<ActiveServer>,
     activity: Arc<BusinessGeneration>,
     identity: QuicIdentity,
+    policy:Arc<tls_policies::PreparedPolicy>,
+    local_key:Arc<CertifiedKey>,
 ) {
     let QuicIdentity { leaf, sni, snapshot } = identity;
-    // Carry the completed QUIC handshake's actual facts into the same request
-    // extensions used by TCP TLS. HTTP fields are not a source of TLS metadata.
-    let tls_metadata = snapshot.metadata().ok();
-    let tls_log = tls_metadata
-        .map(|metadata| Arc::new(super::access_log::Tls::from_metadata(metadata)));
-    let tls_details = tls_metadata.map(super::fastcgi::TlsDetails::from_metadata);
-    let client_cert_cache = super::client_cert_facts::Cache::new(snapshot.clone());
+    let snapshots=Arc::new(RequestSnapshots{initial:snapshot.clone(),complete:std::sync::OnceLock::new(),policy,local_key});
+    // Each stream captures the real handshake phase when its head arrives.
     let sni = server.plan.strict_sni_host.then_some(sni);
     let mut builder = ::h3::server::builder();
-    builder.max_field_section_size(16 * 1024).enable_extended_connect(true);
+    builder.max_field_section_size(server.plan.options.max_header_bytes as u64).enable_extended_connect(true);
     let mut connection = tokio::select! {
         biased;
         _=activity.hard_stop.cancelled()=>return,
@@ -921,9 +1006,7 @@ async fn serve_connection(
                 let activity=activity.clone();
                 let leaf=leaf.clone();
                 let sni = sni.clone();
-                let snapshot = snapshot.clone();
-                let tls_log = tls_log.clone();
-                let client_cert_cache = client_cert_cache.clone();
+                let snapshots=snapshots.clone();
                 let quic_for_stream=quic.clone();
                 let peer=peer.clone();
                 streams.spawn(async move {
@@ -940,6 +1023,10 @@ async fn serve_connection(
                         _=activity.drain.cancelled()=>None,
                         value=head=>value,
                     }) else { return; };
+                    let Some(snapshot)=snapshots.for_request(&quic_for_stream)else{return};
+                    let tls_log=snapshot.metadata().ok().map(|m|Arc::new(super::access_log::Tls::from_metadata(m)));
+                    let tls_details=snapshot.metadata().ok().map(super::fastcgi::TlsDetails::from_metadata);
+                    let client_cert_cache=super::client_cert_facts::Cache::new(snapshot.clone());
                     let Ok(business)=activity.begin() else {return;};
                     if !runtime.current.load().business(&peer.key)
                         .is_some_and(|(s,a)|Arc::ptr_eq(&s,&server)&&Arc::ptr_eq(&a,&activity))

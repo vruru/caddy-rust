@@ -280,3 +280,60 @@ fallible through the existing dispatcher rather than deferred success flags.
 Clients without the context keep their protocol and pooling behavior. HTTP/2
 encoding, HeaderMap/parser storage and full heap accounting are separate work.
 The original dependency licenses and package versions remain unchanged.
+
+## Reverse-proxy transport controls
+
+The native Hyper client builder can configure HTTP/1 read chunks, write-buffer
+batching, and the total response-head limit independently. Explicit large header
+counts allocate parser slots from the actual received head, rather than the
+configured maximum. Hyper-util additionally exposes a shared atomic idle-cache
+limit and complete local socket binding (port and IPv6 scope included).
+
+The optional `NativeRequestHead` extension observes a client's physical HTTP/1
+head flush or complete HTTP/2 HEADERS/CONTINUATION flush independently of the
+existing request-END_STREAM receipt. At most two observations share one codec
+boundary. This supports Expect: 100-continue without starting its interval at
+body completion. Requests without that extension retain the existing protocol
+behavior. These hooks do not claim whole-process memory accounting.
+
+
+Server/listener controls add opt-in HTTP/1 full-duplex gating and forwarding of
+header byte limits. Hyper retains its original library full-duplex default.
+Native's configured false waits for the existing active body reader, preserving
+the read half and response deadlines; it adds no separate unbounded drain.
+Server header-slot allocation uses actual buffered input to honor configured
+byte limits without a hidden 100-field cap. Hyper-util adds a selected-protocol
+upgrade entry, retaining the original automatic-upgrade API unchanged. Local
+verification and fixtures remain outside the repository.
+
+## Native HTTP/1 absolute-target provenance
+
+A Native-only H1 builder option preserves exact request-target Bytes and admits
+Go-compatible encoded host bytes for absolute HTTP(S) targets. Standard builder
+and URI/Authority parsing defaults are unchanged. The stored Authority remains
+valid UTF-8 encoded syntax; decoded invalid UTF-8 is kept in the application's
+byte-valued Host fact. A separate explicit Native logical-Host constructor is
+used only after outgoing Host normalization for HTTP message serialization. It
+requires ASCII and never fabricates UTF-8. This is not a general URL parser.
+
+## RFC 9849 server ECH
+
+The rustls fork adds `server::EchServerKey`, `server::EchConfigProvider`, and
+optional `ServerConfig::ech_provider`. `Acceptor::accept_with_ech` accepts an
+immutable key snapshot before exposing inner SNI to application policy. The
+same decoder serves the normal TCP/QUIC TLS state machines. HRR retains its
+HPKE opener and inner transcript; rejection advertises only keys marked for
+retry. Unregistered configuration IDs are rejected before HPKE trials, avoiding
+Go 1.27.3's all-keys trial behavior. The key constructor validates the pair
+using existing AWS-LC HPKE; private key buffers zeroize on Drop and Debug does
+not expose private bytes. Non-ECH clients and ordinary TLS 1.2 keep their
+configured policies.
+
+Quinn carries actual server ECH acceptance independently of Finished. App
+preflight uses the same fixed key snapshot as the actual handshake and does
+not authenticate a peer. TCP preflight and QUIC preflight/first ClientHello
+use the existing bounded metadata CPU lane. Subsequent HRR stays in Quinn's
+existing driver alongside its other bounded TLS 1.3 crypto; this does not
+claim every Quinn crypto operation runs outside its reactor. The source API
+extensions require rebuilding the dependency graph and promise no binary ABI.
+Go source provenance and BSD terms are in THIRD-PARTY-NOTICES.

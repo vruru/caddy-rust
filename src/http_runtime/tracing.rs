@@ -129,15 +129,15 @@ pub(super) async fn enter(ctx:&mut Context,provider:&Arc<Provider>,plan:&Config)
  if let Some(owner)=&credit{
   if let Ok(expanded)=expand(ctx.lookup_view(),&plan.span,owner).await{name=expanded;}
   let request=ctx.req();let scheme=if ctx.tls{"https"}else{"http"};
-  let authority=ctx.authority.parse::<http::uri::Authority>().ok();
-  let host=authority.as_ref().map_or(ctx.authority.as_str(),|a|a.host()).trim_start_matches('[').trim_end_matches(']');
+  let host_bytes=super::request_host::hostname(&ctx.authority);
+  let host=std::str::from_utf8(host_bytes).ok().map(|h|h.trim_start_matches('[').trim_end_matches(']'));
   let method=request.method().as_str();
   let standard=matches!(method,"CONNECT"|"DELETE"|"GET"|"HEAD"|"OPTIONS"|"PATCH"|"POST"|"PUT"|"TRACE");
-  attributes.push(KeyValue::new("server.address",host.to_owned()));
+  if let Some(host)=host{attributes.push(KeyValue::new("server.address",host.to_owned()));}
   attributes.push(KeyValue::new("http.request.method",if standard{method.to_owned()}else{"_OTHER".into()}));
   if !standard{attributes.push(KeyValue::new("http.request.method_original",method.to_owned()));}
   attributes.push(KeyValue::new("url.scheme",scheme));
-  let port=authority.as_ref().and_then(|a|a.port_u16()).unwrap_or(if ctx.tls{443}else{80});
+  let port=std::str::from_utf8(super::request_host::port(&ctx.authority)).ok().and_then(|p|p.parse::<u16>().ok()).unwrap_or(if ctx.tls{443}else{80});
   if port!=if ctx.tls{443}else{80}{attributes.push(KeyValue::new("server.port",port as i64));}
   let peer=ctx.peer.host();if !peer.is_empty(){attributes.push(KeyValue::new("network.peer.address",peer.clone()));}
   if let Ok(port)=ctx.peer.port_text().parse::<i64>(){if port>0{attributes.push(KeyValue::new("network.peer.port",port));}}

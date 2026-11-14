@@ -13,6 +13,9 @@ impl Cache {
     pub(crate) fn new(snapshot: Arc<ConnectionSnapshot>) -> Arc<Self> {
         Arc::new(Self { snapshot, value: OnceCell::new() })
     }
+    pub(crate) fn ready(&self)->Result<Option<Arc<Facts>>,String>{
+        self.value.get().cloned().ok_or_else(||String::from("TLS client certificate facts are not prepared"))?
+    }
     pub(crate) async fn get(&self, resources: &Resources) -> Result<Option<Arc<Facts>>, String> {
         self.value.get_or_init(|| async {
             let meta = self.snapshot.metadata().map_err(|e| e.to_string())?;

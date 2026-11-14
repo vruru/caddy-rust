@@ -167,7 +167,7 @@ impl OnDemand {
                 })
         })
     }
-    fn manual(&self, name: &str, at: i64) -> bool {
+    pub(super)fn manual(&self, name: &str, at: i64) -> bool {
         let entries = self.manual.load();
         let valid = |entries: Option<&Vec<Arc<Material>>>| {
             entries.is_some_and(|entries| {
@@ -338,6 +338,9 @@ struct Provider {
     state: Arc<OnDemand>,
 }
 impl ScopedCertificateProvider for Provider {
+    fn ech_provider(&self)->Option<Arc<dyn rustls::server::EchConfigProvider>>{
+        self.service.upgrade()?.ech_runtime().map(|runtime|runtime as Arc<dyn rustls::server::EchConfigProvider>)
+    }
     fn validate_acme_server(&self,config:&crate::acme_server::Config)->Result<()> {
         self.service.upgrade().ok_or_else(||anyhow!("certificate services stopped"))?.validate_acme_server_config(config)
     }

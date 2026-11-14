@@ -327,11 +327,11 @@ fn parse(
     let after = cert.validity().not_after.to_datetime();
     result.insert(
         "NotBefore".into(),
-        types::time_value(factory, before.unix_timestamp(), before.nanosecond())?,
+        types::addressable_time(factory, before.unix_timestamp(), before.nanosecond())?,
     );
     result.insert(
         "NotAfter".into(),
-        types::time_value(factory, after.unix_timestamp(), after.nanosecond())?,
+        types::addressable_time(factory, after.unix_timestamp(), after.nanosecond())?,
     );
     let signature = signature_algorithm_id(&cert.signature_algorithm)?;
     result.insert(

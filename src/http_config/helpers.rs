@@ -216,8 +216,27 @@ static PROCESS_CLOCK: std::sync::OnceLock<std::time::Instant> = std::sync::OnceL
 /// Monotonic formatting uses this process-local Rust Instant, never wall-clock deltas.
 pub(crate) fn initialize_globals() {
     PROCESS_CLOCK.get_or_init(std::time::Instant::now);
+    let _=local_location_name();
     let now = chrono::Local::now();
     let _ = local_zone_name(now.timestamp(), &now.format("%z").to_string());
+}
+/// Go's Local.String is the selected location name, not the abbreviation at
+/// one instant. Capture it once with timezone initialization on the CPU lane.
+pub(crate)fn local_location_name()->&'static str{
+    static NAME:std::sync::OnceLock<String>=std::sync::OnceLock::new();
+    NAME.get_or_init(||match std::env::var("TZ"){
+        Err(std::env::VarError::NotPresent)=>if std::path::Path::new("/etc/localtime").is_file(){"Local".into()}else{"UTC".into()},
+        Err(_)=>"UTC".into(),
+        Ok(raw)=>{
+            let name=raw.strip_prefix(':').unwrap_or(&raw);
+            if name.is_empty()||name=="UTC"{"UTC".into()}
+            else if name.starts_with('/'){
+                if std::path::Path::new(name).is_file(){if name=="/etc/localtime"{"Local".into()}else{name.into()}}else{"UTC".into()}
+            }else if ["/usr/share/zoneinfo","/usr/share/lib/zoneinfo","/usr/lib/locale/TZ","/etc/zoneinfo"].iter().any(|root|std::path::Path::new(root).join(name).is_file()){
+                name.into()
+            }else{"UTC".into()}
+        },
+    })
 }
 /// Local UTC offset in seconds east of UTC and the platform timezone abbreviation.
 /// Call only during blocking preparation/encoding after timezone initialization.

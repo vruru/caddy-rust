@@ -2,19 +2,24 @@
 //! before activation. The raw configuration may contain secrets; do not Debug it.
 #[path = "http_config/listeners.rs"]
 mod listeners;
-pub(crate) use listeners::{ListenSpec,ListenIdentity,Family as ListenerFamily};
+pub(crate) use listeners::{ListenSpec,ListenIdentity,Family as ListenerFamily,Network as ListenerNetwork,Address as ListenerAddress};
 mod header_ops;
+mod filesystems;
 pub(crate) mod header_compile;
 #[path = "http_config/helpers.rs"]
 pub(crate) mod helpers;
 #[path = "http_config/proxy_ext.rs"]
 pub(crate) mod proxy_ext;
+pub(crate) mod proxy_transport;
+#[path="http_config/proxy_handler.rs"]
+pub(crate) mod proxy_handler;
 #[path = "http_config/types.rs"]
 pub(crate) mod types;
 #[path = "http_config/route_timeouts.rs"]
 pub(crate) mod route_timeouts;
 #[path = "http_config/server_transfers.rs"]
 pub(crate) mod server_transfers;
+pub(crate) mod server_options;
 use anyhow::{Result, ensure};
 use helpers::*;
 use serde_json::Value;
@@ -71,12 +76,16 @@ pub(crate) struct ServerConfig {
     pub(crate) tls_policies: Vec<crate::tls_policy::ConnectionPolicy>,
     pub(crate) trusted_proxies: Vec<ipnet::IpNet>,
     pub(crate) trusted_strict: bool,
+    pub(crate) client_text_facts: bool,
     pub(crate) client_ip_headers: Vec<String>,
     pub(crate) read_header_timeout: Option<Duration>,
     pub(crate) read_idle_timeout: Duration,
     pub(crate) transfers: server_transfers::ServerTransfers,
     pub(crate) idle_timeout: Option<Duration>,
     pub(crate) protocols: Vec<String>,
+    /// Effective protocols aligned with expanded declarations, not physical DNS addresses.
+    pub(crate) listen_protocols: Vec<server_options::ProtocolSet>,
+    pub(crate) options: server_options::Options,
     pub(crate) redirect_http: bool,
     pub(crate) manage_certificates: bool,
     pub(crate) skip_manage: Vec<String>,
@@ -205,7 +214,8 @@ pub fn validate_json(value: &Value) -> Result<PreparedConfig> {
             .ok_or_else(|| anyhow::anyhow!("apps required"))?,
         "/apps",
     )?;
-    deny_unknown(apps, &["http", "tls"], "/apps")?;
+    deny_unknown(apps, &["http", "tls", "caddy.filesystems"], "/apps")?;
+    filesystems::validate(apps.get("caddy.filesystems"))?;
     let mut certificates = Vec::new();
     if let Some(tls) = apps.get("tls") {
         let tls = object(tls, "/apps/tls")?;
@@ -388,6 +398,14 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
             "routes",
             "errors",
             "protocols",
+            "listen_protocols",
+            "keepalive_interval",
+            "keepalive_idle",
+            "keepalive_count",
+            "max_header_bytes",
+            "enable_full_duplex",
+            "trusted_proxies_unix",
+            "allow_0rtt",
             "automatic_https",
             "listener_wrappers",
             "tls_connection_policies",
@@ -417,10 +435,16 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
         .filter(|value| !value.is_null())
         .map(|value| access_logs(value, path))
         .transpose()?;
+    let raw_listen = strings(required(m,"listen")?,path)?;
+    let (global_protocols,per_listener)=server_options::protocol_fields(m,raw_listen.len(),path)?;
     let mut listen_specs = Vec::new();
-    for raw in strings(required(m, "listen")?, path)? {
-        let raw = helpers::replace(&raw, true, helpers::global_lookup)?;
+    let mut listen_protocols = Vec::new();
+    for (index,raw) in raw_listen.iter().enumerate() {
+        let raw=helpers::replace(raw,true,helpers::global_lookup)?;
+        let before=listen_specs.len();
         listeners::append_specs(&raw,&mut listen_specs)?;
+        listen_protocols.try_reserve_exact(listen_specs.len()-before)?;
+        listen_protocols.resize(listen_specs.len(),per_listener[index]);
     }
     ensure!(!listen_specs.is_empty()&&listen_specs.len()<=1024,"listener count invalid");
     let mut listen=Vec::new();let mut listen_v6_only=std::collections::HashSet::new();
@@ -535,29 +559,7 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
         .is_some_and(|policies| !policies.is_empty())
         || (!disabled && listen_specs.iter().any(|a| a.port() == https_port))
         || inferred;
-    let protocols = m
-        .get("protocols")
-        .map(|v| strings(v, path))
-        .transpose()?
-        .unwrap_or_else(|| {
-            if tls {
-                vec!["h1".into(), "h2".into(), "h3".into()]
-            } else {
-                vec!["h1".into(), "h2".into()]
-            }
-        });
-    ensure!(!protocols.is_empty(), "empty protocol list");
-    for protocol in &protocols {
-        ensure!(
-            matches!(protocol.as_str(), "h1" | "h2" | "h2c" | "h3"),
-            "unsupported HTTP protocol"
-        );
-    }
-    ensure!(
-        !protocols.iter().any(|p| matches!(p.as_str(), "h2" | "h2c"))
-            || protocols.contains(&"h1".to_owned()),
-        "h2 and h2c require h1 for Caddy config compatibility"
-    );
+    let protocols=global_protocols.names();
     let trusted_proxies = if let Some(proxies) = m.get("trusted_proxies") {
         let proxies = object(proxies, path)?;
         deny_unknown(proxies, &["source", "ranges"], path)?;
@@ -591,7 +593,12 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
         expected("expected_underscore_headers")?,
         expected("expected_dot_headers")?,
     )?;
+    fn needs_client_text(value:&Value)->bool{match value{
+        Value::String(s)=>s.to_ascii_lowercase().contains("http.request.tls.client."),
+        Value::Array(v)=>v.iter().any(needs_client_text),Value::Object(v)=>v.values().any(needs_client_text),_=>false,
+    }}
     Ok(ServerConfig {
+        client_text_facts:needs_client_text(value),
         listener_stack:Arc::new(crate::http_runtime::listener_stack::Stack::ordered(listener_operations,tls_wrapper)),
         name: Arc::from("UNKNOWN"),
         access_logs,
@@ -669,6 +676,8 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
             Some(_) => Duration::ZERO,
         },
         protocols,
+        listen_protocols,
+        options:server_options::parse(m,path)?,
         redirect_http,
         manage_certificates,
         skip_manage,
@@ -1311,6 +1320,7 @@ fn parse_handler(
                     "handler",
                     "status_code",
                     "root",
+                    "fs",
                     "hide",
                     "index_names",
                     "pass_thru",
@@ -1323,6 +1333,7 @@ fn parse_handler(
                 path,
             )?;
             Handler::FileServer {
+                fs: m.get("fs").filter(|v|!v.is_null()).map(|v|string(v,path)).transpose()?.filter(|v|!v.is_empty()).unwrap_or_else(||"{http.vars.fs}".into()),
                 status: m.get("status_code").map(crate::module_json::weak_string).transpose()?.unwrap_or_default(),
                 root: m.get("root").map(|v| string(v, path)).transpose()?,
                 hide: m
@@ -1597,6 +1608,8 @@ fn parse_proxy(
             "flush_interval",
             "stream_close_delay",
             "request_buffers",
+            "trusted_proxies", "response_buffers", "proxy_status_name",
+            "stream_timeout", "stream_buffer_size", "verbose_logs",
             "load_balancing",
             "handle_response",
             "health_checks",
@@ -1748,6 +1761,7 @@ fn parse_proxy(
     } else {
         None
     };
+    let transport_options = proxy_transport::parse(if is_fastcgi {None}else{transport},path)?;
     let mut tls = None;
     let mut http2_only = false;
     let mut enable_http2 = true;
@@ -1765,7 +1779,7 @@ fn parse_proxy(
                     "tls",
                     "versions",
                     "compression",
-                    "dial_timeout",
+                    "dial_timeout", "resolver", "keep_alive", "max_conns_per_host", "proxy_protocol", "forward_proxy_url", "network_proxy", "dial_fallback_delay", "local_address", "expect_continue_timeout", "max_response_header_size", "write_buffer_size", "read_buffer_size",
                     "response_header_timeout",
                     "read_timeout",
                     "write_timeout",
@@ -1854,7 +1868,7 @@ fn parse_proxy(
                 ensure!(
                     versions
                         .iter()
-                        .all(|v| matches!(v.as_str(), "1.1" | "2" | "h2c")),
+                        .all(|v| matches!(v.as_str(), "1.1" | "2" | "h2c" | "3")),
                     "unsupported upstream HTTP version"
                 );
                 // Caddy's TLS transport still permits HTTP/1 fallback. Its h2c
@@ -1904,6 +1918,8 @@ fn parse_proxy(
         }
     }
     Ok(ProxyConfig {
+        transport:transport_options,
+        handler:Arc::new(proxy_handler::parse(m,path)?),
         rewrite: m.get("rewrite").filter(|v|!v.is_null()).map(|v|rewrite::parse(object(v,path)?,path,regex_remaining,false).map(Arc::new)).transpose()?,
         ext,
         upstreams,
@@ -1955,7 +1971,6 @@ fn pending_placeholders_depth(value: &Value, depth: usize, typed_expression: boo
                 {
                     let key = &s[i + 1..end];
                     if (key.starts_with("file.") && !matches!(leaf,LeafPlace::Fields))
-                        || (!typed_expression && key.starts_with("http.request.tls.") && helpers::TlsScalar::from_name(key).is_none())
                         || (key.starts_with("http.reverse_proxy.")
                             && !matches!(
                                 key,
@@ -1987,6 +2002,8 @@ fn pending_placeholders_depth(value: &Value, depth: usize, typed_expression: boo
         }
         Value::Object(values) => {
             for (key, value) in values {
+                // This deployment identifier is literal RFC9209 data, not a replacer template.
+                if key=="proxy_status_name" && values.get("handler").and_then(Value::as_str)==Some("reverse_proxy"){continue;}
                 if matches!(
                     key.as_str(),
                     "@id"
@@ -2016,7 +2033,8 @@ fn pending_placeholders_depth(value: &Value, depth: usize, typed_expression: boo
                     (LeafPlace::Auth,"verifiers")=>LeafPlace::Verifiers,
                     (LeafPlace::Verifier,"leaf_certs_loaders") if values.get("verifier").and_then(Value::as_str)==Some("leaf")=>LeafPlace::Loaders,
                     (LeafPlace::Loader,"files") if values.get("loader").and_then(Value::as_str)==Some("file")=>LeafPlace::Fields,
-                    (LeafPlace::Loader,"certificates") if values.get("loader").and_then(Value::as_str)==Some("pem")=>LeafPlace::Fields,
+                    (LeafPlace::Loader,"certificates") if matches!(values.get("loader").and_then(Value::as_str),Some("pem"|"storage"))=>LeafPlace::Fields,
+                    (LeafPlace::Loader,"folders") if values.get("loader").and_then(Value::as_str)==Some("folder")=>LeafPlace::Fields,
                     _=>LeafPlace::Other};
                 pending_placeholders_depth(value, depth + 1, typed_expression || key == "expression",next)?;
             }

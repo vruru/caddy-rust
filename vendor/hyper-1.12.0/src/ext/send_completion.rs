@@ -1,7 +1,7 @@
 //! Shared send-completion signal. HTTP/1-only builds do not pull in h2.
 
 #[cfg(feature = "http2")]
-pub use h2::ext::{SendCompletion, SendOutcome};
+pub use h2::ext::{SendCompletion, SendOutcome,NativeRequestHead};
 #[cfg(all(feature = "http2", feature = "http1", feature = "client"))]
 pub(crate) use h2::ext::SendCompletionOwner;
 
@@ -66,7 +66,7 @@ mod http1_only {
         /// Transfers a signal clone to the unique transport writer.
         #[doc(hidden)]
         pub fn into_owner(self) -> SendCompletionOwner {
-            SendCompletionOwner(Some(self))
+            SendCompletionOwner(Some(self), None)
         }
 
         /// Reports the HTTP protocol that flushed the observed bytes.
@@ -104,13 +104,21 @@ mod http1_only {
     /// The unique producer held by the stream or codec, independent of receivers.
     #[doc(hidden)]
     #[derive(Debug)]
-    pub struct SendCompletionOwner(Option<SendCompletion>);
+    pub struct SendCompletionOwner(Option<SendCompletion>, Option<SendCompletion>);
 
     impl SendCompletionOwner {
+        /// Join two observations of exactly the same physical write boundary.
+        #[doc(hidden)]
+        pub fn combine(mut self,mut other:Self)->Self{
+            debug_assert!(self.1.is_none()&&other.1.is_none());
+            self.1=other.0.take();self
+        }
+
         /// Resolves the signal after a successful write flush.
         pub fn mark_flushed(mut self, now: Instant, version: http::Version) {
             let completion = self.0.take().expect("live write observation");
             completion.finish(SendOutcome::Flushed(now), Some(version));
+        if let Some(other)=self.1.take(){other.finish(SendOutcome::Flushed(now),Some(version));}
         }
     }
 
@@ -118,6 +126,7 @@ mod http1_only {
         fn drop(&mut self) {
             if let Some(completion) = self.0.take() {
                 completion.finish(SendOutcome::Abandoned, None);
+                if let Some(other)=self.1.take(){other.finish(SendOutcome::Abandoned,None);}
             }
         }
     }
@@ -126,3 +135,8 @@ mod http1_only {
 pub use http1_only::{SendCompletion, SendOutcome};
 #[cfg(not(feature = "http2"))]
 pub(crate) use http1_only::SendCompletionOwner;
+
+/// Observe the physical request-head flush independently of its body.
+#[cfg(not(feature="http2"))]
+#[derive(Clone,Debug)]
+pub struct NativeRequestHead(pub SendCompletion);

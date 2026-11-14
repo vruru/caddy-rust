@@ -31,6 +31,7 @@ pub(super) struct Stream {
     /// Number of outstanding handles pointing to this stream
     pub ref_count: usize,
 
+    pub(super) send_head_completion:Option<crate::ext::SendCompletionOwner>,
     pub(super) send_completion: Option<(crate::ext::SendCompletionOwner, SendBoundary)>,
 
     // ===== Fields related to sending =====
@@ -171,7 +172,7 @@ impl Stream {
             id,
             state: State::default(),
             ref_count: 0,
-            send_completion: None,
+            send_completion: None,send_head_completion:None,
             is_counted: false,
 
             // ===== Fields related to sending =====

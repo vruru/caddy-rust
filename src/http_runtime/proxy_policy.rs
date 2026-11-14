@@ -307,7 +307,7 @@ pub(super) struct PreparedSelection {
 }
 
 pub(super) struct SelectionInput<'a> {
-    pub authority: &'a str,
+    pub authority: &'a [u8],
     pub uri: &'a Uri,
     pub version: Version,
     pub headers: &'a HeaderMap,
@@ -317,7 +317,7 @@ pub(super) struct SelectionInput<'a> {
 }
 
 pub(super) struct OwnedSelectionInput {
-    authority: String,
+    authority: Vec<u8>,
     uri: Uri,
     version: Version,
     headers: HeaderMap,
@@ -644,7 +644,7 @@ impl Policy {
             }
             Self::Header(field, fallback) => {
                 let value = if field == "Host" {
-                    Some(input.authority.as_bytes())
+                    Some(input.authority)
                 } else if field.eq_ignore_ascii_case("Host")
                     || field.eq_ignore_ascii_case("Transfer-Encoding")
                 {

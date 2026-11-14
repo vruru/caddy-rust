@@ -10,7 +10,6 @@ mod envfile;
 mod json_indent;
 #[path = "cli/line_diff.rs"]
 mod line_diff;
-#[cfg(feature = "native-run")]
 #[path = "cli/paths.rs"]
 mod paths;
 #[cfg(feature = "native-run")]
@@ -18,6 +17,10 @@ mod paths;
 mod serving;
 #[path = "cli/validation.rs"]
 mod validation;
+#[path="cli/information.rs"]mod information;
+#[path="cli/storage.rs"]mod storage;
+#[cfg(feature="native-run")]
+#[path="cli/pki.rs"]mod pki;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use args::{Flag, Kind};
 use caddy_compat_native::{admin_json, caddyfile_adapter, caddyfile_parser};
@@ -246,6 +249,10 @@ pub unsafe fn dispatch_early(input: &[OsString]) -> Result<Option<i32>> {
         }));
     }
     match command {
+        "environ"|"build-info"|"list-modules"=>Ok(Some(unsafe {information::command(command,&input[1..])?})),
+        #[cfg(feature="native-run")]
+        "trust"|"untrust"=>Ok(Some(pki::command(command,&input[1..])?)),
+        "storage"=>Ok(Some(storage::command(&input[1..])?)),
         "hash-password"=>Ok(Some(unsafe { password::command(&input[1..])? })),
         "fmt" => {
             let mut specs = COMMON.to_vec();

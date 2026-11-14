@@ -543,3 +543,5 @@ fn start(parsed: args::Flags) -> Result<i32> {
         Ok(0)
     })
 }
+
+pub(super) fn admin_endpoint(raw:&str)->Result<(reqwest::Client,String,bool)>{client::endpoint(raw)}

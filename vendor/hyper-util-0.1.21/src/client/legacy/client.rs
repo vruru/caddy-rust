@@ -4,6 +4,7 @@
 //! For now, to enable people to use hyper 1.0 quicker, this `Client` exists
 //! in much the same way it did in hyper 0.14.
 
+pub use super::pool::NativeIdlePool;
 use std::error::Error as StdError;
 use std::fmt;
 use std::future::poll_fn;
@@ -1043,6 +1044,7 @@ impl Builder {
             pool_config: pool::Config {
                 idle_timeout: Some(Duration::from_secs(90)),
                 max_idle_per_host: usize::MAX,
+                idle_limit:None,
             },
             pool_timer: None,
         }
@@ -1094,6 +1096,15 @@ impl Builder {
         self.pool_config.max_idle_per_host = max_idle;
         self
     }
+
+    /// Limit idle entries across client instances sharing this concrete counter.
+    pub fn native_idle_pool(&mut self,pool:NativeIdlePool)->&mut Self{self.pool_config.idle_limit=Some(pool);self}
+    /// Configure HTTP/1 read chunks independently of the response head limit.
+    pub fn http1_read_buffer_size(&mut self,bytes:usize)->&mut Self{self.h1_builder.native_read_buffer_size(bytes);self}
+    /// Bound the complete received HTTP/1 response head.
+    pub fn http1_max_header_size(&mut self,bytes:usize)->&mut Self{self.h1_builder.max_header_size(bytes);self}
+    /// Configure the actual HTTP/1 buffered-write threshold.
+    pub fn http1_write_buffer_size(&mut self,bytes:usize)->&mut Self{self.h1_builder.native_write_buffer_size(bytes);self}
 
     // HTTP/1 options
 
@@ -1668,7 +1679,7 @@ impl Builder {
             #[cfg(feature = "http2")]
             h2_builder: self.h2_builder.clone(),
             connector,
-            pool: pool::Pool::new(self.pool_config, exec, timer),
+            pool: pool::Pool::new(self.pool_config.clone(), exec, timer),
         }
     }
 }

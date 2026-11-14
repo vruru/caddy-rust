@@ -73,6 +73,25 @@ pub enum Reservation<T> {
 /// Simple type alias in case the key type needs to be adjusted.
 // pub type Key = (http::uri::Scheme, http::uri::Authority); //Arc<String>;
 
+/// A shared limit for idle connection entries across fixed-dial client pools.
+/// Admission and release use only atomic scalars; no callback runs in a pool lock.
+#[derive(Clone,Debug)]
+pub struct NativeIdlePool(Arc<NativeIdleState>);
+#[derive(Debug)]
+struct NativeIdleState{limit:usize,used:std::sync::atomic::AtomicUsize}
+impl NativeIdlePool{
+    /// Create one counter shared by the configured transport pools.
+    pub fn new(limit:usize)->Self{Self(Arc::new(NativeIdleState{limit,used:std::sync::atomic::AtomicUsize::new(0)}))}
+    fn take(&self)->Option<NativeIdleToken>{
+        use std::sync::atomic::Ordering;
+        self.0.used.fetch_update(Ordering::AcqRel,Ordering::Acquire,|n|(n<self.0.limit).then_some(n+1)).ok()?;
+        Some(NativeIdleToken(self.clone()))
+    }
+}
+#[derive(Debug)]
+struct NativeIdleToken(NativeIdlePool);
+impl Drop for NativeIdleToken{fn drop(&mut self){self.0.0.used.fetch_sub(1,std::sync::atomic::Ordering::AcqRel);}}
+
 struct PoolInner<T, K: Eq + Hash> {
     // A flag that a connection is being established, and the connection
     // should be shared. This prevents making multiple HTTP/2 connections
@@ -82,6 +101,7 @@ struct PoolInner<T, K: Eq + Hash> {
     // state, waiting to receive a new Request to send on the socket.
     idle: HashMap<K, Vec<Idle<T>>>,
     max_idle_per_host: usize,
+    idle_limit:Option<NativeIdlePool>,
     // These are outstanding Checkouts that are waiting for a socket to be
     // able to send a Request one. This is used when "racing" for a new
     // connection.
@@ -104,10 +124,12 @@ struct PoolInner<T, K: Eq + Hash> {
 // doesn't need it!
 struct WeakOpt<T>(Option<Weak<T>>);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Config {
     pub idle_timeout: Option<Duration>,
     pub max_idle_per_host: usize,
+    /// Optional aggregate idle entry admission across client pools.
+    pub idle_limit:Option<NativeIdlePool>,
 }
 
 impl Config {
@@ -130,6 +152,7 @@ impl<T, K: Key> Pool<T, K> {
                 idle: HashMap::new(),
                 idle_interval_ref: None,
                 max_idle_per_host: config.max_idle_per_host,
+                idle_limit:config.idle_limit,
                 waiters: HashMap::new(),
                 exec,
                 timer,
@@ -309,6 +332,7 @@ impl<'a, T: Poolable + 'a, K: Debug> IdlePopper<'a, T, K> {
                     self.list.push(Idle {
                         idle_at: now,
                         value: to_reinsert,
+                        _limit:entry._limit,
                     });
                     to_checkout
                 }
@@ -318,6 +342,7 @@ impl<'a, T: Poolable + 'a, K: Debug> IdlePopper<'a, T, K> {
             return Some(Idle {
                 idle_at: entry.idle_at,
                 value,
+                _limit:None,
             });
         }
 
@@ -385,11 +410,9 @@ impl<T: Poolable, K: Key> PoolInner<T, K> {
                         return;
                     }
 
+                    let limit=match &self.idle_limit{Some(pool)=>match pool.take(){Some(token)=>Some(token),None=>return},None=>None};
                     debug!("pooling idle connection for {:?}", key);
-                    idle_list.push(Idle {
-                        value,
-                        idle_at: now,
-                    });
+                    idle_list.push(Idle { value, idle_at: now, _limit:limit });
                 }
 
                 self.spawn_idle_interval(__pool_ref);
@@ -575,6 +598,7 @@ impl<T: Poolable, K: Key> fmt::Debug for Pooled<T, K> {
 struct Idle<T> {
     idle_at: Instant,
     value: T,
+    _limit:Option<NativeIdleToken>,
 }
 
 // FIXME: allow() required due to `impl Trait` leaking types to this lint

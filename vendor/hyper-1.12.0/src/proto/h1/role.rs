@@ -161,13 +161,13 @@ impl Http1Transaction for Server {
         // a good ~5% on pipeline benchmarks.
         let mut headers_indices: SmallVec<[MaybeUninit<HeaderIndices>; DEFAULT_MAX_HEADERS]> =
             match ctx.h1_max_headers {
-                Some(cap) => smallvec![MaybeUninit::uninit(); cap],
+                Some(cap) => smallvec![MaybeUninit::uninit(); cap.min(buf.len()/3+1)],
                 None => smallvec_inline![MaybeUninit::uninit(); DEFAULT_MAX_HEADERS],
             };
         {
             let mut headers: SmallVec<[MaybeUninit<httparse::Header<'_>>; DEFAULT_MAX_HEADERS]> =
                 match ctx.h1_max_headers {
-                    Some(cap) => smallvec![MaybeUninit::uninit(); cap],
+                    Some(cap) => smallvec![MaybeUninit::uninit(); cap.min(buf.len()/3+1)],
                     None => smallvec_inline![MaybeUninit::uninit(); DEFAULT_MAX_HEADERS],
                 };
             trace!(bytes = buf.len(), "Request.parse");
@@ -223,10 +223,11 @@ impl Http1Transaction for Server {
         };
 
         let slice = buf.split_to(len).freeze();
+        let native_target=ctx.native_request_target.then(||slice.slice(path_range.clone()));
         let uri = {
             let uri_bytes = slice.slice_ref(&slice[path_range]);
             // TODO(lucab): switch to `Uri::from_shared()` once public.
-            http::Uri::from_maybe_shared(uri_bytes)?
+            if ctx.native_request_target{http::Uri::from_native_http1_target(uri_bytes)?}else{http::Uri::from_maybe_shared(uri_bytes)?}
         };
         subject = RequestLine(method, uri);
 
@@ -361,6 +362,7 @@ impl Http1Transaction for Server {
         }
 
         let mut extensions = http::Extensions::default();
+        if let Some(raw)=native_target{extensions.insert(crate::ext::NativeRequestTarget(raw));}
 
         if let Some(header_case_map) = header_case_map {
             extensions.insert(header_case_map);
@@ -1081,17 +1083,26 @@ impl Http1Transaction for Client {
     fn parse(buf: &mut BytesMut, ctx: ParseContext<'_>) -> ParseResult<StatusCode> {
         debug_assert!(!buf.is_empty(), "parse called with empty buf");
 
+        // A byte bound permits many short fields. Allocate for the head bytes
+        // actually present, rather than the configured maximum on every parse.
+        // Extra folded lines only overestimate, never undercount field slots.
+        // None retains the library's existing inline/default header behavior.
         // Loop to skip information status code headers (100 Continue, etc).
         loop {
+            let capacity=ctx.h1_max_headers.map(|max|{
+                let end=buf.windows(4).position(|v|v==b"\r\n\r\n").map(|n|n+4)
+                    .or_else(||buf.windows(2).position(|v|v==b"\n\n").map(|n|n+2)).unwrap_or(buf.len());
+                max.min(buf[..end].iter().filter(|&&b|b==b'\n').count().saturating_add(1)).max(1)
+            });
             let mut headers_indices: SmallVec<[MaybeUninit<HeaderIndices>; DEFAULT_MAX_HEADERS]> =
-                match ctx.h1_max_headers {
+                match capacity {
                     Some(cap) => smallvec![MaybeUninit::uninit(); cap],
                     None => smallvec_inline![MaybeUninit::uninit(); DEFAULT_MAX_HEADERS],
                 };
             let (len, status, reason, version, headers_len) = {
                 let mut headers: SmallVec<
                     [MaybeUninit<httparse::Header<'_>>; DEFAULT_MAX_HEADERS],
-                > = match ctx.h1_max_headers {
+                > = match capacity {
                     Some(cap) => smallvec![MaybeUninit::uninit(); cap],
                     None => smallvec_inline![MaybeUninit::uninit(); DEFAULT_MAX_HEADERS],
                 };

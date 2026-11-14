@@ -31,6 +31,8 @@ pub(crate) struct Dispatcher<D:Dispatch, Bs: Body, I, T> {
     response_body:Option<Box<super::response_write::BodyState<Bs::Data>>>,
     #[cfg(feature = "client")]
     send_completion: Option<crate::ext::SendCompletionOwner>,
+    #[cfg(feature="client")]
+    request_head_completion:Option<crate::ext::SendCompletionOwner>,
     #[cfg(feature = "client")]
     request_ended: bool,
     #[cfg(feature = "server")]
@@ -39,6 +41,8 @@ pub(crate) struct Dispatcher<D:Dispatch, Bs: Body, I, T> {
     // actual response owner until the interim boundary has physically flushed.
     #[cfg(feature="server")]
     pending_final:Option<Box<(D::PollItem,Bs)>>,
+    #[cfg(feature="server")]
+    full_duplex:bool,
 }
 
 pub(crate) trait Dispatch {
@@ -114,13 +118,37 @@ where
             response_body:None,
             #[cfg(feature = "client")]
             send_completion: None,
+            #[cfg(feature="client")]
+            request_head_completion:None,
             #[cfg(feature = "client")]
             request_ended: false,
             #[cfg(feature = "server")]
             informational_flush: None,
             #[cfg(feature="server")]
             pending_final:None,
+            #[cfg(feature="server")]
+            full_duplex:true,
         }
+    }
+
+    #[cfg(feature="server")]
+    pub(crate) fn set_full_duplex(&mut self,value:bool){self.full_duplex=value;}
+
+    #[cfg(feature="server")]
+    fn poll_post_handler_drain(&mut self,cx:&mut Context<'_>)->Poll<crate::Result<()>> {
+        if !self.conn.can_read_body(){return Poll::Ready(Ok(()))}
+        if self.body_tx.0.is_some(){
+            // Preserve the actual application's body reader, its transfer
+            // clocks and backpressure. The ordinary read half continues to
+            // supply it while this one final response waits. Never steal body
+            // bytes from a still-running reverse-proxy upload.
+            return Poll::Pending;
+        }
+        // A dropped/ignored request body keeps the original Native bounded
+        // immediate-drain-or-close behavior; no unbounded post-handler reader
+        // or extra application request is introduced by this switch.
+        self.conn.poll_drain_or_close_read(cx);
+        Poll::Ready(Ok(()))
     }
 
     #[cfg(feature = "server")]
@@ -438,6 +466,14 @@ where
                 if let Some(msg) = msg {
                     #[allow(unused_mut)]
                     let (mut head, body) = msg.map_err(crate::Error::new_user_service)?;
+                    #[cfg(feature="server")]
+                    if !T::is_client()&&!self.full_duplex&&!self.conn.application_upgrade_requested(){
+                        match self.poll_post_handler_drain(cx){
+                            Poll::Pending=>{self.pending_final=Some(Box::new((head,body)));if let Poll::Ready(result)=self.conn.poll_response_write_deadline(cx){result.map_err(crate::Error::new_body_write)?;}return Poll::Pending},
+                            Poll::Ready(result)=>result?,
+                        }
+                    }
+
                     #[cfg(feature = "server")]
                     if let Some(interim)=self.dispatch.close_informational(){
                         self.write_informational(interim)?;
@@ -458,6 +494,7 @@ where
                             .extensions
                             .remove::<crate::ext::SendCompletion>()
                             .map(crate::ext::SendCompletion::into_owner);
+                        self.request_head_completion=head.extensions.remove::<crate::ext::NativeRequestHead>().map(|value|value.0.into_owner());
                         self.request_ended = false;
                     }
 
@@ -672,13 +709,16 @@ where
         #[cfg(feature = "client")]
         {
             if matches!(&result, Poll::Ready(Err(_))) || self.conn.has_error() {
-                self.send_completion.take();
-            } else if matches!(&result, Poll::Ready(Ok(()))) && self.request_ended {
+                self.send_completion.take();self.request_head_completion.take();
+            } else if matches!(&result,Poll::Ready(Ok(()))){
+                if let Some(head)=self.request_head_completion.take(){head.mark_flushed(std::time::Instant::now(),http::Version::HTTP_11);}
+                if self.request_ended {
                 if let Some(completion) = self.send_completion.take() {
                     completion.mark_flushed(
                         std::time::Instant::now(),
                         http::Version::HTTP_11,
                     );
+                }
                 }
             }
         }

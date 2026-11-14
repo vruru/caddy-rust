@@ -14,6 +14,7 @@ pub(super) async fn serve(
     ctx: &mut Context,
     inner: &Arc<super::Inner>,
     server: &Arc<super::ActiveServer>,
+    fs: &str,
     configured_status: &str,
     root: Option<&str>,
     hide: &[String],
@@ -22,6 +23,9 @@ pub(super) async fn serve(
     sidecars: &SidecarPlan,
     browse: Option<&super::browse::BrowsePlan>,
 ) -> Result<Option<Response<Body>>> {
+    let selected=ctx.expand_text_resolved(fs,true).await?;
+    let name=if selected.is_empty(){"default"}else{selected.trim()};
+    if name!="default" {return Err(failure(StatusCode::NOT_FOUND))}
     let root = ctx.expand_text_resolved(root.unwrap_or("{http.vars.root}"),true).await?;
     let decoded = decoded_path(ctx.req().uri().path())?;
     ctx.reserve_text_copy(root.len().saturating_add(decoded.len()).saturating_mul(8).saturating_add(8192))?;

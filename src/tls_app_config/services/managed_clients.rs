@@ -49,13 +49,17 @@ impl CertificateServices {
         &self,
         mut names: Vec<Vec<String>>,
     ) -> Result<PreparedBusinessNames> {
-        let automate=self.plan.automate.get()?.names();
-        ensure!(names.len().checked_add(automate.len()).is_some_and(|n|n<=crate::tls_resolver::MAX_CERTIFICATES),
+        let configured=self.plan.automate.get()?.names();
+        let ech=self.ech_runtime().map(|r|r.current());
+        let now=now()?;
+        let automate=configured.iter().chain(ech.as_ref().into_iter().flat_map(|s|s.names.iter()).filter(|name|!self.on_demand.manual(name,now)));
+        let automate_len=automate.clone().count();
+        ensure!(names.len().checked_add(automate_len).is_some_and(|n|n<=crate::tls_resolver::MAX_CERTIFICATES),
             "certificate group capacity exceeded");
         let clients=self.client_automate_names.get().map_or(&[][..],Vec::as_slice);
-        let mut count=automate.len().checked_add(clients.len()).ok_or(crate::cert_transient::ResourceDenied)?;
+        let mut count=automate_len.checked_add(clients.len()).ok_or(crate::cert_transient::ResourceDenied)?;
         let mut text=0usize;
-        for name in automate {
+        for name in automate.clone() {
             text=text.checked_add(name.len()).ok_or(crate::cert_transient::ResourceDenied)?;
         }
         count=count.checked_add(names.iter().map(Vec::len).sum::<usize>()).ok_or(crate::cert_transient::ResourceDenied)?;
@@ -69,14 +73,14 @@ impl CertificateServices {
         // ownership keep their existing budgets; this does not replace them.
         let slots=table.checked_mul(6*(std::mem::size_of::<String>()+std::mem::size_of::<Vec<String>>()+32))
             .and_then(|n| n.checked_add(count.checked_mul(4*std::mem::size_of::<String>())?))
-            .and_then(|n| n.checked_add((names.len()+automate.len()+clients.len()).checked_mul(4*std::mem::size_of::<Vec<String>>())?))
+            .and_then(|n| n.checked_add((names.len()+automate_len+clients.len()).checked_mul(4*std::mem::size_of::<Vec<String>>())?))
             .ok_or(crate::cert_transient::ResourceDenied)?;
-        let bytes=if automate.is_empty() { 0 } else {
+        let bytes=if automate_len==0 { 0 } else {
             text.checked_mul(4).and_then(|n|n.checked_add(slots))
                 .and_then(|n|n.checked_add(128*1024)).ok_or(crate::cert_transient::ResourceDenied)?
         };
         let memory=crate::cert_transient::reserve(bytes)?;
-        names.try_reserve(automate.len()+clients.len()).map_err(|_|crate::cert_transient::ResourceDenied)?;
+        names.try_reserve(automate_len+clients.len()).map_err(|_|crate::cert_transient::ResourceDenied)?;
         for name in automate {
             // Values are already strict managed identifiers, normalized before
             // choosing a policy, with the same representation as literal input.

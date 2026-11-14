@@ -95,6 +95,10 @@ impl ExtensionProcessing {
         hello: &ClientHelloPayload,
         resumedata: Option<&persist::ServerSessionValue>,
     ) -> Result<(), Error> {
+        if cx.common.is_tls13() {
+            self.extensions.encrypted_client_hello_ack = cx.data.ech.as_ref()
+                .and_then(super::ech::ServerEch::retry_configs);
+        }
         // ALPN
         let our_protocols = &config.alpn_protocols;
         if let Some(their_protocols) = &hello.protocols {
@@ -700,6 +704,24 @@ impl State<ServerConnectionData> for ExpectClientHello {
     where
         Self: 'm,
     {
+        let m = if self.previous_hello.is_some() {
+            match cx.data.ech.as_mut() {
+                Some(ech) => ech.second(m),
+                None => Ok(super::ech::owned(m)),
+            }
+        } else {
+            let keys = self.config.ech_provider.as_ref().map(|provider| provider.keys())
+                .unwrap_or_else(|| Arc::from([]));
+            super::ech::ServerEch::first(m, keys).map(|(message, ech)| {
+                cx.common.native_ech_accepted = ech.inner_random.is_some();
+                cx.data.ech = Some(ech);
+                message
+            })
+        }.map_err(|error| {
+            let alert = if matches!(error, Error::DecryptError) { AlertDescription::DecryptError }
+                else { AlertDescription::IllegalParameter };
+            cx.common.send_fatal_alert(alert, error)
+        })?;
         let (client_hello, sig_schemes) =
             process_client_hello(&m, self.previous_hello.is_some(), cx)?;
         self.with_certified_key(sig_schemes, client_hello, &m, cx)

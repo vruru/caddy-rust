@@ -241,6 +241,7 @@ mod client_hello {
                     client_hello.session_id,
                     cx.common,
                     selected_kxg.name(),
+                    cx.data.ech.as_ref().and_then(|ech| ech.inner_random.as_ref()),
                 );
                 emit_fake_ccs(cx.common);
 
@@ -558,18 +559,24 @@ mod client_hello {
             ..Default::default()
         });
 
+        let mut hello = ServerHelloPayload {
+            legacy_version: ProtocolVersion::TLSv1_2,
+            random: Random::from(randoms.server),
+            session_id: *session_id,
+            cipher_suite: suite.common.suite,
+            compression_method: Compression::Null,
+            extensions,
+        };
+        if let Some(inner_random) = cx.data.ech.as_ref().and_then(|ech| ech.inner_random.as_ref()) {
+            hello.random.0[24..].fill(0);
+            let encoded = HandshakeMessagePayload(HandshakePayload::ServerHello(hello.clone())).get_encoding();
+            let confirmation = crate::tls13::key_schedule::server_ech_confirmation_secret(
+                suite.hkdf_provider, inner_random, transcript.hash_given(&encoded));
+            hello.random.0[24..].copy_from_slice(&confirmation);
+        }
         let sh = Message {
             version: ProtocolVersion::TLSv1_2,
-            payload: MessagePayload::handshake(HandshakeMessagePayload(
-                HandshakePayload::ServerHello(ServerHelloPayload {
-                    legacy_version: ProtocolVersion::TLSv1_2,
-                    random: Random::from(randoms.server),
-                    session_id: *session_id,
-                    cipher_suite: suite.common.suite,
-                    compression_method: Compression::Null,
-                    extensions,
-                }),
-            )),
+            payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ServerHello(hello))),
         };
 
         cx.common.check_aligned_handshake()?;
@@ -626,8 +633,9 @@ mod client_hello {
         session_id: SessionId,
         common: &mut CommonState,
         group: NamedGroup,
+        inner_random: Option<&[u8; 32]>,
     ) {
-        let req = HelloRetryRequest {
+        let mut req = HelloRetryRequest {
             legacy_version: ProtocolVersion::TLSv1_2,
             session_id,
             cipher_suite: suite.common.suite,
@@ -638,6 +646,14 @@ mod client_hello {
             },
         };
 
+        transcript.rollup_for_hrr();
+        if let Some(inner_random) = inner_random {
+            req.extensions.encrypted_client_hello = Some(crate::msgs::base::Payload::new(alloc::vec![0; 8]));
+            let encoded = HandshakeMessagePayload(HandshakePayload::HelloRetryRequest(req.clone())).get_encoding();
+            let confirmation = crate::tls13::key_schedule::server_ech_hrr_confirmation_secret(
+                suite.hkdf_provider, inner_random, transcript.hash_given(&encoded));
+            req.extensions.encrypted_client_hello = Some(crate::msgs::base::Payload::new(confirmation.to_vec()));
+        }
         let m = Message {
             version: ProtocolVersion::TLSv1_2,
             payload: MessagePayload::handshake(HandshakeMessagePayload(
@@ -646,7 +662,6 @@ mod client_hello {
         };
 
         trace!("Requesting retry {m:?}");
-        transcript.rollup_for_hrr();
         transcript.add_message(&m);
         common.send_msg(m, false);
         common.native_hrr = true;
@@ -1253,6 +1268,9 @@ struct ExpectEarlyData {
 }
 
 impl State<ServerConnectionData> for ExpectEarlyData {
+    fn native_exporter(&self)->Result<alloc::sync::Arc<dyn crate::NativeExporter>,Error>{
+        Ok(self.key_schedule.native_exporter())
+    }
     fn handle<'m>(
         mut self: Box<Self>,
         cx: &mut ServerContext<'_>,
@@ -1398,6 +1416,9 @@ impl ExpectFinished {
 }
 
 impl State<ServerConnectionData> for ExpectFinished {
+    fn native_exporter(&self)->Result<alloc::sync::Arc<dyn crate::NativeExporter>,Error>{
+        Ok(self.key_schedule.native_exporter())
+    }
     fn handle<'m>(
         mut self: Box<Self>,
         cx: &mut ServerContext<'_>,

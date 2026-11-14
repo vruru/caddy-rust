@@ -58,3 +58,7 @@ impl fmt::Debug for Protocol {
         self.value.fmt(f)
     }
 }
+
+/// Observe successful request HEADERS/CONTINUATION flush independently of DATA.
+#[derive(Clone,Debug)]
+pub struct NativeRequestHead(pub SendCompletion);

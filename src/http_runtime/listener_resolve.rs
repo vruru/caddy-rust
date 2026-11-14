@@ -2,7 +2,7 @@
 //! Known Rust payloads have concrete prepaid owners. libc/NSS allocations are
 //! opaque provider memory, bounded here by call concurrency, not fictitious RSS.
 use super::{Inner,ListenerKey,resource_budget::{BlockingBudget,BudgetError}};
-use crate::http_config::{PreparedConfig,ListenSpec,ListenerFamily as Family};
+use crate::http_config::{PreparedConfig,ListenSpec,ListenerFamily as Family,ListenerAddress as Address};
 use anyhow::{Result,anyhow,ensure};
 use native_write_policy::{Pool,Lease};
 use std::{collections::{BTreeMap,BTreeSet,HashSet},net::{SocketAddr,IpAddr},sync::{Arc,Weak,Mutex,atomic::{AtomicUsize,Ordering}},time::{Duration,Instant}};
@@ -139,7 +139,7 @@ pub(super) async fn prepare<'a>(inner:&Arc<Inner>,config:&PreparedConfig,extra:i
  let mut hosts=BTreeMap::new();let mut extra_count=0usize;let mut named_count=0usize;
  // Count borrowed inputs before any collection or copied name allocation.
  for host in extra.clone(){ensure!(host.len()<=MAX_HOST_BYTES&&!host.bytes().any(|b|matches!(b,0|b'\r'|b'\n')),"invalid challenge bind hostname");bytes=bytes.checked_add(host.len().saturating_mul(4)+768).ok_or_else(||anyhow!("listener metadata overflow"))?;extra_count+=1;ensure!(extra_count<=1024,"challenge bind hostname count exceeded");}
- for server in &config.servers{for spec in &server.listen_specs{if let ListenSpec::Hostname{host,..}=spec{named_count+=1;bytes=bytes.checked_add(host.len().saturating_mul(4)+768).ok_or_else(||anyhow!("listener metadata overflow"))?;}}}
+ for server in &config.servers{for spec in &server.listen_specs{match spec{ListenSpec::Hostname{host,..}=>{named_count+=1;bytes=bytes.checked_add(host.len().saturating_mul(4)+768).ok_or_else(||anyhow!("listener metadata overflow"))?;},ListenSpec::Unix{path,..}=>{bytes=bytes.checked_add(path.len().saturating_mul(4)+768).ok_or_else(||anyhow!("listener metadata overflow"))?;},_=>{}}}}
  let owner=Owner::new(&resolver.pool,bytes)?;
  let result:Result<Plan>=async{
   let mut names=Vec::new();let mut declarations=Vec::new();let mut servers=Vec::new();names.try_reserve_exact(config.servers.len())?;declarations.try_reserve_exact(config.servers.len())?;servers.try_reserve_exact(config.servers.len())?;
@@ -191,7 +191,7 @@ pub(super) async fn prepare<'a>(inner:&Arc<Inner>,config:&PreparedConfig,extra:i
   }
   for server in &config.servers{
    let mut addresses=Vec::new();let mut v6_only=HashSet::new();addresses.try_reserve_exact(server.listen_specs.len())?;v6_only.try_reserve(server.listen_specs.len())?;
-   for spec in &server.listen_specs{let(address,mode)=match spec{ListenSpec::Numeric{address,only_v6,..}=>(*address,*only_v6),ListenSpec::Hostname{host,port,family,..}=>{let mut address=find_answer(&hosts,host)?.select(*family)?;address.set_port(*port);(address,*family==Family::V6)}};let address=ListenerKey{address,identity:spec.identity().clone()};if addresses.contains(&address){ensure!(v6_only.contains(&address)==mode,"resolved listener IPv6 modes conflict");}else{addresses.push(address.clone());if mode{v6_only.insert(address);}}work+=1;if work%128==0{check(&cancel,&resolver.stop,deadline)?;tokio::task::yield_now().await;}}
+   for spec in &server.listen_specs{let(address,mode)=match spec{ListenSpec::Numeric{address,only_v6,..}=>(Address::Inet(*address),*only_v6),ListenSpec::Hostname{host,port,family,..}=>{let mut address=find_answer(&hosts,host)?.select(*family)?;address.set_port(*port);(Address::Inet(address),*family==Family::V6)},ListenSpec::Unix{path,packet,..}=>(Address::Unix{path:Arc::from(path.as_bytes()),packet:*packet},false),ListenSpec::Fd{number,datagram,..}=>(Address::Fd{number:*number,datagram:*datagram},false)};let address=ListenerKey{address,identity:spec.identity().clone()};if addresses.contains(&address){ensure!(v6_only.contains(&address)==mode,"resolved listener IPv6 modes conflict");}else{addresses.push(address.clone());if mode{v6_only.insert(address);}}work+=1;if work%128==0{check(&cancel,&resolver.stop,deadline)?;tokio::task::yield_now().await;}}
    names.push(server.name.clone());declarations.push(Arc::from(server.listen_specs.clone()));servers.push(Arc::new(ResolvedServer{addresses,v6_only,_owner:owner.clone()}));
   }
   check(&cancel,&resolver.stop,deadline)?;Ok(Plan{runtime:Arc::downgrade(inner),names,declarations,servers,hosts,_owner:owner.clone()})

@@ -95,7 +95,7 @@ pub(super) fn command(name: &str, flags: args::Flags) -> Result<i32> {
     })
 }
 
-fn endpoint(raw: &str) -> Result<(reqwest::Client, String, bool)> {
+pub(super) fn endpoint(raw: &str) -> Result<(reqwest::Client, String, bool)> {
     let mut builder = reqwest::Client::builder()
             .tls_crypto_provider(caddy_compat_native::crypto::client_provider())
         .no_proxy()
