@@ -948,6 +948,7 @@ impl HttpRuntime {
         Ok(())
     }
     pub fn force_shutdown(&self) {
+        self.inner.forced.cancel();
         let (listeners, pending, retired, stop) = {
             let mut control = self.control.lock();
             control.phase = Phase::Forced;

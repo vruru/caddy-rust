@@ -23,3 +23,11 @@ does not add a watchdog, socket activation, installation or self-upgrade system.
 The production unit's authorization, timeouts and CPU policy remain operator
 configuration. Datagram/credential validation is separate from final acceptance
 under the target machine's actual service manager.
+
+An explicit force signal also cancels the real HTTP/1 and HTTP/2 connection
+future, including after graceful drain has started. This closes the owned IO
+even when the peer has stopped reading or no longer grants flow-control credit;
+it does not depend on another response-body poll. Ordinary shutdown and reload
+continue to drain accepted work. Connection and request credit is released by
+actual IO/body destruction; retained workers keep their own ownership until
+they finish. Force does not synthesize completion or refund permits early.

@@ -275,6 +275,7 @@ struct Inner {
     upgrades: TaskTracker,
     resources: Arc<resource_budget::Resources>,
     stopped: CancellationToken,
+    forced: CancellationToken,
 }
 struct Generation {
     listener_plan: Option<Arc<ListenerPlan>>,
@@ -452,6 +453,7 @@ impl HttpRuntime {
                 resources,
                 connections,
                 stopped: CancellationToken::new(),
+                forced: CancellationToken::new(),
             }),
             control: Arc::new(lifecycle::Lifecycle::new()),
         }
@@ -1603,9 +1605,25 @@ async fn serve_connection<I>(
     let connection = builder.serve_connection_with_upgrades_selected(io, service);
     tokio::pin!(connection);
     tokio::select! {
+        biased;
+        _ = inner.forced.cancelled() => {},
         _ = &mut connection => {},
-        _ = requested_drain.cancelled() => { connection.as_mut().graceful_shutdown(); let _ = connection.await; },
-        _ = inner.stopped.cancelled() => { connection.as_mut().graceful_shutdown(); let _ = connection.await; },
+        _ = async {
+            tokio::select! {
+                _ = requested_drain.cancelled() => {},
+                _ = inner.stopped.cancelled() => {},
+            }
+        } => {
+            connection.as_mut().graceful_shutdown();
+            // Body cancellation alone cannot interrupt a pending socket flush
+            // or HTTP/2 flow-control wait. Explicit force drops the actual
+            // connection and its IO; ordinary drain still awaits completion.
+            tokio::select! {
+                biased;
+                _ = inner.forced.cancelled() => {},
+                _ = &mut connection => {},
+            }
+        },
     }
 }
 struct RetainedBody {
