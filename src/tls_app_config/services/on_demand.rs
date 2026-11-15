@@ -1364,6 +1364,7 @@ impl CertificateServices {
                     super::super::permission::HttpPermission::new(
                         setting.endpoint,
                         self.context.resources.issuance.clone(),
+                        #[cfg(feature="native-run")] self.outgoing_tls.clone(),
                     )?,
                 )))
             })

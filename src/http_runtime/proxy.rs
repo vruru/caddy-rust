@@ -563,6 +563,71 @@ pub(super) async fn serve(
     config: &ProxyConfig,
     server: &Arc<ActiveServer>,
 ) -> Result<PreparedResponse> {
+    let began=std::time::Instant::now();
+    let body_limit=ctx.body_limit.clone();
+    let mut stats=ProxyStats::default();
+    let result=serve_inner(ctx,config,server,&mut stats).await;
+    if let Err(error)=&result {
+        terminal_proxy_log(
+            server.logging.as_ref(),error,
+            super::request::proxy_error_status(error,body_limit.as_deref()),
+            began.elapsed(),&stats,
+        );
+    }
+    // Preserve the original error object and the request layer's status rules.
+    result
+}
+
+#[derive(Default)]
+struct ProxyStats { attempts:u64,retries:u32 }
+
+#[derive(Debug)]
+pub(super) struct ResponseHeaderTimeout;
+impl std::fmt::Display for ResponseHeaderTimeout {
+    fn fmt(&self, f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        f.write_str("upstream response header timeout")
+    }
+}
+impl std::error::Error for ResponseHeaderTimeout {}
+
+fn proxy_error_category(error:&anyhow::Error)->&'static str {
+    if error.is::<ResponseHeaderTimeout>() {return "response_header_timeout"}
+    if error.is::<super::proxy_retry::NoUpstream>() {return "no_upstreams"}
+    let timed_out=error.chain().any(|cause|{
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error|error.kind()==std::io::ErrorKind::TimedOut)
+            ||cause.downcast_ref::<hyper::Error>().is_some_and(hyper::Error::is_timeout)
+    });
+    if timed_out {return if super::proxy_retry::is_dial(error){"dial_timeout"}else{"transport_timeout"}}
+    if error.chain().any(|cause|cause.downcast_ref::<std::io::Error>().is_some_and(|error|error.kind()==std::io::ErrorKind::ConnectionRefused)) {
+        return "connection_refused"
+    }
+    "upstream_error"
+}
+
+fn terminal_proxy_log(logging:Option<&Arc<crate::logging::Logging>>,error:&anyhow::Error,status:StatusCode,elapsed:Duration,stats:&ProxyStats){
+    use crate::logging::{Event,Field,FieldValue,Level,Origin};
+    let Some(logging)=logging else{return};
+    let module="http.handlers.reverse_proxy";
+    let level=if status.is_client_error(){Level::Warn}else{Level::Error};
+    if let Ok(mut event)=Event::new(Origin::Module{module_id:module.into()},module,level,"proxy request failed"){
+        event.fields=vec![
+            Field::new("category",FieldValue::String(proxy_error_category(error).into())),
+            Field::new("status",FieldValue::U64(u64::from(status.as_u16()))),
+            Field::new("elapsed_ns",FieldValue::U64(elapsed.as_nanos().min(u64::MAX as u128)as u64)),
+            Field::new("attempts",FieldValue::U64(stats.attempts)),
+            Field::new("retries",FieldValue::U64(u64::from(stats.retries))),
+        ];
+        // Logging is optional and bounded; failure never changes proxy behavior.
+        let _=logging.try_emit(event);
+    }
+}
+
+async fn serve_inner(
+    ctx: &mut Context,
+    config: &ProxyConfig,
+    server: &Arc<ActiveServer>,
+    stats: &mut ProxyStats,
+) -> Result<PreparedResponse> {
     let rewrite=if let Some(plan)=&config.rewrite{Some(super::rewrite_runtime::upstream(plan,ctx).await?)}else{None};
     let method=rewrite.as_ref().map_or_else(||ctx.req().method().clone(),|r|r.method.clone());
     let has_content=super::proxy_handler::request_has_content(ctx,&method,rewrite.as_ref().is_some_and(|r|r.omit_body));
@@ -614,10 +679,12 @@ pub(super) async fn serve(
     let start = std::time::Instant::now();
     let mut retries = 0;
     loop {
+        stats.retries=retries;
         ctx.values
             .insert("http.reverse_proxy.retries".into(), retries.to_string());
         let mut progress = AttemptProgress::default();
         let result = serve_once(ctx, config, server, Some(&source), &mut progress,rewrite.as_ref()).await;
+        if progress.fetch_started {stats.attempts=stats.attempts.saturating_add(1);}
         let result=match result{Ok(mut prepared)=>{
             prepared.handler=Some(config.handler.clone());prepared.response_method=method.clone();
             prepared.verbose=super::proxy_verbose::Verbose::capture(server.logging.as_ref(),config.handler.verbose_logs);
@@ -636,8 +703,14 @@ pub(super) async fn serve(
             guard.abort();
         }
         let error = result.err().expect("failed attempt");
+        // A FastCGI BEGIN/PARAMS write can already start application work.
+        // A replayable input is not permission to repeat a non-idempotent
+        // exchange whose transmission has started, even with retry_match.
+        let unsafe_fastcgi_replay=error.is::<super::fastcgi::ExchangeStarted>()
+            && !matches!(method, http::Method::GET|http::Method::HEAD|http::Method::OPTIONS
+                |http::Method::TRACE|http::Method::PUT|http::Method::DELETE);
         if progress.response_received || error.is::<DownstreamFailure>()
-            || super::http_dial::is_local_failure(&error) {
+            || super::http_dial::is_local_failure(&error) || unsafe_fastcgi_replay {
             return Err(error);
         }
         // Client upload, body limit and local spool failures do not describe
@@ -657,8 +730,10 @@ pub(super) async fn serve(
             return Err(error);
         }
         let allowed = if let Some(rewrite)=&rewrite{let mut view=ctx.upstream_view(rewrite)?;super::proxy_retry::allowed(&mut view,&config.ext.retry,start,retries,&error,&source).await}else{super::proxy_retry::allowed(ctx,&config.ext.retry,start,retries,&error,&source).await};
-        if !matches!(allowed, Ok(true)) {
-            return Err(error);
+        match allowed {
+            Ok(true) => {},
+            Ok(false) => return Err(error),
+            Err(matcher_error) => return Err(matcher_error),
         }
         if let Some(log)=super::proxy_verbose::Verbose::capture(server.logging.as_ref(),config.handler.verbose_logs){log.number("retrying","after_ns",config.ext.retry.try_interval.as_nanos().min(u64::MAX as u128)as u64);}
         retries = retries
@@ -1228,7 +1303,7 @@ async fn fetch_with_informational(
                 };
                 let response = tokio::time::timeout_at(deadline.into(), &mut pending)
                     .await
-                    .map_err(|_| super::request::failure(StatusCode::GATEWAY_TIMEOUT))??;
+                    .map_err(|elapsed| super::request::failure_with_cause(StatusCode::GATEWAY_TIMEOUT,anyhow::Error::new(elapsed).context(ResponseHeaderTimeout)))??;
                 anyhow::Ok(response)
             }
         }

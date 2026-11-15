@@ -37,6 +37,7 @@ cargo build --locked --release --features native-run
 For compatibility details, refer to:
 *   `COMPATIBILITY.md`
 *   `docs/COMPATIBILITY-STATUS.md`
+*   `docs/BEHAVIOR-REMEDIATION.md`
 *   `docs/PROCESS-NOTIFY.md`
 *   `docs/ACME-SERVER.md`
 *   `docs/SESSION-TICKETS.md`

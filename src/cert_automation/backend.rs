@@ -70,10 +70,18 @@ fn unavailable_at(error:&anyhow::Error,cancel:&CancellationToken,depth:usize)->b
     if depth>=16{return false}
     if cancel.is_cancelled() || crate::cert_transient::is_resource(error)
         ||error.is::<crate::cert_transient::ResourceDenied>()
-        ||error.is::<crate::acme_wire::chain_memory::MemoryDenied>()
-        ||error.is::<super::zerossl::IssuedCandidate>()||error.chain().any(|cause|cause.is::<super::zerossl::IssuedCandidate>())
+        ||error.is::<crate::acme_wire::chain_memory::MemoryDenied>() { return false; }
+    // This sealed receipt already proved read-only protocol state and actual
+    // retirement. Its retained original cause is diagnostic evidence, not a
+    // reason to reclassify it as an ordinary ambiguous remote write.
+    #[cfg(all(feature = "native-run", unix))]
+    {
+        if error.is::<super::acme_leg::ExistingActiveOrder>() { return false; }
+        if error.is::<super::acme_leg::RetiredReadTimeout>() || error.is::<super::acme_leg::PrecheckUnavailable>() { return true; }
+    }
+    if error.is::<super::zerossl::IssuedCandidate>()||error.chain().any(|cause|cause.is::<super::zerossl::IssuedCandidate>())
         ||error.is::<super::zerossl::CreateUncertain>()||error.chain().any(|cause|cause.is::<super::zerossl::CreateUncertain>())
-        ||error.is::<LegDeadline>()||error.is::<ExpiredStoredCandidate>()||error.is::<FutureCertificate>()
+        ||error.is::<LegDeadline>()||error.is::<AmbiguousOrder>()||error.is::<ExpiredStoredCandidate>()||error.is::<FutureCertificate>()
         ||error.is::<crate::acme_wire::AcmeRequestCancelled>() {
         return false
     }
@@ -287,18 +295,37 @@ impl CertificateManager {
             entered=rank+1;
             let mut account=None;let mut reservation=None;
             let test_driver=match backend.kind{BackendKind::Acme(index)=>self.uses_test_driver(index,&state),_=>false};
+            #[cfg(all(feature="native-run",unix))]
+            let scoped_leg = self.scoped_acme_legs();
+            #[cfg(not(all(feature="native-run",unix)))]
+            let scoped_leg = false;
             if let Some(issuer)=backend.acme(&self.inner.issuers) {
                 // Subject incompatibility is one issuer's PreCheck, not loss of
                 // the already authorized Internal capability or ask decision.
                 if normalize_names(&input.record.names).is_err(){last=Some(anyhow!("ACME issuer does not support these authorized identifier types"));continue}
                 let allowed=issuer.ca.next_allowed_unix.load(Ordering::Acquire);
-                if !test_driver&&allowed>now(){last=Some(RetryAfterError(allowed).into());continue}
-                if let Some(key)=&issuer.config.account_key {
+                if !scoped_leg&&!test_driver&&allowed>now(){last=Some(RetryAfterError(allowed).into());continue}
+                if !scoped_leg { if let Some(key)=&issuer.config.account_key {
                     match key.signer(){Ok(_)=>{},
                         Err(error)if error.is::<super::account_key::CredentialUnavailable>()=>{
                             last=Some(error.context("configured ACME issuer credential unavailable"));continue
                         },
                         Err(error)=>return Err(error),
+                    }
+                }
+                }
+                #[cfg(all(feature = "native-run", unix))]
+                if scoped_leg {
+                    let outcome = self.issue_scoped_acme_leg(&names, backend, &attempt_id, &input,
+                        &mut previous, &lifecycle, &cancel, storage_check, &produced, round,
+                        rank + 1 < state.backend_sequence.len()).await;
+                    match outcome {
+                        Ok(value) => return Ok(value),
+                        Err(error) if !error.is::<super::acme_leg::ExistingActiveOrder>()
+                            && (unavailable(&error, &cancel) || error.is::<RetryAfterError>()) => {
+                            record_issuer_error(issuer, &error); last = Some(error); continue;
+                        },
+                        Err(error) => return Err(error),
                     }
                 }
                 if !test_driver {
@@ -341,7 +368,8 @@ impl CertificateManager {
                         self.inner.store.recover_certificate_with_lease(&backend.storage_key,&names_key(&names)?,&lease).await?;
                         let _=self.read_issuer_certificate(&backend.storage_key,&names_key(&names)?,&work).await?;
                         if test_driver {
-                            return self.issue_test_ca_leg(*index,&names,&attempt_id,&input,previous.as_ref(),&lease,&lifecycle,&work,round,&produced).await;
+                            return self.issue_test_ca_leg(*index,&names,&attempt_id,&input,previous.as_ref(),&lease,&lifecycle,&work,round,&produced,
+                                #[cfg(all(feature="native-run",unix))] None).await;
                         }
                         let current=self.read_reservation(&names,issuer).await?;
                         ensure!(current.as_ref().map(|v|v.job_id.as_str())==reservation.as_ref().map(|v|v.job_id.as_str()),

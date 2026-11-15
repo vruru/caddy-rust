@@ -150,9 +150,13 @@ fn master_metadata_bytes() -> Result<usize> {
         cancellation_children_bytes(nodes)?,
     ])
 }
+// Contains no Master/scope/back-reference; escaped CPU metadata can keep only
+// the prepaid capacity alive without retaining execution or creating a cycle.
+struct PrepaidCredit { _permit: OwnedSemaphorePermit }
 struct Loan {
-    total: Option<OwnedSemaphorePermit>,
     local: OwnedSemaphorePermit,
+    // Last: release local admission before the actual global capacity owner.
+    _prepaid: Option<Arc<PrepaidCredit>>,
 }
 struct Master {
     closed: Mutex<bool>,
@@ -160,9 +164,10 @@ struct Master {
     tasks: TaskTracker,
     executor: ClientTlsExecutor,
     sign: SignSlot,
-    total: Option<Arc<Semaphore>>,
     local: Arc<Semaphore>,
     _metadata: Loan,
+    // Loan also retains this independently: CpuMetadata may escape Master.
+    prepaid: Option<Arc<PrepaidCredit>>,
 }
 /// This external owner is never retained by an IO object. Drop can therefore
 /// cancel independently of IO->scope->runtime references and break idle cycles.
@@ -171,24 +176,30 @@ pub(crate) struct Resources {
 }
 impl Resources {
     pub(crate) fn new(total: Arc<Semaphore>) -> Result<Self> {
-        // Preserve certificate total-pool preadmission before constructing its
-        // local semaphore/Arc. Observability passes its existing Process pool.
-        let bytes = master_metadata_bytes()?;
-        let total_credit = total.clone().try_acquire_many_owned(u32::try_from(bytes)?)
+        // Reserve this existing local ceiling once, before any large external
+        // material waiter can queue on the same fair total semaphore. Nested
+        // small try_acquire calls could otherwise reject admitted operations
+        // even with enough unassigned total bytes. No quota is enlarged.
+        let bytes = metadata_sum(&[master_metadata_bytes()?,
+            std::mem::size_of::<PrepaidCredit>(), 2 * std::mem::size_of::<usize>()])?;
+        let total_credit = total.try_acquire_many_owned(u32::try_from(WRAPPER_BYTES)?)
             .map_err(|_| crate::cert_transient::ResourceDenied)?;
-        Self::new_pool(Some(total), Arc::new(Semaphore::new(WRAPPER_BYTES)), Some(total_credit), bytes)
+        Self::new_pool(Arc::new(Semaphore::new(WRAPPER_BYTES)), Some(total_credit), bytes)
     }
     /// Observability owns an independent pool; it never borrows certificate or
     /// metric-label credits for a connection's lifetime.
     pub(crate) fn independent(local: Arc<Semaphore>) -> Result<Self> {
         let bytes = master_metadata_bytes()?;
-        Self::new_pool(None, local, None, bytes)
+        Self::new_pool(local, None, bytes)
     }
-    fn new_pool(total: Option<Arc<Semaphore>>, local: Arc<Semaphore>, total_credit: Option<OwnedSemaphorePermit>, bytes: usize) -> Result<Self> {
+    fn new_pool(local: Arc<Semaphore>, total_credit: Option<OwnedSemaphorePermit>, bytes: usize) -> Result<Self> {
         let local_credit = local
             .clone()
             .try_acquire_many_owned(u32::try_from(bytes)?)
             .map_err(|_| crate::cert_transient::ResourceDenied)?;
+        // Both global capacity and its concrete local layout are paid before
+        // the credit Arc exists. Observability keeps this None.
+        let prepaid=total_credit.map(|permit|Arc::new(PrepaidCredit{_permit:permit}));
         Ok(Self {
             inner: Arc::new(Master {
                 closed: Mutex::new(false),
@@ -196,12 +207,9 @@ impl Resources {
                 tasks: TaskTracker::new(),
                 executor: ClientTlsExecutor::new(),
                 sign: SignSlot::default(),
-                total,
                 local,
-                _metadata: Loan {
-                    total: total_credit,
-                    local: local_credit,
-                },
+                _metadata: Loan { local: local_credit, _prepaid: prepaid.clone() },
+                prepaid,
             }),
         })
     }
@@ -250,16 +258,12 @@ impl Master {
 
     fn loan(&self, bytes: usize) -> Result<Loan> {
         let bytes = u32::try_from(bytes)?;
-        let total = self.total.as_ref().map(|total| {
-            total.clone().try_acquire_many_owned(bytes)
-                .map_err(|_| crate::cert_transient::ResourceDenied)
-        }).transpose()?;
         let local = self
             .local
             .clone()
             .try_acquire_many_owned(bytes)
             .map_err(|_| crate::cert_transient::ResourceDenied)?;
-        Ok(Loan { total, local })
+        Ok(Loan { local, _prepaid:self.prepaid.clone() })
     }
     fn close(&self, force: bool) {
         {
@@ -490,9 +494,6 @@ impl ConnectionBytes {
     pub(crate) fn grow(&mut self, bytes: usize) -> Result<()> {
         let added = self.master.loan(bytes)?;
         self.loan.local.merge(added.local);
-        if let Some(extra) = added.total {
-            self.loan.total.as_mut().expect("same connection pool").merge(extra);
-        }
         Ok(())
     }
 }

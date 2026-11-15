@@ -50,6 +50,7 @@ impl ActiveState {
     pub(super) fn observe(&self, success: bool, passes: u32, fails: u32) -> Option<bool> {
         let mut c = self.counters.lock().unwrap_or_else(|e| e.into_inner());
         if success {
+            c.fails = 0;
             c.passes = c.passes.saturating_add(1);
             if !self.healthy.load(Ordering::Acquire) {
                 if c.passes >= passes as u64 {
@@ -62,6 +63,7 @@ impl ActiveState {
                 return None;
             }
         } else {
+            c.passes = 0;
             c.fails = c.fails.saturating_add(1);
             if self.healthy.load(Ordering::Acquire) {
                 if c.fails >= fails as u64 {

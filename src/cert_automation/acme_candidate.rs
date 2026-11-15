@@ -17,7 +17,7 @@ impl AcmeCandidate {
     pub(super) fn purpose(&self)->AcmePurpose {match self {Self::Stored{purpose,..}|Self::Downloaded{purpose,..}=>*purpose}}
 }
 impl CertificateManager {
-    pub(super) async fn commit_primary_candidate(&self,names:&[String],issuer:&IssuerState,
+    pub(super) async fn commit_primary_candidate(&self,names:&[String],issuer:&IssuerState,wire:&AcmeWire,
         lease:&StorageLease,attempt_id:&str,lifecycle:&crate::cert_events::Attempt,
         cancel:&CancellationToken,input:Option<&Arc<attempt::RuntimeInput>>,
         produced:Option<&std::sync::atomic::AtomicBool>,candidate:AcmeCandidate)->Result<ManagedCertificate> {
@@ -34,7 +34,6 @@ impl CertificateManager {
                 self.managed(names,issuer_name,bundle,info.take().ok_or_else(||anyhow!("ACME stored candidate facts missing"))?,false)
             },
             AcmeCandidate::Downloaded{bundle,info,job,id,issuer_name,..}=>{
-                let wire=issuer.wire.get().ok_or_else(||anyhow!("ACME wire missing at candidate commit"))?;
                 let has_known_order=job.order_url.is_some();
                 let operation=async {
                     let facts=info.as_ref().ok_or_else(||anyhow!("ACME downloaded candidate facts missing"))?;

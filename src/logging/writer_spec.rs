@@ -99,6 +99,12 @@ impl FileSpec {
         };
         let raw_size = config::integer(m.remove("roll_size_mb"))?;
         let size_mb = if raw_size == 0 { 100 } else { raw_size };
+        if roll {
+            ensure!(
+                size_mb > 0 && size_mb.checked_mul(1 << 20).is_some(),
+                "log rotation size must be positive and fit in signed bytes"
+            );
+        }
         let interval = config::duration(m.remove("roll_interval"))?;
         let minutes = match m.remove("roll_minutes") {
             None | Some(Value::Null) => Vec::new(),

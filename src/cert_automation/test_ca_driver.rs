@@ -188,7 +188,8 @@ impl CertificateManager {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn issue_test_ca_leg(&self,index:usize,names:&[String],attempt_id:&str,input:&Arc<RuntimeInput>,
         replacement:Option<&Replacement>,lease:&StorageLease,lifecycle:&crate::cert_events::Attempt,
-        cancel:&CancellationToken,round:retry_operation::AcmeRound<'_>,produced:&std::sync::atomic::AtomicBool)->Result<ManagedCertificate>{
+        cancel:&CancellationToken,round:retry_operation::AcmeRound<'_>,produced:&std::sync::atomic::AtomicBool,
+        #[cfg(all(feature="native-run",unix))] leg:Option<&super::acme_leg::Leg>)->Result<ManagedCertificate>{
         let primary=self.inner.issuers.get(index).ok_or_else(||anyhow!("test CA production index missing"))?;
         let state=self.load_attempt(names).await?.ok_or_else(||anyhow!("test CA attempt missing"))?;
         ensure!(state.attempt_id==attempt_id&&state.winner.is_none(),"test CA attempt superseded");
@@ -235,11 +236,17 @@ impl CertificateManager {
                     let _network=self.net_permit(issuer,cancel).await?;
                     let allowed=issuer.ca.next_allowed_unix.load(Ordering::Acquire);
                     if allowed>now(){return Err(RetryAfterError(allowed).into())}
-                    let wire=issuer.wire.get_or_try_init(||async{
+                    #[cfg(all(feature="native-run",unix))]
+                    let scoped = match leg {Some(leg)=>Some(leg.wire(self,issuer,cancel).await?),None=>None};
+                    #[cfg(not(all(feature="native-run",unix)))]
+                    let scoped: Option<AcmeWire> = None;
+                    let wire=if let Some(wire)=scoped.as_ref(){wire}else{issuer.wire.get_or_try_init(||async{
                         AcmeWire::connect_with_client_tls_scope(issuer.config.wire.clone(),self.inner.local.clone(),self.inner.chain_memory.clone(),
                             #[cfg(feature="native-run")] self.inner.outgoing_tls.clone(),self.wire_client_owner_for(issuer),cancel).await
-                    }).await?;
+                    }).await?};
                     let session=self.account(issuer,wire,old.as_ref().map(|record|record.job.account_location.as_str()),cancel).await?;
+                    #[cfg(all(feature="native-run",unix))]
+                    if leg.is_some(){wire.account_setup_confirmed();}
                     let candidate=self.issue_candidate(names,issuer,&session,lease,(replacement,None,attempt_id),None,cancel,Some(input),
                         acme_journal::AcmeJournal::Probe(binding)).await?;
                     self.complete_probe(names,attempt_id,binding,lease,candidate).await
@@ -252,12 +259,18 @@ impl CertificateManager {
             let _network=self.net_permit(primary,cancel).await?;
             let allowed=primary.ca.next_allowed_unix.load(Ordering::Acquire);
             if allowed>now(){return Err(RetryAfterError(allowed).into())}
-            let wire=primary.wire.get_or_try_init(||async{
+            #[cfg(all(feature="native-run",unix))]
+                    let scoped = match leg {Some(leg)=>Some(leg.wire(self,primary,cancel).await?),None=>None};
+                    #[cfg(not(all(feature="native-run",unix)))]
+                    let scoped: Option<AcmeWire> = None;
+                    let wire=if let Some(wire)=scoped.as_ref(){wire}else{primary.wire.get_or_try_init(||async{
                 AcmeWire::connect_with_client_tls_scope(primary.config.wire.clone(),self.inner.local.clone(),self.inner.chain_memory.clone(),
                     #[cfg(feature="native-run")] self.inner.outgoing_tls.clone(),self.wire_client_owner_for(primary),cancel).await
-            }).await?;
+            }).await?};
             let current=self.read_reservation(names,primary).await?;
             let session=self.account(primary,wire,current.as_ref().map(|marker|marker.account_location.as_str()),cancel).await?;
+                    #[cfg(all(feature="native-run",unix))]
+                    if leg.is_some(){wire.account_setup_confirmed();}
             let current=if let Some(marker)=current {
                 if self.retire_compromised_job(&marker,lease,cancel).await?{None}else{Some(marker)}
             }else{None};
@@ -268,7 +281,7 @@ impl CertificateManager {
             let using_test=if after_probe{false}else{self.same_test_endpoint(index)};
             let candidate=self.issue_candidate(names,primary,&session,lease,(replacement,current.as_ref(),attempt_id),None,cancel,Some(&leg_input),
                 acme_journal::AcmeJournal::Primary{effective_ordinal:effective,using_test_endpoint:using_test}).await?;
-            self.commit_primary_candidate(names,primary,lease,attempt_id,lifecycle,cancel,Some(&leg_input),Some(produced),candidate).await
+            self.commit_primary_candidate(names,primary,session.wire(),lease,attempt_id,lifecycle,cancel,Some(&leg_input),Some(produced),candidate).await
         }.await;
         result.map_err(|error|{
             let retry=error.is::<RetryAfterError>()||error.downcast_ref::<ProtocolError>().is_some_and(|p|p.status()==429);

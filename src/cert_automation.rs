@@ -7,6 +7,8 @@
 mod job_codec;
 mod attempt;
 mod backend;
+#[cfg(all(feature = "native-run", unix))]
+mod acme_leg;
 mod acme_candidate;
 mod acme_probe;
 mod acme_journal;
@@ -257,6 +259,7 @@ struct ManagerInner {
     outgoing_tls:Option<Arc<crate::outgoing_tls::Scope>>,
     chain_memory:Arc<crate::acme_wire::ChainMemoryPools>,
     chain_cleanup:Arc<crate::acme_wire::ChainCleanup>,
+    leg_parent: Option<tokio_util::task::TaskTracker>,
     must_staple: bool,
     reuse_private_keys: bool,
     disable_storage_check: bool,
@@ -719,6 +722,7 @@ impl CertificateManager {
     /// Native service groups adopt cancelled graph cleanup in their own tracker.
     pub(crate) fn with_chain_tasks(mut self,parent:tokio_util::task::TaskTracker)->Result<Self>{
         let inner=Arc::get_mut(&mut self.inner).ok_or_else(||anyhow!("certificate manager is already shared"))?;
+        inner.leg_parent = Some(parent.clone());
         inner.chain_cleanup=Arc::new(crate::acme_wire::ChainCleanup::with_parent(parent));Ok(self)
     }
     /// After cancelling/joining callers, wait for graph cleanup and actual
@@ -921,6 +925,7 @@ impl CertificateManager {
             inner: Arc::new(ManagerInner {
                 chain_memory:resources.chain_memory.clone(),
                 chain_cleanup:Arc::new(crate::acme_wire::ChainCleanup::default()),
+                leg_parent: None,
                 must_staple:false,
                 reuse_private_keys:false,
                 disable_storage_check:false,
@@ -2608,7 +2613,7 @@ impl CertificateManager {
             .is_some_and(|index|self.same_test_endpoint(index));
         let candidate=self.issue_candidate(names,issuer,account,lease,cycle,initial_reuse,cancel,input,
             acme_journal::AcmeJournal::Primary{effective_ordinal,using_test_endpoint}).await?;
-        self.commit_primary_candidate(names,issuer,lease,cycle.2,lifecycle,cancel,input,produced,candidate).await
+        self.commit_primary_candidate(names,issuer,account.wire(),lease,cycle.2,lifecycle,cancel,input,produced,candidate).await
     }
 
     async fn issue_candidate(
@@ -2630,20 +2635,9 @@ impl CertificateManager {
         }
         let candidate_memory=crate::cert_transient::reserve(std::mem::size_of::<acme_candidate::AcmeCandidate>().checked_add(256).ok_or(crate::cert_transient::ResourceDenied)?)?;
         let (replacement, reservation, attempt_id) = cycle;
-        let wire = issuer
-            .wire
-            .get_or_try_init(|| async {
-                AcmeWire::connect_with_client_tls_scope(
-                    issuer.config.wire.clone(),
-                    self.inner.local.clone(),
-                                self.inner.chain_memory.clone(),
-                                #[cfg(feature="native-run")]
-                                self.inner.outgoing_tls.clone(),
-                                self.wire_client_owner_for(issuer),
-                    cancel,
-                ).await
-            })
-            .await?;
+        // The authenticated account carries the exact scoped client that made
+        // it. Do not silently switch a native leg back to a generation client.
+        let wire = account.wire();
         let issuer_name = issuer_key(wire.directory_url())?;
         let initial=match journal {acme_journal::AcmeJournal::Primary{..}=>self.initial_key(&issuer_name,&names_key(names)?,cancel).await?,acme_journal::AcmeJournal::Probe(_)=>None};
         let initial_hash=initial.as_ref().map(|(snapshot,_)|snapshot.digest().to_owned());
@@ -2939,8 +2933,7 @@ impl CertificateManager {
                                         journal.save(self,&id,&job,lease).await?;
                                         return Err(error);
                                     } else {
-                                        return Err(anyhow::Error::new(AmbiguousOrder)
-                                            .context(error.to_string()));
+                                        return Err(error.context(AmbiguousOrder));
                                     }
                                 }
                             }
@@ -2949,7 +2942,7 @@ impl CertificateManager {
                             return Err(error);
                         }
                     } else {
-                        return Err(anyhow::Error::new(AmbiguousOrder).context(error.to_string()));
+                        return Err(error.context(AmbiguousOrder));
                     }
                 }
             };
@@ -3018,7 +3011,7 @@ impl CertificateManager {
             ensure!(resource.value.status=="valid","ACME certificate polling deadline exceeded");
             job.certificate_url=resource.value.certificate;
             if job.downloaded_pem.is_none() {
-                let chains=account.download_order_chains(&url,issuer.config.preferred_chains.wants_names(),issuer.config.preferred_chains.wants_alternates(),self.inner.chain_cleanup.clone(),cancel).await?;
+                let chains=account.download_order_chains(&url,issuer.config.preferred_chains.wants_names(),issuer.config.preferred_chains.wants_alternates(),account.chain_cleanup(&self.inner.chain_cleanup),cancel).await?;
                 let preference=issuer.config.preferred_chains.clone();
                 let selection_credit=crate::acme_wire::chain_memory::scratch(65536,cancel.clone()).await?;
                 let selected=self.cpu(cancel,move||{let _credit=selection_credit;preference.select(chains)}).await?;

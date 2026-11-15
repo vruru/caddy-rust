@@ -21,6 +21,8 @@ pub(in crate::http_runtime) const MEMORY_PREFIX: usize = 128 * 1024;
 
 struct Storage {
     file: File,
+    // The actual file/IO worker, not only its async waiter, retains this request.
+    _business: Arc<super::super::BusinessGuard>,
     _fd: OwnedSemaphorePermit,
     credits: Mutex<Vec<OwnedSemaphorePermit>>,
 }
@@ -49,6 +51,7 @@ impl Spool {
         Ok(Self {
             storage: Arc::new(Storage {
                 file,
+                _business: ctx.business.clone(),
                 _fd: fd,
                 credits: Mutex::new(Vec::new()),
             }),

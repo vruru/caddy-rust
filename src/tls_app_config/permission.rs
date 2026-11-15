@@ -50,13 +50,17 @@ struct CachedClient {
 pub(super) struct HttpPermission {
     endpoint: String,
     resources: Arc<AutomationResources>,
+    #[cfg(feature="native-run")]
+    scope:Option<Arc<crate::outgoing_tls::Scope>>,
     client: Arc<Mutex<Option<CachedClient>>>,
 }
 impl HttpPermission {
     pub(super) fn endpoint(&self) -> &str {
         &self.endpoint
     }
-    pub(super) fn new(endpoint: String, resources: Arc<AutomationResources>) -> Result<Self> {
+    pub(super) fn new(endpoint: String, resources: Arc<AutomationResources>,
+        #[cfg(feature="native-run")] scope:Option<Arc<crate::outgoing_tls::Scope>>,
+    ) -> Result<Self> {
         ensure!(
             endpoint.len() <= 1024 * 1024,
             "permission endpoint limit exceeded"
@@ -64,6 +68,7 @@ impl HttpPermission {
         Ok(Self {
             endpoint,
             resources,
+            #[cfg(feature="native-run")] scope,
             client: Arc::new(Mutex::new(None)),
         })
     }
@@ -116,8 +121,10 @@ impl HttpPermission {
         // per-permission-origin permit. A slow endpoint cannot consume the
         // independent CA network budget while merely waiting.
         let origin = target.origin.clone();
+        #[cfg(feature="native-run")]
+        let scope=self.scope.clone();
         let client = cert_cpu::run(self.resources.cpu_slots(), cancel.clone(), move || {
-            permission_client(&cache, &origin)
+            permission_client(&cache, &origin, #[cfg(feature="native-run")] scope)
         })
         .await?;
         let mut request = client
@@ -182,7 +189,9 @@ fn env(name: &str) -> Option<String> {
                 .filter(|s| !s.is_empty())
         })
 }
-fn permission_client(cache: &Mutex<Option<CachedClient>>, url: &Url) -> Result<reqwest::Client> {
+fn permission_client(cache: &Mutex<Option<CachedClient>>, url: &Url,
+    #[cfg(feature="native-run")] scope:Option<Arc<crate::outgoing_tls::Scope>>,
+) -> Result<reqwest::Client> {
     // Reload the system root inventory before consulting the cached client:
     // commit-time local trust installation must become visible to later checks.
     let mut roots = rustls_native_certs::load_native_certs().certs;
@@ -234,13 +243,20 @@ fn permission_client(cache: &Mutex<Option<CachedClient>>, url: &Url) -> Result<r
         builder =
             builder.proxy(reqwest::Proxy::all(proxy).map_err(|_| PermissionFailure::Transport)?);
     }
+    let builder=crate::acme_wire::attach_owned_scope(builder,
+        #[cfg(feature="native-run")] scope,
+        &crate::acme_wire::ClientOwner::default(),
+    ).map_err(|error|error.context(PermissionFailure::Capacity))?;
     let client = builder.build().map_err(|_| PermissionFailure::Transport)?;
-    *cache
+    let retired=cache
         .lock()
-        .map_err(|_| anyhow!(PermissionFailure::Capacity))? = Some(CachedClient {
+        .map_err(|_| anyhow!(PermissionFailure::Capacity))?.replace(CachedClient {
         identity,
         client: client.clone(),
     });
+    // A last cached client may retire connector/IO owners. Never do so under
+    // the permission cache mutex.
+    drop(retired);
     Ok(client)
 }
 

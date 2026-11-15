@@ -255,6 +255,36 @@ fn normalized_length(headers: &HeaderMap) -> io::Result<Option<u64>> {
 }
 
 impl<R: AsyncRead + Unpin> ReplyBody<R> {
+    pub(super) fn payload_complete(&self) -> bool {
+        self.finished || matches!(self.mode, Mode::Raw(Some(0)))
+    }
+
+    pub(super) fn captures_stderr(&self) -> bool {
+        self.reader.report_stderr.is_some()
+    }
+
+    /// While an upload is still live, keep consuming the responder's tail.
+    /// This permits a stdout-first responder to begin reading STDIN. Preserve
+    /// strict raw Content-Length framing when no diagnostic handoff is active;
+    /// chunked trailers retain the existing unread/diagnostic-tail contract.
+    pub(super) async fn upload_tail(&mut self) -> io::Result<()> {
+        let strict = !self.captures_stderr() && matches!(self.mode, Mode::Raw(Some(0)));
+        let mut extra = 0usize;
+        while self.reader.available().await? {
+            if strict { return Err(bad("FastCGI body exceeds Content-Length")); }
+            extra = extra.saturating_add(self.reader.buffered.len());
+            self.reader.buffered = Bytes::new();
+            if extra > 64 * 1024 || self.reader.stderr_truncated {
+                self.mark_diagnostic_limit();
+            }
+            // A diagnostic storage ceiling is not END_REQUEST. Continue to
+            // release responder backpressure while STDIN is still active;
+            // only a real END, side deadline or cancellation can settle it.
+            tokio::task::consume_budget().await;
+        }
+        Ok(())
+    }
+
     pub(super) fn diagnostics_ready(&self) -> bool {
         self.reader.report_stderr.is_some()
             && (self.finished || matches!(self.mode, Mode::Raw(Some(0))))

@@ -91,7 +91,9 @@ whole-process RSS remain outside these declared source/workspace/layout loans.
 
 This boundary covers admitted trace-driver batches and the closed local encoder
 and byte handoffs above. The SDK Processor::on_end's preexisting queue-full or
-closed direct SpanData destruction is outside it. Ordinary metrics
-ExportPlan::once still has its separate CPU-lane block_on of network work; this
-trace change does not claim all observability callers are split. Standalone SDK
+closed direct SpanData destruction is outside it. Ordinary metrics exports use
+their own resident execution cells: collection and encoding run on their CPU
+lane, while pending network work waits without retaining a CPU permit. Their
+ownership and retirement boundaries are described separately in METRICS.md;
+this trace boundary does not cover every observability caller. Standalone SDK
 bodies and Windows runtime behavior have no new universal acceptance claim.

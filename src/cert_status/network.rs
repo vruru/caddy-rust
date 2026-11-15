@@ -17,6 +17,10 @@ impl OcspTransport {
         proxy: Option<&str>,
         extra_ca_pem: &[Vec<u8>],
     ) -> Result<Self> {
+        Self::build(timeout, max_body, proxy, extra_ca_pem, #[cfg(feature = "native-run")] None)
+    }
+
+    pub(crate) fn validate_limits(timeout: Duration, max_body: usize) -> Result<()> {
         ensure!(
             (1..=4 * 1024 * 1024).contains(&max_body),
             "OCSP body limit out of range"
@@ -25,6 +29,28 @@ impl OcspTransport {
             (Duration::from_secs(1)..=Duration::from_secs(120)).contains(&timeout),
             "OCSP timeout out of range"
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "native-run")]
+    pub(crate) fn new_scoped(
+        timeout: Duration,
+        max_body: usize,
+        proxy: Option<&str>,
+        extra_ca_pem: &[Vec<u8>],
+        scope: Option<std::sync::Arc<crate::outgoing_tls::Scope>>,
+    ) -> Result<Self> {
+        Self::build(timeout, max_body, proxy, extra_ca_pem, scope)
+    }
+
+    fn build(
+        timeout: Duration,
+        max_body: usize,
+        proxy: Option<&str>,
+        extra_ca_pem: &[Vec<u8>],
+        #[cfg(feature = "native-run")] scope: Option<std::sync::Arc<crate::outgoing_tls::Scope>>,
+    ) -> Result<Self> {
+        Self::validate_limits(timeout, max_body)?;
         let mut builder = Client::builder()
             .tls_crypto_provider(crate::crypto::client_provider())
             .rustls_certificate_verifier_wrapper(crate::cert_uri_san::wrap_server_verifier)
@@ -39,6 +65,10 @@ impl OcspTransport {
             crate::cert_uri_san::check_pem_roots(ca)?;
             builder = builder.add_root_certificate(reqwest::Certificate::from_pem(ca)?);
         }
+        #[cfg(feature = "native-run")]
+        let builder = crate::acme_wire::attach_owned_scope(
+            builder, scope, &crate::acme_wire::ClientOwner::default(),
+        )?;
         Ok(Self {
             client: builder.build()?,
             max_body,

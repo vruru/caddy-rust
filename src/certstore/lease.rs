@@ -169,6 +169,8 @@ async fn native_gate(
 /// completion should await `release`; without a runtime the file ages stale.
 pub struct StorageLease {
     inner: Arc<Inner>,
+    // Owned by the external lease, never by Inner: no task/Inner cycle.
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
 }
 
 fn stamp() -> Result<String> {
@@ -281,24 +283,37 @@ impl StorageLease {
             anyhow!("lease check task failed")
         })?
     }
-    pub async fn release(self) -> Result<()> {
+    pub async fn release(mut self) -> Result<()> {
         self.inner.stop.cancel();
-        if self.inner.released.swap(true, Ordering::AcqRel) {
-            bail!("lease already released");
-        }
-        let guard = LostOnFailure::new(&self.inner.lost);
-        let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut guard = guard;
-            let result = inner.remove();
-            guard.settle(&result);
-            result
-        })
-        .await
-        .map_err(|_| {
-            self.inner.lost.cancel();
-            anyhow!("lease release task failed")
-        })?
+        let removed = if self.inner.released.swap(true, Ordering::AcqRel) {
+            Err(anyhow!("lease already released"))
+        } else {
+            let guard = LostOnFailure::new(&self.inner.lost);
+            let inner = self.inner.clone();
+            match tokio::task::spawn_blocking(move || {
+                let mut guard = guard;
+                let result = inner.remove();
+                guard.settle(&result);
+                result
+            }).await {
+                Ok(result) => result,
+                Err(_) => {
+                    self.inner.lost.cancel();
+                    Err(anyhow!("lease release task failed"))
+                }
+            }
+        };
+        // Removal and heartbeat may overlap only behind the existing mutation
+        // fence. Even a removal/verification error must join that real worker.
+        let heartbeat = match self.heartbeat.take() {
+            Some(worker) => worker.await.map_err(|_| {
+                self.inner.lost.cancel();
+                anyhow!("lease heartbeat task failed")
+            }),
+            None => Ok(()),
+        };
+        removed?;
+        heartbeat
     }
 }
 
@@ -533,7 +548,7 @@ pub(super) async fn acquire(
         .map_err(|_| anyhow!("lock acquisition task failed"))??;
         if let Some(inner) = created {
             let heartbeat = inner.clone();
-            tokio::spawn(async move {
+            let heartbeat_task = tokio::spawn(async move {
                 let mut tick = tokio::time::interval_at(
                     tokio::time::Instant::now() + Duration::from_secs(5),
                     Duration::from_secs(5),
@@ -551,7 +566,7 @@ pub(super) async fn acquire(
                     }
                 }
             });
-            let lease = StorageLease { inner };
+            let lease = StorageLease { inner, heartbeat: Some(heartbeat_task) };
             if cancel.is_cancelled() {
                 let _ = lease.release().await;
                 return Err(cancelled());

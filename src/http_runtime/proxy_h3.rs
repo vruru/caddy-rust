@@ -434,7 +434,7 @@ impl Pool {
         let stream = sender.send_request(Request::from_parts(parts, ())).await?;
         let (mut send, mut recv) = stream.split();
         let cancel = CancellationToken::new();
-        let _cancel_on_drop = CancelOnDrop(cancel.clone());
+        let mut cancel_on_drop = CancelOnDrop(Some(cancel.clone()));
         let upload_cancel = cancel.clone();
         let retain = active.clone();
         let binding = entry.binding.clone();
@@ -452,13 +452,13 @@ impl Pool {
             tokio::pin!(response);
             tokio::select! {biased;result=&mut response=>result.map_err(anyhow::Error::new),upload=&mut done=>{
              match upload{Ok(Ok(()))=>{},Ok(Err(error))=>{cancel.cancel();return Err(anyhow::Error::from_boxed(error))},Err(error)=>{cancel.cancel();return Err(error.into())}}
-             if let Some(ns)=timeout.filter(|n|*n>0){tokio::time::timeout(Duration::from_nanos(ns as u64),&mut response).await.map_err(|_|super::request::failure(http::StatusCode::GATEWAY_TIMEOUT))?.map_err(anyhow::Error::new)}else{response.await.map_err(anyhow::Error::new)}
+             if let Some(ns)=timeout.filter(|n|*n>0){tokio::time::timeout(Duration::from_nanos(ns as u64),&mut response).await.map_err(|elapsed|super::request::failure_with_cause(http::StatusCode::GATEWAY_TIMEOUT,anyhow::Error::new(elapsed).context(super::proxy::ResponseHeaderTimeout)))?.map_err(anyhow::Error::new)}else{response.await.map_err(anyhow::Error::new)}
             }}
         };
         match response {
             Ok(mut response) => {
                 *response.version_mut() = Version::HTTP_3;
-                Ok(response.map(|_| {
+                let response=response.map(|_| {
                     H3Body {
                         recv,
                         cancel,
@@ -467,7 +467,11 @@ impl Pool {
                         done: false,
                     }
                     .boxed_unsync()
-                }))
+                });
+                // Cancellation ownership is now with the real response body.
+                // Returning early final headers must not abort a live upload.
+                cancel_on_drop.0.take();
+                Ok(response)
             }
             Err(error) => {
                 cancel.cancel();
@@ -542,9 +546,9 @@ impl Drop for H3Body {
     }
 }
 
-struct CancelOnDrop(CancellationToken);
+struct CancelOnDrop(Option<CancellationToken>);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
-        self.0.cancel();
+        if let Some(cancel)=&self.0 {cancel.cancel();}
     }
 }

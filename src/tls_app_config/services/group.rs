@@ -1585,6 +1585,8 @@ impl CertificateServices {
             self.context.resources.ocsp.clone(),
             self.context.resources.cpu.clone(),
         )?;
+        #[cfg(feature = "native-run")]
+        let manager = manager.with_client_tls_scope(self.outgoing_tls.clone())?;
         self.state.lock().await.ocsp.insert(
             "manual:false".into(),
             OcspScope::new(manager, Vec::new(), &self.context.cancel),

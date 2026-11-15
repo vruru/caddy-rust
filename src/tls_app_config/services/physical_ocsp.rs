@@ -85,6 +85,8 @@ impl CertificateServices {
             }, policy, inventory, self.context.resources.ocsp.clone(),
             self.context.resources.cpu.clone(),
         )?.with_identity_scope(chain)?;
+        #[cfg(feature = "native-run")]
+        let manager = manager.with_client_tls_scope(self.outgoing_tls.clone())?;
         Ok(Some(manager))
     }
 

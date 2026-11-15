@@ -18,6 +18,7 @@ impl Manager {
         &self,
         hello: &CertificateHello,
         resources: &Arc<AutomationResources>,
+        #[cfg(feature="native-run")] scope:Option<Arc<crate::outgoing_tls::Scope>>,
         cancel: CancellationToken,
     ) -> Result<Option<Zeroizing<Vec<u8>>>> {
         let caller = cancel;
@@ -31,7 +32,7 @@ impl Manager {
                     if let Some(ip)=&hello.local_ip{parameters.push(("local_ip",ip.as_slice()));}
                     let (request, target) = super::permission::external_request(endpoint,&parameters)?;
                     let (status, body) =
-                        fetch_http(request, Some(target), resources, &cancel).await?;
+                        fetch_http(request, Some(target), resources, #[cfg(feature="native-run")] scope.clone(), &cancel).await?;
                     if status == 204 {
                         return Ok(None);
                     }
@@ -52,7 +53,12 @@ impl Manager {
                     let permit = resources
                         .admit_permission("tailscale-local-api".into(), &cancel)
                         .await?;
-                    let client = route.client()?;
+                    // Build the complete existing client on the certificate CPU
+                    // lane. The route/token stay in the same owned input/result.
+                    let (route,client)=crate::cert_cpu::run(resources.cpu_slots(),cancel.clone(),move||{
+                        let client=route.client(#[cfg(feature="native-run")] scope)?;
+                        Ok((route,client))
+                    }).await?;
                     let status =
                         local_get(&client, &route, "/localapi/v0/status", resources, &cancel).await;
                     if let Ok((200, body)) = status {
@@ -175,6 +181,7 @@ async fn fetch_http(
     mut request: reqwest::Request,
     mut target: Option<http::uri::PathAndQuery>,
     resources: &Arc<AutomationResources>,
+    #[cfg(feature="native-run")] scope:Option<Arc<crate::outgoing_tls::Scope>>,
     cancel: &CancellationToken,
 ) -> Result<(u16, Zeroizing<Vec<u8>>)> {
     for redirects in 0..=10 {
@@ -182,7 +189,8 @@ async fn fetch_http(
         let _permit = resources
             .admit_permission(url.origin().ascii_serialization(), cancel)
             .await?;
-        let (tls, proxy) = crate::cert_cpu::run(resources.cpu_slots(), cancel.clone(), move || {
+        #[cfg(feature="native-run")] let scope=scope.clone();
+        let client = crate::cert_cpu::run(resources.cpu_slots(), cancel.clone(), move || {
             let proxy = super::permission::external_proxy(&url)?;
             let mut roots = rustls::RootCertStore::empty();
             for cert in rustls_native_certs::load_native_certs().certs {
@@ -193,23 +201,23 @@ async fn fetch_http(
                 .with_root_certificates(roots)
                 .with_no_client_auth();
             tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-            Ok((crate::cert_uri_san::guarded_config(tls)?, proxy))
-        })
-        .await?;
-        let mut builder = reqwest::Client::builder()
-            .no_proxy()
-            .use_preconfigured_tls(tls)
-            .connect_timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none());
-        if let Some(proxy) = proxy {
-            builder = builder.proxy(
-                reqwest::Proxy::all(proxy)
-                    .map_err(|_| anyhow!("invalid external certificate proxy"))?,
-            );
-        }
-        let client = builder
-            .build()
-            .map_err(|_| anyhow!("external certificate HTTP transport unavailable"))?;
+            let mut builder = reqwest::Client::builder()
+                .no_proxy()
+                .use_preconfigured_tls(crate::cert_uri_san::guarded_config(tls)?)
+                .connect_timeout(Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none());
+            if let Some(proxy) = proxy {
+                builder = builder.proxy(
+                    reqwest::Proxy::all(proxy)
+                        .map_err(|_| anyhow!("invalid external certificate proxy"))?,
+                );
+            }
+            let builder=crate::acme_wire::attach_owned_scope(builder,
+                #[cfg(feature="native-run")] scope,
+                &crate::acme_wire::ClientOwner::default(),
+            )?;
+            builder.build().map_err(|_| anyhow!("external certificate HTTP transport unavailable"))
+        }).await?;
         request.headers_mut().insert(
             http::header::USER_AGENT,
             http::HeaderValue::from_static("Go-http-client/1.1"),
@@ -301,7 +309,7 @@ struct TailRoute {
     token: Option<Zeroizing<String>>,
 }
 impl TailRoute {
-    fn client(&self) -> Result<reqwest::Client> {
+    fn client(&self, #[cfg(feature="native-run")] scope:Option<Arc<crate::outgoing_tls::Scope>>) -> Result<reqwest::Client> {
         let mut builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -309,9 +317,11 @@ impl TailRoute {
         if let Some(socket) = &self.socket {
             builder = builder.unix_socket(socket.clone());
         }
-        builder
-            .build()
-            .map_err(|_| anyhow!("Tailscale local transport unavailable"))
+        let builder=crate::acme_wire::attach_owned_scope(builder,
+            #[cfg(feature="native-run")] scope,
+            &crate::acme_wire::ClientOwner::default(),
+        )?;
+        builder.build().map_err(|_| anyhow!("Tailscale local transport unavailable"))
     }
 }
 async fn local_get(

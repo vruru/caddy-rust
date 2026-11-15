@@ -46,6 +46,9 @@ pub(super) struct Context {
     pub original_uri: Uri,
     request_content_length:i64,
     original_method: Method,
+    // Ordinary errors have no HandlerError status placeholder, but still
+    // establish an error context for consumers such as file_server.
+    pub(super) error_context: bool,
     pub(super) error_status: Option<StatusCode>,
     access_start: Option<std::time::Instant>,
     log_fields: Option<Box<log_append::LogFields>>,
@@ -155,6 +158,7 @@ impl Context {
             trusted: false,
             drain: business.generation().drain.clone(),
             business,
+            error_context: false,
             error_status: None,
             access_start: None,
             log_fields: None,
@@ -189,7 +193,7 @@ impl Context {
         request.extensions_mut().insert(super::rewrite_runtime::Original{uri:self.req().uri().clone(),method:self.req().method().clone(),projection:super::rewrite_runtime::projection(self.req()).cloned()});
         request.extensions_mut().insert(rewritten.projection.clone());
         *request.body_mut()=body.unwrap_or_else(||std::mem::replace(self.req_mut().body_mut(),full(Bytes::new())));
-        Ok(Self{metrics:self.metrics.clone(),request_started:self.request_started,push_sni:self.push_sni.clone(),trace_context:self.trace_context.clone(),timeouts:self.timeouts.take(),raw_regex_captures:std::mem::take(&mut self.raw_regex_captures),typed_vars:std::mem::take(&mut self.typed_vars),cel_body:self.cel_body.take(),cel_body_failure:self.cel_body_failure,request:Some(request),fastcgi_body_claimed:self.fastcgi_body_claimed,body_limit:self.body_limit.clone(),await_h2_response_head:self.await_h2_response_head,original_framing:self.original_framing,resources:self.resources.clone(),peer:self.peer.clone(),local:self.local.clone(),tls:self.tls,access_names:None,skip_access:true,authority:self.authority.clone(),client_ip:self.client_ip,trusted:self.trusted,drain:self.drain.clone(),business:self.business.clone(),original_uri:self.original_uri.clone(),request_content_length:self.request_content_length,original_method:self.original_method.clone(),error_status:self.error_status,access_start:None,log_fields:None,values:std::mem::take(&mut self.values),regex_capture_budget:self.regex_capture_budget,immediate:std::mem::take(&mut self.immediate),informational:None,close_after_response:self.close_after_response,deferred:Vec::new(),groups:HashSet::new(),invoke_depth:self.invoke_depth,response_route_depth:self.response_route_depth,proxy_response:None,maps:std::mem::take(&mut self.maps),probe:self.probe,_map_text:std::mem::take(&mut self._map_text),_map_registration_credit:self._map_registration_credit.take(),_rewrite_view_credit:Some(credit)})
+        Ok(Self{metrics:self.metrics.clone(),request_started:self.request_started,push_sni:self.push_sni.clone(),trace_context:self.trace_context.clone(),timeouts:self.timeouts.take(),raw_regex_captures:std::mem::take(&mut self.raw_regex_captures),typed_vars:std::mem::take(&mut self.typed_vars),cel_body:self.cel_body.take(),cel_body_failure:self.cel_body_failure,request:Some(request),fastcgi_body_claimed:self.fastcgi_body_claimed,body_limit:self.body_limit.clone(),await_h2_response_head:self.await_h2_response_head,original_framing:self.original_framing,resources:self.resources.clone(),peer:self.peer.clone(),local:self.local.clone(),tls:self.tls,access_names:None,skip_access:true,authority:self.authority.clone(),client_ip:self.client_ip,trusted:self.trusted,drain:self.drain.clone(),business:self.business.clone(),original_uri:self.original_uri.clone(),request_content_length:self.request_content_length,original_method:self.original_method.clone(),error_context:self.error_context,error_status:self.error_status,access_start:None,log_fields:None,values:std::mem::take(&mut self.values),regex_capture_budget:self.regex_capture_budget,immediate:std::mem::take(&mut self.immediate),informational:None,close_after_response:self.close_after_response,deferred:Vec::new(),groups:HashSet::new(),invoke_depth:self.invoke_depth,response_route_depth:self.response_route_depth,proxy_response:None,maps:std::mem::take(&mut self.maps),probe:self.probe,_map_text:std::mem::take(&mut self._map_text),_map_registration_credit:self._map_registration_credit.take(),_rewrite_view_credit:Some(credit)})
     }
     fn merge_upstream(&mut self,mut view:Self,return_body:bool){
         self.timeouts=view.timeouts.take();
@@ -426,6 +430,7 @@ where
         request_content_length,
         trace_context: None,
         original_method,
+        error_context: false,
         error_status: None,
         access_start: access.as_ref().map(|access| access.started_at()),
         log_fields: None,
@@ -674,6 +679,29 @@ pub(super) fn budget_failure(
         }
     }
 }
+/// Shared proxy status classification. Preserve structured errors before
+/// classifying upload limits and transport timeouts.
+pub(super) fn proxy_error_status(
+    error: &anyhow::Error,
+    body_limit: Option<&super::request_body::LimitState>,
+) -> StatusCode {
+    if let Some(error) = error.downcast_ref::<HttpError>() {
+        error.status
+    } else if super::request_body::limit_error(error.as_ref())
+        || super::request_body::limit_hit(body_limit)
+    {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else if error.chain().any(|source| {
+        source.downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+            || source.downcast_ref::<hyper::Error>().is_some_and(hyper::Error::is_timeout)
+    }) {
+        StatusCode::GATEWAY_TIMEOUT
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
 #[derive(Debug)]
 struct HttpError {
     status: StatusCode,
@@ -756,6 +784,7 @@ impl std::fmt::Display for MissingNamedRoute {
 impl std::error::Error for MissingNamedRoute {}
 
 fn populate_error(ctx: &mut Context, error: &anyhow::Error) -> StatusCode {
+    ctx.error_context = true;
     if let Some(error) = error.downcast_ref::<MissingNamedRoute>() {
         // A missing name is an ordinary Go error, so WithError adds only
         // the error object. It does not fabricate the HandlerError fields.
@@ -1353,21 +1382,8 @@ fn handlers<'a>(
                             .map_err(|error| {
                                 if error.is::<HttpError>() {
                                     error
-                                } else if super::request_body::limit_error(error.as_ref())
-                                    || super::request_body::limit_hit(body_limit.as_deref())
-                                {
-                                    failure(StatusCode::PAYLOAD_TOO_LARGE)
-                                } else if error.chain().any(|source| {
-                                    source
-                                        .downcast_ref::<std::io::Error>()
-                                        .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
-                                        || source
-                                            .downcast_ref::<hyper::Error>()
-                                            .is_some_and(hyper::Error::is_timeout)
-                                }) {
-                                    failure(StatusCode::GATEWAY_TIMEOUT)
                                 } else {
-                                    failure(StatusCode::BAD_GATEWAY)
+                                    failure(proxy_error_status(&error, body_limit.as_deref()))
                                 }
                             })?;
                     return response_routes::reverse_proxy(
@@ -1467,30 +1483,25 @@ pub(super) fn matches<'a>(
             Matcher::HeaderRegex(rules) => {
                 let mut all = true;
                 for (header, plan) in rules {
-                    if header==http::header::HOST&&std::str::from_utf8(&ctx.authority).is_err(){
-                        let input=ctx.resources.rewrite_bytes.reserve(ctx.authority.len().saturating_mul(2).saturating_add(4096)).map_err(|e|failure_with_cause(StatusCode::SERVICE_UNAVAILABLE,e.into()))?;
-                        if !super::request_regex::matches_bytes(plan,ctx.authority.to_vec(),input,ctx).await?{all=false;break}continue
-                    }
-                    let values = if header == http::header::HOST {
-                        vec![String::from_utf8(ctx.authority.to_vec()).expect("valid Host checked above")]
+                    let (bytes,count) = if header == http::header::HOST {
+                        (ctx.authority.len(),1)
                     } else {
-                        let values = ctx
-                            .req()
-                            .headers()
-                            .get_all(header)
-                            .iter()
-                            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
-                            .collect::<Vec<_>>();
-                        if values.is_empty()
-                            && header == http::header::TRANSFER_ENCODING
-                            && ctx.original_framing.chunked
-                        {
-                            vec!["chunked".into()]
-                        } else {
-                            values
-                        }
+                        ctx.req().headers().get_all(header).iter()
+                            .fold((0usize,0usize),|(bytes,count),value|(bytes.saturating_add(value.len()),count.saturating_add(1)))
                     };
-                    if !super::request_regex::matches(plan, values, ctx).await? {
+                    let input_credit=ctx.resources.rewrite_bytes.reserve(bytes.saturating_mul(2)
+                        .saturating_add(count.saturating_mul(std::mem::size_of::<Vec<u8>>() * 2))
+                        .saturating_add(4096)).map_err(|_|failure(StatusCode::SERVICE_UNAVAILABLE))?;
+                    let mut values = if header == http::header::HOST {
+                        vec![ctx.authority.to_vec()]
+                    } else {
+                        ctx.req().headers().get_all(header).iter()
+                            .map(|value|value.as_bytes().to_vec()).collect::<Vec<_>>()
+                    };
+                    if values.is_empty() && header == http::header::TRANSFER_ENCODING && ctx.original_framing.chunked {
+                        values.push(b"chunked".to_vec());
+                    }
+                    if !super::request_regex::matches_header_bytes(plan, values, input_credit, ctx).await? {
                         all = false;
                         break;
                     }

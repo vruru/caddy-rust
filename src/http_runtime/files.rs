@@ -115,9 +115,9 @@ pub(super) async fn serve(
     };
     if canonical_uris && base(&original) == base(&current) {
         if implicit_index && !original.ends_with('/') {
-            return Ok(Some(redirect(ctx, &format!("{original}/"))?));
+            return Ok(Some(redirect(ctx, &format!("{}/", ctx.original_uri.path()))?));
         } else if !implicit_index && original.ends_with('/') {
-            return Ok(Some(redirect(ctx, original.trim_end_matches('/'))?));
+            return Ok(Some(redirect(ctx, ctx.original_uri.path().trim_end_matches('/'))?));
         }
     }
     if !metadata.is_file() {
@@ -179,7 +179,7 @@ pub(super) async fn serve(
         );
     }
     if !matches!(*ctx.req().method(), Method::GET | Method::HEAD)
-        && !ctx.values.contains_key("http.error.status_code")
+        && !ctx.error_context
     {
         ctx.immediate
             .insert(http::header::ALLOW, HeaderValue::from_static("GET, HEAD"));
@@ -290,7 +290,7 @@ pub(super) async fn serve(
         if allow {
             match parse_ranges(&String::from_utf8_lossy(value.as_bytes()), size) {
                 Ok(list) => {
-                    if list
+                    if !list.is_empty() && list
                         .iter()
                         .try_fold(0u64, |total, r| total.checked_add(r.end() - r.start() + 1))
                         .is_some_and(|total| total <= size)
@@ -519,7 +519,9 @@ fn content_status<'a>(
 ) -> impl std::future::Future<Output = Result<Option<StatusCode>>> + Send + 'a {
     use futures_util::future::{Either, ready};
     if configured.is_empty() {
-        return Either::Left(ready(Ok(ctx.error_status)));
+        return Either::Left(ready(Ok(ctx.error_context.then_some(
+            ctx.error_status.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        ))));
     }
     if configured.len() <= 32
         && !configured.as_bytes().iter().any(|byte| matches!(byte, b'{' | b'}'))
@@ -697,6 +699,20 @@ impl HiddenPaths {
 }
 fn redirect(ctx: &Context, path: &str) -> Result<Response<Body>> {
     let path = format!("/{}", path.trim_start_matches('/'));
+    // Callers pass the original escaped URI path. Keep existing %XX bytes,
+    // including reserved separators, and escape only raw spaces/non-ASCII.
+    let mut escaped_path = String::with_capacity(path.len());
+    const HEX: &[u8;16] = b"0123456789abcdef";
+    for byte in path.bytes() {
+        if byte == b' ' || !byte.is_ascii() {
+            escaped_path.push('%');
+            escaped_path.push(HEX[usize::from(byte >> 4)] as char);
+            escaped_path.push(HEX[usize::from(byte & 15)] as char);
+        } else {
+            escaped_path.push(char::from(byte));
+        }
+    }
+    let path = escaped_path;
     let location = match ctx.req().uri().query() {
         Some(q) => format!("{path}?{q}"),
         None => path,
@@ -764,17 +780,23 @@ fn parse_ranges(
     value: &str,
     size: u64,
 ) -> std::result::Result<Vec<RangeInclusive<u64>>, &'static str> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
     let value = value.strip_prefix("bytes=").ok_or("invalid range")?;
     let mut ranges = Vec::new();
     let mut no_overlap = false;
+    let mut zero_suffix = false;
     for part in value.split(',') {
-        if part.trim().is_empty() {
+        if part.trim_ascii().is_empty() {
             continue;
         }
-        let (start, end) = part.trim().split_once('-').ok_or("invalid range")?;
+        let (start, end) = part.trim_ascii().split_once('-').ok_or("invalid range")?;
+        let (start, end) = (start.trim_ascii(), end.trim_ascii());
         let range = if start.is_empty() {
             let suffix = end.parse::<u64>().map_err(|_| "invalid range")?;
             if suffix == 0 {
+                zero_suffix = true;
                 continue;
             }
             if size == 0 {
@@ -808,7 +830,9 @@ fn parse_ranges(
     if ranges.is_empty() && no_overlap {
         return Err("invalid range: failed to overlap");
     }
-    if ranges.is_empty() {
+    // An empty list is ignored, as in ServeContent. A zero suffix is
+    // unsatisfiable under RFC 9110 and must not become a full-file response.
+    if ranges.is_empty() && zero_suffix {
         return Err("invalid range");
     }
     Ok(ranges)

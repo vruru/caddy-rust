@@ -69,20 +69,35 @@ pub(super) struct RawCaptures{
 }
 impl RawCaptures{pub(super) fn get(&self,key:&str)->Option<&[u8]>{self.values.get(key).map(bytes::Bytes::as_ref)}}
 pub(super) async fn matches_bytes(plan:&RequestRegex,input:Vec<u8>,input_credit:native_write_policy::Lease,ctx:&mut Context)->Result<bool>{
+    matches_byte_inputs(plan, vec![input], input_credit, ctx, true).await
+}
+
+/// Header values are Go byte strings, not paths. Preserve each invalid UTF-8
+/// byte and every captured source byte; never apply URI path cleaning.
+pub(super) async fn matches_header_bytes(plan:&RequestRegex,inputs:Vec<Vec<u8>>,input_credit:native_write_policy::Lease,ctx:&mut Context)->Result<bool>{
+    matches_byte_inputs(plan, inputs, input_credit, ctx, false).await
+}
+
+async fn matches_byte_inputs(plan:&RequestRegex,inputs:Vec<Vec<u8>>,input_credit:native_write_policy::Lease,ctx:&mut Context,clean_path:bool)->Result<bool>{
+    if inputs.is_empty(){return Ok(false)}
     let regex=plan.regex.clone();let remaining=ctx.regex_capture_budget;let pool=ctx.resources.rewrite_bytes.clone();let prefix_bytes=plan.name.len().saturating_add(32).saturating_mul(8);
     // Input is at most the admitted URI limit. Normalization grows invalid
     // bytes to one RuneError each; returned captures retain separate credit.
-    let scratch_bytes=input.len().checked_mul(32).and_then(|n|n.checked_add(regex.search_memory())).and_then(|n|n.checked_add(4096)).ok_or_else(||failure(StatusCode::SERVICE_UNAVAILABLE))?;
+    let input_bytes=inputs.iter().try_fold(0usize,|sum,input|sum.checked_add(input.len())).ok_or_else(||failure(StatusCode::SERVICE_UNAVAILABLE))?;
+    let scratch_bytes=input_bytes.checked_mul(32).and_then(|n|n.checked_add(regex.search_memory())).and_then(|n|n.checked_add(4096)).ok_or_else(||failure(StatusCode::SERVICE_UNAVAILABLE))?;
     let scratch=pool.reserve(scratch_bytes).map_err(|_|failure(StatusCode::SERVICE_UNAVAILABLE))?;
     let captures=ctx.resources.request_regexp.run(move||{
         let _scratch=scratch;let _input_credit=input_credit;
-        let input=super::rewrite_ops::clean(&input,true);
-        let budget=ReplaceBudget::new(regex.search_memory().saturating_add(input.len().saturating_mul(8)),Some(Instant::now()+Duration::from_millis(150)));
+        let budget=ReplaceBudget::new(regex.search_memory().saturating_add(input_bytes.saturating_mul(8)),Some(Instant::now()+Duration::from_millis(150)));
         let mut credits=Vec::new();
-        let value=regex.first_match_bytes_limited(&input,&budget,remaining,|n|{
-            let credit=pool.reserve(n.saturating_add(prefix_bytes)).map_err(|_|OperationError::ByteLimit)?;credits.push(credit);Ok(())
-        })?;
-        Ok::<_,OperationError>((value,credits))
+        for input in inputs {
+            let input=if clean_path{super::rewrite_ops::clean(&input,true)}else{input};
+            let value=regex.first_match_bytes_limited(&input,&budget,remaining,|n|{
+                let credit=pool.reserve(n.saturating_add(prefix_bytes)).map_err(|_|OperationError::ByteLimit)?;credits.push(credit);Ok(())
+            })?;
+            if value.is_some(){return Ok::<_,OperationError>((value,credits))}
+        }
+        Ok::<_,OperationError>((None,credits))
     }).await.map_err(|_|failure(StatusCode::SERVICE_UNAVAILABLE))?.map_err(|_|failure(StatusCode::SERVICE_UNAVAILABLE))?;
     let(Some(captures),credits)=captures else{return Ok(false)};
     let total=captures.iter().try_fold(0usize,|total,(key,value)|{

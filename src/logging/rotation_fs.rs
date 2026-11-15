@@ -301,7 +301,9 @@ impl Paths {
         }
     }
     pub(super) fn max_bytes(spec: &FileSpec) -> i64 {
-        spec.size_mb.wrapping_mul(MB)
+        // Parsed rolling writers reject invalid sizes before publication.
+        // Do not turn a future internal oversized value into a negative limit.
+        spec.size_mb.saturating_mul(MB)
     }
 }
 pub(super) struct Transition<'a>(Option<&'a Paths>);

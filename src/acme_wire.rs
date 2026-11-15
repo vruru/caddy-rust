@@ -199,6 +199,9 @@ struct WireInner {
     allow_loopback: bool,
     allowed_http_origin: Option<String>,
     nonces: Mutex<Vec<String>>,
+    // Native closed legs use their own graph retirement and write evidence.
+    leg_progress: Option<Arc<std::sync::atomic::AtomicBool>>,
+    leg_cleanup: Option<Arc<ChainCleanup>>,
     // Last owner: no early refund when an AccountSession outlives its manager.
     _issuer_owner:ClientOwner,
 }
@@ -227,6 +230,24 @@ struct WireResponse {
 }
 
 impl AcmeWire {
+    #[cfg(all(feature = "native-run", unix))]
+    pub(crate) fn with_native_leg(mut self, progress: Arc<std::sync::atomic::AtomicBool>, cleanup: Arc<ChainCleanup>) -> Result<Self> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| anyhow!("ACME leg wire is already shared"))?;
+        inner.leg_progress = Some(progress);
+        inner.leg_cleanup = Some(cleanup);
+        Ok(self)
+    }
+    fn write_started(&self) {
+        if let Some(progress) = &self.inner.leg_progress {
+            progress.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    #[cfg(all(feature = "native-run", unix))]
+    pub(crate) fn account_setup_confirmed(&self) {
+        if let Some(progress) = &self.inner.leg_progress {
+            progress.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
     pub async fn connect(options: WireOptions, cancel: &CancellationToken) -> Result<Self> {
         static CPU: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
         let cpu = CPU.get_or_init(|| Arc::new(Semaphore::new(std::thread::available_parallelism().map_or(1,usize::from).min(4)))).clone();
@@ -315,6 +336,8 @@ impl AcmeWire {
                 allow_loopback,
                 allowed_http_origin,
                 nonces: Mutex::new(Vec::new()),
+                leg_progress: None,
+                leg_cleanup: None,
                 _issuer_owner:built.owner,
             }),
         })
@@ -340,6 +363,7 @@ impl AcmeWire {
             .append_pair("email", email)
             .finish()
             .into_bytes();
+        self.write_started();
         let mut response = send_with_type(
             &self.inner.client,
             Method::POST,
@@ -525,6 +549,9 @@ impl AcmeWire {
             let body_credit=match first_credit.take(){Some(credit)=>Some(credit),None=>memory.as_ref().map(|p|p.payload.reserve(MAX_BODY)).transpose()?};
             let nonce = self.nonce(cancel).await?;
             let body = self.jws_body(signer, nonce, &url, kid, payload, cancel).await?;
+            // A real payload is a write; POST-as-GET is read-only. Record before
+            // submitting to HTTP, never infer safety merely from cancellation.
+            if payload.is_some() { self.write_started(); }
             let response = send_body_with_memory(
                 &self.inner.client,
                 Method::POST,
@@ -650,6 +677,9 @@ impl AcmeWire {
 }
 
 impl AccountSession {
+    pub(crate) fn chain_cleanup(&self, fallback: &Arc<ChainCleanup>) -> Arc<ChainCleanup> {
+        self.wire.inner.leg_cleanup.clone().unwrap_or_else(|| fallback.clone())
+    }
     pub fn location(&self) -> &str {
         &self.location
     }

@@ -21,6 +21,7 @@ use hyper::body::{Body as _, Frame};
 use std::{
     collections::BTreeMap,
     io,
+    future::Future,
     net::{SocketAddr, ToSocketAddrs},
     path::PathBuf,
     pin::Pin,
@@ -34,6 +35,7 @@ use tokio::{
     sync::OwnedSemaphorePermit,
     time::Instant,
 };
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy)]
 pub(super) struct TlsDetails {
@@ -90,6 +92,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 
 struct Socket {
     io: Box<dyn Io>,
+    _business: Arc<super::BusinessGuard>,
     // Declaration order keeps admission held until actual I/O destruction.
     _permit: (OwnedSemaphorePermit, OwnedSemaphorePermit),
 }
@@ -102,6 +105,33 @@ impl AsyncRead for Socket {
         Pin::new(&mut *self.io).poll_read(cx, buf)
     }
 }
+
+impl AsyncWrite for Socket {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut PollContext<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.io).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut PollContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.io).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut PollContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.io).poll_shutdown(cx)
+    }
+    fn is_write_vectored(&self) -> bool { self.io.is_write_vectored() }
+    fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut PollContext<'_>, bufs: &[io::IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.io).poll_write_vectored(cx, bufs)
+    }
+}
+
+/// The connected exchange may have emitted a partial BEGIN/PARAMS record.
+/// A failed non-idempotent request must not be replayed on another backend.
+#[derive(Debug)]
+pub(super) struct ExchangeStarted;
+impl std::fmt::Display for ExchangeStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FastCGI exchange may have started")
+    }
+}
+impl std::error::Error for ExchangeStarted {}
 
 enum Target {
     Tcp {
@@ -398,6 +428,32 @@ struct PrefixedBody {
     hint: hyper::body::SizeHint,
 }
 
+impl BodyPrefix {
+    fn into_body(mut self) -> Body {
+        let spool_reader = self.spool.take().map(|spool| spool.reader());
+        let stored = spool_reader.as_ref().map_or(0, spool::SpoolReader::len)
+            + self
+                .buffered
+                .iter()
+                .map(|bytes| bytes.len() as u64)
+                .sum::<u64>();
+        let remaining = self.body.size_hint();
+        let mut hint = hyper::body::SizeHint::new();
+        if let Some(upper) = remaining.upper().and_then(|n| n.checked_add(stored)) {
+            hint.set_upper(upper);
+        }
+        hint.set_lower(remaining.lower().saturating_add(stored));
+        let buffered = std::mem::take(&mut self.buffered).into();
+        PrefixedBody {
+            prefix: self,
+            spool_body: spool_reader.map(spool::SpoolReader::into_body),
+            buffered,
+            hint,
+        }
+        .boxed_unsync()
+    }
+}
+
 impl hyper::body::Body for PrefixedBody {
     type Data = Bytes;
     type Error = BoxError;
@@ -461,33 +517,13 @@ pub(super) async fn prepare_source(
         .map(|v| v.length);
     let known = replacement.or_else(|| body.size_hint().exact());
     let incremental = super::incremental::is_enabled(ctx.req().headers());
-    let mut source = prefix(ctx, body, known, transport, incremental,&config.handler.proxy_status_name).await?;
+    let source = prefix(ctx, body, known, transport, incremental,&config.handler.proxy_status_name).await?;
     let length = PreparedLength {
         config: config as *const ProxyConfig as usize,
         length: source.length,
         content_length_override: source.content_length_override,
     };
-    let spool_reader = source.spool.take().map(|spool| spool.reader());
-    let stored = spool_reader.as_ref().map_or(0, spool::SpoolReader::len)
-        + source
-            .buffered
-            .iter()
-            .map(|bytes| bytes.len() as u64)
-            .sum::<u64>();
-    let remaining = source.body.size_hint();
-    let mut hint = hyper::body::SizeHint::new();
-    if let Some(upper) = remaining.upper().and_then(|n| n.checked_add(stored)) {
-        hint.set_upper(upper);
-    }
-    hint.set_lower(remaining.lower().saturating_add(stored));
-    let buffered = std::mem::take(&mut source.buffered).into();
-    let body = PrefixedBody {
-        prefix: source,
-        spool_body: spool_reader.map(spool::SpoolReader::into_body),
-        buffered,
-        hint,
-    }
-    .boxed_unsync();
+    let body = source.into_body();
     ctx.req_mut().extensions_mut().insert(length);
     Ok(super::proxy_replay::ReplaySource::new(body))
 }
@@ -597,6 +633,204 @@ async fn prefix(
     })
 }
 
+type ReadSocket = tokio::io::ReadHalf<Socket>;
+type WriteSocket = tokio::io::WriteHalf<Socket>;
+
+#[derive(Debug)]
+struct UploadFailure {
+    error: anyhow::Error,
+    retry_after: bool,
+}
+impl std::fmt::Display for UploadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+impl std::error::Error for UploadFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+impl UploadFailure {
+    fn status(status: StatusCode) -> Self {
+        Self { error: failure(status), retry_after: false }
+    }
+    fn source_error(error: BoxError) -> Self {
+        let mut retry_after = false;
+        let status = if let Some(spool) = error.downcast_ref::<spool::SpoolReadError>() {
+            match spool {
+                spool::SpoolReadError::Budget(BudgetError::Overloaded) => {
+                    retry_after = true;
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                spool::SpoolReadError::Budget(BudgetError::WorkerFailed) => StatusCode::INTERNAL_SERVER_ERROR,
+                spool::SpoolReadError::Io(error) if super::request::descriptor_exhausted(error) => {
+                    retry_after = true;
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                spool::SpoolReadError::Io(error) if error.kind() == io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
+                spool::SpoolReadError::Io(_) => StatusCode::BAD_GATEWAY,
+            }
+        } else if super::request_body::limit_error(error.as_ref()) {
+            StatusCode::PAYLOAD_TOO_LARGE
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        Self { error: failure(status), retry_after }
+    }
+    fn into_error(self, ctx: &mut Context) -> anyhow::Error {
+        if self.retry_after {
+            ctx.immediate.insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        self.error
+    }
+}
+
+enum UploadOutcome {
+    Complete,
+    Cancelled,
+    Failed(UploadFailure),
+}
+struct UploadJob {
+    writer: WriteSocket,
+    source: Body,
+    remaining: u64,
+    bodyless: bool,
+    deadline: Option<Instant>,
+    cancel: CancellationToken,
+    hard_stop: CancellationToken,
+    _business: Arc<super::BusinessGuard>,
+}
+impl UploadJob {
+    async fn write(&mut self) -> std::result::Result<(), UploadFailure> {
+        if !self.bodyless {
+            while let Some(frame) = self.source.frame().await {
+                if let Ok(data) = frame.map_err(UploadFailure::source_error)?.into_data() {
+                    self.remaining = send_checked(&mut self.writer, &data, self.remaining, self.deadline)
+                        .await.map_err(|error| UploadFailure { error, retry_after: false })?;
+                }
+            }
+            if self.remaining != 0 { return Err(UploadFailure::status(StatusCode::BAD_REQUEST)); }
+        }
+        wire::finish_stdin(&mut self.writer, self.deadline).await
+            .map_err(|error| UploadFailure { error: error.into(), retry_after: false })
+    }
+    async fn execute(mut self) -> UploadOutcome {
+        let cancel = self.cancel.clone();
+        let hard_stop = self.hard_stop.clone();
+        let outcome = {
+            let writing = self.write();
+            tokio::pin!(writing);
+            tokio::select! { biased;
+                _ = hard_stop.cancelled() => UploadOutcome::Cancelled,
+                _ = cancel.cancelled() => UploadOutcome::Cancelled,
+                result = &mut writing => match result {
+                    Ok(()) => UploadOutcome::Complete,
+                    Err(error) => UploadOutcome::Failed(error),
+                },
+            }
+        };
+        // The result/JoinHandle cannot retire the request before actual source,
+        // write future and socket-half destruction. Spool workers additionally
+        // retain the same request through their real Storage owner.
+        drop(self);
+        outcome
+    }
+}
+
+struct UploadControl {
+    job: Option<tokio::task::JoinHandle<UploadOutcome>>,
+    cancel: CancellationToken,
+    hard_stop: CancellationToken,
+}
+impl Drop for UploadControl {
+    fn drop(&mut self) { self.cancel.cancel(); }
+}
+impl UploadControl {
+    fn pending(&self) -> bool { self.job.is_some() }
+    fn decode(result: std::result::Result<UploadOutcome, tokio::task::JoinError>, allow_cancel: bool)
+        -> std::result::Result<(), UploadFailure>
+    {
+        match result {
+            Ok(UploadOutcome::Complete) => Ok(()),
+            Ok(UploadOutcome::Cancelled) if allow_cancel => Ok(()),
+            Ok(UploadOutcome::Cancelled) => Err(UploadFailure::status(StatusCode::SERVICE_UNAVAILABLE)),
+            Ok(UploadOutcome::Failed(error)) => Err(error),
+            Err(_) => Err(UploadFailure::status(StatusCode::INTERNAL_SERVER_ERROR)),
+        }
+    }
+    async fn during<F: Future>(&mut self, operation: F) -> std::result::Result<F::Output, UploadFailure> {
+        tokio::pin!(operation);
+        loop {
+            if let Some(job) = self.job.as_mut() {
+                tokio::select! { biased;
+                    _ = self.hard_stop.cancelled() => return Err(UploadFailure::status(StatusCode::SERVICE_UNAVAILABLE)),
+                    result = job => {
+                        self.job = None;
+                        Self::decode(result, false)?;
+                        // Keep polling the SAME pinned parser future. Dropping
+                        // a partially-read record after upload success poisons it.
+                    },
+                    result = &mut operation => return Ok(result),
+                }
+            } else {
+                return tokio::select! { biased;
+                    _ = self.hard_stop.cancelled() => Err(UploadFailure::status(StatusCode::SERVICE_UNAVAILABLE)),
+                    result = &mut operation => Ok(result),
+                };
+            }
+        }
+    }
+    async fn finish(&mut self) -> std::result::Result<(), UploadFailure> {
+        self.cancel.cancel();
+        if let Some(job) = self.job.take() { Self::decode(job.await, true)?; }
+        Ok(())
+    }
+
+    // Known-length HTTP/1 consumers may discard a body immediately after its
+    // last data frame. Hold at most that final FastCGI record until upload is
+    // settled, while still reading the entire responder tail concurrently.
+    async fn tail<F: Future>(&mut self, operation: F, diagnostic: bool)
+        -> std::result::Result<Option<F::Output>, UploadFailure>
+    {
+        tokio::pin!(operation);
+        let mut deadline = None;
+        loop {
+            if let Some(job) = self.job.as_mut() {
+                tokio::select! { biased;
+                    _ = self.hard_stop.cancelled() => return Err(UploadFailure::status(StatusCode::SERVICE_UNAVAILABLE)),
+                    result = job => {
+                        self.job = None;
+                        Self::decode(result, false)?;
+                        if diagnostic {
+                            deadline = Some(Instant::now() + Duration::from_millis(250));
+                        }
+                    },
+                    result = &mut operation => {
+                        self.finish().await?;
+                        return Ok(Some(result));
+                    },
+                }
+            } else {
+                if !diagnostic {
+                    // STDIN flush completion is not END_REQUEST. In strict
+                    // mode keep this exact parser alive through the real END.
+                    return tokio::select! { biased;
+                        _ = self.hard_stop.cancelled() => Err(UploadFailure::status(StatusCode::SERVICE_UNAVAILABLE)),
+                        result = &mut operation => Ok(Some(result)),
+                    };
+                }
+                let limit = *deadline.get_or_insert_with(|| Instant::now() + Duration::from_millis(250));
+                return tokio::select! { biased;
+                    _ = self.hard_stop.cancelled() => Err(UploadFailure::status(StatusCode::SERVICE_UNAVAILABLE)),
+                    result = &mut operation => Ok(Some(result)),
+                    _ = tokio::time::sleep_until(limit) => Ok(None),
+                };
+            }
+        }
+    }
+}
+
 pub(super) struct ExchangeState {
     pub(super) transport_started: bool,
     pub(super) complete_length: Option<u64>,
@@ -652,7 +886,7 @@ pub(super) async fn serve(
         .filter(|v| v.config == config as *const ProxyConfig as usize);
     ctx.request = Some(Request::from_parts(parts, full(Bytes::new())));
     let is_incremental = super::incremental::is_enabled(&incoming_headers);
-    let mut source = if let Some(prepared) = prepared {
+    let source = if let Some(prepared) = prepared {
         BodyPrefix {
             body,
             buffered: Vec::new(),
@@ -777,53 +1011,6 @@ pub(super) async fn serve(
         params.remove("SERVER_ADDR");
     }
     let bodyless = matches!(*method, Method::HEAD | Method::OPTIONS) || source.length == 0;
-    let parameters = wire::Parameters::new(&params)?;
-    exchange.transport_started = true;
-    exchange.transport_began = Some(std::time::Instant::now());
-    let mut socket = Socket {
-        io: target
-            .connect(ctx, config.dial_timeout)
-            .await
-            .map_err(|error| error.context(super::proxy_retry::DialFailure))?,
-        _permit: (permit, target_permit),
-    };
-    let read_limit = deadline(config.read_timeout)?;
-    let write_limit = deadline(config.write_timeout)?;
-    wire::begin(&mut socket.io, write_limit).await?;
-    parameters.send(&mut socket.io, write_limit).await?;
-    drop(params);
-    if !bodyless {
-        let mut remaining = source.length;
-        if let Some(spool) = source.spool.take() {
-            let mut offset = 0;
-            while let Some(data) = spool.read(ctx, offset).await? {
-                remaining = send_checked(&mut socket.io, &data, remaining, write_limit).await?;
-                offset += data.len() as u64;
-            }
-        }
-        for data in source.buffered {
-            remaining = send_checked(&mut socket.io, &data, remaining, write_limit).await?;
-        }
-        source.prefix_credits.clear();
-        while let Some(frame) = source.body.frame().await {
-            if let Ok(data) = frame
-                .map_err(|error| {
-                    failure(if super::request_body::limit_error(error.as_ref()) {
-                        StatusCode::PAYLOAD_TOO_LARGE
-                    } else {
-                        StatusCode::BAD_REQUEST
-                    })
-                })?
-                .into_data()
-            {
-                remaining = send_checked(&mut socket.io, &data, remaining, write_limit).await?;
-            }
-        }
-        if remaining != 0 {
-            return Err(failure(StatusCode::BAD_REQUEST));
-        }
-    }
-    wire::finish_stdin(&mut socket.io, write_limit).await?;
     let capture = transport.capture_stderr;
     let stderr: Option<reply::StderrSink> = if capture {
         let logging = logging
@@ -859,9 +1046,52 @@ pub(super) async fn serve(
     } else {
         None
     };
-    let reply = reply::Reader::new(wire::Responses::new(socket, read_limit), stderr)
-        .headers()
-        .await?;
+    let parameters = wire::Parameters::new(&params)?;
+    exchange.transport_started = true;
+    exchange.transport_began = Some(std::time::Instant::now());
+    let mut socket = Socket {
+        io: target
+            .connect(ctx, config.dial_timeout)
+            .await
+            .map_err(|error| error.context(super::proxy_retry::DialFailure))?,
+        _business: ctx.business.clone(),
+        _permit: (permit, target_permit),
+    };
+    let read_limit = deadline(config.read_timeout)?;
+    let write_limit = deadline(config.write_timeout)?;
+    let starting = async {
+        wire::begin(&mut socket.io, write_limit).await?;
+        parameters.send(&mut socket.io, write_limit).await?;
+        Ok::<_, io::Error>(())
+    }.await;
+    starting.map_err(|error| anyhow::Error::new(error).context(ExchangeStarted))?;
+    drop(params);
+    let remaining = source.length;
+    let source = source.into_body();
+    // Split the complete Socket: both halves retain its real IO and permits.
+    let (reader, writer) = tokio::io::split(socket);
+    let cancel = CancellationToken::new();
+    let hard_stop = ctx.business.generation().hard_stop.clone();
+    let job = UploadJob {
+        writer, source, remaining, bodyless, deadline: write_limit,
+        cancel: cancel.clone(), hard_stop: hard_stop.clone(),
+        _business: ctx.business.clone(),
+    };
+    let job = ctx.resources.fastcgi.tasks().spawn(job.execute());
+    let mut upload = UploadControl { job: Some(job), cancel, hard_stop };
+    let reading = reply::Reader::new(wire::Responses::new(reader, read_limit), stderr).headers();
+    let reply = match upload.during(reading).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(error)) => {
+            let _ = upload.finish().await;
+            return Err(anyhow::Error::new(error).context(ExchangeStarted));
+        }
+        Err(error) => {
+            let error = error.into_error(ctx);
+            let _ = upload.finish().await;
+            return Err(error.context(ExchangeStarted));
+        }
+    };
     let response_headers = reply.headers;
     let no_body = ctx.req().method() == Method::HEAD
         || matches!(
@@ -871,40 +1101,72 @@ pub(super) async fn serve(
         || response_headers
             .get(header::CONTENT_LENGTH)
             .is_some_and(|value| value == "0");
-    let reply_body = reply.body;
+    let mut reply_body = reply.body;
     let sniff = !no_body
         && !response_headers.contains_key(header::CONTENT_TYPE)
         && !response_headers.contains_key(header::CONTENT_ENCODING)
         && !response_headers.contains_key(header::CONTENT_RANGE);
     let diagnostic_owner = capture.then(|| (ctx.resources.clone(), ctx.business.clone()));
     let body = if no_body {
-        if let Some(owner) = diagnostic_owner {
-            handoff_diagnostics(reply_body, &owner);
+        if upload.pending() || !capture {
+            let captured = reply_body.captures_stderr();
+            let result = upload.tail(reply_body.upload_tail(), captured).await;
+            match result {
+                Ok(Some(Ok(()))) => {},
+                Ok(Some(Err(error))) => {
+                    let _ = upload.finish().await;
+                    return Err(anyhow::Error::new(error).context(ExchangeStarted));
+                }
+                Ok(None) => { if captured { reply_body.mark_diagnostic_limit(); } },
+                Err(error) => {
+                    let error = error.into_error(ctx);
+                    let _ = upload.finish().await;
+                    return Err(error.context(ExchangeStarted));
+                }
+            }
+            drop(reply_body);
+            upload.finish().await.map_err(|error| error.into_error(ctx).context(ExchangeStarted))?;
+        } else if let Some(owner) = diagnostic_owner {
+            handoff_diagnostics(reply_body, upload, &owner);
+        } else {
+            drop(reply_body);
+            upload.finish().await.map_err(|error| error.into_error(ctx).context(ExchangeStarted))?;
         }
         full(Bytes::new())
     } else {
         let frames = stream::try_unfold(
-            (Some(reply_body), diagnostic_owner),
-            |(body, owner)| async move {
-                let Some(mut body) = body else {
-                    return Ok(None);
-                };
-                let result = body.next().await;
-                if result.is_err() {
-                    // Give Hyper one flush opportunity before closing an already
-                    // started HTTP/1 response on an upstream framing failure.
-                    tokio::task::yield_now().await;
-                }
+            (Some(reply_body), Some(upload), diagnostic_owner),
+            |(body, upload, owner)| async move {
+                let (Some(mut body), Some(mut upload)) = (body, upload) else { return Ok(None); };
+                let result = upload.during(body.next()).await
+                    .map_err(|error| -> BoxError { Box::new(error) })?;
+                if result.is_err() { tokio::task::yield_now().await; }
                 let bytes = result?;
-                let body = if let Some(ref owner) = owner
-                    && body.diagnostics_ready()
-                {
-                    handoff_diagnostics(body, owner);
-                    None
-                } else {
-                    Some(body)
-                };
-                Ok::<_, BoxError>(bytes.map(|bytes| (Frame::data(bytes), (body, owner))))
+                if body.payload_complete() && (upload.pending() || !body.captures_stderr()) {
+                    // Hold at most this final <=64KiB record, while both input
+                    // and the responder tail continue to make real progress.
+                    let captured = body.captures_stderr();
+                    let result = upload.tail(body.upload_tail(), captured).await
+                        .map_err(|error| -> BoxError { Box::new(error) })?;
+                    match result {
+                        Some(result) => result?,
+                        None if captured => body.mark_diagnostic_limit(),
+                        None => {},
+                    }
+                    drop(body);
+                    upload.finish().await.map_err(|error| -> BoxError { Box::new(error) })?;
+                    return Ok::<_, BoxError>(bytes.map(|bytes| (Frame::data(bytes), (None, None, owner))));
+                }
+                if let Some(ref owner) = owner && body.diagnostics_ready() {
+                    handoff_diagnostics(body, upload, owner);
+                    return Ok(bytes.map(|bytes| (Frame::data(bytes), (None, None, Some(owner.clone())))));
+                }
+                if bytes.is_none() {
+                    drop(body);
+                    upload.finish().await.map_err(|error| -> BoxError { Box::new(error) })?;
+                    return Ok(None);
+                }
+                Ok(bytes.map(|bytes| (Frame::data(bytes), (Some(body), Some(upload), owner))))
             },
         );
         StreamBody::new(frames).boxed_unsync()
@@ -925,7 +1187,8 @@ pub(super) async fn serve(
 // exact socket (and its admission) moves to a bounded owned task; no retry
 // or second request occurs. The generation remains live only for this budget.
 fn handoff_diagnostics(
-    mut body: reply::ReplyBody<Socket>,
+    mut body: reply::ReplyBody<ReadSocket>,
+    mut upload: UploadControl,
     owner: &(
         Arc<super::resource_budget::Resources>,
         Arc<super::BusinessGuard>,
@@ -935,6 +1198,8 @@ fn handoff_diagnostics(
     let lane = &resources.fastcgi_admission;
     let Ok(permit) = lane.diagnostic_slots.clone().try_acquire_owned() else {
         body.mark_diagnostic_limit();
+        // Upload is already settled at the handoff boundary. Drop still
+        // cancels defensively; the real task remains tracked if ever pending.
         return;
     };
     let business = business.clone();
@@ -946,13 +1211,14 @@ fn handoff_diagnostics(
             body.mark_diagnostic_limit();
         }
         drop(body);
+        let _ = upload.finish().await;
         drop(business);
         drop(permit);
     });
 }
 
-async fn send_checked(
-    socket: &mut Box<dyn Io>,
+async fn send_checked<W: AsyncWrite + Unpin>(
+    socket: &mut W,
     data: &[u8],
     remaining: u64,
     limit: Option<Instant>,

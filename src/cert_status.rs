@@ -234,6 +234,8 @@ struct Inner {
     resources: Arc<OcspResources>,
     inventory: OcspInventorySelector,
     identity_scope: Option<[u8; 32]>,
+    #[cfg(feature = "native-run")]
+    outgoing_tls: Option<Arc<crate::outgoing_tls::Scope>>,
     entries: Mutex<HashMap<CertificateKey, Entry>>,
     observations: Mutex<HashMap<[u8; 32], Observed>>,
     events: broadcast::Sender<OcspEvent>,
@@ -326,7 +328,7 @@ impl OcspManager {
             "invalid OCSP retry interval"
         );
         // Validate transport limits before starting any workers.
-        let _ = OcspTransport::new(options.request_timeout, 1024 * 1024, None, &[])?;
+        OcspTransport::validate_limits(options.request_timeout, 1024 * 1024)?;
         let (events, _) = broadcast::channel(256);
         Ok(Self {
             inner: Arc::new(Inner {
@@ -338,6 +340,8 @@ impl OcspManager {
                 resources,
                 inventory,
                 identity_scope: None,
+                #[cfg(feature = "native-run")]
+                outgoing_tls: None,
                 options,
                 policy,
                 entries: Mutex::new(HashMap::new()),
@@ -373,6 +377,15 @@ impl OcspManager {
             .ok_or_else(|| anyhow!("OCSP scope already shared"))?;
         inner.identity_scope = Some(identity);
         inner.events = broadcast::channel(8).0;
+        Ok(self)
+    }
+    #[cfg(feature = "native-run")]
+    pub(crate) fn with_client_tls_scope(
+        mut self, scope: Option<Arc<crate::outgoing_tls::Scope>>,
+    ) -> Result<Self> {
+        Arc::get_mut(&mut self.inner)
+            .ok_or_else(|| anyhow!("OCSP scope already shared"))?
+            .outgoing_tls = scope;
         Ok(self)
     }
     pub fn subscribe(&self) -> broadcast::Receiver<OcspEvent> {
@@ -624,15 +637,27 @@ impl OcspManager {
             .cloned()
             .unwrap_or_else(|| original.clone());
         let query_disabled = responder.is_empty();
-        let transport = if mode == RefreshMode::Online {
-            Some(OcspTransport::new(
-                self.inner.options.request_timeout,
-                1024 * 1024,
-                config.http_proxy.as_deref(),
-                &config.extra_ca_pem,
-            )?)
+        let (config, transport) = if mode == RefreshMode::Online {
+            let timeout = self.inner.options.request_timeout;
+            #[cfg(feature = "native-run")]
+            let outgoing_tls = self.inner.outgoing_tls.clone();
+            // TLS/root construction may block. Move the existing policy into
+            // the bounded CPU job rather than cloning its trust material or
+            // performing synchronous work on an async network worker.
+            crate::cert_cpu::run(self.inner.cpu_slots.clone(), cancel.clone(), move || {
+                #[cfg(feature = "native-run")]
+                let transport = OcspTransport::new_scoped(
+                    timeout, 1024 * 1024, config.http_proxy.as_deref(),
+                    &config.extra_ca_pem, outgoing_tls,
+                )?;
+                #[cfg(not(feature = "native-run"))]
+                let transport = OcspTransport::new(
+                    timeout, 1024 * 1024, config.http_proxy.as_deref(), &config.extra_ca_pem,
+                )?;
+                Ok((config, Some(transport)))
+            }).await?
         } else {
-            None
+            (config, None)
         };
         let limiter = if mode == RefreshMode::Online {
             Some(self.responder_limit(if query_disabled {

@@ -32,7 +32,7 @@ impl CertificateServices {
             let mut last_error=None;
             let mut selected=None;
             for manager in &policy.managers {
-                match manager.fetch(&hello,&this.context.resources.issuance,cancel.clone()).await {
+                match manager.fetch(&hello,&this.context.resources.issuance,#[cfg(feature="native-run")] this.outgoing_tls.clone(),cancel.clone()).await {
                     Ok(Some(value))=>{
                         let parsed=crate::cert_cpu::run(this.context.resources.cpu.clone(),cancel.clone(),move||{
                             let (certificate,key)=super::super::external::split_bundle(value)?;
@@ -90,6 +90,8 @@ impl CertificateServices {
                     OcspOptions{check_interval:this.plan.ocsp_interval,max_concurrent,max_concurrent_per_responder,..OcspOptions::default()},
                     Arc::new(move |_|Ok(OcspConfig{responder_overrides:overrides.clone(),..OcspConfig::default()})),
                     Arc::new(|_|true),this.context.resources.ocsp.clone(),this.context.resources.cpu.clone())?;
+                #[cfg(feature="native-run")]
+                let manager=manager.with_client_tls_scope(this.outgoing_tls.clone())?;
                 let cert=resolver.ocsp_certificates()?.into_iter().next().ok_or_else(||anyhow!("external certificate status instance missing"))?;
                 manager.prime_cached_one(cert,cancel.clone()).await?;
                 reject_revoked(&material,&this.context.leaf_guard,true)?;
