@@ -619,6 +619,9 @@ pub(crate) fn ca_source_prepared_tls(ca:Option<serde_json::Value>,insecure:bool,
 }
 
 impl FixedDialConnector{
+    pub(super) fn connection_gate(&self)->Option<Arc<tokio::sync::Semaphore>>{
+        self.gate.clone()
+    }
     pub(super) fn with_forward_proxy(mut self,route:Option<Arc<super::proxy_transport::ProxyRoute>>)->Result<Self>{
         if let Some(route)=&route{if self.dial.scheme_str()==Some("http"){self.gate=self.settings.as_ref().map(|s|s.gate(route.endpoint.authority().map_or("",|a|a.as_str()))).transpose()?.flatten();}}
         self.route=route;Ok(self)

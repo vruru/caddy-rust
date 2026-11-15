@@ -1573,6 +1573,7 @@ async fn serve_connection<I>(
     builder
         .http1()
         .native_request_target(true)
+        .native_body_read_buffer_size(64 * 1024)
         .informational_responses(
             request::MAX_INFORMATIONAL_HEADS,
             request::MAX_INFORMATIONAL_BYTES,

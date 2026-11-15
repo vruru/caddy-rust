@@ -88,6 +88,7 @@ pub struct Builder {
     h1_initial_header_deadline: Option<Instant>,
     h1_writev: Option<bool>,
     max_buf_size: Option<usize>,
+    native_body_read_buffer_size: Option<usize>,
     pipeline_flush: bool,
     date_header: bool,
     informational: Option<crate::ext::InformationalLimits>,
@@ -272,6 +273,7 @@ impl Builder {
             h1_initial_header_deadline: None,
             h1_writev: None,
             max_buf_size: None,
+            native_body_read_buffer_size: None,
             pipeline_flush: false,
             date_header: true,
             informational: None,
@@ -460,6 +462,15 @@ impl Builder {
         self
     }
 
+    /// Set a bounded read window for an empty adaptive request-body buffer.
+    ///
+    /// This does not change header or trailer limits. Reads remain streaming
+    /// and may return fewer bytes than this window. Disabled by default.
+    pub fn native_body_read_buffer_size(&mut self, bytes: usize) -> &mut Self {
+        self.native_body_read_buffer_size = Some(bytes.max(1));
+        self
+    }
+
     /// Set the maximum buffer size for the connection.
     ///
     /// Default is ~400kb.
@@ -605,6 +616,9 @@ impl Builder {
         conn.set_flush_pipeline(self.pipeline_flush);
         if let Some(max) = self.max_buf_size {
             conn.set_max_buf_size(max);
+        }
+        if let Some(bytes) = self.native_body_read_buffer_size {
+            conn.set_native_body_read_buffer_size(bytes);
         }
         if !self.date_header {
             conn.disable_date_header();

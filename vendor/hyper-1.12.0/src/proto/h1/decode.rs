@@ -236,10 +236,10 @@ impl Decoder {
                 if *is_eof {
                     Poll::Ready(Ok(Frame::data(Bytes::new())))
                 } else {
-                    // 8192 chosen because its about 2 packets, there probably
-                    // won't be that much available, so don't have MemReaders
-                    // allocate buffers to big
-                    body.read_mem(cx, 8192).map_ok(|slice| {
+                    // Generic MemReaders retain the existing 8192-byte read.
+                    // Opted-in native readers supply their bounded body
+                    // window without changing header or metadata reads.
+                    body.read_mem_eof(cx).map_ok(|slice| {
                         *is_eof = slice.is_empty();
                         Frame::data(slice)
                     })

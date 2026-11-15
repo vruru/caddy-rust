@@ -36,6 +36,8 @@ pub(crate) struct Buffered<T, B> {
     read_blocked: bool,
     read_buf: BytesMut,
     read_buf_strategy: ReadStrategy,
+    #[cfg(feature = "server")]
+    server_body_read_buffer_size: Option<usize>,
     write_buf: WriteBuf<B>,
     #[cfg(feature="server")]
     pub(super) response_write:Option<Box<super::response_write::ObservedWrite>>,
@@ -89,6 +91,8 @@ where
             read_blocked: false,
             read_buf: BytesMut::with_capacity(0),
             read_buf_strategy: ReadStrategy::default(),
+            #[cfg(feature = "server")]
+            server_body_read_buffer_size: None,
             write_buf,
             #[cfg(feature="server")]
             response_write:None,
@@ -113,6 +117,11 @@ where
         );
         self.read_buf_strategy = ReadStrategy::with_max(max);
         self.write_buf.max_buf_size = max;
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn set_native_body_read_buffer_size(&mut self, bytes: usize) {
+        self.server_body_read_buffer_size = Some(bytes.max(1));
     }
 
     #[cfg(feature = "client")]
@@ -260,15 +269,46 @@ where
     }
 
     pub(crate) fn poll_read_from_io(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        // Headers, idle checks and force-IO retain the configured strategy.
+        self.poll_read_from_io_sized(cx, None)
+    }
+
+    fn native_body_window(&self) -> Option<usize> {
+        match self.read_buf_strategy {
+            ReadStrategy::Fixed { chunk, max } => Some(chunk.max(32 * 1024).min(max)),
+            #[cfg(feature = "server")]
+            ReadStrategy::Adaptive { .. } => self.server_body_read_buffer_size,
+            #[cfg(not(feature = "server"))]
+            ReadStrategy::Adaptive { .. } => None,
+            #[cfg(feature = "client")]
+            ReadStrategy::Exact(_) => None,
+        }
+    }
+
+    fn poll_read_from_io_sized(
+        &mut self,
+        cx: &mut Context<'_>,
+        body_window: Option<usize>,
+    ) -> Poll<io::Result<usize>> {
         self.read_blocked = false;
-        // Get the next amount to allocate, but make sure we don't go over
-        // the max read buf size configured.
-        let next = cmp::min(
-            self.read_buf_strategy.next(),
-            self.read_buf_strategy
-                .max()
-                .saturating_sub(self.read_buf.len()),
-        );
+        // Body windows are already bounded by their decoder/request policy.
+        // In particular the server body window is independent of header max.
+        // Headers, metadata and force-IO keep the original strategy limit.
+        let next = match body_window {
+            Some(window) => window,
+            None => cmp::min(
+                self.read_buf_strategy.next(),
+                self.read_buf_strategy
+                    .max()
+                    .saturating_sub(self.read_buf.len()),
+            ),
+        };
+        if body_window.is_some() && next == 0 {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "native body read window is empty",
+            )));
+        }
         if self.read_buf_remaining_mut() < next {
             self.read_buf.reserve(next);
         }
@@ -277,7 +317,7 @@ where
         // bytes onto `dst`.
         let fixed=matches!(self.read_buf_strategy,ReadStrategy::Fixed{..});
         let dst = unsafe { self.read_buf.chunk_mut().as_uninit_slice_mut() };
-        let dst=if fixed{let count=next.min(dst.len());&mut dst[..count]}else{dst};
+        let dst=if body_window.is_some()||fixed{let count=next.min(dst.len());&mut dst[..count]}else{dst};
         let mut buf = ReadBuf::uninit(dst);
         match Pin::new(&mut self.io).poll_read(cx, buf.unfilled()) {
             Poll::Ready(Ok(())) => {
@@ -356,6 +396,16 @@ where
         }
     }
 
+    #[cfg(feature="server")]
+    pub(crate) fn response_write_chunk_limit(&self) -> usize {
+        // Queue retains the existing body owner without a payload copy.
+        // Flatten keeps its smaller boundary and encoding allocation bound.
+        match self.write_buf.strategy {
+            WriteStrategy::Queue => 32 << 10,
+            WriteStrategy::Flatten => 16 << 10,
+        }
+    }
+
     // This is opted in only: every accepted wire segment is followed by a
     // real underlying flush before another segment can extend idle/rate credit.
     #[cfg(feature="server")]
@@ -415,6 +465,10 @@ impl<T: Unpin, B> Unpin for Buffered<T, B> {}
 // TODO: This trait is old... at least rename to PollBytes or something...
 pub(crate) trait MemRead {
     fn read_mem(&mut self, cx: &mut Context<'_>, len: usize) -> Poll<io::Result<Bytes>>;
+
+    fn read_mem_eof(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Bytes>> {
+        self.read_mem(cx, 8192)
+    }
 }
 
 impl<T, B> MemRead for Buffered<T, B>
@@ -427,9 +481,35 @@ where
             let n = std::cmp::min(len, self.read_buf.len());
             Poll::Ready(Ok(self.read_buf.split_to(n).freeze()))
         } else {
-            let n = ready!(self.poll_read_from_io(cx))?;
+            // An opted-in server body window applies only to empty adaptive
+            // body reads. Fixed clients retain their bufio-style threshold;
+            // one-byte chunk metadata always keeps the old strategy fill.
+            let window = match self.read_buf_strategy {
+                ReadStrategy::Fixed { chunk, .. } if len > 1 && len >= chunk.max(1) => {
+                    self.native_body_window().map(|window| window.min(len))
+                }
+                ReadStrategy::Adaptive { .. } if len > 1 => {
+                    self.native_body_window().map(|window| window.min(len))
+                }
+                _ => None,
+            };
+            let n = ready!(self.poll_read_from_io_sized(cx, window))?;
             Poll::Ready(Ok(self.read_buf.split_to(::std::cmp::min(len, n)).freeze()))
         }
+    }
+
+    fn read_mem_eof(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Bytes>> {
+        let length = match self.native_body_window() {
+            Some(0) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "native body read window is empty",
+                )));
+            }
+            Some(window) => window,
+            None => 8192,
+        };
+        self.read_mem(cx, length)
     }
 }
 

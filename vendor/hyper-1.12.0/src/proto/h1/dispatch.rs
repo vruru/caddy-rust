@@ -648,7 +648,7 @@ where
                 return Poll::Pending;
             }
             if let Some((data,eos))=state.chunk.as_mut(){
-                let n=data.remaining().min(16<<10);let end=*eos;
+                let n=data.remaining().min(self.conn.response_write_chunk_limit());let end=*eos;
                 if n==0{state.chunk=None;if end{state.ended=true;}continue;}
                 // Bytes overrides copy_to_bytes with an ownership-preserving
                 // split. A generic Buf can copy at most this bounded chunk.

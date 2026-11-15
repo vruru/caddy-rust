@@ -44,6 +44,7 @@ pub struct Client<C, B> {
     #[cfg(feature = "http2")]
     h2_builder: hyper::client::conn::http2::Builder<Exec>,
     pool: pool::Pool<PoolClient<B>, PoolKey>,
+    native_fixed_pool_key: Option<PoolKey>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -236,6 +237,9 @@ where
             }
         };
 
+        // Validation and CONNECT normalization above still use the wire URI.
+        // A fixed connector may pool by its real dial destination instead.
+        let pool_key = self.native_fixed_pool_key.clone().unwrap_or(pool_key);
         ResponseFuture::new(self.clone().send_request(req, pool_key))
     }
 
@@ -433,7 +437,14 @@ where
                 //
                 // If it *wasn't* ready yet, then the connect future will
                 // have been started...
-                if connecting.started() {
+                // A fixed-dial loser may be waiting for a finite connection
+                // gate whose only permit is held by this pool's idle IO.
+                // Keeping that loser in the background would retain the pool
+                // and prevent cache eviction from releasing the idle permit.
+                // It has not sent the application's request: dropping this
+                // loser is cancellation of a connection race, not a retry.
+                // Preserve the legacy background-connect policy by default.
+                if connecting.started() && self.native_fixed_pool_key.is_none() {
                     let bg = connecting
                         .map_err(|err| {
                             trace!("background connect error: {}", err);
@@ -718,6 +729,7 @@ impl<C: Clone, B> Clone for Client<C, B> {
             h2_builder: self.h2_builder.clone(),
             connector: self.connector.clone(),
             pool: self.pool.clone(),
+            native_fixed_pool_key: self.native_fixed_pool_key.clone(),
         }
     }
 }
@@ -1021,6 +1033,7 @@ pub struct Builder {
     h2_builder: hyper::client::conn::http2::Builder<Exec>,
     pool_config: pool::Config,
     pool_timer: Option<timer::Timer>,
+    native_fixed_pool_key: Option<PoolKey>,
 }
 
 impl Builder {
@@ -1047,8 +1060,23 @@ impl Builder {
                 idle_limit:None,
             },
             pool_timer: None,
+            native_fixed_pool_key: None,
         }
     }
+    /// Pool a fixed connector by its actual dial destination.
+    ///
+    /// This does not replace request URI validation or CONNECT normalization,
+    /// and does not change the wire URI, Host header or HTTP/2 authority.
+    /// The connector must dial this destination independently of its URI input.
+    pub fn native_fixed_pool_key(
+        &mut self,
+        scheme: Scheme,
+        authority: http::uri::Authority,
+    ) -> &mut Self {
+        self.native_fixed_pool_key = Some((scheme, authority));
+        self
+    }
+
     /// Set an optional timeout for idle sockets being kept-alive.
     /// A `Timer` is required for this to take effect. See `Builder::pool_timer`
     ///
@@ -1680,6 +1708,7 @@ impl Builder {
             h2_builder: self.h2_builder.clone(),
             connector,
             pool: pool::Pool::new(self.pool_config.clone(), exec, timer),
+            native_fixed_pool_key: self.native_fixed_pool_key.clone(),
         }
     }
 }

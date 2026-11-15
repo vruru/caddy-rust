@@ -977,6 +977,14 @@ impl<E> Http1Builder<'_, E> {
         self
     }
 
+    /// Set the bounded adaptive HTTP/1 request-body read window.
+    ///
+    /// Header and trailer limits are unchanged. Disabled by default.
+    pub fn native_body_read_buffer_size(&mut self, bytes: usize) -> &mut Self {
+        self.inner.http1.native_body_read_buffer_size(bytes);
+        self
+    }
+
     /// Set the maximum buffer size for the connection.
     ///
     /// Default is ~400kb.

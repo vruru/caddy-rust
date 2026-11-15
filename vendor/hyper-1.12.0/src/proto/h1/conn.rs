@@ -132,6 +132,11 @@ where
         self.io.set_max_buf_size(max);
     }
 
+    #[cfg(feature = "server")]
+    pub(crate) fn set_native_body_read_buffer_size(&mut self, bytes: usize) {
+        self.io.set_native_body_read_buffer_size(bytes);
+    }
+
     #[cfg(feature = "client")]
     #[cfg(feature="client")]
     pub(crate) fn set_write_buffer_size(&mut self,bytes:usize){self.io.set_write_buffer_size(bytes);}
@@ -735,6 +740,9 @@ where
     pub(crate) fn response_write_retention(&self)->Option<Bytes>{self.io.response_write.as_ref().and_then(|w|w.retention())}
     #[cfg(feature="server")]
     pub(crate) fn response_write_active(&self)->bool{self.io.response_write.as_ref().is_some_and(|w|!w.done())}
+
+    #[cfg(feature="server")]
+    pub(crate) fn response_write_chunk_limit(&self)->usize {self.io.response_write_chunk_limit()}
 
     #[cfg(feature="server")]
     pub(crate) fn response_write_pending(&self)->bool{self.io.response_write.as_ref().is_some_and(|w|w.pending())}

@@ -40,8 +40,9 @@ struct ClientCache {
 }
 // The key itself owns its allocation credit, independently of HashMap's
 // entry destruction order and the connector/client's asynchronous lifetime.
+// gate is concrete admission identity only; Hash/Eq remain the text key.
 #[derive(Clone)]
-struct ClientKey{text:String,cost:usize,_cache:Option<Arc<native_write_policy::Lease>>,_map:Option<Arc<super::map_runtime::DialOwner>>}
+struct ClientKey{text:String,cost:usize,gate:Option<Arc<tokio::sync::Semaphore>>,_cache:Option<Arc<native_write_policy::Lease>>,_map:Option<Arc<super::map_runtime::DialOwner>>}
 impl std::borrow::Borrow<str> for ClientKey{fn borrow(&self)->&str{&self.text}}
 impl PartialEq for ClientKey{fn eq(&self,other:&Self)->bool{self.text==other.text}}impl Eq for ClientKey{}
 impl std::hash::Hash for ClientKey{fn hash<H:std::hash::Hasher>(&self,state:&mut H){std::hash::Hash::hash(&self.text,state)}}
@@ -96,6 +97,10 @@ impl ProxyClient {
         }else{None};
         let uri = dial.parse::<Uri>()?;
         let mut builder = Client::builder(TokioExecutor::new());
+        builder.native_fixed_pool_key(
+            uri.scheme().cloned().ok_or_else(||anyhow::anyhow!("fixed upstream dial requires a scheme"))?,
+            uri.authority().cloned().ok_or_else(||anyhow::anyhow!("fixed upstream dial requires an authority"))?,
+        );
         // Go's transfer reader requires the whole HTTP/1 trailer block to fit
         // the default 4096-byte bufio reader. Do not cap ordinary headers here.
         builder.http1_max_trailer_size(4096);
@@ -118,10 +123,13 @@ impl ProxyClient {
         };
         let mut connector=transport.connector(uri,family,server_name,unix_path)?.with_proxy_source(source)?.with_forward_proxy(forward)?;
         if let Some(owner)=&owner{connector=connector.with_map_owner(owner.clone(),dns);}
+        let gate=connector.connection_gate();
         let client = builder.build(connector);
-        if cache_credit.is_none(){return Ok(client)}
-        // Building a pool must not hold the shared cache lock. Another request
-        // may have populated the same key meanwhile; keep that existing pool.
+        // Build outside the cache lock. A conflicting pool may retain idle IO
+        // that owns this same finite gate. Retire one such cache entry at a
+        // time, with all client/metadata destruction outside the mutex, then
+        // recheck under the insertion lock to cover concurrent builders.
+        loop {
         let mut cache = self
             .cache
             .lock()
@@ -130,8 +138,23 @@ impl ProxyClient {
         let clock = cache.clock;
         if let Some((existing, last)) = cache.clients.get_mut(cache_key.as_str()) {
             *last = clock;
-            return Ok(existing.clone());
+            let existing=existing.clone();
+            drop(cache);
+            return Ok(existing);
         }
+        let conflicting=gate.as_ref().and_then(|gate|cache.clients.keys().find(|key|{
+            key.text!=cache_key&&key.gate.as_ref().is_some_and(|peer|Arc::ptr_eq(gate,peer))
+        }).cloned());
+        if let Some(key)=conflicting {
+            let evicted=cache.clients.remove_entry(key.text.as_str());
+            if let Some((key,_))=&evicted {cache.bytes=cache.bytes.saturating_sub(key.cost);}
+            drop(cache);
+            drop(evicted);
+            continue;
+        }
+        // Optional cache pressure must not leave a conflicting cached pool
+        // owning all permits while this uncached client attempts its dial.
+        if cache_credit.is_none(){drop(cache);return Ok(client)}
         // A concurrent insertion may have consumed this proxy's optional
         // space after construction. Keep the usable client without caching.
         if cache.clients.len()>=1024||cache.bytes.saturating_add(cost)>CLIENT_CACHE_BYTES{drop(cache);return Ok(client)}
@@ -159,9 +182,10 @@ impl ProxyClient {
             cache.table=Some(table);
         }
         cache.bytes+=cost;
-        cache.clients.insert(ClientKey{text:cache_key,cost,_cache:cache_credit,_map:owner},(client.clone(),clock));
+        cache.clients.insert(ClientKey{text:cache_key,cost,gate,_cache:cache_credit,_map:owner},(client.clone(),clock));
         drop(cache);
-        Ok(client)
+        return Ok(client);
+        }
     }
 }
 pub(super) fn prepare_clients(

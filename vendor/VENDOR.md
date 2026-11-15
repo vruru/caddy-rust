@@ -60,6 +60,53 @@ or turn CR/LF into an injected value. These dependency changes do not establish
 full Caddy or module compatibility. Remaining capability and validation gates
 continue to apply; no production replacement is authorized by vendoring alone.
 
+## Native HTTP/1 body batching
+
+The opt-in Fixed upstream reader keeps the configured fill size for headers,
+idle checks, and one-byte chunk metadata. When its buffer is empty, a large
+body read may use a 32 KiB window instead of the smaller header fill. An
+explicitly larger fill size retains its existing window, and the original
+maximum still applies. Content-Length and chunk payload reads are clipped to
+the decoder's remaining length; buffered bytes are consumed first. Short reads
+return immediately, without waiting to fill the window. EOF-delimited bodies
+use the same bounded window; other reader strategies retain their old behavior.
+Header and trailer acceptance limits, upgrade handoff, and retry rules do not
+change with this batching.
+
+The Caddy business server separately opts into a 64 KiB adaptive request-body
+window. Empty body reads are clipped to the decoder's remaining length instead
+of inheriting the header buffer growth limit. Existing bytes are consumed
+first, metadata keeps its old fill, and short reads return immediately. Other
+server builders default to no body-window override. Header parsing retains its
+strategy and acceptance limits; reusable capacity can still affect the actual
+size of a later adaptive read.
+
+Opted-in observed HTTP/1 response writes split an existing body frame into at
+most 32 KiB segments when the actual write strategy queues owned buffers.
+Flatten keeps 16 KiB segments and its existing encoding allocation allowance,
+including when writev is disabled or pipeline flushing selects Flatten.
+Separate body frames are not combined. Every accepted wire segment still
+requires an actual underlying flush before payload progress is recorded, with
+the same deadlines, partial-write accounting, retained owners, and bounded
+16-iteration dispatcher loop.
+
+## Fixed-dial connection identity and handoff
+
+The native proxy opts into a fixed Hyper client pool key for the actual dial
+scheme and authority. Request URI validation and CONNECT normalization still
+run first; wire URI, Host and HTTP/2 authority remain separate. Other clients
+retain the legacy key behavior by default.
+
+Different client policies keep separate connectors and TLS/ALPN negotiation.
+When their cached pools share one finite connection gate, a new policy retires
+conflicting cache entries outside the cache mutex. Active response, upgrade and
+IO owners retain the actual permit until their own lifetime ends. Insertion
+rechecks conflicts while holding the cache lock, including uncached fallback.
+The fixed-dial mode also drops an unused connecting race loser when checkout
+wins, instead of keeping a background future that can pin an old idle pool
+while waiting for the same gate. No application request has been sent through
+that loser. Legacy clients retain their existing background-connect behavior.
+
 ## Transport write completion
 
 The h2 copy retains the original MIT license. Its development targets and
