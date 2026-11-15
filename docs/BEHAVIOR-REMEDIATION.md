@@ -36,7 +36,9 @@ FastCGI STDIN writing and response reading make progress concurrently using the
 existing admitted socket and task tracker. Source buffers, spool workers,
 socket halves and request ownership remain attached to their actual work.
 Response parsing observes upload failure; dropping a response cancels the
-tracked upload. A started non-idempotent exchange is not replayed merely because
+tracked upload. Record headers, payload and padding are offered together through
+a borrowed vectored cursor when the writer supports it. Partial writes advance
+the same cursor; no complete request copy or extra upload queue is introduced. A started non-idempotent exchange is not replayed merely because
 the input was buffered. A connection failure before transmission retains the
 ordinary retry rules.
 

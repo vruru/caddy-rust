@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! FastCGI responder framing. The exchange owner keeps deadlines, body and
 //! socket ownership; this module does not spawn detached work.
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use std::{collections::BTreeMap, future::Future, io};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -47,9 +47,12 @@ async fn record<W: AsyncWrite + Unpin>(writer: &mut W, kind: u8, bytes: &[u8]) -
     let [high, low] = length.to_be_bytes();
     let padding = (8 - bytes.len() % 8) % 8;
     let header = [1, kind, ID[0], ID[1], high, low, padding as u8, 0];
-    writer.write_all(&header).await?;
-    writer.write_all(bytes).await?;
-    writer.write_all(&[0; 7][..padding]).await
+    let zeros = [0; 7];
+    // Offer one record together without copying its payload. The same cursor
+    // advances across short writes, including a partial header or padding.
+    // Non-vectored writers retain their ordinary sequential fallback.
+    let mut record = Buf::chain(Buf::chain(header.as_slice(), bytes), &zeros[..padding]);
+    writer.write_all_buf(&mut record).await
 }
 fn length_width(length: usize) -> usize {
     if length < 128 { 1 } else { 4 }
