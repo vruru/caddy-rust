@@ -104,3 +104,33 @@ Validate each target's complete configuration and actual request paths before
 cutover. Module registration and a successful `validate` alone are not runtime
 acceptance. Certificate storage and automatic certificate behavior continue to
 use the existing native TLS lifecycle.
+
+
+## Filesystem storage and native runtime state
+
+The native certificate store keeps runtime identity and coordination state under
+`<configuration directory>/native-state`. On Linux, `XDG_CONFIG_HOME` selects the
+configuration directory as `$XDG_CONFIG_HOME/caddy`; otherwise it defaults to
+`$HOME/.config/caddy`. This state is required even when admin configuration
+persistence is disabled.
+
+Each certificate data root and its native state root must be absolute, separate,
+non-nested directories. An explicit file-system storage root that contains the
+home directory's default configuration path therefore needs an external
+configuration directory. For example, with certificate storage at
+`/var/lib/caddy`, use `XDG_CONFIG_HOME=/var/lib/caddy-native-config`. Keep the
+existing certificate data and ACME accounts in their original storage root;
+changing the configuration directory does not require moving those files.
+
+The directory must be owned and writable by the service account. Sandboxed
+systemd units with `ProtectSystem=strict` also need an explicit
+`ReadWritePaths=/var/lib/caddy-native-config` addition. Apply the same environment
+and filesystem permissions to pre-start validation, normal startup, and reload.
+Preserve unrelated service limits and capabilities.
+
+Deployment validation must preserve the target's storage/state path relationships,
+service identity, mount permissions, and listener capabilities. Mapping storage
+and configuration paths to unrelated writable temporary directories can hide a
+real startup failure. Check actual isolated startup and normal stop/restart as
+well as `validate`; preserve production certificate files and keep any copied
+store identity state isolated from the live store.
