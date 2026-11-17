@@ -100,6 +100,10 @@ pub(crate) use path_glob::go_path_glob;
 mod proxy;
 #[path = "http_runtime/proxy_buffer.rs"]
 mod proxy_buffer;
+#[path = "http_runtime/bounded_body.rs"]
+mod bounded_body;
+#[path = "http_runtime/cache_handler.rs"]
+pub(crate) mod cache_handler;
 #[path="http_runtime/proxy_handler.rs"]
 mod proxy_handler;
 #[path="http_runtime/proxy_verbose.rs"]
@@ -311,6 +315,7 @@ impl Generation {
 }
 #[derive(Clone)]
 struct ActiveServer {
+    cache: Option<Arc<crate::cache_app::Runtime>>,
     resolved_listener: Option<Arc<listener_resolve::ResolvedServer>>,
     protocols: crate::http_config::server_options::ProtocolSet,
     network:crate::http_config::ListenerNetwork,
@@ -782,6 +787,7 @@ async fn prepare_servers(
             acme_servers:prepare_acme_handlers(server,provider,validate_only,resources).await?,
             metrics: metrics.clone(),
             events: config.events.clone(),
+            cache: config.cache.clone(),
             logging: logging.cloned(),
             plan: server.clone(),
             tls,
@@ -874,6 +880,7 @@ async fn prepare_servers(
                     resolved_listener: existing.resolved_listener.clone(),
                     metrics: metrics.clone(),
                     events: config.events.clone(),
+            cache: config.cache.clone(),
                     logging: logging.cloned(),
                     plan,
                     tls: None,
@@ -903,6 +910,7 @@ async fn prepare_servers(
                 strict_sni_host: false,
                 tls_policies: Vec::new(),
                 trusted_proxies: Vec::new(),
+                scoped_proxies: None,
                 trusted_strict: false,
                 client_ip_headers: vec!["X-Forwarded-For".into()],
                 read_header_timeout: Some(Duration::from_secs(60)),
@@ -925,6 +933,7 @@ async fn prepare_servers(
                     tracing: tracing.clone(),
                     metrics: metrics.clone(),
                     events: config.events.clone(),
+            cache: config.cache.clone(),
                     logging: logging.cloned(),
                     plan: Arc::new(plan),
                     acme_servers:Arc::new(HashMap::new()),

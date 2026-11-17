@@ -87,6 +87,7 @@ enum DeferredResponse {
     Trace(Arc<super::tracing::Observation>),
 }
 impl Context {
+    pub(super) fn set_content_length(&mut self, length: u64) { self.request_content_length = length as i64; }
     pub(super) fn proxy_content_length(&self)->i64{self.request_content_length}
 
     pub(super) fn client_ip_text(&self)->String{
@@ -356,9 +357,13 @@ where
         }
         return response;
     }
+    // Resolve one immutable host-specific view for both the direct peer and every XFF hop.
+    let proxy_ranges = server.plan.scoped_proxies.as_ref().map_or(server.plan.trusted_proxies.as_slice(), |policy| {
+        std::str::from_utf8(&authority).map_or(&[], |host| policy.ranges_for(host))
+    });
     let trusted = (server.plan.options.trusted_proxies_unix&&peer.raw_text().as_ref()==b"@")
-        ||server.plan.trusted_proxies.iter().any(|range|peer.ip().is_some_and(|ip|range.contains(&ip)));
-    let client_ip=client_ip(request.headers(),peer.ip(),trusted,&server.plan);
+        ||proxy_ranges.iter().any(|range|peer.ip().is_some_and(|ip|range.contains(&ip)));
+    let client_ip=client_ip(request.headers(),peer.ip(),trusted,&server.plan,proxy_ranges);
     let access = server
         .plan
         .access_logs
@@ -685,7 +690,7 @@ pub(super) fn proxy_error_status(
     error: &anyhow::Error,
     body_limit: Option<&super::request_body::LimitState>,
 ) -> StatusCode {
-    if let Some(error) = error.downcast_ref::<HttpError>() {
+    if let Some(error) = error.downcast_ref::<HttpError>().or_else(|| error.chain().find_map(|source| source.downcast_ref::<HttpError>())) {
         error.status
     } else if super::request_body::limit_error(error.as_ref())
         || super::request_body::limit_hit(body_limit)
@@ -1068,6 +1073,31 @@ fn handlers<'a>(
                         response.extensions_mut().insert(head_length);
                     }
                     return Ok(Flow::Response(response));
+                }
+                Handler::Cache(plan) => {
+                    let runtime = server.cache.as_ref().ok_or_else(|| anyhow::anyhow!("cache app was not prepared"))?;
+                    match super::cache_handler::before(ctx, runtime, plan).await? {
+                        super::cache_handler::Decision::Bypass => continue,
+                        super::cache_handler::Decision::Hit(response) => return Ok(Flow::Response(response)),
+                        super::cache_handler::Decision::Miss(token) => {
+                            let mark = ctx.deferred.len();
+                            let after = Next::Handlers(&list[index+1..], traces.get(index+1..).unwrap_or_default(), next);
+                            let flow = continue_chain(after, ctx, inner, server).await?;
+                            let (mut response, explicit) = match flow {
+                                Flow::Response(response) => (response, true),
+                                Flow::ImplicitResponse(response) => (response, false),
+                                Flow::Continue | Flow::Stop => (simple(StatusCode::OK, Bytes::new()), false),
+                            };
+                            let mut headers = take_writer_headers(&mut response, ctx);
+                            if explicit { finalize_transforms(&mut headers, &mut response, true, mark, ctx).await?; }
+                            else { ctx.deferred.truncate(mark); }
+                            *response.headers_mut() = headers;
+                            return Ok(Flow::Response(super::cache_handler::finish(ctx, runtime, token, response).await?));
+                        }
+                    }
+                }
+                Handler::BoundedBody(plan) => {
+                    Box::pin(super::bounded_body::apply(ctx, plan)).await?;
                 }
                 Handler::RequestBody(plan) => {
                     Box::pin(super::request_body::apply(ctx, plan)).await?;
@@ -2011,7 +2041,7 @@ pub(super) fn header_value_bytes_pattern(pattern: &[u8], value: &[u8]) -> bool {
         pattern == value
     }
 }
-fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>, trusted: bool, server: &ServerConfig) -> Option<IpAddr> {
+fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>, trusted: bool, server: &ServerConfig, proxy_ranges: &[ipnet::IpNet]) -> Option<IpAddr> {
     if !trusted {
         return peer;
     }
@@ -2025,7 +2055,7 @@ fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>, trusted: bool, server: &
                 .join(",");
             for part in all.split(',').rev() {
                 if let Some(ip) = parse_forwarded_ip(part)
-                    && !server.trusted_proxies.iter().any(|r| r.contains(&ip))
+                    && !proxy_ranges.iter().any(|r| r.contains(&ip))
                 {
                     return Some(ip);
                 }

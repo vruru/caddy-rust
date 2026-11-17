@@ -1,9 +1,10 @@
 # Compatibility contract and current gaps
 
-Baseline: Caddy v2.11.7, CertMagic v0.25.6, acmez/v3 v3.1.7. The three inspected
-production binaries expose the same 135 standard modules and no additional
-third-party modules. The live configuration uses a subset; that observation does
-not authorize removing capabilities from the requested replacement.
+Baseline: Caddy v2.11.7, CertMagic v0.25.6, acmez/v3 v3.1.7. The original standard baseline exposes 135 standard modules. Additional target
+builds can contain third-party or site-specific modules and must be inventoried
+separately. Native cache and HTTP policy extensions are described in
+[`docs/NATIVE-EXTENSIONS.md`](docs/NATIVE-EXTENSIONS.md). A live configuration
+using a subset does not authorize removing other requested capabilities.
 
 Current integration stage: the native process serves supported HTTP/Admin and
 certificate configurations with `native-run`. Formatting, adaptation,

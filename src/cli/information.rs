@@ -138,6 +138,14 @@ static STANDARD_MODULES: &[&str] = &[
     "tls.stek.distributed",
     "tls.stek.standard",
 ];
+static NATIVE_EXTENSIONS: &[&str] = &[
+    "cache",
+    "http.handlers.cache",
+    "http.handlers.bounded_body",
+    "http.ip_sources.scoped_policy",
+    "storages.cache.otter",
+];
+
 
 pub(super) unsafe fn command(name: &str, input: &[OsString]) -> Result<i32> {
     match name {
@@ -288,30 +296,21 @@ pub(super) unsafe fn command(name: &str, input: &[OsString]) -> Result<i32> {
             let want_packages = flags.boolean("packages");
             let count = STANDARD_MODULES.len();
 
+            let modules = STANDARD_MODULES.iter().filter(|_| !skip_standard)
+                .map(|id| (*id, "standard"))
+                .chain(NATIVE_EXTENSIONS.iter().map(|id| (*id, "non-standard")));
             if want_json {
-                if skip_standard {
-                    println!("[]");
-                } else {
-                    let mut entries = Vec::with_capacity(count);
-                    for id in STANDARD_MODULES {
-                        entries.push(serde_json::json!({
-                            "module_name": id,
-                            "module_type": "standard",
-                            "version": env!("CARGO_PKG_VERSION"),
-                            "package_url": "github.com/vruru/caddy-rust",
-                        }));
-                    }
-                    println!("{}", serde_json::to_string_pretty(&entries)?);
-                }
+                let entries: Vec<_> = modules.map(|(id, kind)| serde_json::json!({
+                    "module_name": id,
+                    "module_type": kind,
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "package_url": "github.com/vruru/caddy-rust",
+                })).collect();
+                println!("{}", serde_json::to_string_pretty(&entries)?);
                 return Ok(0);
             }
-
-            if skip_standard {
-                return Ok(0);
-            }
-
-            for id in STANDARD_MODULES {
-                let mut line = String::from(*id);
+            for (id, _) in modules {
+                let mut line = String::from(id);
                 if want_versions {
                     line.push_str(&format!("  {}", env!("CARGO_PKG_VERSION")));
                 }
@@ -321,7 +320,8 @@ pub(super) unsafe fn command(name: &str, input: &[OsString]) -> Result<i32> {
                 println!("{}", line);
             }
             println!();
-            println!("  Standard modules: {}", count);
+            if !skip_standard { println!("  Standard modules: {}", count); }
+            println!("  Non-standard modules: {}", NATIVE_EXTENSIONS.len());
             Ok(0)
         }
         _ => bail!("unknown information subcommand: {}", name),

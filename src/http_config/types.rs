@@ -92,6 +92,8 @@ pub(crate) struct HeaderOps {
 
 #[derive(Clone)]
 pub(crate) enum Handler {
+    Cache(std::sync::Arc<crate::http_runtime::cache_handler::Plan>),
+    BoundedBody(std::sync::Arc<super::bounded_body::Plan>),
     Push(std::sync::Arc<PushConfig>),
     Tracing(std::sync::Arc<crate::metrics::distributed_trace::config::Config>),
     Timeouts(super::route_timeouts::RouteTimeouts),

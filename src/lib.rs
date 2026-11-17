@@ -14,6 +14,7 @@ pub mod challenge;
 pub mod crypto;
 pub mod password;
 pub mod http_config;
+pub(crate) mod cache_app;
 pub mod http_runtime;
 pub mod leaf_guard;
 mod storage_boundary;

@@ -5,6 +5,8 @@ mod listeners;
 pub(crate) use listeners::{ListenSpec,ListenIdentity,Family as ListenerFamily,Network as ListenerNetwork,Address as ListenerAddress};
 mod header_ops;
 mod filesystems;
+pub(crate) mod scoped_policy;
+pub(crate) mod bounded_body;
 pub(crate) mod header_compile;
 #[path = "http_config/helpers.rs"]
 pub(crate) mod helpers;
@@ -32,6 +34,8 @@ mod rewrite;
 pub struct PreparedConfig {
     pub(crate) metrics: Option<crate::metrics::config::Config>,
     pub(crate) events: Option<Arc<crate::events::EventsApp>>,
+    pub(crate) cache_plan: Option<Arc<crate::cache_app::Config>>,
+    pub(crate) cache: Option<Arc<crate::cache_app::Runtime>>,
     pub(crate) http_port: u16,
     pub(crate) https_port: u16,
     pub(crate) explicit_tls_subjects: std::sync::Arc<crate::tls_app_config::ExplicitSubjects>,
@@ -75,6 +79,7 @@ pub(crate) struct ServerConfig {
     pub(crate) strict_sni_host: bool,
     pub(crate) tls_policies: Vec<crate::tls_policy::ConnectionPolicy>,
     pub(crate) trusted_proxies: Vec<ipnet::IpNet>,
+    pub(crate) scoped_proxies: Option<Arc<scoped_policy::ScopedPolicy>>,
     pub(crate) trusted_strict: bool,
     pub(crate) client_text_facts: bool,
     pub(crate) client_ip_headers: Vec<String>,
@@ -214,7 +219,8 @@ pub fn validate_json(value: &Value) -> Result<PreparedConfig> {
             .ok_or_else(|| anyhow::anyhow!("apps required"))?,
         "/apps",
     )?;
-    deny_unknown(apps, &["http", "tls", "caddy.filesystems"], "/apps")?;
+    deny_unknown(apps, &["http", "tls", "caddy.filesystems", "cache"], "/apps")?;
+    let cache_plan = apps.get("cache").filter(|v| !v.is_null()).map(crate::cache_app::Config::parse).transpose()?.map(Arc::new);
     filesystems::validate(apps.get("caddy.filesystems"))?;
     let mut certificates = Vec::new();
     if let Some(tls) = apps.get("tls") {
@@ -323,7 +329,10 @@ pub fn validate_json(value: &Value) -> Result<PreparedConfig> {
         // Distinct declarations may intentionally share a physical TCP port.
         servers.push(Arc::new(config));
     }
+    ensure!(cache_plan.is_some() || !cache_required(&servers), "cache handler requires an explicit cache application");
     Ok(PreparedConfig {
+        cache_plan,
+        cache: None,
         metrics,
         events: None,
         http_port,https_port,
@@ -560,17 +569,18 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
         || (!disabled && listen_specs.iter().any(|a| a.port() == https_port))
         || inferred;
     let protocols=global_protocols.names();
+    let mut scoped_proxies = None;
     let trusted_proxies = if let Some(proxies) = m.get("trusted_proxies") {
-        let proxies = object(proxies, path)?;
-        deny_unknown(proxies, &["source", "ranges"], path)?;
-        ensure!(
-            proxies.get("source").and_then(Value::as_str) == Some("static"),
-            "unsupported trusted proxy source"
-        );
-        parse_ranges(required(proxies, "ranges")?, path)?
-    } else {
-        Vec::new()
-    };
+        let object = object(proxies, path)?;
+        if object.get("source").and_then(Value::as_str) == Some("scoped_policy") {
+            scoped_proxies = Some(Arc::new(scoped_policy::parse(proxies, path)?));
+            Vec::new()
+        } else {
+            deny_unknown(object, &["source", "ranges"], path)?;
+            ensure!(object.get("source").and_then(Value::as_str) == Some("static"), "unsupported trusted proxy source");
+            parse_ranges(required(object, "ranges")?, path)?
+        }
+    } else { Vec::new() };
     let trusted_strict = m
         .get("trusted_proxies_strict")
         .filter(|v| !v.is_null())
@@ -644,6 +654,7 @@ fn parse_server(value: &Value, regex_remaining: &mut usize,http_port:u16,https_p
         )?,
         tls_policies,
         trusted_proxies,
+        scoped_proxies,
         trusted_strict,
         client_ip_headers: m
             .get("client_ip_headers")
@@ -1001,6 +1012,8 @@ fn parse_handler(
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("handler ID required"))?;
     Ok(match handler {
+        "cache" => Handler::Cache(Arc::new(crate::http_runtime::cache_handler::parse(value)?)),
+        "bounded_body" => Handler::BoundedBody(Arc::new(bounded_body::parse(value, path)?)),
         "acme_server" => Handler::AcmeServer(std::sync::Arc::new(crate::acme_server::parse(value)?)),
         "error" => {
             deny_unknown(m, &["handler", "status_code", "error"], path)?;
@@ -2320,4 +2333,17 @@ fn parse_selector(
         }
         _ => unreachable!("policy keys checked before parsing"),
     })
+}
+
+fn cache_required(servers: &[Arc<ServerConfig>]) -> bool {
+    fn routes(list: &[Route]) -> bool {
+        list.iter().any(|r| r.handlers.iter().any(|h| match h {
+            Handler::Cache(_) => true,
+            Handler::Subroute { routes: nested, errors, .. } => routes(nested) || routes(errors),
+            Handler::ReverseProxy(p) => p.response_routes.iter().any(|r| r.routes.as_deref().is_some_and(routes)),
+            Handler::Intercept(list) => list.iter().any(|r| r.routes.as_deref().is_some_and(routes)),
+            _ => false,
+        }))
+    }
+    servers.iter().any(|s| routes(&s.routes) || routes(&s.errors) || s.named_routes.values().any(|r| routes(std::slice::from_ref(r))))
 }

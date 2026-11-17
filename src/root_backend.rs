@@ -81,6 +81,7 @@ struct Root {
     retirements: TaskTracker,
 }
 struct Active {
+    cache: Option<Arc<crate::cache_app::Runtime>>,
     events: Arc<crate::events::EventsApp>,
     generation: u64,
     digest: [u8; 32],
@@ -361,6 +362,8 @@ impl Root {
         let registry = self.events_registry.clone();
         let events = self.offload(move || crate::events::EventsApp::prepare(&raw_events, &registry, Default::default()).map_err(|_| failed("invalid_events_application"))).await?;
         prepared.http.events = Some(events.clone());
+        let cache = prepared.http.cache_plan.as_ref().map(|config| crate::cache_app::Runtime::new(config.clone(), previous.as_ref().and_then(|old| old.cache.as_ref())));
+        prepared.http.cache = cache.clone();
         let (mode, restore_tickets) = if restore_only {
             let old = self
                 .retained
@@ -503,6 +506,7 @@ impl Root {
                 .stage_ticket_worker(&tickets, epoch)
                 .map_err(|_| failed("session_ticket_worker_preparation_failed"))?;
             let next = Arc::new(Active {
+                cache: cache.clone(),
                 events: events.clone(),
                 generation: epoch,
                 digest: prepared.digest,
@@ -906,7 +910,7 @@ fn prepare(raw: Value) -> Result<Prepared, AdminError> {
     if apps.is_some_and(|v| {
         v.as_object().is_none_or(|o| {
             o.keys()
-                .any(|key| !matches!(key.as_str(), "http" | "tls" | "pki" | "events" | "caddy.filesystems"))
+                .any(|key| !matches!(key.as_str(), "http" | "tls" | "pki" | "events" | "caddy.filesystems" | "cache"))
         })
     }) {
         return Err(failed("unsupported_application_module"));
@@ -930,6 +934,7 @@ fn prepare(raw: Value) -> Result<Prepared, AdminError> {
     // the original integer-negative-zero provenance needed by typed fields.
     let mut applications = serde_json::Map::new();
     applications.insert("http".to_owned(), http);
+    if let Some(cache) = apps.and_then(|a| a.get("cache")).filter(|v| !v.is_null()) { applications.insert("cache".into(), cache.clone()); }
     if let Some(fs)=apps.and_then(|a|a.get("caddy.filesystems")).filter(|v|!v.is_null()){
         applications.insert("caddy.filesystems".into(),fs.clone());
     }
