@@ -235,7 +235,7 @@ impl NativeBackend {
         let result = async {
             services.set_effective_tls_app(prepared.effective_tls_app)
                 .map_err(|_| failed("certificate_scope_preparation_failed"))?;
-            let logging=logging::prepare(prepared.logging,root.logging_registry.clone(),root.candidates.child_token()).await
+            let logging=logging::prepare_for_validation(prepared.logging,root.logging_registry.clone(),root.candidates.child_token()).await
                 .map_err(|_|failed("logging_candidate_preparation_failed"))?;
             events.set_logging(logging.clone());
             services.prepare(root.candidates.child_token()).await

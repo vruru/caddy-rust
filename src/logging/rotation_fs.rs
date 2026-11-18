@@ -77,8 +77,34 @@ impl Identity {
         (self.dev, self.ino)
     }
 }
+fn probe_directory(directory: &File, base: &str) -> io::Result<()> {
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce)
+        .map_err(|_| io::Error::other("log directory probe entropy unavailable"))?;
+    let name = format!("{base}.probe-{}", hex(&nonce));
+    let probe = fs::openat(
+        directory,
+        name.as_str(),
+        SAFE_FLAGS | OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY,
+        Mode::RUSR | Mode::WUSR,
+    )?;
+    // Keep the new descriptor alive until unlink succeeds. No log data is
+    // written, and the probe name cannot match the archive/maintenance prefix.
+    fs::unlinkat(directory, name.as_str(), AtFlags::empty())?;
+    drop(probe);
+    Ok(())
+}
+
 impl Paths {
     pub(super) fn open(spec: &FileSpec) -> io::Result<Arc<Self>> {
+        Self::prepare(spec, true)
+    }
+    /// Probe the real destination without owning or modifying its live writer.
+    pub(super) fn validate(spec: &FileSpec) -> io::Result<()> {
+        drop(Self::prepare(spec, false)?);
+        Ok(())
+    }
+    fn prepare(spec: &FileSpec, runtime: bool) -> io::Result<Arc<Self>> {
         if spec.filename.ends_with('/') {
             return Err(io::ErrorKind::InvalidInput.into());
         }
@@ -123,7 +149,12 @@ impl Paths {
         if gate_id.uid != owner || gate_id.mode != 0o600 || gate_id.links != 1 {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
-        fs::flock(&gate, FlockOperation::NonBlockingLockExclusive)?;
+        if runtime {
+            fs::flock(&gate, FlockOperation::NonBlockingLockExclusive)?;
+        }
+        // Rotation needs directory creation/removal even when an existing
+        // active file and gate remain appendable in a read-only directory.
+        probe_directory(&directory, &base)?;
         // Do not unlink the persistent gate: a late opener might still hold
         // its old inode. Old Go instances do not honor this native gate.
         let paths = Arc::new(Self {
@@ -153,7 +184,11 @@ impl Paths {
             return Err(io::ErrorKind::InvalidData.into());
         }
         if spec.mode != 0 && identity.mode != mode {
-            fs::fchmod(&preflight, mode_bits(mode))?;
+            if runtime {
+                fs::fchmod(&preflight, mode_bits(mode))?;
+            } else if identity.uid != owner && owner != 0 {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
         }
         paths.set_active(Some(identity));
         Ok(paths)

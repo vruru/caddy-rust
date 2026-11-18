@@ -80,6 +80,7 @@ pub use credits::AdmissionError;
 pub use dispatch::{Delivery, DeliveryReport, DeliveryTicket, DestinationReport};
 pub use level::Level;
 pub use limits::RuntimeLimits;
+pub(crate) use registry::prepare_for_validation;
 pub use registry::{
     FlushReport, Logging, LoggingRegistry, RegistryStatus, ShutdownReport, prepare,
 };

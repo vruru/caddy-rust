@@ -4,7 +4,7 @@
 use super::writer_spec::{FileSpec, parse_mode, unix_mode};
 use anyhow::{Result, anyhow, bail};
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::{
     fs::{self, File, OpenOptions},
     path::{Component, Path, PathBuf},
@@ -23,7 +23,14 @@ pub(super) fn prepare_directory(spec: &FileSpec) -> Result<PathBuf> {
     mkdir_all(&directory, dir_mode)?;
     Ok(directory)
 }
+pub(super) fn validate_plain(spec: &FileSpec) -> Result<()> {
+    drop(prepare_plain_inner(spec, false)?);
+    Ok(())
+}
 pub(super) fn prepare_plain(spec: &FileSpec) -> Result<File> {
+    prepare_plain_inner(spec, true)
+}
+fn prepare_plain_inner(spec: &FileSpec, apply_permissions: bool) -> Result<File> {
     prepare_directory(spec)?;
     let mode = if spec.mode == 0 { 0o600 } else { spec.mode };
     let mut options = OpenOptions::new();
@@ -38,11 +45,18 @@ pub(super) fn prepare_plain(spec: &FileSpec) -> Result<File> {
         .map_err(|e| anyhow!("log file stat failed: {}", e.kind()))?;
     #[cfg(unix)]
     if spec.mode != 0 && (metadata.permissions().mode() & 0o777) != (spec.mode & 0o777) {
-        fs::set_permissions(
-            &spec.filename,
-            fs::Permissions::from_mode(unix_mode(spec.mode)),
-        )
-        .map_err(|e| anyhow!("log file chmod failed: {}", e.kind()))?;
+        if apply_permissions {
+            fs::set_permissions(
+                &spec.filename,
+                fs::Permissions::from_mode(unix_mode(spec.mode)),
+            )
+            .map_err(|e| anyhow!("log file chmod failed: {}", e.kind()))?;
+        } else {
+            let owner = rustix::process::geteuid().as_raw();
+            if metadata.uid() != owner && owner != 0 {
+                bail!("log file mode cannot be changed by this account");
+            }
+        }
     }
     #[cfg(not(unix))]
     let _ = (mode, metadata);

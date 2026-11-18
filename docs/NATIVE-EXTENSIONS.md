@@ -134,3 +134,22 @@ and configuration paths to unrelated writable temporary directories can hide a
 real startup failure. Check actual isolated startup and normal stop/restart as
 well as `validate`; preserve production certificate files and keep any copied
 store identity state isolated from the live store.
+
+
+## Validating a running service's file logging
+
+Offline `validate` provisions file logging with destination probes, separately
+from the running writer. It checks writer options, destination access and the
+rolling writer's directory, gate and file identity protections. It can create
+missing configured directories, gate files and log files during provisioning,
+and briefly create/remove a private empty probe to check directory writability.
+It does not append log events, rotate files, or change an existing log file's
+permissions. Validation-only writer leases have separate registry keys, so they
+cannot accidentally reuse an active runtime writer.
+
+The actual running rolling writer still takes its exclusive pathname gate.
+A second runtime writer for the same destination remains an error. Only the
+provision-only probe omits that exclusive lock; it never receives a usable
+rolling writer. This allows a service-account policy synchronizer to validate a
+candidate while the service continues logging, then perform the normal
+transactional reload without modifying or bypassing the live writer.

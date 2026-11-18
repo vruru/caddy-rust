@@ -19,6 +19,21 @@ enum Output {
     Discard,
     File(File),
 }
+/// Provision-only file destinations never write, rotate or own the live gate.
+pub(super) fn open_for_validation(
+    spec: WriterSpec,
+    resolver: Arc<Resolver>,
+) -> std::result::Result<Box<dyn WriterIo>, Error> {
+    if let WriterSpec::File(file) = &spec {
+        if file.roll {
+            RollingWriter::validate(file).map_err(|_| Error::Open)?;
+        } else {
+            file_open::validate_plain(file).map_err(|_| Error::Open)?;
+        }
+        return Ok(Box::new(Output::Discard));
+    }
+    open(spec, resolver)
+}
 pub(super) fn open(
     spec: WriterSpec,
     resolver: Arc<Resolver>,

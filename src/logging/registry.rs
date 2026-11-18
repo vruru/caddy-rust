@@ -346,6 +346,21 @@ pub async fn prepare(
     registry: Arc<LoggingRegistry>,
     cancel: CancellationToken,
 ) -> Result<Arc<Logging>> {
+    prepare_impl(config, registry, cancel, false).await
+}
+pub(crate) async fn prepare_for_validation(
+    config: Option<Value>,
+    registry: Arc<LoggingRegistry>,
+    cancel: CancellationToken,
+) -> Result<Arc<Logging>> {
+    prepare_impl(config, registry, cancel, true).await
+}
+async fn prepare_impl(
+    config: Option<Value>,
+    registry: Arc<LoggingRegistry>,
+    cancel: CancellationToken,
+    validation: bool,
+) -> Result<Arc<Logging>> {
     let token = registry.plans.begin()?;
     let worker_registry = registry.clone();
     let worker_token = token.clone();
@@ -372,13 +387,20 @@ pub async fn prepare(
         let pool = registry.pool.clone();
         let resolver = resolver.clone();
         let pinned = writer.spec.pinned();
+        let key = if validation { format!("validation:{key}") } else { key };
         async move {
             let lease = pool
                 .acquire(
                     key,
                     writer.fingerprint,
                     pinned,
-                    Box::new(move || writer_io::open(writer.spec, resolver)),
+                    Box::new(move || {
+                        if validation {
+                            writer_io::open_for_validation(writer.spec, resolver)
+                        } else {
+                            writer_io::open(writer.spec, resolver)
+                        }
+                    }),
                 )
                 .await
                 .map_err(|error| anyhow!("logging writer unavailable: {error:?}"))?;

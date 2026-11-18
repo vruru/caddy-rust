@@ -36,6 +36,11 @@ pub(super) struct RollingWriter {
     opened: Timestamp,
 }
 impl RollingWriter {
+    pub(super) fn validate(spec: &FileSpec) -> io::Result<()> {
+        Algorithm::from_name(&spec.compression)?;
+        backup_layout(&spec.backup_format)?;
+        Paths::validate(spec)
+    }
     pub(super) fn open(spec: FileSpec) -> io::Result<Self> {
         let paths = Paths::open(&spec)?;
         let compression = Algorithm::from_name(&spec.compression)?;
