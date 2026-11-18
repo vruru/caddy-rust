@@ -25,7 +25,8 @@ pub(super) fn clean(input: &[u8], merge: bool) -> Vec<u8> {
     let trailing = input.ends_with(b"/");
     // Empty components are concrete stack entries when repeated slashes are
     // significant. This avoids a sentinel colliding with a real request byte.
-    let mut parts: Vec<&[u8]> = Vec::with_capacity(input.len() / 2 + 1);
+    let slots = input.iter().filter(|&&byte| byte == b'/').count() + 1;
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(slots);
     let mut at = usize::from(rooted);
     while at < input.len() {
         let end = memchr::memchr(b'/', &input[at..]).map_or(input.len(), |n| at + n);
@@ -161,7 +162,19 @@ fn decode(b: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| anyhow::anyhow!("invalid escaped path"))
 }
 fn encode(b: &[u8]) -> Vec<u8> {
-    super::http_redirect::url::template_encode_path_bytes(b)
+    let mut out = Vec::with_capacity(encoded_len(b));
+    for &byte in b {
+        if byte.is_ascii_alphanumeric() || b"-_.~$&+,/:;=@".contains(&byte) {
+            out.push(byte);
+        } else {
+            out.extend_from_slice(&[
+                b'%',
+                b"0123456789ABCDEF"[(byte >> 4) as usize],
+                b"0123456789ABCDEF"[(byte & 15) as usize],
+            ]);
+        }
+    }
+    out
 }
 fn encoded_len(path: &[u8]) -> usize {
     path.iter()
@@ -237,7 +250,104 @@ pub(super) struct State {
     pub fragment: Vec<u8>,
     pub force_query: bool,
 }
+fn sum_bytes(values: &[usize]) -> Result<usize> {
+    values.iter().try_fold(0usize, |sum, &value| {
+        sum.checked_add(value)
+            .ok_or_else(|| anyhow::anyhow!("rewrite workspace overflow"))
+    })
+}
+fn times(value: usize, multiplier: usize) -> Result<usize> {
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("rewrite workspace overflow"))
+}
+fn plus(value: usize, extra: usize) -> Result<usize> {
+    sum_bytes(&[value, extra])
+}
+fn clean_allocation_bound(input: usize) -> Result<usize> {
+    // At most one stack slot per separator plus the final segment. `clean`
+    // preallocates those slots, so repeated slashes cannot grow this Vec.
+    let slots = plus(input, 1)?;
+    sum_bytes(&[times(slots, std::mem::size_of::<&[u8]>())?, slots])
+}
 impl State {
+    pub(super) fn read_allocation_bound(uri: &http::Uri) -> Result<usize> {
+        let raw = uri.path_and_query().map_or(0, |p| p.raw_path().len());
+        sum_bytes(&[times(raw, 2)?, uri.query().map_or(0, str::len), 256])
+    }
+    pub(super) fn clone_allocation_bound(&self) -> Result<usize> {
+        sum_bytes(&[
+            self.path.len(),
+            self.raw_path.len(),
+            self.query.len(),
+            self.fragment.len(),
+            256,
+        ])
+    }
+    pub(super) fn strip_allocation_bound(&self, pattern: &[u8], suffix: bool) -> Result<usize> {
+        let escaped = self.escaped_len();
+        let decoded = self.path.len();
+        let raw_result = plus(escaped, 1)?;
+        let fallback = plus(decoded, 1)?;
+        let changed = raw_result.max(fallback);
+        let prefixed = plus(changed, 1)?;
+        let encoded = times(prefixed, 3)?;
+        let canonical = plus(encoded, 1)?;
+        let raw_prefixed = plus(raw_result, 1)?;
+        // Sum each concrete allocation, including both raw/decoded fallback
+        // and canonicalization branches. Their sum conservatively bounds the
+        // peak; every term scales with this request, never with CAP.
+        sum_bytes(&[
+            if !suffix && !pattern.starts_with(b"/") {
+                plus(pattern.len(), 1)?
+            } else {
+                0
+            },
+            escaped,
+            clean_allocation_bound(escaped)?,
+            raw_result,
+            raw_result,
+            clean_allocation_bound(decoded)?,
+            fallback,
+            prefixed,
+            encoded,
+            clean_allocation_bound(encoded)?,
+            canonical,
+            raw_prefixed,
+            raw_prefixed,
+            times(canonical, 3)?,
+            4096,
+        ])
+    }
+    pub(super) fn target_allocation_bound(&self, request_uri: bool) -> Result<usize> {
+        let escaped = self.escaped_len();
+        let target = sum_bytes(&[
+            escaped.max(usize::from(request_uri)),
+            if self.force_query || !self.query.is_empty() {
+                plus(self.query.len(), 1)?
+            } else {
+                0
+            },
+        ])?;
+        sum_bytes(&[escaped, target, 256])
+    }
+    pub(super) fn projection_allocation_bound(&self, request_uri: &Vec<u8>) -> Result<usize> {
+        let escaped = self.escaped_len();
+        let wire = self.wire_target_len(false)?;
+        // Retain physical capacities (clear() need not free a raw-path Vec),
+        // Vec-to-Arc overlap, and the mechanical HTTP Uri copy in commit/uri.
+        sum_bytes(&[
+            self.path.capacity(),
+            self.raw_path.capacity(),
+            self.query.capacity(),
+            self.fragment.capacity(),
+            request_uri.capacity(),
+            request_uri.len(),
+            escaped,
+            times(wire, 2)?,
+            4096,
+        ])
+    }
     pub fn read(uri: &http::Uri) -> Result<Self> {
         let raw = uri.path_and_query().map_or("", |p| p.raw_path()).as_bytes();
         let path = decode(raw)?;
@@ -303,8 +413,44 @@ impl State {
     }
     // Mechanical HTTP URI storage remains valid UTF-8. Logical Go-string query
     // bytes live separately in State; illegal wire octets are percent encoded.
+    fn wire_target_len(&self, request_uri: bool) -> Result<usize> {
+        let mut query_size = 0usize;
+        let mut input = &self.query[..];
+        while !input.is_empty() {
+            let valid = match std::str::from_utf8(input) {
+                Ok(_) => input.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            for &byte in &input[..valid] {
+                query_size = plus(
+                    query_size,
+                    if byte < 128 && !matches!(byte,0x21|0x24..=0x3b|0x3d|0x3f..=0x7e) {
+                        3
+                    } else {
+                        1
+                    },
+                )?;
+            }
+            input = &input[valid..];
+            if let Some((_, rest)) = input.split_first() {
+                query_size = plus(query_size, 3)?;
+                input = rest;
+            }
+        }
+        let size = sum_bytes(&[
+            self.escaped_len().max(usize::from(request_uri)),
+            if self.force_query || !self.query.is_empty() {
+                plus(query_size, 1)?
+            } else {
+                0
+            },
+        ])?;
+        ensure!(size <= CAP, "rewritten URI exceeds limit");
+        Ok(size)
+    }
     pub fn target(&self, request_uri: bool) -> Result<String> {
-        let mut out = self.escaped();
+        let mut out = Vec::with_capacity(self.wire_target_len(request_uri)?);
+        out.extend_from_slice(&self.escaped());
         if request_uri && out.is_empty() {
             out.push(b'/');
         }
@@ -359,14 +505,19 @@ impl State {
         Ok(())
     }
     fn canonicalize(&mut self) -> Result<()> {
-        let mut path = self.path.clone();
-        if !path.starts_with(b"/") {
-            path.insert(0, b'/');
+        let prefix = !self.path.starts_with(b"/");
+        let mut path = Vec::with_capacity(self.path.len() + usize::from(prefix));
+        if prefix {
+            path.push(b'/');
         }
+        path.extend_from_slice(&self.path);
         let path = decode(&clean(&encode(&path), false))?;
         if !self.raw_path.is_empty() {
             if !self.raw_path.starts_with(b"/") {
-                self.raw_path.insert(0, b'/');
+                let mut prefixed = Vec::with_capacity(self.raw_path.len() + 1);
+                prefixed.push(b'/');
+                prefixed.extend_from_slice(&self.raw_path);
+                self.raw_path = prefixed;
             }
             if !decode(&self.raw_path).is_ok_and(|p| p == path) || self.raw_path == encode(&path) {
                 self.raw_path.clear();
@@ -376,7 +527,11 @@ impl State {
         Ok(())
     }
     pub fn strip(&mut self, pattern: &[u8], suffix: bool) -> Result<()> {
-        let mut prefix = Vec::new();
+        let mut prefix = Vec::with_capacity(if !suffix && !pattern.starts_with(b"/") {
+            pattern.len() + 1
+        } else {
+            0
+        });
         let pattern = if !suffix && !pattern.starts_with(b"/") {
             prefix.push(b'/');
             prefix.extend_from_slice(pattern);

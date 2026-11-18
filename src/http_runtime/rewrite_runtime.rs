@@ -42,30 +42,83 @@ struct Args {
     leases: Vec<Lease>,
     lookup: Option<Lease>,
     bytes: usize,
+    _base: Lease,
 }
 impl Args {
     fn new(pool: Pool) -> Result<Self> {
-        let fixed = pool.reserve(ops::CAP + 4096)?;
+        let base = pool.reserve(4096)?;
         Ok(Self {
             pool,
             leases: Vec::new(),
-            lookup: Some(fixed),
+            lookup: None,
             bytes: 0,
+            _base: base,
         })
     }
-    async fn expand(&mut self,view:super::request::ReplacerView<'_>,text:&str,known:bool)->Result<Vec<u8>>{
-        let out=view.expand_resolved(text,!known).await?;
-        self.bytes=self.bytes.checked_add(out.len()).filter(|n|*n<=ops::CAP).ok_or_else(||anyhow::anyhow!("rewrite expanded arguments exceed limit"))?;
-        self.leases.push(self.pool.reserve(out.len().saturating_mul(2)+1024)?);
+    fn protect_dynamic_lookup(&mut self) -> Result<()> {
+        if self.lookup.is_none() {
+            self.lookup = Some(self.pool.reserve(ops::CAP + 4096)?);
+        }
+        Ok(())
+    }
+    async fn expand(
+        &mut self,
+        view: super::request::ReplacerView<'_>,
+        text: &str,
+        known: bool,
+    ) -> Result<Vec<u8>> {
+        ensure!(text.len() <= 1 << 20, "replacement input exceeds limit");
+        if !text
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, b'{' | b'}'))
+        {
+            self.bytes = self
+                .bytes
+                .checked_add(text.len())
+                .filter(|n| *n <= ops::CAP)
+                .ok_or_else(|| anyhow::anyhow!("rewrite expanded arguments exceed limit"))?;
+            self.leases.push(
+                self.pool.reserve(
+                    text.len()
+                        .checked_mul(2)
+                        .and_then(|n| n.checked_add(1024))
+                        .ok_or_else(|| anyhow::anyhow!("rewrite argument size overflow"))?,
+                )?,
+            );
+            return Ok(text.as_bytes().to_vec());
+        }
+        // Primitive placeholder providers are not all accounted yet. Preserve
+        // their previous CAP workspace only for an actual dynamic expansion.
+        self.protect_dynamic_lookup()?;
+        let out = view.expand_resolved(text, !known).await?;
+        self.bytes = self
+            .bytes
+            .checked_add(out.len())
+            .filter(|n| *n <= ops::CAP)
+            .ok_or_else(|| anyhow::anyhow!("rewrite expanded arguments exceed limit"))?;
+        self.leases
+            .push(self.pool.reserve(out.len().saturating_mul(2) + 1024)?);
         Ok(out.to_vec())
     }
-    async fn pairs(&mut self,view:super::request::ReplacerView<'_>,list:&[RewriteArgument],skip_empty:bool)->Result<Vec<(Vec<u8>,Vec<u8>)>>{
-        self.leases.push(self.pool.reserve(list.len().saturating_mul(128)+1024)?);
-        let mut out=Vec::with_capacity(list.len());
-        for v in list{let key=self.expand(view,&v.key,false).await?;if skip_empty&&key.is_empty(){continue}out.push((key,self.expand(view,&v.val,false).await?));}
+    async fn pairs(
+        &mut self,
+        view: super::request::ReplacerView<'_>,
+        list: &[RewriteArgument],
+        skip_empty: bool,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.leases
+            .push(self.pool.reserve(list.len().saturating_mul(128) + 1024)?);
+        let mut out = Vec::with_capacity(list.len());
+        for v in list {
+            let key = self.expand(view, &v.key, false).await?;
+            if skip_empty && key.is_empty() {
+                continue;
+            }
+            out.push((key, self.expand(view, &v.val, false).await?));
+        }
         Ok(out)
     }
-
 }
 enum Op {
     Identity,
@@ -76,7 +129,7 @@ enum Op {
 }
 async fn transform(
     ctx: &mut Context,
-    old: Option<Arc<State>>,
+    old: Option<Projection>,
     uri: Uri,
     op: Op,
     mut args: Args,
@@ -89,7 +142,7 @@ async fn transform(
         .run(move || -> Result<Projection> {
             let old_size = old
                 .as_ref()
-                .map_or_else(|| ops::uri_bytes(&uri), |v| v.bytes());
+                .map_or_else(|| ops::uri_bytes(&uri), |v| v.state.bytes());
             let rows = match &op {
                 Op::Query(q) => {
                     old.as_ref().map_or_else(
@@ -100,7 +153,7 @@ async fn transform(
                                 .filter(|b| *b == b'&')
                                 .count()
                         },
-                        |state| state.query.iter().filter(|b| **b == b'&').count(),
+                        |previous| previous.state.query.iter().filter(|b| **b == b'&').count(),
                     ) + q.rename.len()
                         + q.set.len()
                         + q.add.len()
@@ -120,19 +173,39 @@ async fn transform(
                     .unwrap_or_default(),
                 _ => 0,
             };
-            let scratch = old_size
-                .checked_mul(32)
-                .and_then(|n| rows.checked_mul(1024).and_then(|rows| n.checked_add(rows)))
-                .and_then(|n| n.checked_add(regex_size))
-                .and_then(|n| n.checked_add(16 << 20))
-                .ok_or_else(|| anyhow::anyhow!("rewrite workspace overflow"))?;
-            let _scratch = pool.reserve(scratch)?;
+            let fast = matches!(&op, Op::Identity | Op::Strip(_, _));
+            let initial = match &old {
+                Some(previous) => previous.state.clone_allocation_bound()?,
+                None => State::read_allocation_bound(&uri)?,
+            };
+            let workspace = if fast {
+                initial
+            } else {
+                old_size
+                    .checked_mul(32)
+                    .and_then(|n| rows.checked_mul(1024).and_then(|rows| n.checked_add(rows)))
+                    .and_then(|n| n.checked_add(regex_size))
+                    .and_then(|n| n.checked_add(16 << 20))
+                    .ok_or_else(|| anyhow::anyhow!("rewrite workspace overflow"))?
+            };
+            let mut scratch = pool.reserve(workspace)?;
             let _args = args;
-            let mut state = if let Some(old) = old {
-                (*old).clone()
+            // Keep the complete previous Projection in this producer: its
+            // state and credit must outlive a cancelled awaiting Context.
+            let mut state = if let Some(previous) = &old {
+                (*previous.state).clone()
             } else {
                 State::read(&uri)?
             };
+            if let Op::Strip(pattern, suffix) = &op {
+                let bound = state.strip_allocation_bound(pattern, *suffix)?;
+                scratch.resize(
+                    scratch
+                        .bytes()
+                        .checked_add(bound)
+                        .ok_or_else(|| anyhow::anyhow!("rewrite workspace overflow"))?,
+                )?;
+            }
             match op {
                 Op::Identity => {}
                 Op::Strip(pattern, suffix) => state.strip(&pattern, suffix)?,
@@ -148,8 +221,23 @@ async fn transform(
                 state.bytes() <= ops::CAP * 4,
                 "rewritten components exceed limit"
             );
+            if fast {
+                scratch.resize(
+                    scratch
+                        .bytes()
+                        .checked_add(state.target_allocation_bound(true)?)
+                        .ok_or_else(|| anyhow::anyhow!("rewrite workspace overflow"))?,
+                )?;
+            }
             let request_uri = state.target_bytes(true)?;
-            let _lease = Arc::new(pool.reserve(state.bytes() * 4 + request_uri.len() * 4 + 4096)?);
+            let _lease = Arc::new(if fast {
+                // All modifier temporaries have retired. Transfer the same
+                // credit to the physical retained buffers and Uri handoff.
+                scratch.resize(state.projection_allocation_bound(&request_uri)?)?;
+                scratch
+            } else {
+                pool.reserve(state.bytes() * 4 + request_uri.len() * 4 + 4096)?
+            });
             Ok(Projection {
                 state: Arc::new(state),
                 request_uri: request_uri.into(),
@@ -211,10 +299,7 @@ async fn advance(
     args: Args,
     upstream: bool,
 ) -> Result<()> {
-    let old = current
-        .as_ref()
-        .or_else(|| projection(ctx.req()))
-        .map(|p| p.state.clone());
+    let old = current.as_ref().or_else(|| projection(ctx.req())).cloned();
     let uri = ctx.req().uri().clone();
     let next = transform(ctx, old, uri, op, args).await?;
     if !upstream {
@@ -234,7 +319,11 @@ async fn apply_plan(
     let original_uri = ctx.req().uri().clone();
     let original_projection = projection(ctx.req()).cloned();
     if !plan.method.is_empty() {
-        method = ctx.expand_text_resolved(&plan.method,true).await?.to_uppercase().parse::<Method>()?;
+        method = ctx
+            .expand_text_resolved(&plan.method, true)
+            .await?
+            .to_uppercase()
+            .parse::<Method>()?;
         if !upstream {
             *ctx.req_mut().method_mut() = method.clone();
         }
@@ -268,6 +357,7 @@ async fn apply_plan(
             continue;
         }
         let mut args = Args::new(ctx.resources.rewrite_bytes.clone())?;
+        args.protect_dynamic_lookup()?;
         let find = args.expand(ctx.lookup_view(), &rule.find, false).await?;
         let replace = args.expand(ctx.lookup_view(), &rule.replace, false).await?;
         let merge = !rule.find.contains("//");
@@ -283,6 +373,7 @@ async fn apply_plan(
     for rule in &plan.path_regexp {
         let Some(regex) = &rule.regex else { continue };
         let mut args = Args::new(ctx.resources.rewrite_bytes.clone())?;
+        args.protect_dynamic_lookup()?;
         let replacement = args.expand(ctx.lookup_view(), &rule.replace, false).await?;
         advance(
             ctx,
@@ -295,9 +386,10 @@ async fn apply_plan(
     }
     if let Some(query) = &plan.query {
         let mut args = Args::new(ctx.resources.rewrite_bytes.clone())?;
-        let rename=args.pairs(ctx.lookup_view(),&query.rename,false).await?;
-        let set=args.pairs(ctx.lookup_view(),&query.set,true).await?;
-        let add=args.pairs(ctx.lookup_view(),&query.add,true).await?;
+        args.protect_dynamic_lookup()?;
+        let rename = args.pairs(ctx.lookup_view(), &query.rename, false).await?;
+        let set = args.pairs(ctx.lookup_view(), &query.set, true).await?;
+        let add = args.pairs(ctx.lookup_view(), &query.add, true).await?;
         let mut replace = Vec::with_capacity(query.replace.len());
         for r in &query.replace {
             replace.push((
@@ -307,8 +399,10 @@ async fn apply_plan(
                 r.regex.clone(),
             ));
         }
-        let mut delete=Vec::with_capacity(query.delete.len());
-        for value in &query.delete{delete.push(args.expand(ctx.lookup_view(),value,false).await?);}
+        let mut delete = Vec::with_capacity(query.delete.len());
+        for value in &query.delete {
+            delete.push(args.expand(ctx.lookup_view(), value, false).await?);
+        }
         advance(
             ctx,
             &mut current,
@@ -362,6 +456,14 @@ async fn apply_plan(
 async fn setter(plan: &Arc<RewritePlan>, ctx: &mut Context) -> Result<Projection> {
     let pool = ctx.resources.rewrite_bytes.clone();
     let mut args = Args::new(pool.clone())?;
+    let literal = !plan
+        .uri
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(byte, b'{' | b'}'));
+    if !literal {
+        args.protect_dynamic_lookup()?;
+    }
     let mut values = std::collections::BTreeMap::<String, Vec<u8>>::new();
     let bytes = plan.uri.as_bytes();
     let mut at = 0usize;
@@ -400,7 +502,7 @@ async fn setter(plan: &Arc<RewritePlan>, ctx: &mut Context) -> Result<Projection
         }
         at = end + 1;
     }
-    let old = projection(ctx.req()).map(|p| p.state.clone());
+    let old = projection(ctx.req()).cloned();
     let uri = ctx.req().uri().clone();
     let plan = plan.clone();
     drop(args.lookup.take());
@@ -409,10 +511,10 @@ async fn setter(plan: &Arc<RewritePlan>, ctx: &mut Context) -> Result<Projection
         .run(move || -> Result<Projection> {
             let size = old
                 .as_ref()
-                .map_or_else(|| ops::uri_bytes(&uri), |p| p.bytes());
+                .map_or_else(|| ops::uri_bytes(&uri), |p| p.state.bytes());
             args.leases.push(pool.reserve(size * 16 + 4096)?);
-            let mut state = if let Some(old) = old {
-                (*old).clone()
+            let mut state = if let Some(previous) = &old {
+                (*previous.state).clone()
             } else {
                 State::read(&uri)?
             };
@@ -469,7 +571,11 @@ async fn setter(plan: &Arc<RewritePlan>, ctx: &mut Context) -> Result<Projection
                 )?;
             }
             let request_uri = state.target_bytes(true)?;
-            let credit = Arc::new(pool.reserve(state.bytes() * 4 + request_uri.len() * 4 + 4096)?);
+            let credit = Arc::new(pool.reserve(if literal {
+                state.projection_allocation_bound(&request_uri)?
+            } else {
+                state.bytes() * 4 + request_uri.len() * 4 + 4096
+            })?);
             Ok(Projection {
                 state: Arc::new(state),
                 request_uri: request_uri.into(),

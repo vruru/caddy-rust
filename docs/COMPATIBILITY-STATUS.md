@@ -191,6 +191,22 @@ source repository. No GitHub Actions are introduced by this process. Passing
 an isolated subset does not grant a general production release or change the
 separately authorized deployment scope.
 
+## Rewrite allocation admission
+
+Literal arguments, identity rewrites and path-prefix/suffix stripping reserve
+workspace from the actual request and argument sizes. Short rewrites do not
+prepay the maximum URI size or a fixed multi-megabyte transformation buffer.
+The shared 128 MiB pool, URI limits, work deadlines and parallel admission remain
+in force. Complex substring, regexp and query transformations retain their
+conservative workspace guards; this is not a claim of exact accounting for
+every placeholder provider or all process allocations.
+
+Reservations precede copies and transformation work. Retained projections cover
+physical buffer capacities and URI handoff, and a blocking producer retains the
+previous projection's allocation lease after its awaiting request is cancelled.
+Completed simple transformations transfer their workspace lease to their
+retained result instead of briefly charging the same result twice.
+
 ## Reverse-proxy HTTP transport
 
 The HTTP transport consumes resolver addresses, TCP keepalive probes, HTTP idle
