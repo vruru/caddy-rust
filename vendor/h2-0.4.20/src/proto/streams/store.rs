@@ -79,6 +79,12 @@ pub(super) trait Resolve {
 // ===== impl Store =====
 
 impl Store {
+    /// Includes new streams not yet prioritized, but excludes retained closed
+    /// reset records and closed receive buffers which need no more wire reads.
+    pub(super) fn native_has_open_streams(&self) -> bool {
+        self.ids.values().any(|index| !self.slab[index.0 as usize].is_closed())
+    }
+
     pub fn new() -> Self {
         Store {
             slab: slab::Slab::new(),

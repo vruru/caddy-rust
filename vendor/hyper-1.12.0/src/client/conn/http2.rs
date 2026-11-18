@@ -304,6 +304,12 @@ impl<Ex> Builder<Ex>
 where
     Ex: Clone,
 {
+    /// Observes aggregate idle/active protocol phases for this HTTP/2 client.
+    pub fn native_client_activity(&mut self, activity: Option<crate::ext::NativeClientActivity>) -> &mut Self {
+        self.h2_builder.native_client_activity = activity;
+        self
+    }
+
     /// Creates a new connection builder.
     #[inline]
     pub fn new(exec: Ex) -> Builder<Ex> {

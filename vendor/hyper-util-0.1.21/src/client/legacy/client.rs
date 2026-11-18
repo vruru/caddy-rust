@@ -555,6 +555,8 @@ where
                         Either::Left(Box::pin(async move {
                             let tx = if is_h2 {
                                 #[cfg(feature = "http2")] {
+                                    let mut h2_builder = h2_builder;
+                                    h2_builder.native_client_activity(connected.native_client_activity.clone());
                                     let (mut tx, conn) =
                                         h2_builder.handshake(io).await.map_err(Error::tx)?;
 
@@ -578,6 +580,8 @@ where
                                     // Perform the HTTP/1.1 handshake on the provided I/O stream.
                                     // Uses the h1_builder to establish a connection, returning a sender (tx) for requests
                                     // and a connection task (conn) that manages the connection lifecycle.
+                                    let mut h1_builder = h1_builder;
+                                    h1_builder.native_client_activity(connected.native_client_activity.clone());
                                     let (mut tx, conn) =
                                         h1_builder.handshake(io).await.map_err(crate::client::legacy::client::Error::tx)?;
 

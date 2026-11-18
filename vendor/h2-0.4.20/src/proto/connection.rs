@@ -286,6 +286,12 @@ where
         self.codec.has_pending_stream_output()
     }
 
+    /// Protocol activity includes queued new streams and final stream frames
+    /// still owned by the codec, without changing automatic-close accounting.
+    pub(crate) fn native_has_active_streams(&self) -> bool {
+        self.inner.streams.native_has_active_streams() || self.codec.has_pending_stream_output()
+    }
+
     /// Checks if there are any streams
     pub fn has_streams(&self) -> bool {
         self.inner.streams.has_streams()

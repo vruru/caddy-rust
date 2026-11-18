@@ -36,6 +36,11 @@
 //!
 //! See the documentation on each item for details about its usage and requirements.
 
+#[cfg(all(feature = "client", any(feature = "http1", feature = "http2")))]
+mod client_activity;
+#[cfg(all(feature = "client", any(feature = "http1", feature = "http2")))]
+pub use client_activity::NativeClientActivity;
+
 /// Monotonic start of this server request's read phase. HTTP/1 retains the
 /// beginning of head parsing; HTTP/2 records completion of its request headers,
 /// matching that protocol's independent body-read deadline epoch.

@@ -103,6 +103,8 @@ pub struct Connected {
     pub(super) is_proxied: bool,
     pub(super) extra: Option<Extra>,
     pub(super) poisoned: PoisonPill,
+    #[cfg(any(feature = "http1", feature = "http2"))]
+    pub(super) native_client_activity: Option<hyper::ext::NativeClientActivity>,
 }
 
 #[derive(Clone)]
@@ -153,7 +155,16 @@ impl Connected {
             is_proxied: false,
             extra: None,
             poisoned: PoisonPill::healthy(),
+            #[cfg(any(feature = "http1", feature = "http2"))]
+            native_client_activity: None,
         }
+    }
+
+    /// Carries an optional HTTP client protocol-phase observer into the handshake.
+    #[cfg(any(feature = "http1", feature = "http2"))]
+    pub fn native_client_activity(mut self, activity: hyper::ext::NativeClientActivity) -> Self {
+        self.native_client_activity = Some(activity);
+        self
     }
 
     /// Set whether the connected transport is to an HTTP proxy.
@@ -230,6 +241,8 @@ impl Connected {
             is_proxied: self.is_proxied,
             extra: self.extra.clone(),
             poisoned: self.poisoned.clone(),
+            #[cfg(any(feature = "http1", feature = "http2"))]
+            native_client_activity: self.native_client_activity.clone(),
         }
     }
 }

@@ -355,6 +355,16 @@ verification and fixtures remain outside the repository.
 
 ## Native HTTP/1 absolute-target provenance
 
+The optional `NativeClientActivity` observer carries transport-local activity
+through Hyper-util connection metadata into the selected Hyper client driver.
+HTTP/1 reports initial idle, request-head activation and completed-exchange idle
+transitions. HTTP/2 reports actual pending/active streams and pending codec
+output, excluding streams retained solely after closure. Clients without the
+observer retain their existing behavior. The native transport uses these
+boundaries to keep idle EOF detection from borrowing an active request's read
+deadline. The hook adds no request retries and does not change write/flush
+deadlines. It is a source extension, not a binary ABI.
+
 A Native-only H1 builder option preserves exact request-target Bytes and admits
 Go-compatible encoded host bytes for absolute HTTP(S) targets. Standard builder
 and URI/Authority parsing defaults are unchanged. The stored Authority remains

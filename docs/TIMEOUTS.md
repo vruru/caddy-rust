@@ -18,6 +18,27 @@ Timeout scopes are restored upon unwind, including during error conditions. The 
 
 During a failed reload, the old configuration remains active. Accepted old requests retain their generation-specific timeouts. Normal shutdown is graceful, with a declared hard stop to prevent indefinite hangs. CPU detection occurs automatically at startup. There is no fixed production CPU count assumption.
 
+## Upstream connection reuse
+
+The upstream HTTP/1 driver reports the actual idle and active protocol phases to
+its transport. Idle EOF monitoring continues, but does not start or retain an
+active read deadline. Encoding the next request head starts a fresh read epoch;
+an idle connection's old timer cannot expire against that new exchange. The
+connection pool's own configured idle lifetime still controls idle retention.
+
+HTTP/2 derives its activity from the connection's actual pending/active streams,
+including output awaiting a flush. Completing one multiplexed stream does not
+mark other active streams idle. Closed streams retained only for reset tracking
+or application-owned received data do not extend an active transport deadline.
+
+Active reads retain strict per-operation deadlines, independent of writes and
+flushes. TLS establishment keeps its original deadlines, and an upgraded
+HTTP/1 connection remains active. This repair
+does not add retries of already-sent requests or replay non-idempotent bodies.
+The implementation is shared by deployments; host-specific paths, permissions,
+certificate data and policy remain external configuration. Machines using the
+same target architecture and operating system can use the same release binary.
+
 ## Release scope
 
 These are implemented native transport paths against the Caddy 2.11.7 reference. The project remains a development candidate. Other certificate, ACME, CBC and standard module gaps and the full release gates remain; this document does not establish production readiness.

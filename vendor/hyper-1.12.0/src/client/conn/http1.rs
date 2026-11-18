@@ -143,6 +143,7 @@ pub struct Builder {
     h1_max_buf_size: Option<usize>,
     native_write_buffer_size:Option<usize>,
     native_read_buffer_size:Option<usize>,
+    native_client_activity: Option<crate::ext::NativeClientActivity>,
 }
 
 /// Returns a handshake future over some IO.
@@ -359,6 +360,7 @@ impl Builder {
             h1_read_buf_exact_size: None,
             native_write_buffer_size:None,
             native_read_buffer_size:None,
+            native_client_activity: None,
             h1_parser_config: ParserConfig::default(),
             h1_obsolete_trailer_folding: false,
             h1_max_trailer_size: None,
@@ -457,6 +459,11 @@ impl Builder {
 
     /// Opt in to accounting for the real HTTP/1 reusable encoding Vec.
     pub fn native_encoding_budget(&mut self,budget:Option<crate::ext::NativeEncodingBudget>)->&mut Self{self.encoding_budget=budget;self}
+    /// Observes idle/active protocol phases for this HTTP/1 client transport.
+    pub fn native_client_activity(&mut self, activity: Option<crate::ext::NativeClientActivity>) -> &mut Self {
+        self.native_client_activity = activity;
+        self
+    }
 
     /// Set whether HTTP/1 connections should try to use vectored writes,
     /// or always flatten into a single buffer.
@@ -641,6 +648,7 @@ impl Builder {
             let mut conn = if let Some(budget)=opts.encoding_budget{
                 proto::Conn::new_with_encoding_budget(io,budget).map_err(crate::Error::new_io)?
             }else{proto::Conn::new(io)};
+            conn.set_native_client_activity(opts.native_client_activity);
             conn.set_h1_parser_config(opts.h1_parser_config);
             if let Some(writev) = opts.h1_writev {
                 if writev {

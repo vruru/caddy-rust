@@ -230,6 +230,7 @@ pub struct ReadySendRequest<B: Buf> {
 #[must_use = "futures do nothing unless polled"]
 pub struct Connection<T, B: Buf = Bytes> {
     inner: proto::Connection<T, Peer, B>,
+    native_activity: Option<std::sync::Arc<dyn Fn(bool) + Send + Sync>>,
 }
 
 /// A future of an HTTP response.
@@ -1373,12 +1374,28 @@ where
             pending: None,
         };
 
-        let mut connection = Connection { inner };
+        let mut connection = Connection { inner, native_activity: None };
         if let Some(sz) = builder.initial_target_connection_window_size {
             connection.set_target_window_size(sz);
         }
 
         Ok((send_request, connection))
+    }
+
+    /// Observes aggregate protocol activity (`true` means no active exchange).
+    /// The synchronous callback must not block or re-enter this connection.
+    pub fn native_activity_observer(
+        &mut self,
+        observer: Option<std::sync::Arc<dyn Fn(bool) + Send + Sync>>,
+    ) {
+        self.native_activity = observer;
+        self.native_observe_activity();
+    }
+
+    fn native_observe_activity(&self) {
+        if let Some(observer) = &self.native_activity {
+            observer(!self.inner.native_has_active_streams());
+        }
     }
 
     /// Sets the target window size for the whole connection.
@@ -1473,8 +1490,10 @@ where
         // waker. A snapshot taken after that drop would be false and skip the
         // self-wake below, leaving the connection pending without closing.
         let had_streams_or_refs = self.inner.has_streams_or_other_references();
+        self.native_observe_activity();
         self.inner.maybe_close_connection_if_no_streams();
         let result = self.inner.poll(cx).map_err(Into::into);
+        self.native_observe_activity();
         // if we had streams/refs, and don't anymore, wake up one more time to
         // ensure proper shutdown
         if result.is_pending()

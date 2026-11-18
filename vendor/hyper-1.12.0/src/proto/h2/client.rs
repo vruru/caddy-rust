@@ -3,6 +3,7 @@ use std::{
     future::Future,
     marker::PhantomData,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -63,6 +64,7 @@ const DEFAULT_INITIAL_MAX_SEND_STREAMS: usize = 100;
 #[derive(Clone, Debug)]
 pub(crate) struct Config {
     pub(crate) adaptive_window: bool,
+    pub(crate) native_client_activity: Option<crate::ext::NativeClientActivity>,
     pub(crate) initial_conn_window_size: u32,
     pub(crate) initial_stream_window_size: u32,
     pub(crate) initial_max_send_streams: usize,
@@ -84,6 +86,7 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             adaptive_window: false,
+            native_client_activity: None,
             initial_conn_window_size: DEFAULT_CONN_WINDOW,
             initial_stream_window_size: DEFAULT_STREAM_WINDOW,
             initial_max_send_streams: DEFAULT_INITIAL_MAX_SEND_STREAMS,
@@ -165,6 +168,10 @@ where
         .handshake::<_, SendBuf<B::Data>>(Compat::new(io))
         .await
         .map_err(crate::Error::new_h2)?;
+
+    if let Some(activity) = config.native_client_activity.clone() {
+        conn.native_activity_observer(Some(Arc::new(move |idle| activity.notify(idle))));
+    }
 
     // An mpsc channel is used entirely to detect when the
     // 'Client' has been dropped. This is to get around a bug

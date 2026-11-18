@@ -1164,6 +1164,11 @@ where
         me.store.num_active_streams()
     }
 
+    pub(crate) fn native_has_active_streams(&self) -> bool {
+        let me = self.inner.lock().unwrap();
+        me.counts.has_streams() || me.store.native_has_open_streams()
+    }
+
     pub fn has_streams(&self) -> bool {
         let me = self.inner.lock().unwrap();
         me.counts.has_streams()

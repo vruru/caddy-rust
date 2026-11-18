@@ -66,6 +66,8 @@ where
                 cached_headers: None,
                 error: None,
                 keep_alive: KA::Busy,
+                #[cfg(feature = "client")]
+                native_client_activity: None,
                 method: None,
                 h1_parser_config: ParserConfig::default(),
                 h1_max_headers: None,
@@ -112,6 +114,14 @@ where
             },
             _marker: PhantomData,
         }
+    }
+
+    #[cfg(feature = "client")]
+    pub(crate) fn set_native_client_activity(&mut self, activity: Option<crate::ext::NativeClientActivity>) {
+        if let Some(observer) = &activity {
+            observer.notify(true);
+        }
+        self.state.native_client_activity = activity;
     }
 
     #[cfg(feature = "server")]
@@ -788,6 +798,10 @@ where
         debug_assert!(self.can_write_head());
 
         if !T::should_read_first() {
+            #[cfg(feature = "client")]
+            if let Some(observer) = &self.state.native_client_activity {
+                observer.notify(false);
+            }
             self.state.busy();
             // A client request carrying `Connection: close` must not be pooled or
             // reused. hyper otherwise derives connection reuse from the response
@@ -1186,6 +1200,8 @@ struct State {
     error: Option<crate::Error>,
     /// Current keep-alive status.
     keep_alive: KA,
+    #[cfg(feature = "client")]
+    native_client_activity: Option<crate::ext::NativeClientActivity>,
     /// If mid-message, the HTTP Method that started it.
     ///
     /// This is used to know things such as if the message can include
@@ -1397,6 +1413,12 @@ impl State {
 
         self.reading = Reading::Init;
         self.writing = Writing::Init;
+        #[cfg(feature = "client")]
+        if !T::should_read_first() {
+            if let Some(observer) = &self.native_client_activity {
+                observer.notify(true);
+            }
+        }
         #[cfg(feature = "server")]
         {
             self.h1_waiting_next = T::is_server() && self.h1_idle_timeout.is_some();
