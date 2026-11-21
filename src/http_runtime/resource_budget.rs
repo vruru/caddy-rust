@@ -6,10 +6,13 @@ use std::sync::{
 use std::time::Duration;
 use tokio_util::task::TaskTracker;
 
+#[path = "resource_budget/file_capacity.rs"]
+mod file_capacity;
+
 /// ResourceLimits represents admission control quotas for concurrent operations.
 /// These are NOT fixed CPU worker threads; they are upper bounds on in-flight resources.
 /// CPU worker threads are detected from the process's available CPUs at startup.
-/// `for_parallelism` is pure; `automatic` additionally reserves descriptor headroom.
+/// `for_parallelism` is pure; `automatic` sizes file bodies from descriptor and memory headroom when available.
 /// `None` disables an independent deadline; `Some(Duration::ZERO)` is rejected.
 /// Counts remain bounded even when no independent deadline is configured.
 /// `HttpRuntime::with_resource_limits` validates custom limits before use.
@@ -41,10 +44,10 @@ impl ResourceLimits {
             .map(|n| n.get())
             .unwrap_or(1);
         let mut limits = Self::for_parallelism(cpu);
-        if let Some(soft) = descriptor_limit() {
-            // Most descriptors belong to network connections and other services.
-            limits.file_streams = file_body_limit(cpu, Some(soft));
-        }
+        limits.file_streams =
+            file_body_limit(cpu, descriptor_limit(), file_capacity::memory_headroom());
+        limits.file_stream_waiting = limits.file_stream_waiting.max(limits.file_streams);
+        limits.file_read_waiting = limits.file_read_waiting.max(limits.file_streams);
         limits
     }
 
@@ -52,7 +55,7 @@ impl ResourceLimits {
         let c = cpu.clamp(1, Semaphore::MAX_PERMITS);
         let ar = c.saturating_sub(1).clamp(1, 256);
         let meta_run = c.clamp(4, 64);
-        let stream = file_body_limit(c, None);
+        let stream = file_body_limit(c, None, None);
         let reads = c.saturating_mul(4).clamp(8, 128);
         let auth_wait = ar.saturating_mul(8).clamp(32, 512);
         let meta_wait = c.saturating_mul(64).clamp(256, 1024);
@@ -78,9 +81,14 @@ impl ResourceLimits {
 
 use tokio::sync::Semaphore;
 
-pub(crate) fn file_body_limit(cpu: usize, soft: Option<usize>) -> usize {
-    let base = cpu.max(1).saturating_mul(16).clamp(128, 512);
-    soft.map_or(base, |n| base.min((n / 8).max(1)))
+fn file_body_limit(cpu: usize, soft: Option<usize>, memory_headroom: Option<usize>) -> usize {
+    let fallback = cpu.saturating_mul(16).clamp(128, 512);
+    // A stalled response owns a descriptor and request state, with reads of
+    // at most 64 KiB. Reserve 256 KiB per body from a share of memory available
+    // at startup, leaving the bulk for sockets, protocol queues and other work.
+    let by_memory = memory_headroom.map_or(fallback, |bytes| (bytes / 16 / (256 * 1024)).max(1));
+    let by_descriptor = soft.map_or(fallback, |count| (count / 8).max(1));
+    by_memory.min(by_descriptor).min(Semaphore::MAX_PERMITS)
 }
 
 #[derive(Clone)]
