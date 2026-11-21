@@ -6,7 +6,7 @@ use crate::{
     http_config::AccessLogConfig,
     logging::{Event, Field, FieldValue as V, Level, Logging, Origin},
 };
-use http::{HeaderMap, Request, Response, Version, header};
+use http::{HeaderMap, Method, Request, Response, StatusCode, Version, header};
 use http_body_util::BodyExt;
 use hyper::body::{Body as HyperBody, Frame, SizeHint};
 use std::{
@@ -188,6 +188,7 @@ pub(super) struct Access {
     start: Instant,
     credentials: bool,
     reduced: bool,
+    http1_get: bool,
     budget: Arc<CaptureBudget>,
     _request_capture: OwnedSemaphorePermit,
 }
@@ -273,6 +274,7 @@ impl Access {
             start: Instant::now(),
             credentials,
             reduced,
+            http1_get: request.version() == Version::HTTP_11 && request.method() == Method::GET,
             budget: budget.clone(),
             _request_capture: permit,
         })
@@ -289,6 +291,24 @@ impl Access {
             self.names = names;
         }
         let status = response.status().as_u16();
+        // HTTP/1.1 finishes a fixed-length response at the byte boundary.
+        // Hyper may drop the stream there without polling it for EOF.
+        let fixed_range_length = if self.http1_get
+            && response.status() == StatusCode::PARTIAL_CONTENT
+            && !response.headers().contains_key(header::TRANSFER_ENCODING)
+        {
+            let mut lengths = response
+                .headers()
+                .get_all(header::CONTENT_LENGTH)
+                .into_iter();
+            lengths
+                .next()
+                .filter(|value| value.as_bytes().iter().all(u8::is_ascii_digit))
+                .filter(|_| lengths.next().is_none())
+                .and_then(|value| value.to_str().ok()?.parse::<u64>().ok())
+        } else {
+            None
+        };
         let permit = if self.reduced {
             None
         } else {
@@ -316,6 +336,7 @@ impl Access {
                 user_id,
                 extra,
                 bytes: 0,
+                fixed_range_length,
                 failed: false,
                 ended: false,
             }
@@ -360,6 +381,7 @@ struct WriteCount {
     user_id: String,
     extra: ExtraFields,
     bytes: u64,
+    fixed_range_length: Option<u64>,
     failed: bool,
     ended: bool,
 }
@@ -392,6 +414,11 @@ impl HyperBody for WriteCount {
 }
 impl Drop for WriteCount {
     fn drop(&mut self) {
+        let interrupted = self.failed
+            || match self.fixed_range_length {
+                Some(length) => self.bytes != length,
+                None => !self.ended && !self.body.is_end_stream(),
+            };
         let elapsed = self.access.start.elapsed().as_nanos().min(i64::MAX as u128) as i64;
         let level = if self.status >= 500 {
             Level::Error
@@ -434,7 +461,7 @@ impl Drop for WriteCount {
                     .fields
                     .push(Field::new("resp_headers_omitted", V::Bool(true)));
             }
-            if self.failed || (!self.ended && !self.body.is_end_stream()) {
+            if interrupted {
                 event.fields.push(Field::new(
                     "write_error",
                     V::String("response body interrupted".into()),
