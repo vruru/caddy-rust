@@ -613,7 +613,7 @@ enum Mode {
 }
 struct FileState {
     file: Arc<std::fs::File>,
-    admission: Arc<tokio::sync::OwnedSemaphorePermit>,
+    admission: Arc<super::resource_budget::FilePermit>,
     offset: u64,
     read_timeout: Duration,
     read_budget: super::resource_budget::BlockingBudget,

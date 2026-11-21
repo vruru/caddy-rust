@@ -77,6 +77,15 @@ signature work use bounded workers; an async function alone is not evidence of
 nonblocking execution. Limits and overload behavior must be explicit, with no
 unbounded task spawning, buffered file bodies or queues hidden behind a mutex.
 
+The Linux HTTP runtime samples memory headroom and the file-descriptor soft
+limit once a second. Static file admission and its waiting room resize with
+those observations. HTTP/3 listeners share a process-wide connection budget
+sized from memory headroom and QUIC flow-control windows. Reducing either
+budget limits new work while valid permits drain naturally. TLS handshake
+admission and HTTP/3 request stream limits continue to apply independently.
+If resource observations are unavailable, automatic admission uses a
+conservative fallback. Explicit library file limits remain fixed.
+
 Configuration publication is ordered and transactional. Per-certificate storage
 generations and account identity changes also require scoped ordering. These
 short consistency boundaries must not hold a global request lock during network

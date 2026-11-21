@@ -393,7 +393,13 @@ impl HttpRuntime {
         resolver: Arc<HotCertificateResolver>,
         limits: ConnectionLimits,
     ) -> Result<Self> {
-        Self::with_limits(registry, resolver, ResourceLimits::automatic(), limits)
+        let connections = connection_budget::Budgets::new(limits)?;
+        Ok(Self::from_resources(
+            registry,
+            resolver,
+            Arc::new(resource_budget::Resources::automatic()),
+            connections,
+        ))
     }
     pub fn with_limits(
         registry: ChallengeRegistry,

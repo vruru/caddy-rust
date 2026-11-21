@@ -16,7 +16,8 @@ mod sessions;
 pub(super) mod stream;
 pub(super) type Pool = HashMap<ListenerKey, Weak<Binding>>;
 const STREAMS: usize = 64;
-const MAX_CONNECTIONS: usize = 256;
+pub(super) const CONNECTION_RECEIVE_WINDOW: u32 = 2 * 1024 * 1024;
+pub(super) const CONNECTION_SEND_WINDOW: u64 = 2 * 1024 * 1024;
 struct PreflightLanes {
     fragments: Semaphore,
     issuance: Semaphore,
@@ -32,7 +33,6 @@ impl PreflightLanes {
 pub(super) struct Limits {
     handshakes: Arc<Semaphore>,
     preflight: PreflightLanes,
-    connections: Arc<Semaphore>,
     streams: Arc<Semaphore>,
 }
 impl Limits {
@@ -40,7 +40,6 @@ impl Limits {
         Self {
             handshakes: Arc::new(Semaphore::new(32)),
             preflight: PreflightLanes::new(8, 16),
-            connections: Arc::new(Semaphore::new(512)),
             streams: Arc::new(Semaphore::new(2048)),
         }
     }
@@ -58,7 +57,6 @@ pub(super) struct Binding {
     accept_stop: CancellationToken,
     handshakes: Arc<Semaphore>,
     preflight: PreflightLanes,
-    connections: Arc<Semaphore>,
 }
 impl Drop for Binding {
     fn drop(&mut self) {
@@ -123,8 +121,8 @@ pub(super) fn stage(
             .max_concurrent_uni_streams(8u8.into())
             .max_idle_timeout(Some(Duration::from_secs(30).try_into()?))
             .stream_receive_window((256u32 * 1024).into())
-            .receive_window((2u32 * 1024 * 1024).into())
-            .send_window(2u64 * 1024 * 1024);
+            .receive_window(CONNECTION_RECEIVE_WINDOW.into())
+            .send_window(CONNECTION_SEND_WINDOW);
         let transport = Arc::new(transport);
         let scope = IpScope::of(server);
         let wanted=tcp.get(key).copied().or_else(||key.socket());
@@ -157,7 +155,6 @@ pub(super) fn stage(
                 accept_stop: CancellationToken::new(),
                 handshakes: Arc::new(Semaphore::new(16)),
                 preflight: PreflightLanes::new(4, 8),
-                connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             });
             pool.insert(key.clone(), Arc::downgrade(&binding));
             inner.tasks.spawn(accept_loop(
@@ -565,16 +562,11 @@ async fn accept_loop(
             incoming.refuse();
             continue;
         };
-        let Ok(connection_slot) = binding.connections.clone().try_acquire_owned() else {
-            incoming.refuse();
-            continue;
-        };
         let Ok(process_handshake) = inner.quic_limits.handshakes.clone().try_acquire_owned() else {
             incoming.refuse();
             continue;
         };
-        let Ok(process_connection) = inner.quic_limits.connections.clone().try_acquire_owned()
-        else {
+        let Some(connection_slot) = inner.resources.quic_connections.try_acquire() else {
             incoming.refuse();
             continue;
         };
@@ -592,7 +584,7 @@ async fn accept_loop(
         let runtime = inner.clone();
         let key=key.clone();
         inner.tasks.spawn(async move {
-            let _connection_slot=(connection_slot,process_connection);
+            let _connection_slot = connection_slot;
             let budget = server.plan.read_header_timeout.unwrap_or(Duration::from_secs(15)).min(Duration::from_secs(15));
             let deadline = Instant::now() + budget;
             let Some(first) = server.tls_policies.first() else { return; };

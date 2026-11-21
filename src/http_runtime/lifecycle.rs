@@ -585,6 +585,7 @@ impl HttpRuntime {
             Arc::ptr_eq(&self.inner.managed.leaf_guard(), &managed.leaf_guard()),
             "HTTP candidate must share the runtime leaf guard"
         );
+        self.inner.resources.start_resource_refresh();
         // The guard is constructed under the same short lock as reservation:
         // dropping this future at any await cannot strand a pending ticket.
         let (guard, generation) = {

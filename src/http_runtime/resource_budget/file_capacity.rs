@@ -1,4 +1,4 @@
-//! Startup memory headroom for open static-file responses.
+//! Linux memory headroom for open static-file responses.
 
 #[cfg(target_os = "linux")]
 pub(super) fn memory_headroom() -> Option<usize> {

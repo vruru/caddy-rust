@@ -8,11 +8,17 @@ use tokio_util::task::TaskTracker;
 
 #[path = "resource_budget/file_capacity.rs"]
 mod file_capacity;
+#[path = "resource_budget/adaptive.rs"]
+mod adaptive;
+#[path = "resource_budget/file_streams.rs"]
+mod file_streams;
+pub(crate) use file_streams::Permit as FilePermit;
 
 /// ResourceLimits represents admission control quotas for concurrent operations.
 /// These are NOT fixed CPU worker threads; they are upper bounds on in-flight resources.
 /// CPU worker threads are detected from the process's available CPUs at startup.
-/// `for_parallelism` is pure; `automatic` sizes file bodies from descriptor and memory headroom when available.
+/// `for_parallelism` is pure; `automatic` provides an initial resource snapshot.
+/// The default Linux runtime also refreshes its file admission while serving.
 /// `None` disables an independent deadline; `Some(Duration::ZERO)` is rejected.
 /// Counts remain bounded even when no independent deadline is configured.
 /// `HttpRuntime::with_resource_limits` validates custom limits before use.
@@ -84,8 +90,8 @@ use tokio::sync::Semaphore;
 fn file_body_limit(cpu: usize, soft: Option<usize>, memory_headroom: Option<usize>) -> usize {
     let fallback = cpu.saturating_mul(16).clamp(128, 512);
     // A stalled response owns a descriptor and request state, with reads of
-    // at most 64 KiB. Reserve 256 KiB per body from a share of memory available
-    // at startup, leaving the bulk for sockets, protocol queues and other work.
+    // at most 64 KiB. Reserve 256 KiB per body from a share of available
+    // memory, leaving the bulk for sockets, protocol queues and other work.
     let by_memory = memory_headroom.map_or(fallback, |bytes| (bytes / 16 / (256 * 1024)).max(1));
     let by_descriptor = soft.map_or(fallback, |count| (count / 8).max(1));
     by_memory.min(by_descriptor).min(Semaphore::MAX_PERMITS)
@@ -275,6 +281,7 @@ pub struct ResourceDiagnostics {
     pub metadata: BudgetSnapshot,
     pub file_streams: BudgetSnapshot,
     pub file_reads: BudgetSnapshot,
+    pub http3_connections: BudgetSnapshot,
     pub compression: super::CompressionDiagnostics,
     pub proxy_selection: BudgetSnapshot,
     pub proxy_passive_dropped: u64,
@@ -308,8 +315,11 @@ pub(crate) struct Resources {
     auth_leader_limit: usize,
     auth_follower_limit: usize,
     pub metadata: BlockingBudget,
-    pub streams: BlockingBudget,
+    pub streams: file_streams::FileStreams,
     pub reads: BlockingBudget,
+    pub(crate) quic_connections: Arc<file_streams::Admission>,
+    refresh: Option<adaptive::Refresh>,
+    file_admission_adaptive: bool,
     pub(super) access_capture: Arc<super::access_log::CaptureBudget>,
     pub(super) request_body_bytes: Arc<Semaphore>,
     pub fastcgi: BlockingBudget,
@@ -343,9 +353,13 @@ impl Resources {
         self.client_tls.prepare()
     }
     pub(crate) fn automatic() -> Self {
-        Self::from_limits(ResourceLimits::automatic()).expect("valid automatic HTTP limits")
+        Self::new(ResourceLimits::automatic(), cfg!(target_os = "linux"))
+            .expect("valid automatic HTTP limits")
     }
     pub(crate) fn from_limits(limits: ResourceLimits) -> anyhow::Result<Self> {
+        Self::new(limits, false)
+    }
+    fn new(limits: ResourceLimits, file_admission_adaptive: bool) -> anyhow::Result<Self> {
         // The process runtime sets this shared blocking ceiling explicitly.
         // Reserve headroom for other services; this is not physical isolation.
         for timeout in [
@@ -384,17 +398,37 @@ impl Resources {
             limits.metadata_waiting,
             limits.io_queue_timeout.unwrap_or(Duration::ZERO),
         )?;
-        let streams = BlockingBudget::new(
+        anyhow::ensure!(
+            (1..=Semaphore::MAX_PERMITS).contains(&limits.file_streams)
+                && limits.file_stream_waiting <= Semaphore::MAX_PERMITS,
+            "file stream admission outside bounds"
+        );
+        let cpu = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let streams = file_streams::FileStreams::new(
             limits.file_streams,
-            limits.file_stream_waiting,
+            if file_admission_adaptive {
+                limits.file_streams
+            } else {
+                limits.file_stream_waiting
+            },
             limits.io_queue_timeout.unwrap_or(Duration::ZERO),
-        )?;
+        );
+        let quic_connections = file_streams::Admission::new(
+            adaptive::quic_limit(cpu, file_capacity::memory_headroom()),
+            0,
+        );
+        // Each file stream owns at most one outstanding read, including
+        // detached reads. Its admission already bounds this queue as it grows
+        // and while an older set of streams drains after a shrink.
         let reads = BlockingBudget::new(
             limits.file_read_running,
-            limits.file_read_waiting,
+            if file_admission_adaptive {
+                Semaphore::MAX_PERMITS
+            } else {
+                limits.file_read_waiting
+            },
             limits.io_queue_timeout.unwrap_or(Duration::ZERO),
         )?;
-        let cpu = std::thread::available_parallelism().map_or(1, |n| n.get());
         let capacity = cpu
             .saturating_mul(8)
             .clamp(16, 128)
@@ -470,6 +504,9 @@ impl Resources {
             metadata,
             streams,
             reads,
+            quic_connections,
+            refresh: cfg!(target_os = "linux").then(adaptive::Refresh::new),
+            file_admission_adaptive,
             auth_leaders: Arc::new(Semaphore::new(auth_leader_limit)),
             auth_followers: Arc::new(Semaphore::new(limits.auth_followers)),
             auth_comparisons: Arc::new(AtomicU64::new(0)),
@@ -526,6 +563,15 @@ impl Resources {
             read_timeout: limits.file_read_timeout.unwrap_or(Duration::ZERO),
         })
     }
+    pub(super) fn start_resource_refresh(&self) {
+        if let Some(refresh) = &self.refresh {
+            refresh.start(
+                self.file_admission_adaptive.then(|| self.streams.shared.clone()),
+                self.quic_connections.clone(),
+            );
+        }
+    }
+
     pub(crate) fn close(&self) {
         // The HTTP lifecycle has fenced incoming work. Existing requests may
         // still produce DNS, template and crypto descendants while draining.
@@ -535,7 +581,9 @@ impl Resources {
         self.auth_tasks.close();
         self.auth.tasks.close();
         self.metadata.tasks.close();
-        self.streams.tasks.close();
+        if let Some(refresh) = &self.refresh {
+            refresh.close();
+        }
         self.reads.tasks.close();
         self.fastcgi.tasks.close();
         self.compression.close();
@@ -579,7 +627,9 @@ impl Resources {
         self.auth_tasks.wait().await;
         self.auth.tasks.wait().await;
         self.metadata.tasks.wait().await;
-        self.streams.tasks.wait().await;
+        if let Some(refresh) = &self.refresh {
+            refresh.wait().await;
+        }
         self.reads.tasks.wait().await;
         self.fastcgi.tasks.wait().await;
         self.compression.wait().await;
@@ -594,6 +644,11 @@ impl Resources {
         self.fastcgi_admission.diagnostics.wait().await;
     }
     pub(crate) fn snapshot(&self) -> ResourceDiagnostics {
+        let file_streams = self.streams.snapshot();
+        let mut file_reads = self.reads.snapshot();
+        if self.file_admission_adaptive {
+            file_reads.waiting_limit = file_streams.running_limit.max(file_streams.running);
+        }
         let (access_capture_rejected, access_capture_reduced, access_response_headers_omitted) =
             self.access_capture.stats();
         let (cel_dynamic_entries, cel_dynamic_bytes) = self.cel_dynamic.snapshot();
@@ -621,8 +676,9 @@ impl Resources {
             auth_followers: self.auth_follower_limit - self.auth_followers.available_permits(),
             auth_follower_limit: self.auth_follower_limit,
             metadata: self.metadata.snapshot(),
-            file_streams: self.streams.snapshot(),
-            file_reads: self.reads.snapshot(),
+            file_streams,
+            file_reads,
+            http3_connections: self.quic_connections.snapshot(),
             compression: self.compression.snapshot(),
             proxy_selection: self.proxy_selection.snapshot(),
             proxy_passive_dropped: self.proxy_hosts.dropped_failures(),
@@ -660,7 +716,7 @@ where
 /// retain both their descriptor reference and real worker slot until completion.
 pub(crate) async fn read_chunk(
     file: Arc<std::fs::File>,
-    admission: Arc<tokio::sync::OwnedSemaphorePermit>,
+    admission: Arc<FilePermit>,
     budget: BlockingBudget,
     offset: u64,
     length: usize,
