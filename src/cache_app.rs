@@ -9,7 +9,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -42,6 +42,7 @@ impl Runtime {
                     state: Mutex::new(State {
                         entries: VecDeque::new(),
                         index: HashMap::new(),
+                        collect_cursor: 0,
                     }),
                     bytes: BYTE_BUDGET
                         .get_or_init(|| Arc::new(AtomicUsize::new(0)))
@@ -86,6 +87,7 @@ pub(crate) struct Entry {
     pub lifetime: Duration,
     pub initial_age: u64,
     pub charge: Charge,
+    pub touched: AtomicBool,
 }
 pub(crate) struct Store {
     capacity: usize,
@@ -97,6 +99,7 @@ pub(crate) struct Store {
 struct State {
     entries: VecDeque<Arc<Entry>>,
     index: HashMap<String, Vec<Weak<Entry>>>,
+    collect_cursor: usize,
 }
 impl State {
     fn unindex(&mut self, e: &Arc<Entry>) {
@@ -108,38 +111,118 @@ impl State {
         }
     }
     fn collect(&mut self, retired: &mut Vec<Arc<Entry>>) {
-        // At most sixteen entries are visited per request; payloads drop only
-        // after the state lock is released. Hash lookup never scans the cache.
-        for _ in 0..self.entries.len().min(16) {
-            let Some(e) = self.entries.pop_front() else {
-                break;
+        // At most sixteen entries are visited per request without disturbing
+        // recency order; payloads drop only after the state lock is released.
+        let mut remaining = self.entries.len().min(16);
+        while remaining > 0 && !self.entries.is_empty() {
+            remaining -= 1;
+            if self.collect_cursor >= self.entries.len() {
+                self.collect_cursor = 0;
+            }
+            let idx = self.collect_cursor;
+            let expired_or_stale = {
+                let e = &self.entries[idx];
+                let registered = self
+                    .index
+                    .get(&e.key)
+                    .is_some_and(|v| v.iter().any(|w| w.as_ptr() == Arc::as_ptr(e)));
+                e.inserted.elapsed() >= e.lifetime || !registered
             };
-            let registered = self
-                .index
-                .get(&e.key)
-                .is_some_and(|v| v.iter().any(|w| w.as_ptr() == Arc::as_ptr(&e)));
-            if e.inserted.elapsed() >= e.lifetime || !registered {
-                self.unindex(&e);
-                retired.push(e);
+            if expired_or_stale {
+                if let Some(e) = self.entries.remove(idx) {
+                    self.unindex(&e);
+                    retired.push(e);
+                }
             } else {
-                self.entries.push_back(e);
+                self.collect_cursor += 1;
             }
         }
     }
 }
 impl Store {
+    fn evict_for(&self, needed: usize) -> bool {
+        if needed > RETAINED_BYTES {
+            return false;
+        }
+        loop {
+            if self.bytes.load(Ordering::Acquire).saturating_add(needed) <= RETAINED_BYTES {
+                return true;
+            }
+            let mut retired = Vec::new();
+            {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut reclaimed = 0usize;
+                let total = state.entries.len();
+                for _ in 0..total {
+                    let Some(e) = state.entries.pop_front() else {
+                        break;
+                    };
+                    let registered = state
+                        .index
+                        .get(&e.key)
+                        .is_some_and(|v| v.iter().any(|w| w.as_ptr() == Arc::as_ptr(&e)));
+                    if e.inserted.elapsed() >= e.lifetime || !registered {
+                        state.unindex(&e);
+                        reclaimed = reclaimed.saturating_add(e.charge.held);
+                        retired.push(e);
+                    } else {
+                        state.entries.push_back(e);
+                    }
+                }
+                if reclaimed < needed {
+                    let live = state.entries.len();
+                    let mut scanned = 0usize;
+                    while reclaimed < needed && scanned < live {
+                        let Some(e) = state.entries.pop_front() else {
+                            break;
+                        };
+                        scanned += 1;
+                        if e.touched.swap(false, Ordering::AcqRel) && !state.entries.is_empty() {
+                            state.entries.push_back(e);
+                            continue;
+                        }
+                        state.unindex(&e);
+                        reclaimed = reclaimed.saturating_add(e.charge.held);
+                        retired.push(e);
+                    }
+                    while reclaimed < needed {
+                        let Some(e) = state.entries.pop_front() else {
+                            break;
+                        };
+                        state.unindex(&e);
+                        reclaimed = reclaimed.saturating_add(e.charge.held);
+                        retired.push(e);
+                    }
+                }
+            }
+            if retired.is_empty() {
+                return self.bytes.load(Ordering::Acquire).saturating_add(needed) <= RETAINED_BYTES;
+            }
+            drop(retired);
+        }
+    }
     pub(crate) fn reserve(&self, n: usize) -> Option<Charge> {
         let mut c = Charge {
             used: self.bytes.clone(),
             held: 0,
         };
-        c.grow(n).then_some(c)
+        if self.grow(&mut c, n) {
+            Some(c)
+        } else {
+            None
+        }
+    }
+    pub(crate) fn grow(&self, charge: &mut Charge, n: usize) -> bool {
+        if charge.grow(n) {
+            return true;
+        }
+        self.evict_for(n) && charge.grow(n)
     }
     pub(crate) fn lookup(&self, key: &str, headers: &HeaderMap) -> Option<Arc<Entry>> {
         let mut retired = Vec::new();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.collect(&mut retired);
-        state
+        let found = state
             .index
             .get(key)?
             .iter()
@@ -154,7 +237,11 @@ impl Store {
                             .map(|h| h.as_bytes())
                             .eq(v.iter().map(Vec::as_slice))
                     })
-            })
+            });
+        if let Some(entry) = &found {
+            entry.touched.store(true, Ordering::Relaxed);
+        }
+        found
     }
     pub(crate) fn insert(&self, entry: Entry) {
         if self.capacity < 2 {
@@ -163,6 +250,35 @@ impl Store {
         let mut retired = Vec::new();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.collect(&mut retired);
+        let replaced = {
+            let variants = state.index.entry(entry.key.clone()).or_default();
+            let before = variants.len();
+            let mut stale_ptrs = Vec::new();
+            variants.retain(|w| match w.upgrade() {
+                Some(e) if e.vary != entry.vary && e.inserted.elapsed() < e.lifetime => true,
+                Some(e) => {
+                    stale_ptrs.push(Arc::as_ptr(&e));
+                    false
+                }
+                None => false,
+            });
+            if before != variants.len() && !stale_ptrs.is_empty() {
+                stale_ptrs
+            } else {
+                Vec::new()
+            }
+        };
+        if !replaced.is_empty() {
+            let mut keep = VecDeque::with_capacity(state.entries.len());
+            while let Some(e) = state.entries.pop_front() {
+                if replaced.contains(&Arc::as_ptr(&e)) {
+                    retired.push(e);
+                } else {
+                    keep.push_back(e);
+                }
+            }
+            state.entries = keep;
+        }
         while state.entries.len() >= self.capacity / 2 {
             if let Some(e) = state.entries.pop_front() {
                 state.unindex(&e);
@@ -170,12 +286,11 @@ impl Store {
             }
         }
         let entry = Arc::new(entry);
-        let variants = state.index.entry(entry.key.clone()).or_default();
-        variants.retain(|w| {
-            w.upgrade()
-                .is_some_and(|e| e.vary != entry.vary && e.inserted.elapsed() < e.lifetime)
-        });
-        variants.push(Arc::downgrade(&entry));
+        state
+            .index
+            .entry(entry.key.clone())
+            .or_default()
+            .push(Arc::downgrade(&entry));
         state.entries.push_back(entry);
     }
 }

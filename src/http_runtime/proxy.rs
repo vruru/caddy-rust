@@ -590,6 +590,53 @@ impl std::fmt::Display for ResponseHeaderTimeout {
 }
 impl std::error::Error for ResponseHeaderTimeout {}
 
+fn is_stale_reused_connection_error(error: &anyhow::Error) -> bool {
+    if error.is::<ResponseHeaderTimeout>() {
+        return false;
+    }
+    let Some(client_err) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<hyper_util::client::legacy::Error>())
+    else {
+        return false;
+    };
+    if !client_err.is_reused_connection()
+        || client_err.is_connect()
+        || !(client_err.is_send_request() || client_err.is_canceled())
+    {
+        return false;
+    }
+    let mut saw_closed_transport = false;
+    for cause in error.chain() {
+        if let Some(hyper_err) = cause.downcast_ref::<hyper::Error>() {
+            if hyper_err.is_timeout() {
+                return false;
+            }
+            if hyper_err.is_incomplete_message()
+                || hyper_err.is_closed()
+                || hyper_err.is_canceled()
+            {
+                saw_closed_transport = true;
+            }
+        }
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            if io_err.kind() == std::io::ErrorKind::TimedOut {
+                return false;
+            }
+            if matches!(
+                io_err.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionAborted
+            ) {
+                saw_closed_transport = true;
+            }
+        }
+    }
+    saw_closed_transport
+}
+
 fn proxy_error_category(error:&anyhow::Error)->&'static str {
     if error.is::<ResponseHeaderTimeout>() {return "response_header_timeout"}
     if error.is::<super::proxy_retry::NoUpstream>() {return "no_upstreams"}
@@ -678,6 +725,7 @@ async fn serve_inner(
     ctx.req_mut().extensions_mut().insert(source.clone());
     let start = std::time::Instant::now();
     let mut retries = 0;
+    let mut stale_conn_retries: u32 = 0;
     loop {
         stats.retries=retries;
         ctx.values
@@ -721,6 +769,24 @@ async fn serve_inner(
             .is_some_and(|obs| obs.upload_failed())
         {
             return Err(error);
+        }
+        // Match Go net/http.Transport's automatic retry when an upstream closes
+        // an idle keep-alive connection just as an idempotent request is written.
+        // Only retries proven reused pooled sockets before any response arrives.
+        if progress.fetch_started
+            && stale_conn_retries < 3
+            && source.replayable()
+            && matches!(
+                method,
+                http::Method::GET
+                    | http::Method::HEAD
+                    | http::Method::OPTIONS
+                    | http::Method::TRACE
+            )
+            && is_stale_reused_connection_error(&error)
+        {
+            stale_conn_retries += 1;
+            continue;
         }
         if progress.fetch_started {
             if let Some(host) = progress.host {

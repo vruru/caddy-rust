@@ -60,6 +60,7 @@ pub struct Error {
     source: Option<Box<dyn StdError + Send + Sync>>,
     #[cfg(any(feature = "http1", feature = "http2"))]
     connect_info: Option<Connected>,
+    reused: bool,
 }
 
 #[derive(Debug)]
@@ -79,6 +80,7 @@ macro_rules! e {
             kind: ErrorKind::$kind,
             source: None,
             connect_info: None,
+            reused: false,
         }
     };
     ($kind:ident, $src:expr) => {
@@ -86,6 +88,7 @@ macro_rules! e {
             kind: ErrorKind::$kind,
             source: Some($src.into()),
             connect_info: None,
+            reused: false,
         }
     };
 }
@@ -329,17 +332,20 @@ where
         let mut res = match pooled.try_send_request(req).await {
             Ok(res) => res,
             Err(mut err) => {
+                let reused = pooled.is_reused();
                 return if let Some(req) = err.take_message() {
                     Err(TrySendError::Retryable {
-                        connection_reused: pooled.is_reused(),
+                        connection_reused: reused,
                         error: e!(Canceled, err.into_error())
-                            .with_connect_info(pooled.conn_info.clone()),
+                            .with_connect_info(pooled.conn_info.clone())
+                            .with_reused(reused),
                         req,
                     })
                 } else {
                     Err(TrySendError::Nope(
                         e!(SendRequest, err.into_error())
-                            .with_connect_info(pooled.conn_info.clone()),
+                            .with_connect_info(pooled.conn_info.clone())
+                            .with_reused(reused),
                     ))
                 };
             }
@@ -1770,7 +1776,24 @@ impl Error {
             ..self
         }
     }
-    fn is_canceled(&self) -> bool {
+
+    fn with_reused(mut self, reused: bool) -> Self {
+        self.reused = reused;
+        self
+    }
+
+    /// Returns true if this error occurred on a reused pooled connection.
+    pub fn is_reused_connection(&self) -> bool {
+        self.reused
+    }
+
+    /// Returns true if this was a send-request transport error.
+    pub fn is_send_request(&self) -> bool {
+        matches!(self.kind, ErrorKind::SendRequest)
+    }
+
+    /// Returns true if this request was canceled before transmission completed.
+    pub fn is_canceled(&self) -> bool {
         matches!(self.kind, ErrorKind::Canceled)
     }
 

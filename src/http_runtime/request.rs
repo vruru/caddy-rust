@@ -1078,7 +1078,14 @@ fn handlers<'a>(
                     let runtime = server.cache.as_ref().ok_or_else(|| anyhow::anyhow!("cache app was not prepared"))?;
                     match super::cache_handler::before(ctx, runtime, plan).await? {
                         super::cache_handler::Decision::Bypass => continue,
-                        super::cache_handler::Decision::Hit(response) => return Ok(Flow::Response(response)),
+                        super::cache_handler::Decision::Hit(response) => {
+                            let alt_svc = ctx.immediate.remove(http::header::ALT_SVC);
+                            ctx.immediate.clear();
+                            if let Some(alt_svc) = alt_svc {
+                                ctx.immediate.insert(http::header::ALT_SVC, alt_svc);
+                            }
+                            return Ok(Flow::Response(response));
+                        }
                         super::cache_handler::Decision::Miss(token) => {
                             let mark = ctx.deferred.len();
                             let after = Next::Handlers(&list[index+1..], traces.get(index+1..).unwrap_or_default(), next);

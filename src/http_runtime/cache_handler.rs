@@ -451,7 +451,10 @@ pub(super) async fn finish(
         miss(response.headers_mut(), runtime, &token, "STALE");
         return Ok(response);
     }
-    if !token.charge.grow(metadata(headers).saturating_add(4096)) {
+    if !runtime
+        .store
+        .grow(&mut token.charge, metadata(headers).saturating_add(4096))
+    {
         miss(response.headers_mut(), runtime, &token, "CACHE-BUDGET");
         return Ok(response);
     }
@@ -486,7 +489,7 @@ pub(super) async fn finish(
                 .map(|v| v.as_bytes().len() + 128)
                 .sum::<usize>()
                 .saturating_add(256);
-            if !token.charge.grow(vary_bytes) {
+            if !runtime.store.grow(&mut token.charge, vary_bytes) {
                 miss(response.headers_mut(), runtime, &token, "CACHE-BUDGET");
                 return Ok(response);
             }
@@ -501,6 +504,7 @@ pub(super) async fn finish(
     }
     let mut saved = headers.clone();
     strip_hop(&mut saved);
+    saved.remove(header::ALT_SVC);
     saved.remove("cache-status");
     saved.remove("x-souin-stored-ttl");
     saved.remove("x-souin-stored-length");
@@ -523,6 +527,7 @@ pub(super) async fn finish(
         lifetime,
         initial_age,
         charge: token.charge,
+        touched: std::sync::atomic::AtomicBool::new(false),
     };
     let head = token.method == Method::HEAD;
     if body.is_end_stream() {
@@ -631,62 +636,64 @@ impl HttpBody for Capture {
         mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
     ) -> Poll<Option<std::result::Result<Frame<Bytes>, BoxError>>> {
-        if let Some(frame) = self.queued.take() {
+        let this = self.get_mut();
+        if let Some(frame) = this.queued.take() {
             return Poll::Ready(Some(frame));
         }
         loop {
-            if self.held.is_some() {
-                match Pin::new(&mut self.inner).poll_frame(cx) {
+            if this.held.is_some() {
+                match Pin::new(&mut this.inner).poll_frame(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(None) => {
-                        self.complete();
-                        return Poll::Ready(self.held.take().map(Ok));
+                        this.complete();
+                        return Poll::Ready(this.held.take().map(Ok));
                     }
                     Poll::Ready(Some(next)) => {
-                        self.entry = None;
-                        self.flight.take();
-                        self.queued = Some(next);
-                        return Poll::Ready(self.held.take().map(Ok));
+                        this.entry = None;
+                        this.flight.take();
+                        this.queued = Some(next);
+                        return Poll::Ready(this.held.take().map(Ok));
                     }
                 }
             }
-            let result = Pin::new(&mut self.inner).poll_frame(cx);
+            let result = Pin::new(&mut this.inner).poll_frame(cx);
             match result {
                 Poll::Ready(Some(Ok(frame))) => {
                     let mut final_data = false;
                     if let Some(bytes) = frame.data_ref() {
-                        let maximum = self.maximum;
-                        let expected = self.expected;
-                        if let Some(e) = self.entry.as_mut() {
+                        let maximum = this.maximum;
+                        let expected = this.expected;
+                        let store = &this.store;
+                        if let Some(e) = this.entry.as_mut() {
                             if e.length.saturating_add(bytes.len()) > maximum
-                                || !e.charge.grow(bytes.len().saturating_add(128))
+                                || !store.grow(&mut e.charge, bytes.len().saturating_add(128))
                             {
-                                self.entry = None;
-                                self.flight.take();
+                                this.entry = None;
+                                this.flight.take();
                             } else {
                                 e.length += bytes.len();
                                 e.chunks.push(Bytes::copy_from_slice(bytes));
                                 final_data = expected == Some(e.length);
                             }
                         }
-                        if self.entry.is_some() && (final_data || self.inner.is_end_stream()) {
-                            self.held = Some(frame);
+                        if this.entry.is_some() && (final_data || this.inner.is_end_stream()) {
+                            this.held = Some(frame);
                             continue;
                         }
                     } else {
-                        self.entry = None;
-                        self.flight.take();
+                        this.entry = None;
+                        this.flight.take();
                     }
                     return Poll::Ready(Some(Ok(frame)));
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    self.entry = None;
-                    self.flight.take();
-                    self.done = true;
+                    this.entry = None;
+                    this.flight.take();
+                    this.done = true;
                     return Poll::Ready(Some(Err(e)));
                 }
                 Poll::Ready(None) => {
-                    self.complete();
+                    this.complete();
                     return Poll::Ready(None);
                 }
                 Poll::Pending => return Poll::Pending,

@@ -35,7 +35,12 @@ serving and other backend/options are rejected. The body limit defaults to
 
 A process-wide 128 MiB budget covers retained cache data, in-flight captures,
 entry metadata, response metadata and evicted data still held by clients. This
-is not a bound on total process RSS. Same-capacity reloads share the existing
+is not a bound on total process RSS. When byte-budget pressure is reached, the
+store reclaims expired/unindexed entries and evicts cold retained entries via
+second-chance rotation outside the state lock rather than stalling on
+`CACHE-BUDGET`. Transport-level `Alt-Svc` headers are not stored in cached
+entries, and cache hits preserve the current listener's `Alt-Svc` while keeping
+`Server` and immediate headers consistent with the cached response. Same-capacity reloads share the existing
 store. A capacity change creates a fresh store under the same process budget.
 Entries retain copied bytes, not request/generation guards or upload spools.
 This backend uses uncompressed native bytes and bounded approximate rotation,
