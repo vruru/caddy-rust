@@ -115,11 +115,19 @@ pub(super) fn stage(
         crypto.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
         crypto.send_tls13_tickets = 0;
         crypto.max_early_data_size = 0;
+        let quic_idle_timeout = server
+            .plan
+            .idle_timeout
+            .unwrap_or(Duration::from_secs(300))
+            .max(Duration::from_secs(30));
+        let keep_alive = (quic_idle_timeout > Duration::from_secs(15))
+            .then_some(Duration::from_secs(15));
         let mut transport = TransportConfig::default();
         transport
             .max_concurrent_bidi_streams((STREAMS as u32).into())
             .max_concurrent_uni_streams(8u8.into())
-            .max_idle_timeout(Some(Duration::from_secs(30).try_into()?))
+            .max_idle_timeout(Some(quic_idle_timeout.try_into()?))
+            .keep_alive_interval(keep_alive)
             .stream_receive_window((256u32 * 1024).into())
             .receive_window(CONNECTION_RECEIVE_WINDOW.into())
             .send_window(CONNECTION_SEND_WINDOW);

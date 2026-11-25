@@ -98,6 +98,9 @@ pub(super) const DEFAULT_TYPES: &[&[u8]] = &[
 ];
 
 fn encoding_allowed(headers: &HeaderMap) -> bool {
+    if is_sse(headers) {
+        return false;
+    }
     let forbidden = b"no-transform";
     headers.get(header::CACHE_CONTROL).is_none_or(|value| {
         !value
@@ -194,7 +197,7 @@ impl ResponseEncoding {
         // final 200, but the encoding writer matches the status it observed.
         let matcher_status = preceding_static_interim.unwrap_or(status.as_u16());
         let incremental = super::incremental::is_enabled(headers);
-        let eager = preceding_static_interim.is_none() && (incremental || is_sse(headers));
+        let eager = preceding_static_interim.is_none() && incremental;
         let min = self.plan.minimum_length;
         let declared_large = headers
             .get(header::CONTENT_LENGTH)
